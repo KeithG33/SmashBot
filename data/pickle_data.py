@@ -43,7 +43,7 @@ def parse_projectiles(projectiles):
             projectile.speed.x, projectile.speed.y,
             projectile.subtype, projectile.type.value, 
         ]
-        projectile_state_list.extend(projectile_state)
+        projectile_state_list.append(projectile_state)
     return projectile_state_list
 
 def parse_nana(nana):
@@ -53,7 +53,7 @@ def parse_nana(nana):
         nana.action.value, nana.action_frame, nana.character.value,
         int(nana.facing), int(nana.hitlag_left), nana.hitstun_frames_left, 
         nana.invulnerability_left, int(nana.invulnerable), nana.jumps_left,
-        nana.nana, int(nana.on_ground), nana.percent, 
+        int(nana.on_ground), nana.percent, # nana index removed
         nana.position.x, nana.position.y, nana.shield_strength,
         nana.speed_air_x_self, nana.speed_ground_x_self, nana.speed_x_attack,
         nana.speed_y_attack, nana.speed_y_self, nana.stock
@@ -118,8 +118,6 @@ def parse_game_state(gamestate):
     playerstate_list = []
     controllerstate_list = []
 
-    assert len(gamestate.players) == 2, "Only 2 players are supported"
-
     for port, pstate in gamestate.players.items():
         # Player state
         nana = parse_nana(pstate.nana)
@@ -144,15 +142,13 @@ def parse_game_state(gamestate):
         
         controller_state = controller_button_state + controller_analog_state
 
-        playerstate_list.extend(player_state)
+        playerstate_list.append(player_state)
         controllerstate_list.append(controller_state)
     
     observation = env_info + playerstate_list
-    
-    p1_action = controllerstate_list[0] 
-    p2_action = controllerstate_list[1]
+    actions = controllerstate_list
 
-    return observation, p1_action, p2_action
+    return observation, actions
 
 def save_data(data, output_dir, batch_number):
     """ Save the data to a pickle file with a unique batch number """
@@ -162,46 +158,57 @@ def save_data(data, output_dir, batch_number):
 
 def process_files(file_batch, output_dir, batch_number):
     game_data_batch = []
+    try:
+        for index, slp_file in enumerate(file_batch):
+            print(f"Processing file {batch_number} / {index}:", slp_file)
+            console = melee.Console(is_dolphin=False, allow_old_version=True, path=slp_file)
+            console.connect()
 
-    for index, slp_file in enumerate(file_batch):
-        print(f"Processing file {batch_number} / {index} :", slp_file)
-        console = melee.Console(is_dolphin=False, allow_old_version=True, path=slp_file)
-        console.connect()
+            prev_actions = None
+            while True:
+                gamestate = console.step()
+                if gamestate is None:
+                    break
 
-        previous_p1_action = None
-        previous_p2_action = None
-        while True:
-            gamestate = console.step()
-            if gamestate is None:
-                break
+                obs, actions = parse_game_state(gamestate)
+                print(obs)
+                game_data_batch.append({
+                    "observation": obs,
+                    "actions": actions,
+                    "prev_actions": prev_actions
+                })
 
-            obs, p1_action, p2_action = parse_game_state(gamestate)
-            game_data_batch.append({
-                "observation": obs,
-                "p1_action": p1_action,
-                "p2_action": p2_action,
-                "prev_p1_action": previous_p1_action,
-                "prev_p2_action": previous_p2_action
-            })
-            previous_p1_action = p1_action
-            previous_p2_action = p2_action
+                prev_actions = actions
 
-    save_data(game_data_batch, output_dir, batch_number)
+    except Exception as e:
+        print(f"An error occurred while processing files: {e}")
+    else:
+        # If no exceptions were raised, save the data.
+        save_data(game_data_batch, output_dir, batch_number)
+        # pass
 
 
 def main():
     SLIPPI_FILE_DIR = '/home/kage/smashbot_workspace/dataset/Slippi_Public_Dataset_v3/slp'
-    OUTPUT_DIR = '/home/kage/smashbot_workspace/dataset/pickle_files/'
-    NUM_WORKERS = 20  # Number of processes
-
+    OUTPUT_DIR = '/home/kage/smashbot_workspace/dataset/'
+    NUM_WORKERS = 41  # Number of processes
+    
     slp_files = glob.glob(SLIPPI_FILE_DIR + '**/*.slp', recursive=True)
-    batch_size = 50  # Define the batch size per worker
+    batch_size = 25  # Define the batch size per worker
     chunks = [slp_files[i:i + batch_size] for i in range(0, len(slp_files), batch_size)]
 
     with multiprocessing.Pool(NUM_WORKERS) as pool:
         jobs = [(chunk, OUTPUT_DIR, i + 1) for i, chunk in enumerate(chunks)]
         pool.starmap(process_files, jobs)
 
+def test():
+    SLIPPI_FILE = '/home/kage/smashbot_workspace/dataset/mygame.slp'
+    OUTPUT_DIR = '/home/kage/smashbot_workspace/dataset/pickle_files/'
+
+    slp_files = [SLIPPI_FILE]
+    process_files(slp_files, OUTPUT_DIR, 1)
+
 
 if __name__ == "__main__":
-    main()
+    # main()
+    test()
