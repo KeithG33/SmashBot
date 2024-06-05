@@ -1,4 +1,5 @@
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import Pool
 import multiprocessing
 import pickle, os
@@ -18,72 +19,6 @@ PLAYER_TYPE = 3
 NANA_TYPE = 4
 ACTION_TYPE = 5
 
-# def generate_input_tensor(observation, prev_action, player_index):
-#     """
-#     Generate the input tensor from the observation. Create a sequence of
-#     features to handle the variable sized number of players and projectiles
-
-#     First index indicates whether tensor corresponds to player, projectile, nana,
-#     or misc info. Negative value indicates currently active player.
-
-#     Also includes prev action in observation 
-#     """
-    
-#     all_tensors = []
-
-#     # misc_info includes distance, frame, and stage
-#     # players is a list of lists of length 20
-#     # nanas is a list of lists of length 20
-#     # projectiles is a list of lists of length 8
-#     misc = torch.tensor(observation[:3]).view(1, 3)
-#     players = observation[4:]  # 2 to 4 players
-#     projectiles = observation[3]
-#     nana_states = [obs.pop(9) for obs in players]
-    
-#     misc_types = torch.full((1, 1), MISC_TYPE)
-#     misc_padded = F.pad(misc, (0, 20 - misc.shape[1]))
-#     misc = torch.cat([misc_types, misc_padded], dim=1)
-#     all_tensors.append(misc)
-    
-#     players = torch.tensor(players)
-#     player_types = torch.full((players.shape[0], 1), PLAYER_TYPE)
-#     player_types[player_index] = -PLAYER_TYPE  # Neg value for active player
-#     players = torch.cat([player_types, players], dim=1)
-#     all_tensors.append(players)
-
-#     nana_list = []
-#     for i, nana in enumerate(nana_states):
-#         if nana is not None:
-#             nana_tensor = torch.tensor(nana).view(1, -1)
-#             nana_type = -NANA_TYPE if i == player_index else NANA_TYPE
-#             nana_types = torch.full((1, 1), nana_type)
-#             nana_tensor = torch.cat([nana_types, nana_tensor], dim=1)
-#             nana_list.append(nana_tensor)
-#     if nana_list: 
-#         nana_tensors = torch.cat(nana_list, dim=0)
-#         all_tensors.append(nana_tensors)
-
-#     # TODO: experiment conditioning on previous action
-#     #
-#     # if prev_action is not None:
-#     #     prev_action = prev_action + [0] * (20 - len(prev_action))
-#     #     prev_action = torch.tensor(prev_action).view(1, -1)
-#     # else:
-#     #     prev_action = torch.zeros(1, 20)
-#     # action_types = torch.full((len(prev_action), 1), ACTION_TYPE)
-#     # action_tensors = torch.cat([action_types, prev_action], dim=1)
-#     # all_tensors.append(action_tensors)
-
-#     if projectiles:
-#         projectile_tensors = torch.tensor(projectiles)
-#         projectile_types = torch.full((projectile_tensors.shape[0], 1), PROJECTILE_TYPE)
-#         projectile_padded = F.pad(projectile_tensors, (0, 20 - projectile_tensors.shape[1]))
-#         projectiles = torch.cat([projectile_types, projectile_padded], dim=1)
-#         all_tensors.append(projectiles)
-        
-#     combined_tensor = torch.cat(all_tensors, dim=0)  # (seq, 21)
-#     return combined_tensor
-
 
 # TODO: the only difference here is the player_index parts
 #       Only need to call this once and then manipulate the player indices
@@ -97,12 +32,13 @@ def generate_input_python(observation, prev_action, player_index):
     or misc info. Negative value indicates currently active player.
     """
 
+    copy_observation = copy.deepcopy(observation)
     all_tensors = []
 
     # misc_info includes distance, frame, and stage
-    misc = observation[:3]  # Assuming this slices correctly
-    players = observation[4:]  # Assuming players data start from index 4
-    projectiles = observation[3]
+    misc = copy_observation[:3]  # Assuming this slices correctly
+    projectiles = copy_observation[3]
+    players = copy_observation[4:]  # Assuming players data start from index 4
     nana_states = [obs.pop(9) for obs in players]  # Modify this if structure differs
 
     # Creating misc tensor data
@@ -216,7 +152,7 @@ class SmashBrosDataset(Dataset):
             actions = d["actions"]
 
             for i in range(len(actions)):
-                player_input = generate_input_python(copy.deepcopy(obs), None, i)
+                player_input = generate_input_python(obs, None, i)
                 player_output = actions[i]
                 inputs.append(player_input)
                 outputs.append(player_output)
@@ -228,25 +164,42 @@ class SmashBrosDataset(Dataset):
 
     def __getitem__(self, index):
         return torch.tensor(self.inputs[index]), torch.tensor(self.outputs[index])
-    
 
+    
+def get_memory_usage():
+    process = psutil.Process(os.getpid())
+    mem_usage = process.memory_info().rss / float(2 ** 20)  # in MB
+    return mem_usage
+
+import psutil
 if __name__ == "__main__":
     # Test the dataset
-    # TODO fix multiprocessing: currently OSError: too many open files :(
-    PKL_DIR_TEST = '/home/kage/smashbot_workspace/dataset/pickle_files/test'
-    PKL_DIR_TRAIN = '/home/kage/smashbot_workspace/dataset/pickle_files/train'
+    PKL_DIR_TEST = '/home/kage/smashbot_workspace/dataset/Slippi_Public_Dataset_v3/pickle/test'
+    # PKL_DIR_TRAIN = '/home/kage/smashbot_workspace/dataset/pickle_files/train'
 
-    # Test files successfully load
-    test_data = [pkl.path for pkl in os.scandir(PKL_DIR_TEST) if pkl.name.endswith(".pkl")]
-    train_data = [pkl.path for pkl in os.scandir(PKL_DIR_TRAIN) if pkl.name.endswith(".pkl")]
+    # TODO: test batch_2067.pkl or _2344 or _636
 
-    testing_data = test_data + train_data
+    FILES = [pkl.path for pkl in os.scandir(PKL_DIR_TEST) if pkl.name.endswith(".pkl")]
+    print(f"Found {len(FILES)} files")
 
-    t1 = time.perf_counter()
-    dataset = SmashBrosDataset(testing_data[:4], num_processes=4)
-    print(f"Loaded {len(dataset)} data points in {time.perf_counter() - t1:.2f} seconds")
-    # for pkl_file in testing_data:
-    #     t1 = time.perf_counter()
-    #     print(f"Loading {pkl_file}...")
-    #     dataset = SmashBrosDataset([pkl_file], num_processes=2)
-    #     print(f"Loaded {pkl_file} in {time.perf_counter() - t1:.2f} seconds")
+    for i in range(10):
+        dataset = SmashBrosDataset(FILES[:3], num_processes=3)
+        print(f"Loop {i+1}, Memory usage: {get_memory_usage()} MB")
+        del dataset  # Explicitly delete the dataset object to free up memory
+
+
+
+    # with open(FILES[0], 'rb') as f:
+    #     data = pickle.load(f)
+    #     print(f"Loaded {len(data)} data points from {FILES[0]}")
+    # # Test files successfully load
+    # # test_data = [pkl.path for pkl in os.scandir(PKL_DIR_TEST) if pkl.name.endswith(".pkl")]
+    # # train_data = [pkl.path for pkl in os.scandir(PKL_DIR_TRAIN) if pkl.name.endswith(".pkl")]
+
+    # # testing_data = test_data + train_data
+    # # testing_data = [pkl.path for pkl in os.scandir(FILES) if pkl.name.endswith(".pkl")]
+
+    # t1 = time.perf_counter()
+    # # dataset = SmashBrosDataset(testing_data[:4], num_processes=4, inner_num_processes=4)9
+    # dataset = SmashBrosDataset(FILES, num_processes=3)
+    # print(f"Loaded {len(dataset)} data points in {time.perf_counter() - t1:.2f} seconds")
