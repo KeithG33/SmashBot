@@ -1,9 +1,15 @@
 """ Test file to parse slippi files and extract relevant gamestate information """
 
+import copy
 from functools import partial
 import multiprocessing
 import pickle
+import hickle as hkl
+import random
 import sys
+from typing import LiteralString
+
+import numpy as np
 import melee
 import glob
 import shutil
@@ -13,18 +19,23 @@ import torch
 from melee.enums import Button
 
 
+# Enums for indicating data type
+MISC_TYPE = 1
+PROJECTILE_TYPE = 2
+PLAYER_TYPE = 3
+NANA_TYPE = 4
+ACTION_TYPE = 5
+
+
 def buttons_to_list(button_dict):
     """ Order is [A, B, L, X, Z] """
     button_list = []
-
     button_list.append(int(button_dict.get(Button.BUTTON_A)))
     button_list.append(int(button_dict.get(Button.BUTTON_B)))
     button_list.append(int(button_dict.get(Button.BUTTON_L) or button_dict.get(Button.BUTTON_R)))
     button_list.append(int(button_dict.get(Button.BUTTON_X) or button_dict.get(Button.BUTTON_Y)))
     button_list.append(int(button_dict.get(Button.BUTTON_Z)))
-    
     return button_list
-
 
 def analog_to_list(main_stick, c_stick, l_shoulder, r_shoulder):
     """ Order is [Main Stick, C-Stick, L_shoulder] """
@@ -60,7 +71,6 @@ def parse_nana(nana):
     ]
     return player_state 
 
-
 def parse_game_state(gamestate):
     """ 
     Get relevant observations from gamestate object (https://libmelee.readthedocs.io/en/latest/gamestate.html)
@@ -95,18 +105,19 @@ def parse_game_state(gamestate):
         - nana                            (PlayerState)
         - percent                         (int)
         - on_ground                       (bool)
-    3. controller state (*)               (controller.ControllerState)
+    3. controller state (**)               (controller.ControllerState)
         - button                          (dict[enums.Button, bool])
         - c_stick                         (tuple(float,float))
         - l_shoulder                      (float)
         - main_stick                      (tuple(float,float))
-    4. previous actions **                (list[controller.ControllerState])
+    4. previous actions ***                (list[controller.ControllerState])
 
     NOTES:
-        - asterisk (*) applies to both both players
-        - double asterisk (**) means not actually part of gamestate, but is part of model obvservation
-        - will use one shoulder L-trigger and one of x or y. This means action space becomes:
-            - [A, B, L, X, Z] + [Main Stick, C-Stick]
+        *applies to both both players
+        ** model outputs: use one of shoulder trigger and one of x or y. Thus, action space becomes:
+           [A, B, L, X/Y, Z] + [Main Stick X, Main Stick Y, C-Stick X, C-Stick Y, L/R]
+        ***maybe used in future
+
 
     """
     # 1. environment state info
@@ -150,65 +161,146 @@ def parse_game_state(gamestate):
 
     return observation, actions
 
-def save_data(data, output_dir, batch_number):
-    """ Save the data to a pickle file with a unique batch number """
-    filename = f'{output_dir}/batch_{batch_number}.pkl'
-    with open(filename, 'wb') as f:
-        pickle.dump(data, f)
 
-def process_files(file_batch, output_dir, batch_number):
-    game_data_batch = []
+def generate_input_python(observation, prev_action, player_index):
+    """
+    Generate the input data from the observation. Uses plain python lists instead of arrays
+    or tensors to limit memory usage during multiprocessing. 
+    
+    Output of function can be converted to tensors or arrays directly with torch.tensor()
+    or np.array(). Will have shape (S,21), where S depends on number of players, projectiles, nanas, etc
+
+    First index indicates whether the data corresponds to player, projectile, nana,
+    or misc info. Negative value indicates currently active player.
+    """
+
+    copy_observation = copy.deepcopy(observation)
+    all_tensors = []
+
+    # misc_info includes distance, frame, and stage
+    misc = copy_observation[:3]  
+    projectiles = copy_observation[3]
+    players = copy_observation[4:] 
+    nana_states = [obs.pop(9) for obs in players] 
+
+    # Creating misc tensor data
+    misc_types = [MISC_TYPE]
+    misc_padded = misc + [0] * (20 - len(misc))
+    misc = misc_types + misc_padded
+    all_tensors.append(misc)
+    
+    # Processing players
+    players_list = []
+    for i, player in enumerate(players):
+        player_type = [-PLAYER_TYPE] if i == player_index else [PLAYER_TYPE]
+        player_data = player_type + player + [0] * (20 - len(player))
+        players_list.append(player_data)
+    all_tensors.extend(players_list)
+
+    # Processing Nana states
+    nana_list = []
+    for i, nana in enumerate(nana_states):
+        if nana is not None:
+            nana_type = [-NANA_TYPE] if i == player_index else [NANA_TYPE]
+            nana_data = nana_type + nana + [0] * (20 - len(nana))
+            nana_list.append(nana_data)
+    all_tensors.extend(nana_list)
+
+    # Handling projectiles
+    if projectiles:
+        projectile_list = []
+        for projectile in projectiles:
+            projectile_type = [PROJECTILE_TYPE]
+            projectile_data = projectile_type + projectile + [0] * (20 - len(projectile))
+            projectile_list.append(projectile_data)
+        all_tensors.extend(projectile_list)
+    
+    # TODO: experiment conditioning on previous action. Switch this to python lists
+    #
+    # if prev_action is not None:
+    #     prev_action = prev_action + [0] * (20 - len(prev_action))
+    #     prev_action = torch.tensor(prev_action).view(1, -1)
+    # else:
+    #     prev_action = torch.zeros(1, 20)
+    # action_types = torch.full((len(prev_action), 1), ACTION_TYPE)
+    # action_tensors = torch.cat([action_types, prev_action], dim=1)
+    # all_tensors.append(action_tensors)
+
+    return all_tensors
+
+
+def process_files3(file_batch, output_dir, batch_number):
+    grouped_data = {}
+    file_counters = {}  # Tracks number of files saved for each input_length
+
     try:
         for index, slp_file in enumerate(file_batch):
-            print(f"Processing file {batch_number} / {index}:", slp_file)
+            print(f"Processing batch {batch_number} / file {index}:", slp_file)
             console = melee.Console(is_dolphin=False, allow_old_version=True, path=slp_file)
             console.connect()
 
-            prev_actions = None
-            while True:
-                gamestate = console.step()
-                if gamestate is None:
-                    break
-
+            while gamestate := console.step():
                 obs, actions = parse_game_state(gamestate)
-                print(obs)
-                game_data_batch.append({
-                    "observation": obs,
-                    "actions": actions,
-                    "prev_actions": prev_actions
-                })
+                
+                # Dynamically group data by input length
+                for i in range(len(actions)):
+                    player_input = generate_input_python(obs, None, i)
+                    player_output = actions[i]
+                    input_length = len(player_input)
+                    
+                    if input_length not in grouped_data:
+                        grouped_data[input_length] = []
+                        file_counters[input_length] = 0  # Initialize counter for this input length
 
-                prev_actions = actions
+                    grouped_data[input_length].append((player_input, player_output))
+                    
+                    # Optionally convert to numpy arrays on-the-fly if a group reaches a certain size
+                    if len(grouped_data[input_length]) >= 2_000_000:  # example threshold
+                        save_as_hickle(grouped_data[input_length], input_length, output_dir, batch_number, file_counters[input_length])
+                        grouped_data[input_length] = []  # reset the list after saving
+                        file_counters[input_length] += 1  # Increment file counter
 
     except Exception as e:
         print(f"An error occurred while processing files: {e}")
     else:
-        # If no exceptions were raised, save the data.
-        save_data(game_data_batch, output_dir, batch_number)
-        # pass
+        # Convert and save any remaining data after processing
+        for length, data in grouped_data.items():
+            if data:
+                save_as_hickle(data, length, output_dir, batch_number, file_counters[length])
+                file_counters[length] += 1
+
+def save_as_hickle(data, input_length, output_dir, batch_number, file_index):
+    inputs, outputs = map(np.asarray, zip(*data))
+
+    hkl.dump(
+        inputs,
+        f"{output_dir}/inputs{input_length}_batch{batch_number}_{file_index}.hkl",
+        compression='gzip', 
+        mode='w'
+    )
+    hkl.dump(
+        outputs,
+        f"{output_dir}/outputs{input_length}_batch{batch_number}_{file_index}.hkl",
+        compression='gzip', 
+        mode='w'
+    )
+    print(f"Saved {output_dir}/inputs{input_length}_batch{batch_number}_{file_index}.hkl")
 
 
 def main():
     SLIPPI_FILE_DIR = '/home/kage/smashbot_workspace/dataset/Slippi_Public_Dataset_v3/slp'
-    OUTPUT_DIR = '/home/kage/smashbot_workspace/dataset/'
-    NUM_WORKERS = 41  # Number of processes
-    
+    OUTPUT_DIR = '/home/kage/smashbot_workspace/dataset/Slippi_Public_Dataset_v3/pickle'
+    NUM_WORKERS = 30
+    CHUNK_SIZE = 100  # Original batch size doubled
+
     slp_files = glob.glob(SLIPPI_FILE_DIR + '**/*.slp', recursive=True)
-    batch_size = 25  # Define the batch size per worker
-    chunks = [slp_files[i:i + batch_size] for i in range(0, len(slp_files), batch_size)]
+    random.shuffle(slp_files)
+    chunks = [slp_files[i:i + CHUNK_SIZE] for i in range(0, len(slp_files), CHUNK_SIZE)]
 
     with multiprocessing.Pool(NUM_WORKERS) as pool:
         jobs = [(chunk, OUTPUT_DIR, i + 1) for i, chunk in enumerate(chunks)]
-        pool.starmap(process_files, jobs)
-
-def test():
-    SLIPPI_FILE = '/home/kage/smashbot_workspace/dataset/mygame.slp'
-    OUTPUT_DIR = '/home/kage/smashbot_workspace/dataset/pickle_files/'
-
-    slp_files = [SLIPPI_FILE]
-    process_files(slp_files, OUTPUT_DIR, 1)
+        pool.starmap(process_files3, jobs)
 
 
 if __name__ == "__main__":
-    # main()
-    test()
+    main()
