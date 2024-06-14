@@ -71,7 +71,7 @@ def parse_nana(nana):
     ]
     return player_state 
 
-def parse_game_state(gamestate):
+def parse_game_state(gamestate, in_game=False, rl=False):
     """ 
     Get relevant observations from gamestate object (https://libmelee.readthedocs.io/en/latest/gamestate.html)
     
@@ -129,6 +129,8 @@ def parse_game_state(gamestate):
     playerstate_list = []
     controllerstate_list = []
 
+    reward = []
+
     for port, pstate in gamestate.players.items():
         # Player state
         nana = parse_nana(pstate.nana)
@@ -143,23 +145,29 @@ def parse_game_state(gamestate):
             pstate.speed_y_attack, pstate.speed_y_self, pstate.stock
         ]
 
-        # Player action
-        controller_button_state = buttons_to_list(pstate.controller_state.button)
-        controller_analog_state = analog_to_list(
-            pstate.controller_state.main_stick,
-            pstate.controller_state.c_stick,
-            pstate.controller_state.l_shoulder,
-            pstate.controller_state.r_shoulder)
+        if not in_game:
+            # Player action
+            controller_button_state = buttons_to_list(pstate.controller_state.button)
+            controller_analog_state = analog_to_list(
+                pstate.controller_state.main_stick,
+                pstate.controller_state.c_stick,
+                pstate.controller_state.l_shoulder,
+                pstate.controller_state.r_shoulder)
+            
+            controller_state = controller_button_state + controller_analog_state
+            controllerstate_list.append(controller_state)
         
-        controller_state = controller_button_state + controller_analog_state
+        if rl:
+            # return percent for reward calculation
+            reward.append(pstate.percent)
+
 
         playerstate_list.append(player_state)
-        controllerstate_list.append(controller_state)
     
     observation = env_info + playerstate_list
     actions = controllerstate_list
 
-    return observation, actions
+    return observation, actions, reward
 
 
 def generate_input_python(observation, prev_action, player_index):
@@ -231,18 +239,18 @@ def generate_input_python(observation, prev_action, player_index):
 
 def process_files3(file_batch, output_dir, batch_number):
     grouped_data = {}
-    file_counters = {}  # Tracks number of files saved for each input_length
-
+    file_counters = {}  # Track files saved for each input_length
     try:
+
         for index, slp_file in enumerate(file_batch):
             print(f"Processing batch {batch_number} / file {index}:", slp_file)
             console = melee.Console(is_dolphin=False, allow_old_version=True, path=slp_file)
             console.connect()
-
+        
             while gamestate := console.step():
-                obs, actions = parse_game_state(gamestate)
-                
-                # Dynamically group data by input length
+                obs, actions, _ = parse_game_state(gamestate)
+
+                # Generate input and group by length 
                 for i in range(len(actions)):
                     player_input = generate_input_python(obs, None, i)
                     player_output = actions[i]
@@ -250,24 +258,24 @@ def process_files3(file_batch, output_dir, batch_number):
                     
                     if input_length not in grouped_data:
                         grouped_data[input_length] = []
-                        file_counters[input_length] = 0  # Initialize counter for this input length
+                        file_counters[input_length] = 0  
 
                     grouped_data[input_length].append((player_input, player_output))
                     
-                    # Optionally convert to numpy arrays on-the-fly if a group reaches a certain size
-                    if len(grouped_data[input_length]) >= 2_000_000:  # example threshold
+                    if len(grouped_data[input_length]) >= 2_000_000:  
                         save_as_hickle(grouped_data[input_length], input_length, output_dir, batch_number, file_counters[input_length])
-                        grouped_data[input_length] = []  # reset the list after saving
-                        file_counters[input_length] += 1  # Increment file counter
+                        grouped_data[input_length] = [] 
+                        file_counters[input_length] += 1  
 
     except Exception as e:
-        print(f"An error occurred while processing files: {e}")
+        print(f"An error occurred while processing file {slp_file}: {e}")
     else:
         # Convert and save any remaining data after processing
         for length, data in grouped_data.items():
             if data:
                 save_as_hickle(data, length, output_dir, batch_number, file_counters[length])
                 file_counters[length] += 1
+
 
 def save_as_hickle(data, input_length, output_dir, batch_number, file_index):
     inputs, outputs = map(np.asarray, zip(*data))
@@ -289,8 +297,8 @@ def save_as_hickle(data, input_length, output_dir, batch_number, file_index):
 
 def main():
     SLIPPI_FILE_DIR = '/home/kage/smashbot_workspace/dataset/Slippi_Public_Dataset_v3/slp'
-    OUTPUT_DIR = '/home/kage/smashbot_workspace/dataset/Slippi_Public_Dataset_v3/pickle'
-    NUM_WORKERS = 30
+    OUTPUT_DIR = '/home/kage/smashbot_workspace/dataset/Slippi_Public_Dataset_v3/hickle'
+    NUM_WORKERS = 32
     CHUNK_SIZE = 100  # Original batch size doubled
 
     slp_files = glob.glob(SLIPPI_FILE_DIR + '**/*.slp', recursive=True)

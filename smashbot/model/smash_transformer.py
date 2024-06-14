@@ -4,10 +4,15 @@ import torch.nn.functional as F
 
 import wandb 
 
-from data.dataset import MISC_TYPE, ACTION_TYPE, PROJECTILE_TYPE, PLAYER_TYPE, NANA_TYPE
-
 from melee.enums import Stage, Action, Character, ProjectileType
 
+
+# From dataset.py
+MISC_TYPE = 1
+PROJECTILE_TYPE = 2
+PLAYER_TYPE = 3
+NANA_TYPE = 4
+ACTION_TYPE = 5
 
 TYPE_LIST = [MISC_TYPE, ACTION_TYPE, PROJECTILE_TYPE, PLAYER_TYPE, NANA_TYPE, -PLAYER_TYPE, -NANA_TYPE]
 
@@ -106,12 +111,12 @@ class SmashTransformer(nn.Module):
         # cross entropy for buttons and mse for sticks
         buttons = pred_action[:, :self.action_dim//2]
         sticks = pred_action[:, self.action_dim//2:]
-
-        buttons_loss = F.cross_entropy(buttons, target_action[:, :self.action_dim//2])
+        buttons_loss = F.binary_cross_entropy_with_logits(buttons, target_action[:, :self.action_dim//2])
+        # buttons_loss = F.cross_entropy(buttons, target_action[:, :self.action_dim//2])
         sticks_loss = F.mse_loss(sticks, target_action[:, self.action_dim//2:])
         total_loss = buttons_loss + sticks_loss
         return total_loss, buttons_loss, sticks_loss
-        
+    
     def forward(self, src):
         # Each of the s in S contain info related to playerstate, or nanastate, or projectiles, or misc
         # The misc info is distance (btwn players), frame, and stage.
@@ -119,8 +124,7 @@ class SmashTransformer(nn.Module):
 
         all_sequence_embeddings = torch.zeros(B, S, self.embed_dim, device=src.device)
 
-        # Process MISC_TYPE
-        # misc is always 0th sequence
+        # Process MISC_TYPE - always 0th sequence
         stage_indices = self.stage_lookup_tensor[src[:,0,3].long()] # stage is 3rd feature
         embedded_stage = self.stage_embedding(stage_indices)
         all_sequence_embeddings[:,0,:] = torch.cat([src[:,0,:3], embedded_stage], dim=-1)
@@ -139,14 +143,12 @@ class SmashTransformer(nn.Module):
         if player_types_mask.any():
             action_indices = src[:,:,1][player_types_mask]
             character_indices = src[:,:,3][player_types_mask]
-
             if action_indices.any():
                 action_indices = self.action_lookup_tensor[action_indices.long()]
                 embedded_actions = self.action_embedding(action_indices)
             if character_indices.any():
                 character_indices = self.character_lookup_tensor[character_indices.long()]
                 embedded_characters = self.character_embedding(character_indices)
-        
             rest_features = src[:, :, self.non_embedded_player_feats][player_types_mask]
             all_sequence_embeddings[player_types_mask] = torch.cat([embedded_actions, embedded_characters, rest_features], dim=-1)
         
@@ -164,3 +166,47 @@ class SmashTransformer(nn.Module):
         output = self.policy_head(output[:, :self.pred_sequences, :].view(B, -1))
         return output
     
+
+# For future fun times
+import torch
+
+from xlstm import (
+    xLSTMBlockStack,
+    xLSTMBlockStackConfig,
+    mLSTMBlockConfig,
+    mLSTMLayerConfig,
+    sLSTMBlockConfig,
+    sLSTMLayerConfig,
+    FeedForwardConfig,
+)
+
+cfg = xLSTMBlockStackConfig(
+    mlstm_block=mLSTMBlockConfig(
+        mlstm=mLSTMLayerConfig(
+            conv1d_kernel_size=4, qkv_proj_blocksize=4, num_heads=4
+        )
+    ),
+    slstm_block=sLSTMBlockConfig(
+        slstm=sLSTMLayerConfig(
+            backend="cuda",
+            num_heads=4,
+            conv1d_kernel_size=4,
+            bias_init="powerlaw_blockdependent",
+        ),
+        feedforward=FeedForwardConfig(proj_factor=1.3, act_fn="gelu"),
+    ),
+    context_length=4,
+    num_blocks=7,
+    embedding_dim=768,
+    slstm_at=[1],
+
+)
+
+xlstm_stack = xLSTMBlockStack(cfg).cuda()
+
+# x = torch.randn(1, 5, 512).cuda()
+# y = xlstm_stack(x)
+
+# print(y.shape)
+
+model = SmashTransformer(action_dim=10, embed_dim=224, model_dim=768, nhead=24, num_layers=8, dropout=0.1)
