@@ -1,0 +1,3 @@
+[submodule "vendor/slippi-ai"]
+	path = vendor/slippi-ai
+	url = https://github.com/vladfi1/slippi-ai
