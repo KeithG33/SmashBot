@@ -94,6 +94,32 @@ def make_sources(config: DataConfig, extra_frames: int) -> Sources:
     return Sources(train=make(train_replays), test=make(test_replays), name_map=name_map)
 
 
+def batch_to_frames(batch: data_lib.Batch, network, pin: bool = False):
+    """Training-path glue: numpy Batch [B, T] -> encoded, time-major torch Frames.
+
+    Mirrors slippi-ai's TrainManager.produce_frames: the p0 controller becomes
+    the action stream, the network's embedding encodes (discretizes) it, and
+    everything transposes to time-major.
+    """
+    from slippi_ai.types import Frames, StateAction
+
+    if np.any(np.asarray(batch.is_resetting)[:, 1:]):
+        raise ValueError("Unexpected mid-episode reset.")
+
+    state_action = StateAction(
+        state=batch.game, action=batch.game.p0.controller, name=batch.name
+    )
+    state_action = network.encode(state_action)  # numpy
+
+    frames = data_lib.Frames(
+        state_action=state_action,
+        is_resetting=batch.is_resetting,
+        reward=batch.reward,
+    )
+    frames = tree.map_structure(lambda x: np.asarray(x).swapaxes(0, 1), frames)
+    return tree.map_structure(lambda x: _to_torch(np.ascontiguousarray(x), pin), frames)
+
+
 class TorchBatchStream:
     """Background thread: pulls numpy batches, converts to (pinned) torch."""
 
