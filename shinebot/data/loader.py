@@ -73,10 +73,19 @@ class Sources:
     name_map: dict[str, int]
 
 
-def make_sources(config: DataConfig, extra_frames: int) -> Sources:
-    """Build train/test DataSources. extra_frames must be policy.delay + 1."""
+def make_sources(
+    config: DataConfig,
+    extra_frames: int,
+    name_map: tp.Optional[dict[str, int]] = None,
+) -> Sources:
+    """Build train/test DataSources. extra_frames must be policy.delay + 1.
+
+    name_map: pass the checkpoint's map when resuming — indices are assigned
+    by frequency, so recomputing on changed data would silently permute them.
+    """
     train_replays, test_replays = data_lib.train_test_split(config.dataset)
-    name_map = create_name_map(train_replays, config.max_names)
+    if name_map is None:
+        name_map = create_name_map(train_replays, config.max_names)
 
     def make(replays: list[data_lib.ReplayInfo]) -> data_lib.DataSource:
         return data_lib.DataSource(

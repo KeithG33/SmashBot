@@ -134,7 +134,20 @@ def main(config: TrainConfig) -> None:
     np.random.seed(rt.seed)
     discount = 0.5 ** (1 / (config.value.reward_halflife * 60))
 
-    sources = loader.make_sources(config.data, extra_frames=config.policy.delay + 1)
+    # On resume, the checkpoint's name_map is authoritative: indices are
+    # frequency-assigned, so recomputing on changed data would permute them.
+    restored_name_map = None
+    if rt.restore:
+        restore_path = (
+            os.path.join(run_dir, "latest.pt") if rt.restore == "auto" else rt.restore
+        )
+        restored_name_map = saving.load_checkpoint(restore_path)["state"].get("name_map")
+
+    sources = loader.make_sources(
+        config.data,
+        extra_frames=config.policy.delay + 1,
+        name_map=restored_name_map,
+    )
     print(f"name_map: {sources.name_map}")
 
     policy = build_policy(
@@ -190,7 +203,7 @@ def main(config: TrainConfig) -> None:
     step = 0
     best_eval_loss = math.inf
     if rt.restore:
-        path = os.path.join(run_dir, "latest.pt") if rt.restore == "auto" else rt.restore
+        path = restore_path
         ckpt = saving.load_checkpoint(path)
         policy.load_state_dict(ckpt["state"]["policy"])
         value_fn.load_state_dict(ckpt["state"]["value"])

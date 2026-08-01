@@ -59,14 +59,24 @@ def main() -> None:
     ap.add_argument("--gfx_backend", default="OGL", help="OGL | Vulkan | ''")
     ap.add_argument("--max_frames", type=int, default=0, help="0 = play forever")
     ap.add_argument("--temperature", type=float, default=None)
+    ap.add_argument(
+        "--name", default="Master Player",
+        help="identity to condition on (looked up in the checkpoint's name_map)",
+    )
     # CPU beats GPU for batch-1 inference (kernel-launch overhead dominates):
     # 13.8ms vs 17.4ms per frame on the 3090 box.
     ap.add_argument("--device", default="cpu")
     args = ap.parse_args()
 
     policy, name_map, step = load_policy(args.ckpt, args.device)
+    if args.name in name_map:
+        name_code = name_map[args.name]
+    else:
+        name_code = 0
+        if name_map:
+            print(f"'{args.name}' not in name_map {name_map}; using code 0")
     print(f"loaded {args.ckpt} (train step {step}), delay={policy.delay}, "
-          f"name_map={name_map}")
+          f"conditioning on {args.name!r} -> code {name_code} (map: {name_map})")
 
     opponent_char = melee.Character[args.opponent_char.upper()]
     if args.opponent == "cpu":
@@ -100,6 +110,7 @@ def main() -> None:
         policy,
         own_port=1,
         opponent_port=2,
+        name_code=name_code,
         console_delay=0,
         temperature=args.temperature,
         device=args.device,
