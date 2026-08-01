@@ -200,7 +200,12 @@ class OneHotEmbedding(Embedding[int, np.ndarray]):
             logits = logits / temperature
         flat = logits.reshape(-1, logits.shape[-1])
         samples = torch.multinomial(F.softmax(flat, dim=-1), 1).squeeze(-1)
-        return samples.reshape(logits.shape[:-1])
+        samples = samples.reshape(logits.shape[:-1])
+        # match the embedding's declared dtype so decode()'s round-trip holds
+        torch_dtype = {"uint8": torch.uint8, "int32": torch.int32}[
+            np.dtype(self.dtype).name
+        ]
+        return samples.to(torch_dtype)
 
 
 NT = TypeVar("NT")
