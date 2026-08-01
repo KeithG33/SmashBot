@@ -15,7 +15,7 @@ Usage:
 """
 
 import os
-os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")  # multi-connection downloads
+os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")  # multi-connection downloads
 
 import argparse
 import json
@@ -90,7 +90,7 @@ def main() -> None:
                     default=Path("/home/kage/drive2/ShineBot/data/hf-raw"))
     ap.add_argument("--downloaders", type=int, default=4)
     ap.add_argument("--parse_threads", type=int, default=40)
-    ap.add_argument("--max_pending_zips", type=int, default=6,
+    ap.add_argument("--max_pending_zips", type=int, default=48,
                     help="disk guard: downloader stalls if this many unparsed zips")
     ap.add_argument("--limit", type=int, default=0, help="only first N shards (testing)")
     ap.add_argument("--keep_raw", action="store_true")
