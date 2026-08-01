@@ -1,4 +1,4 @@
-"""M7 dataset builder: pipelined download -> repack -> parse for all Fox shards.
+"""M7 dataset builder: pipelined download -> repack -> parse for ranked shards.
 
 Producer threads download tar.gz shards from HuggingFace and repack the .slp
 files into stored zips under <root>/Raw/. The main loop runs slippi_db's
@@ -9,9 +9,13 @@ Resumable: already-parsed shards are recorded in <root>/raw.json and skipped;
 interrupted downloads resume via huggingface_hub.
 
 Usage:
-  .venv/bin/python scripts/download_fox.py                  # all 36 Fox shards
+  .venv/bin/python scripts/download_fox.py                  # ALL shards (1.4TB dl)
+  .venv/bin/python scripts/download_fox.py --chars FOX      # one character
   .venv/bin/python scripts/download_fox.py --limit 2        # trial run
 """
+
+import os
+os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")  # multi-connection downloads
 
 import argparse
 import json
@@ -27,11 +31,15 @@ REPO = "erickfm/melee-ranked-replays"
 VENDOR = Path(__file__).resolve().parent.parent / "vendor" / "slippi-ai"
 
 
-def list_fox_shards() -> list[str]:
+def list_shards(chars: str) -> list[str]:
     from huggingface_hub import HfApi
 
     files = HfApi().list_repo_files(REPO, repo_type="dataset")
-    return sorted(f for f in files if f.startswith("FOX/") and f.endswith(".tar.gz"))
+    shards = sorted(f for f in files if f.endswith(".tar.gz"))
+    if chars != "all":
+        wanted = {c.strip().upper() for c in chars.split(",")}
+        shards = [s for s in shards if s.split("/")[0].upper() in wanted]
+    return shards
 
 
 def shard_zip_name(shard: str) -> str:
@@ -75,12 +83,14 @@ def download_and_repack(shard: str, root: Path, dl_dir: Path) -> str:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", type=Path,
-                    default=Path("/home/kage/drive2/ShineBot/data/fox-full/Root"))
+                    default=Path("/home/kage/drive2/ShineBot/data/full/Root"))
+    ap.add_argument("--chars", default="all",
+                    help="'all' or comma list of character dirs, e.g. FOX,FALCO")
     ap.add_argument("--dl_dir", type=Path,
                     default=Path("/home/kage/drive2/ShineBot/data/hf-raw"))
-    ap.add_argument("--downloaders", type=int, default=2)
+    ap.add_argument("--downloaders", type=int, default=4)
     ap.add_argument("--parse_threads", type=int, default=40)
-    ap.add_argument("--max_pending_zips", type=int, default=3,
+    ap.add_argument("--max_pending_zips", type=int, default=6,
                     help="disk guard: downloader stalls if this many unparsed zips")
     ap.add_argument("--limit", type=int, default=0, help="only first N shards (testing)")
     ap.add_argument("--keep_raw", action="store_true")
@@ -88,7 +98,7 @@ def main() -> None:
 
     (args.root / "Raw").mkdir(parents=True, exist_ok=True)
 
-    shards = list_fox_shards()
+    shards = list_shards(args.chars)
     if args.limit:
         shards = shards[: args.limit]
     done = already_processed(args.root)
