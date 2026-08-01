@@ -22,7 +22,7 @@ from slippi_ai import dolphin as dolphin_lib
 
 from shinebot import configs, embed as embed_lib, saving
 from shinebot.eval.agent import DelayedAgent
-from shinebot.paths import EXIAI_APPIMAGE, MELEE_ISO
+from shinebot.paths import EXIAI_APPIMAGE, MELEE_ISO, NETPLAY_APPIMAGE
 from shinebot.policy import build_policy
 
 
@@ -75,16 +75,19 @@ def main() -> None:
         opponent = dolphin_lib.Human()
 
     players = {1: dolphin_lib.AI(character=melee.Character.FOX), 2: opponent}
+    # ExiAI builds are inference-only (Null video, no rendering) — perfect for
+    # headless, useless for watching. Visible play uses the standard netplay build.
     console_kwargs = {}
-    if not args.headless:
-        # libmelee defaults to fullscreen=True, which black-screens on some
-        # Linux/NVIDIA setups. Windowed + explicit OGL backend is reliable.
+    if args.headless:
+        dolphin_path = EXIAI_APPIMAGE
+    else:
+        dolphin_path = NETPLAY_APPIMAGE
         console_kwargs = dict(fullscreen=args.fullscreen)
         if args.gfx_backend:
             console_kwargs["gfx_backend"] = args.gfx_backend
 
     dolphin = dolphin_lib.Dolphin(
-        path=str(EXIAI_APPIMAGE),
+        path=str(dolphin_path),
         iso=str(MELEE_ISO),
         players=players,
         headless=args.headless,

@@ -30,3 +30,12 @@ EXIAI_APPIMAGE = Path(
 )
 # Ishiiruka ExiAI build (Slippi 3.5.1) — fallback / playback duties.
 EXIAI_ISHIIRUKA_APPIMAGE = DRIVE2 / "dolphin" / "Slippi_Online-x86_64-ExiAI.AppImage"
+
+# Standard Slippi netplay Dolphin (renders!) — ExiAI builds are Null-video only,
+# so visible play uses the Launcher-maintained build (auto-updated, currently 3.6.4).
+NETPLAY_APPIMAGE = Path(
+    os.environ.get(
+        "SHINEBOT_NETPLAY_DOLPHIN",
+        "/home/kage/.config/Slippi Launcher/netplay/Slippi_Online-x86_64.AppImage",
+    )
+)
