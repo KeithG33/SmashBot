@@ -55,6 +55,8 @@ def main() -> None:
     ap.add_argument("--cpu_level", type=int, default=9)
     ap.add_argument("--opponent_char", default="MARTH")
     ap.add_argument("--headless", action="store_true")
+    ap.add_argument("--fullscreen", action="store_true", help="default is windowed")
+    ap.add_argument("--gfx_backend", default="OGL", help="OGL | Vulkan | ''")
     ap.add_argument("--max_frames", type=int, default=0, help="0 = play forever")
     ap.add_argument("--temperature", type=float, default=None)
     # CPU beats GPU for batch-1 inference (kernel-launch overhead dominates):
@@ -73,6 +75,14 @@ def main() -> None:
         opponent = dolphin_lib.Human()
 
     players = {1: dolphin_lib.AI(character=melee.Character.FOX), 2: opponent}
+    console_kwargs = {}
+    if not args.headless:
+        # libmelee defaults to fullscreen=True, which black-screens on some
+        # Linux/NVIDIA setups. Windowed + explicit OGL backend is reliable.
+        console_kwargs = dict(fullscreen=args.fullscreen)
+        if args.gfx_backend:
+            console_kwargs["gfx_backend"] = args.gfx_backend
+
     dolphin = dolphin_lib.Dolphin(
         path=str(EXIAI_APPIMAGE),
         iso=str(MELEE_ISO),
@@ -80,6 +90,7 @@ def main() -> None:
         headless=args.headless,
         online_delay=0,
         emulation_speed=0 if args.headless else 1,
+        **console_kwargs,
     )
 
     agent = DelayedAgent(
