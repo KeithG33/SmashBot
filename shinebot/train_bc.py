@@ -271,7 +271,12 @@ def main(config: TrainConfig) -> None:
             "value_uev": float(np.mean([m["uev"] for m in value_metrics_acc])),
         }
 
-    print(f"training to step {rt.steps}; eval every {rt.eval_interval} steps")
+    from tqdm import tqdm
+
+    pbar = tqdm(
+        total=rt.steps, initial=step, unit="step", dynamic_ncols=True,
+        desc=rt.tag, smoothing=0.05,
+    )
     t_window = time.perf_counter()
     step_window = step
     try:
@@ -326,11 +331,14 @@ def main(config: TrainConfig) -> None:
                     },
                     step=step,
                 )
-                print(
-                    f"step {step:6d}  epoch {epoch:6.1f}  "
-                    f"train {metrics['policy_loss']:7.4f}  "
-                    f"value_uev {value_metrics['uev']:5.2f}  "
-                    f"{fps/1e3:.0f}k frames/s"
+                pbar.set_postfix(
+                    train=f"{metrics['policy_loss']:.4f}",
+                    best_eval=(
+                        f"{best_eval_loss:.4f}" if best_eval_loss < math.inf else "-"
+                    ),
+                    epoch=f"{epoch:.1f}",
+                    fps=f"{fps/1e3:.0f}k",
+                    refresh=False,
                 )
 
             if step % rt.eval_interval == 0:
@@ -349,13 +357,16 @@ def main(config: TrainConfig) -> None:
                 )
                 marker = " *best*" if is_best else ""
                 base = f"  (baseline {baseline:.3f})" if baseline else ""
-                print(
-                    f"  eval {eval_metrics['policy_loss']:7.4f}{base}{marker}"
+                pbar.write(
+                    f"step {step:6d}  eval {eval_metrics['policy_loss']:7.4f}"
+                    f"{base}{marker}"
                 )
 
             if step % rt.checkpoint_interval == 0:
                 save("latest.pt")
+            pbar.update(1)
     finally:
+        pbar.close()
         save("latest.pt")
         train_stream.stop()
         eval_stream.stop()
