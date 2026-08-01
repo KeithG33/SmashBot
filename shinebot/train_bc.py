@@ -43,6 +43,7 @@ class RuntimeConfig:
     restore: str = ""  # checkpoint path, or "auto" for <run_dir>/<tag>/latest.pt
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     compute_baseline: bool = True
+    seed: int = 0  # seeds model init; makes A/B runs attributable
 
 
 @dataclasses.dataclass
@@ -129,6 +130,8 @@ def main(config: TrainConfig) -> None:
     run_dir = os.path.join(rt.run_dir, rt.tag)
     os.makedirs(run_dir, exist_ok=True)
     device = rt.device
+    torch.manual_seed(rt.seed)
+    np.random.seed(rt.seed)
     discount = 0.5 ** (1 / (config.value.reward_halflife * 60))
 
     sources = loader.make_sources(config.data, extra_frames=config.policy.delay + 1)
