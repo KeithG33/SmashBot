@@ -20,7 +20,7 @@ from shinebot.networks import RecurrentState, StateActionNetwork
 class UnrollOutputs(tp.NamedTuple):
     log_probs: torch.Tensor  # [T, B]
     distances: tp.Any  # controller struct of [T, B]
-    value_loss: torch.Tensor  # [T, B]
+    value_loss: tp.Optional[torch.Tensor]  # [T, B]; None when value head disabled
     value_metrics: dict
     final_state: RecurrentState
 
@@ -97,10 +97,14 @@ class Policy(nn.Module):
         policy_loss = sum(tree.flatten(distance_outputs.distance))
         log_probs = -policy_loss
 
-        value_loss, value_metrics = self._value_outputs(
-            outputs, last_input, frames.is_resetting, final_state,
-            frames.reward, discount,
-        )
+        # With a separate value network (production config), skip the built-in head.
+        if self.train_value_head:
+            value_loss, value_metrics = self._value_outputs(
+                outputs, last_input, frames.is_resetting, final_state,
+                frames.reward, discount,
+            )
+        else:
+            value_loss, value_metrics = None, {}
 
         return UnrollOutputs(
             log_probs=log_probs,
@@ -132,6 +136,14 @@ class Policy(nn.Module):
         if self.train_value_head:
             total_loss = total_loss + value_cost * outputs.value_loss.mean()
         metrics["total_loss"] = total_loss.item()
+        metrics["controller_flat"] = {
+            "buttons": sum(metrics["controller"]["buttons"]) / 8,
+            "main_x": metrics["controller"]["main_stick"].x,
+            "main_y": metrics["controller"]["main_stick"].y,
+            "c_x": metrics["controller"]["c_stick"].x,
+            "c_y": metrics["controller"]["c_stick"].y,
+            "shoulder": metrics["controller"]["shoulder"],
+        }
 
         return total_loss, outputs.final_state, metrics
 

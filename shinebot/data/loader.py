@@ -121,10 +121,20 @@ def batch_to_frames(batch: data_lib.Batch, network, pin: bool = False):
 
 
 class TorchBatchStream:
-    """Background thread: pulls numpy batches, converts to (pinned) torch."""
+    """Background thread: pulls numpy batches, converts to (pinned) torch.
 
-    def __init__(self, source: data_lib.AbstractDataSource, config: DataConfig):
+    With `encode_network` set, instead yields encoded, time-major Frames ready
+    for Policy.imitation_loss (mirrors slippi-ai's TrainManager.produce_frames).
+    """
+
+    def __init__(
+        self,
+        source: data_lib.AbstractDataSource,
+        config: DataConfig,
+        encode_network=None,
+    ):
         self._source = source
+        self._network = encode_network
         self._pin = config.pin_memory and torch.cuda.is_available()
         self._queue: queue.Queue = queue.Queue(maxsize=config.prefetch)
         self._stop = threading.Event()
@@ -136,10 +146,15 @@ class TorchBatchStream:
         try:
             while not self._stop.is_set():
                 batch_with_meta, epoch = next(self._source)
-                torch_batch = batch_to_torch(batch_with_meta.batch, self._pin)
+                if self._network is not None:
+                    item = batch_to_frames(
+                        batch_with_meta.batch, self._network, pin=self._pin
+                    )
+                else:
+                    item = batch_to_torch(batch_with_meta.batch, self._pin)
                 while not self._stop.is_set():
                     try:
-                        self._queue.put((torch_batch, epoch), timeout=1.0)
+                        self._queue.put((item, epoch), timeout=1.0)
                         break
                     except queue.Full:
                         continue
