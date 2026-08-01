@@ -58,3 +58,5 @@ class ValueConfig:
 class LearnerConfig:
     learning_rate: float = 1e-4
     value_cost: float = 0.5
+    # 0 = no clipping (faithful to slippi-ai); enable if loss spikes appear.
+    max_grad_norm: float = 0.0

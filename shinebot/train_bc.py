@@ -256,8 +256,8 @@ def main(config: TrainConfig) -> None:
         }
 
     print(f"training to step {rt.steps}; eval every {rt.eval_interval} steps")
-    t0 = time.perf_counter()
-    start_step = step
+    t_window = time.perf_counter()
+    step_window = step
     try:
         while step < rt.steps:
             step += 1
@@ -270,6 +270,10 @@ def main(config: TrainConfig) -> None:
             train_hidden = detach(train_hidden)
             policy_opt.zero_grad(set_to_none=True)
             policy_loss.backward()
+            if config.learner.max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    policy.parameters(), config.learner.max_grad_norm
+                )
             policy_opt.step()
 
             sliced = slice_delayed_frames(frames, config.policy.delay)
@@ -280,11 +284,18 @@ def main(config: TrainConfig) -> None:
             value_hidden = detach(value_hidden)
             value_opt.zero_grad(set_to_none=True)
             value_loss.backward()
+            if config.learner.max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    value_fn.parameters(), config.learner.max_grad_norm
+                )
             value_opt.step()
 
             if step % rt.log_interval == 0:
-                dt = time.perf_counter() - t0
-                fps = (step - start_step) * B * config.data.unroll_length / dt
+                now = time.perf_counter()
+                fps = (step - step_window) * B * config.data.unroll_length / (
+                    now - t_window
+                )
+                t_window, step_window = now, step
                 wandb.log(
                     {
                         "train/policy_loss": metrics["policy_loss"],
