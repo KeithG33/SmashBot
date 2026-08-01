@@ -44,15 +44,21 @@ class ValueFunction(nn.Module):
         )
         last_value = self.head(last_output).squeeze(-1)
 
-        discounts = torch.where(
-            frames.is_resetting[1:], 0.0,
-            torch.as_tensor(discount, device=values.device),
-        )
-        targets = delay_lib.discounted_returns(
-            rewards=frames.reward, discounts=discounts, bootstrap=last_value
-        ).detach()
-        loss = torch.square(targets - values).mean()
-        uev = loss / (targets.var() + 1e-8)
+        # Return recursion and regression in fp32 even under bf16 autocast:
+        # an 80-step serial accumulation is where low precision actually hurts.
+        with torch.autocast(values.device.type, enabled=False):
+            values = values.float()
+            last_value = last_value.float()
+            rewards = frames.reward.float()
+            discounts = torch.where(
+                frames.is_resetting[1:], 0.0,
+                torch.as_tensor(discount, device=values.device),
+            )
+            targets = delay_lib.discounted_returns(
+                rewards=rewards, discounts=discounts, bootstrap=last_value
+            ).detach()
+            loss = torch.square(targets - values).mean()
+            uev = loss / (targets.var() + 1e-8)
 
         metrics = {
             "loss": loss.item(),
