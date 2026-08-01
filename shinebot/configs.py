@@ -58,5 +58,10 @@ class ValueConfig:
 class LearnerConfig:
     learning_rate: float = 1e-4
     value_cost: float = 0.5
-    # 0 = no clipping (faithful to slippi-ai); enable if loss spikes appear.
-    max_grad_norm: float = 0.0
+    # slippi-ai doesn't clip; we default to 1.0 as cheap recurrent-net insurance.
+    max_grad_norm: float = 1.0
+    # bf16 autocast on Ampere+. Use fp32 for faithful-baseline comparisons.
+    precision: str = "bf16"  # bf16 | fp32
+    # Measured SLOWER than eager (125k vs 152k frames/s): dynamo graph-breaks
+    # on tree-structured code + cuDNN LSTM boundary. Left as opt-in.
+    compile: bool = False

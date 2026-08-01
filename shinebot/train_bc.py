@@ -10,6 +10,7 @@ Usage (from repo root):
   .venv/bin/python -m shinebot.train_bc --tag debug-fox-v0 --restore auto  # resume
 """
 
+import contextlib
 import dataclasses
 import math
 import os
@@ -164,6 +165,20 @@ def main(config: TrainConfig) -> None:
     policy_opt = torch.optim.Adam(policy.parameters(), lr=config.learner.learning_rate)
     value_opt = torch.optim.Adam(value_fn.parameters(), lr=config.learner.learning_rate)
 
+    if config.learner.precision == "bf16" and device == "cuda":
+        autocast = lambda: torch.autocast("cuda", dtype=torch.bfloat16)
+    else:
+        autocast = contextlib.nullcontext
+
+    policy_loss_fn = policy.imitation_loss
+    value_loss_fn = value_fn.loss
+    if config.learner.compile and device == "cuda":
+        # Whole-loss compile: dynamo graph-breaks around the cuDNN LSTM (fine)
+        # and fuses the embedding/head/return math around it.
+        policy_loss_fn = torch.compile(policy_loss_fn)
+        value_loss_fn = torch.compile(value_loss_fn)
+        print("torch.compile enabled (first steps will be slow while compiling)")
+
     n_params = sum(p.numel() for p in policy.parameters())
     print(f"policy: {n_params/1e6:.1f}M params | value: "
           f"{sum(p.numel() for p in value_fn.parameters())/1e6:.1f}M params | "
@@ -242,11 +257,12 @@ def main(config: TrainConfig) -> None:
             for _ in range(rt.eval_batches):
                 frames, _ = next(eval_stream)
                 frames = to_device(frames)
-                loss, eval_hidden, m = policy.imitation_loss(frames, eval_hidden)
-                sliced = slice_delayed_frames(frames, config.policy.delay)
-                _, eval_value_hidden, vm = value_fn.loss(
-                    sliced, eval_value_hidden, discount
-                )
+                with autocast():
+                    loss, eval_hidden, m = policy.imitation_loss(frames, eval_hidden)
+                    sliced = slice_delayed_frames(frames, config.policy.delay)
+                    _, eval_value_hidden, vm = value_fn.loss(
+                        sliced, eval_value_hidden, discount
+                    )
                 losses.append(m["policy_loss"])
                 value_metrics_acc.append(vm)
         policy.train()
@@ -264,9 +280,10 @@ def main(config: TrainConfig) -> None:
             frames, epoch = next(train_stream)
             frames = to_device(frames)
 
-            policy_loss, train_hidden, metrics = policy.imitation_loss(
-                frames, train_hidden
-            )
+            with autocast():
+                policy_loss, train_hidden, metrics = policy_loss_fn(
+                    frames, train_hidden
+                )
             train_hidden = detach(train_hidden)
             policy_opt.zero_grad(set_to_none=True)
             policy_loss.backward()
@@ -278,9 +295,10 @@ def main(config: TrainConfig) -> None:
 
             sliced = slice_delayed_frames(frames, config.policy.delay)
             sliced = tree.map_structure(lambda t: t.detach(), sliced)
-            value_loss, value_hidden, value_metrics = value_fn.loss(
-                sliced, value_hidden, discount
-            )
+            with autocast():
+                value_loss, value_hidden, value_metrics = value_loss_fn(
+                    sliced, value_hidden, discount
+                )
             value_hidden = detach(value_hidden)
             value_opt.zero_grad(set_to_none=True)
             value_loss.backward()
