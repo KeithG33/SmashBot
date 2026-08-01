@@ -20,6 +20,7 @@ os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")  # multi-connection downlo
 import argparse
 import json
 import queue
+import time
 import subprocess
 import sys
 import tarfile
@@ -90,8 +91,10 @@ def main() -> None:
                     default=Path("/home/kage/drive2/ShineBot/data/hf-raw"))
     ap.add_argument("--downloaders", type=int, default=4)
     ap.add_argument("--parse_threads", type=int, default=40)
-    ap.add_argument("--max_pending_zips", type=int, default=48,
+    ap.add_argument("--max_pending_zips", type=int, default=12,
                     help="disk guard: downloader stalls if this many unparsed zips")
+    ap.add_argument("--max_raw_gb", type=float, default=100.0,
+                    help="disk guard: pause downloads while Raw exceeds this size")
     ap.add_argument("--limit", type=int, default=0, help="only first N shards (testing)")
     ap.add_argument("--keep_raw", action="store_true")
     args = ap.parse_args()
@@ -119,6 +122,11 @@ def main() -> None:
             except queue.Empty:
                 return
             ready.acquire()  # wait if too many unparsed zips on disk
+            # byte guard: platinum shards unpack to 40GB+, so count is not enough
+            while sum(
+                f.stat().st_size for f in (args.root / "Raw").glob("*.zip*")
+            ) > args.max_raw_gb * 1e9:
+                time.sleep(30)
             try:
                 msg = download_and_repack(shard, args.root, args.dl_dir)
                 print(f"[dl] {msg}", flush=True)
