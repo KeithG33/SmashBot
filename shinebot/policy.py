@@ -144,8 +144,10 @@ class Policy(nn.Module):
         temperature: tp.Optional[float] = None,
     ) -> tuple[SampleOutputs, RecurrentState]:
         if is_resetting is None:
-            batch_size = state_action.state.stage.shape[0]
-            is_resetting = torch.zeros(batch_size, dtype=torch.bool)
+            stage = state_action.state.stage
+            is_resetting = torch.zeros(
+                stage.shape[0], dtype=torch.bool, device=stage.device
+            )
 
         output, final_state = self.network.step_with_reset(
             state_action, is_resetting, initial_state
