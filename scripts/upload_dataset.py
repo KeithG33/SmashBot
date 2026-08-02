@@ -1,4 +1,4 @@
-"""Upload the parsed dataset to a private HF dataset repo as tar shards.
+"""Upload the parsed dataset to a public HF dataset repo as tar shards.
 
 HF repos degrade past ~100k files, and Parsed/ holds 1.578M parquets — so
 games are packed into ~32 uncompressed tars (~4GB each, parquet is already
@@ -31,7 +31,7 @@ def main() -> None:
     from huggingface_hub import HfApi
 
     api = HfApi()
-    api.create_repo(args.repo, repo_type="dataset", private=True, exist_ok=True)
+    api.create_repo(args.repo, repo_type="dataset", private=False, exist_ok=True)
     existing = set(api.list_repo_files(args.repo, repo_type="dataset"))
 
     files = sorted(p.name for p in (args.root / "Parsed").iterdir())
