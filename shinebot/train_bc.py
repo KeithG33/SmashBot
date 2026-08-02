@@ -42,7 +42,6 @@ class RuntimeConfig:
     wandb_mode: str = "online"  # online | offline | disabled
     restore: str = ""  # checkpoint path, or "auto" for <run_dir>/<tag>/latest.pt
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    compute_baseline: bool = True
     seed: int = 0  # seeds model init; makes A/B runs attributable
 
 
@@ -67,62 +66,6 @@ class TrainConfig:
             self.data.dataset.meta_path = f"{root}/meta.json"
             self.data.dataset.allowed_characters = "fox"
             self.data.dataset.allowed_opponents = "all"
-
-
-def marginal_baseline(source, num_batches: int = 10) -> float:
-    """NLL of eval targets under component-wise marginal frequencies.
-
-    The 'dumbest possible model' — predicting overall action frequencies with
-    no state input. Eval loss must beat this or the model learned nothing.
-    """
-    counts: dict[str, np.ndarray] = {}
-
-    def accumulate(batch):
-        actions = batch.game.p0.controller
-        flat = {
-            **{f"b_{f}": getattr(actions.buttons, f) for f in actions.buttons._fields},
-            "main_x": actions.main_stick.x, "main_y": actions.main_stick.y,
-            "c_x": actions.c_stick.x, "c_y": actions.c_stick.y,
-            "shoulder": actions.shoulder,
-        }
-        for k, v in flat.items():
-            v = np.asarray(v)
-            if v.dtype == np.float32:  # sticks/shoulder: discretize like training
-                n = 16 if k != "shoulder" else 4
-                v = (v * n + 0.5).astype(np.int64)
-            else:
-                v = v.astype(np.int64)
-            hist = np.bincount(v.reshape(-1), minlength=18)
-            counts[k] = counts.get(k, 0) + hist
-
-    nll_sum, n_frames = 0.0, 0
-    batches = []
-    for _ in range(num_batches):
-        batch_with_meta, _ = next(source)
-        batches.append(batch_with_meta.batch)
-        accumulate(batch_with_meta.batch)
-
-    probs = {k: (c + 1e-9) / (c + 1e-9).sum() for k, c in counts.items()}
-    for batch in batches:
-        actions = batch.game.p0.controller
-        flat = {
-            **{f"b_{f}": getattr(actions.buttons, f) for f in actions.buttons._fields},
-            "main_x": actions.main_stick.x, "main_y": actions.main_stick.y,
-            "c_x": actions.c_stick.x, "c_y": actions.c_stick.y,
-            "shoulder": actions.shoulder,
-        }
-        total = 0.0
-        for k, v in flat.items():
-            v = np.asarray(v)
-            if v.dtype == np.float32:
-                n = 16 if k != "shoulder" else 4
-                v = (v * n + 0.5).astype(np.int64)
-            else:
-                v = v.astype(np.int64)
-            total += -np.log(probs[k][v.reshape(-1)]).sum()
-        nll_sum += total
-        n_frames += v.size
-    return nll_sum / n_frames
 
 
 def main(config: TrainConfig) -> None:
@@ -224,12 +167,6 @@ def main(config: TrainConfig) -> None:
         resume="allow",
         id=rt.tag,
     )
-
-    baseline = None
-    if rt.compute_baseline:
-        baseline = marginal_baseline(sources.test)
-        print(f"marginal-distribution baseline (eval NLL): {baseline:.4f}")
-        wandb.summary["baseline_nll"] = baseline
 
     B = config.data.batch_size
     train_hidden = policy.initial_state(B, device)
@@ -372,10 +309,8 @@ def main(config: TrainConfig) -> None:
                     step=step,
                 )
                 marker = " *best*" if is_best else ""
-                base = f"  (baseline {baseline:.3f})" if baseline else ""
                 pbar.write(
-                    f"step {step:6d}  eval {eval_metrics['policy_loss']:7.4f}"
-                    f"{base}{marker}"
+                    f"step {step:6d}  eval {eval_metrics['policy_loss']:7.4f}{marker}"
                 )
 
             if step % rt.checkpoint_interval == 0:
