@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["smashbot", "smashbot.model", "smashbot.data", "smashbot.gym"]
+
+
+[project]
+name = "smashbot"
+version = "0.1.0"
+description = "A package for SmashBot AI development."
+authors = [
+    { name = "Your Name", email = "your.email@example.com" }
+]
+license = { file = "LICENSE" }
+readme = "README.md"
+
+
+[project.urls]
+"Homepage" = "http://example.com"
+"Repository" = "https://github.com/username/smashbot"

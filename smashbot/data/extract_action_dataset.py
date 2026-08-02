@@ -75,15 +75,15 @@ def parse_nana(nana):
     player_state = [
         nana.action.value,          nana.action_frame,
         nana.character.value,       int(nana.facing),
-        int(nana.hitlag_left),      nana.hitstun_frames_left,
-        nana.invulnerability_left,  int(nana.invulnerable),
-        nana.jumps_left,            int(nana.on_ground),
-        nana.percent,
-        nana.position.x,            nana.position.y,
-        nana.shield_strength,       nana.speed_air_x_self,
-        nana.speed_ground_x_self,   nana.speed_x_attack,
-        nana.speed_y_attack,        nana.speed_y_self,
-        nana.stock,
+        int(nana.hitlag_left),    
+        nana.hitstun_frames_left,   nana.invulnerability_left,
+        int(nana.invulnerable),   nana.jumps_left,
+                                    int(nana.on_ground), # no nana
+        nana.percent,               nana.position.x,
+        nana.position.y,            nana.shield_strength, 
+        nana.speed_air_x_self,      nana.speed_ground_x_self,
+        nana.speed_x_attack,        nana.speed_y_attack,     
+        nana.speed_y_self,          nana.stock,
     ]
     return player_state
 
@@ -91,51 +91,6 @@ def parse_nana(nana):
 def parse_game_state(gamestate, in_game=False):
     """
     Get relevant observations from gamestate object (https://libmelee.readthedocs.io/en/latest/gamestate.html)
-
-    In no particular order:
-
-    1. Environment state info
-        - distance                        (float)
-        - frame                           (int)
-        - stage                           (enums.Stage)
-        - projectile state info:
-            - frame                       (int)
-            - owner                       (int)
-            - position                    (tuple(float,float))
-            - speed                       (tuple(float,float))
-            - type                        (enums.ProjectileType)
-            - subtype                     (int)
-    2. player state info (*)              (dict[port, PlayerState])
-        - action (animation)              (enum.Action)
-        - action_frame                    (int)
-        - characters                      (enum.Character)
-        - facing                          (bool)
-        - position                        (tuple(float,float))
-        - shield strength                 (float)
-        - ground/air self/attack speed    (float/float float/float)
-        - stocks                          (int)
-        - hitlag_left                     (bool)
-        - hitstun_frames_left             (int)
-        - invulnerable                    (bool)
-        - invulnerability_left            (int)
-        - jumps_left                      (int)
-        - nana                            (PlayerState)
-        - percent                         (int)
-        - on_ground                       (bool)
-    3. controller state (**)               (controller.ControllerState)
-        - button                          (dict[enums.Button, bool])
-        - c_stick                         (tuple(float,float))
-        - l_shoulder                      (float)
-        - main_stick                      (tuple(float,float))
-    4. previous actions ***                (list[controller.ControllerState])
-
-    NOTES:
-        *applies to both both players
-        ** model outputs: use one of shoulder trigger and one of x or y. Thus, action space becomes:
-           [A, B, L, X/Y, Z] + [Main Stick X, Main Stick Y, C-Stick X, C-Stick Y, L/R]
-        ***maybe used in future
-
-
     """
     # 1. environment state info
     env_info = [gamestate.distance, gamestate.frame, gamestate.stage.value]
@@ -146,11 +101,9 @@ def parse_game_state(gamestate, in_game=False):
     playerstate_list = []
     controllerstate_list = []
 
-    reward = []
-
     for port, pstate in gamestate.players.items():
         # Player state
-        nana = parse_nana(pstate.nana)
+        # nana = parse_nana(pstate.nana)
 
         player_state = [
             pstate.action.value,          pstate.action_frame,
@@ -158,59 +111,8 @@ def parse_game_state(gamestate, in_game=False):
             int(pstate.hitlag_left), 
             pstate.hitstun_frames_left,   pstate.invulnerability_left,
             int(pstate.invulnerable),   pstate.jumps_left,
-            nana,                         int(pstate.on_ground),
-            pstate.percent,               pstate.position.x,
-            pstate.position.y,            pstate.shield_strength,
-            pstate.speed_air_x_self,      pstate.speed_ground_x_self,
-            pstate.speed_x_attack,        pstate.speed_y_attack,
-            pstate.speed_y_self,          pstate.stock,
-        ]
-
-        if not in_game:
-            # Player action
-            controller_button_state = buttons_to_list(pstate.controller_state.button)
-            controller_analog_state = analog_to_list(
-                pstate.controller_state.main_stick,
-                pstate.controller_state.c_stick,
-                pstate.controller_state.l_shoulder,
-                pstate.controller_state.r_shoulder,
-            )
-
-            controller_state = controller_button_state + controller_analog_state
-            controllerstate_list.append(controller_state)
-
-        playerstate_list.append(player_state)
-
-    observation = env_info + playerstate_list
-    actions = controllerstate_list
-
-    return observation, actions
-def parse_game_state_new(gamestate, in_game=False):
-    """
-    Get relevant observations from gamestate object (https://libmelee.readthedocs.io/en/latest/gamestate.html)
-    """
-    # 1. environment state info
-    env_info = [gamestate.distance, gamestate.frame, gamestate.stage.value]
-    projectiles = parse_projectiles(gamestate.projectiles)
-    env_info.append(projectiles)
-
-    # 2. player state info
-    playerstate_list = []
-    controllerstate_list = []
-
-    reward = []
-
-    for port, pstate in gamestate.players.items():
-        # Player state
-        nana = parse_nana(pstate.nana)
-
-        player_state = [
-            pstate.action.value,          pstate.action_frame,
-            pstate.character.value,       int(pstate.facing),
-            int(pstate.hitlag_left), 
-            pstate.hitstun_frames_left,   pstate.invulnerability_left,
-            int(pstate.invulnerable),   pstate.jumps_left,
-            nana,                         int(pstate.on_ground),
+            # nana,                         int(pstate.on_ground),
+                                          int(pstate.on_ground),
             pstate.percent,               pstate.position.x,
             pstate.position.y,            pstate.shield_strength,
             pstate.speed_air_x_self,      pstate.speed_ground_x_self,
@@ -251,16 +153,19 @@ def generate_input_python(observation, prev_action, player_index):
     or misc info. Negative value indicates currently active player.
     """
 
-    copy_observation = copy.deepcopy(observation)
+    # copy_observation = copy.deepcopy(observation)
     all_tensors = []
 
-    # misc_info includes distance, frame, and stage
-    misc = copy_observation[:3]
-    projectiles = copy_observation[3]
-    players = copy_observation[4:]
-    nana_states = [obs.pop(9) for obs in players]
+    misc = observation[:3] # distance, frame, stage
+    projectiles = observation[3]
+    players = observation[4:]
+    # nana_states = [obs.pop(9) for obs in players]
 
+    if prev_action is None:
+        prev_action = [-1] * 10
+    
     # Creating misc tensor data
+    misc += prev_action
     misc = [MISC_TYPE] + misc + [0] * (20 - len(misc))
     all_tensors.append(misc)
 
@@ -272,15 +177,6 @@ def generate_input_python(observation, prev_action, player_index):
         players_list.append(player_data)
     all_tensors.extend(players_list)
 
-    # Processing Nana states
-    nana_list = []
-    for i, nana in enumerate(nana_states):
-        if nana is not None:
-            nana_type = [-NANA_TYPE] if i == player_index else [NANA_TYPE]
-            nana_data = nana_type + nana + [0] * (20 - len(nana))
-            nana_list.append(nana_data)
-    all_tensors.extend(nana_list)
-
     # Handling projectiles
     if projectiles:
         projectile_list = []
@@ -290,17 +186,6 @@ def generate_input_python(observation, prev_action, player_index):
             )
             projectile_list.append(projectile_data)
         all_tensors.extend(projectile_list)
-
-    # TODO: experiment conditioning on previous action. Switch this to python lists
-    #
-    # if prev_action is not None:
-    #     prev_action = prev_action + [0] * (20 - len(prev_action))
-    #     prev_action = torch.tensor(prev_action).view(1, -1)
-    # else:
-    #     prev_action = torch.zeros(1, 20)
-    # action_types = torch.full((len(prev_action), 1), ACTION_TYPE)
-    # action_tensors = torch.cat([action_types, prev_action], dim=1)
-    # all_tensors.append(action_tensors)
 
     return all_tensors
 
@@ -315,12 +200,23 @@ def process_files(file_batch, output_dir, batch_number):
             console = melee.Console(is_dolphin=False, allow_old_version=True, path=slp_file)
             console.connect()
 
+            prev_actions = [None, None]
+            
             while gamestate := console.step():
+                if len(gamestate.players) > 2:
+                    print("Skipping game with more than 2 players")
+                    break
+
+                characters = [player.character for player in gamestate.players.values()]
+                if melee.enums.Character.POPO in characters or melee.enums.Character.NANA in characters:
+                    print("Skipping Ice Climbers game")
+                    break
+
                 obs, actions = parse_game_state(gamestate)
 
                 # Generate input and group by length
                 for i in range(len(actions)):
-                    player_input = generate_input_python(obs, None, i)
+                    player_input = generate_input_python(obs, prev_actions[i], i)
                     player_output = actions[i]
                     input_length = len(player_input)
 
@@ -341,6 +237,9 @@ def process_files(file_batch, output_dir, batch_number):
                         grouped_data[input_length] = []
                         file_counters[input_length] += 1
 
+                    
+                    prev_actions[i] = player_output
+
     except Exception as e:
         print(f"An error occurred while processing file {slp_file}: {e}")
     else:
@@ -360,14 +259,12 @@ def save_as_hickle(data, input_length, output_dir, batch_number, file_index):
         f"{output_dir}/inputs{input_length}_batch{batch_number}_{file_index}.hkl",
         compression="gzip",
         mode="w",
-        track_times=False,
     )
     hkl.dump(
         outputs,
         f"{output_dir}/outputs{input_length}_batch{batch_number}_{file_index}.hkl",
         compression="gzip",
         mode="w",
-        track_times=False,
     )
     print(
         f"Saved {output_dir}/inputs{input_length}_batch{batch_number}_{file_index}.hkl"
@@ -381,35 +278,40 @@ def extract_dataset(slp_dir, output_dir, num_workers=32, chunk_size=100):
         slp_files[i : i + chunk_size] for i in range(0, len(slp_files), chunk_size)
     ]
 
-    with multiprocessing.Pool(num_workers) as pool:
-        jobs = [(chunk, output_dir, i + 1) for i, chunk in enumerate(chunks)]
-        pool.starmap(process_files, jobs)
+    if num_workers == 1:
+        for i, chunk in enumerate(chunks):
+            process_files(chunk, output_dir, i + 1)
+    else:
+        with multiprocessing.Pool(num_workers) as pool:
+            jobs = [(chunk, output_dir, i + 1) for i, chunk in enumerate(chunks)]
+            pool.starmap(process_files, jobs)
 
 
-def main():
-    SLIPPI_FILE_DIR = (
-        "/home/kage/smashbot_workspace/dataset/Slippi_Public_Dataset_v3/slp"
-    )
-    OUTPUT_DIR = "/home/kage/smashbot_workspace/dataset/Slippi_Public_Dataset_v3/hickle"
-    NUM_WORKERS = 32
-    CHUNK_SIZE = 100  # Original batch size doubled
+# def main():
+#     SLIPPI_FILE_DIR = (
+#         "/home/kage/smashbot_workspace/dataset/Slippi_Public_Dataset_v3/slp"
+#     )
+#     OUTPUT_DIR = "/home/kage/smashbot_workspace/dataset/Slippi_Public_Dataset_v3/hickle"
+#     NUM_WORKERS = 32
+#     CHUNK_SIZE = 100  # Original batch size doubled
 
-    slp_files = glob.glob(SLIPPI_FILE_DIR + "**/*.slp", recursive=True)
-    random.shuffle(slp_files)
-    chunks = [
-        slp_files[i : i + CHUNK_SIZE] for i in range(0, len(slp_files), CHUNK_SIZE)
-    ]
+#     slp_files = glob.glob(SLIPPI_FILE_DIR + "**/*.slp", recursive=True)
+#     random.shuffle(slp_files)
+#     chunks = [
+#         slp_files[i : i + CHUNK_SIZE] for i in range(0, len(slp_files), CHUNK_SIZE)
+#     ]
 
-    with multiprocessing.Pool(NUM_WORKERS) as pool:
-        jobs = [(chunk, OUTPUT_DIR, i + 1) for i, chunk in enumerate(chunks)]
-        pool.starmap(process_files, jobs)
+#     with multiprocessing.Pool(NUM_WORKERS) as pool:
+#         jobs = [(chunk, OUTPUT_DIR, i + 1) for i, chunk in enumerate(chunks)]
+#         pool.starmap(process_files, jobs)
 
 
 if __name__ == "__main__":
     # main()
 
-    SLIPPI_DIR = "/home/kage/smashbot_workspace/dataset/"
-    OUTPUT_DIR = "/home/kage/smashbot_workspace/dataset/hickle"
+    # Path to directory containing the Slippi files
+    SLIPPI_DIR = '/home/kage/smashbot_workspace/dataset/Slippi_Public_Dataset_v3/slp'
+    OUTPUT_DIR = '/home/kage/smashbot_workspace/dataset/hickle_action'
     num_workers = 20
     chunk_size = 85
 

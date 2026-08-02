@@ -28,7 +28,6 @@ def load_pair(file_pair):
 
 class SequenceBatchSampler(Sampler):
     def __init__(self, dataset, batch_size):
-        # self.dataset = dataset
         self.batch_size = batch_size
         self.batches = []
 
@@ -67,37 +66,43 @@ class SmashBrosDataset(Dataset):
 
         self.load_data(file_pairs)
 
-    def load_data(self, file_pairs):        
-        # Use multiprocessing to load data if more than 1 process is requested
+    def data_generator(self, file_pairs):
+        # Multiprocessing version
         if self.num_processes > 1:
             with Pool(self.num_processes) as p:
-                data = p.map(load_pair, file_pairs)
+                for result in p.imap(load_pair, file_pairs):
+                    yield result
+        # Single process version
         else:
-            data = [load_pair(pair) for pair in file_pairs]
-        
-        print("Data loaded, organizing...")
-        # Organize data by sequence length
-        for seq_len, inp, out in data:
-            if seq_len not in self.inputs:
-                self.inputs[seq_len] = inp
-                self.outputs[seq_len] = out
-            else:
-                self.inputs[seq_len] = np.concatenate([self.inputs[seq_len], inp], axis=0)
-                self.outputs[seq_len] = np.concatenate([self.outputs[seq_len], out], axis=0)
+            for pair in file_pairs:
+                yield load_pair(pair)
 
-        # Create index map
-        for seq_len in sorted(self.inputs):
+    def load_data(self, file_pairs):
+        # Organize data by sequence length using a generator
+        for seq_len, inp, out in self.data_generator(file_pairs):
+            if seq_len not in self.inputs:
+                self.inputs[seq_len] = [inp]
+                self.outputs[seq_len] = [out]
+            else:
+                self.inputs[seq_len].append(inp)
+                self.outputs[seq_len].append(out)
+
+        # Concatenate data once at the end
+        for seq_len in self.inputs:
+            self.inputs[seq_len] = np.concatenate(self.inputs[seq_len], axis=0)
+            self.outputs[seq_len] = np.concatenate(self.outputs[seq_len], axis=0)
             for batch_index in range(self.inputs[seq_len].shape[0]):
                 self.index_map.append((seq_len, batch_index))
 
     def __len__(self):
         return len(self.index_map)
-
+    
     def __getitem__(self, index):
         seq_len, batch_index = self.index_map[index]
         input_tensor = self.inputs[seq_len][batch_index]
         output_tensor = self.outputs[seq_len][batch_index]
-        return torch.tensor(input_tensor, dtype=torch.float32), torch.tensor(output_tensor, dtype=torch.float32)
+        return torch.as_tensor(input_tensor, dtype=torch.float32), torch.as_tensor(output_tensor, dtype=torch.float32)
+
 
 def sample_data(directory, num_samples):
     input_files = [f.path for f in os.scandir(directory) if "inputs" in f.name]
