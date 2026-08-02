@@ -3,7 +3,7 @@
 The production harness: train/eval split, separate policy and value networks
 with separate optimizers, periodic eval on held-out games (key metric:
 eval/policy_loss), best-eval + latest checkpoints with resume, wandb logging,
-and a marginal-distribution baseline computed at startup.
+and tqdm/wandb progress reporting.
 
 Usage (from repo root):
   .venv/bin/python -m shinebot.train_bc --tag debug-fox-v0
