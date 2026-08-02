@@ -33,10 +33,14 @@ class PolicyConfig:
 
 @dataclasses.dataclass
 class NetworkConfig:
+    name: str = "tx_like"  # tx_like | transformer
     hidden_size: int = 512
     num_layers: int = 3
     ffw_multiplier: int = 2
-    recurrent_layer: str = "lstm"  # or "gru"
+    recurrent_layer: str = "lstm"  # or "gru" (tx_like only)
+    # transformer only:
+    num_heads: int = 8
+    window: int = 256  # KV-cache length (frames of memory carried at play time)
 
 
 @dataclasses.dataclass

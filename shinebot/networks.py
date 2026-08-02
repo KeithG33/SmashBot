@@ -17,16 +17,20 @@ RecurrentState = tp.Any
 
 
 def _mask_state(reset: torch.Tensor, initial, prev):
-    """Replace state with initial where reset is True. reset: [B]."""
+    """Replace state with initial where reset is True. reset: [B].
+
+    State leaves are batch-first ([B, ...], e.g. KV caches) except torch RNN
+    states, which are [layers, B, H] — disambiguated by which dim matches B.
+    """
+    B = reset.shape[0]
 
     def where(init: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
-        # states are [B, H] or [layers, B, H] (torch RNN convention)
-        if state.dim() == 3:  # [layers, B, H]: batch is dim 1
-            mask = reset.view(1, -1, 1)
-        else:
+        if state.dim() >= 1 and state.shape[0] == B:
             mask = reset
             while mask.dim() < state.dim():
                 mask = mask.unsqueeze(-1)
+        else:  # [layers, B, H] torch RNN convention
+            mask = reset.view(1, -1, *([1] * (state.dim() - 2)))
         return torch.where(mask, init, state)
 
     return torch.utils._pytree.tree_map(where, initial, prev)
@@ -221,6 +225,172 @@ class TransformerLike(Sequential):
         self.output_size = hidden_size
 
 
+def _rope(x: torch.Tensor, positions: torch.Tensor, theta: float = 10000.0):
+    """Rotary embedding. x: [B, T, heads, head_dim], positions: [B, T] (absolute)."""
+    hd = x.shape[-1]
+    freqs = theta ** (
+        -torch.arange(0, hd, 2, device=x.device, dtype=torch.float32) / hd
+    )
+    angles = positions.float()[..., None] * freqs  # [B, T, hd/2]
+    cos = angles.cos()[:, :, None, :]  # [B, T, 1, hd/2]
+    sin = angles.sin()[:, :, None, :]
+    x1, x2 = x.float()[..., 0::2], x.float()[..., 1::2]
+    out = torch.empty_like(x, dtype=torch.float32)
+    out[..., 0::2] = x1 * cos - x2 * sin
+    out[..., 1::2] = x1 * sin + x2 * cos
+    return out.to(x.dtype)
+
+
+class TransformerBlock(nn.Module):
+    """Pre-RMSNorm causal attention + SwiGLU, zero-init output projections."""
+
+    def __init__(self, d: int, num_heads: int):
+        super().__init__()
+        assert d % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = d // num_heads
+
+        self.attn_norm = nn.RMSNorm(d)
+        self.qkv = nn.Linear(d, 3 * d, bias=False)
+        self.q_norm = nn.RMSNorm(self.head_dim)  # QK-norm: attention stability
+        self.k_norm = nn.RMSNorm(self.head_dim)
+        self.attn_out = nn.Linear(d, d, bias=False)
+        nn.init.zeros_(self.attn_out.weight)
+
+        self.ffw_norm = nn.RMSNorm(d)
+        hidden = int(8 * d / 3 / 64) * 64  # SwiGLU sizing, 64-aligned
+        self.gate_up = nn.Linear(d, 2 * hidden, bias=False)
+        self.down = nn.Linear(hidden, d, bias=False)
+        nn.init.zeros_(self.down.weight)
+
+    def attend(
+        self,
+        x: torch.Tensor,  # [B, T, d]
+        positions: torch.Tensor,  # [B, T] absolute positions of x
+        k_cache: torch.Tensor,  # [B, W, d] (rotated keys, newest right-aligned)
+        v_cache: torch.Tensor,  # [B, W, d]
+        cache_len: torch.Tensor,  # [B] valid entries in the cache
+    ):
+        B, T, d = x.shape
+        W = k_cache.shape[1]
+        h = self.num_heads
+
+        qkv = self.qkv(self.attn_norm(x))
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = self.q_norm(q.view(B, T, h, self.head_dim))
+        k = self.k_norm(k.view(B, T, h, self.head_dim))
+        q = _rope(q, positions)
+        k = _rope(k, positions)
+        k_flat = k.reshape(B, T, d)
+
+        keys = torch.cat([k_cache, k_flat], dim=1)  # [B, W+T, d]
+        values = torch.cat([v_cache, v], dim=1)
+
+        # mask [B, 1, T, W+T]: cache slot w valid iff w >= W - cache_len[b];
+        # segment part is causal (key t' attendable by query t iff t' <= t).
+        slot = torch.arange(W, device=x.device)
+        cache_ok = slot[None, :] >= (W - cache_len)[:, None]  # [B, W]
+        t = torch.arange(T, device=x.device)
+        causal = t[None, :] <= t[:, None]  # [T(query), T(key)]
+        mask = torch.cat(
+            [
+                cache_ok[:, None, :].expand(B, T, W),
+                causal[None, :, :].expand(B, T, T),
+            ],
+            dim=2,
+        ).unsqueeze(1)  # [B, 1, T, W+T]
+
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(1, 2),  # [B, h, T, hd]
+            keys.view(B, W + T, h, self.head_dim).transpose(1, 2),
+            values.view(B, W + T, h, self.head_dim).transpose(1, 2),
+            attn_mask=mask,
+        )
+        x = x + self.attn_out(out.transpose(1, 2).reshape(B, T, d))
+
+        gate, up = self.gate_up(self.ffw_norm(x)).chunk(2, dim=-1)
+        x = x + self.down(torch.nn.functional.silu(gate) * up)
+
+        # slide the cache: keep the last W of [cache + new]
+        new_k = torch.cat([k_cache, k_flat], dim=1)[:, -W:]
+        new_v = torch.cat([v_cache, v], dim=1)[:, -W:]
+        return x, new_k, new_v
+
+
+class TransformerCore(Network):
+    """Sliding-window causal transformer. Recurrent state = per-layer KV cache
+    (last `window` frames) + per-element absolute position / cache length.
+    Memory horizon is exactly `window` frames — a deliberate contrast to the
+    LSTM's unbounded carry."""
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int = 512,
+        num_layers: int = 4,
+        num_heads: int = 8,
+        window: int = 256,
+    ):
+        super().__init__()
+        self.d = hidden_size
+        self.window = window
+        self.encoder = nn.Linear(input_size, hidden_size)
+        self.blocks = nn.ModuleList(
+            [TransformerBlock(hidden_size, num_heads) for _ in range(num_layers)]
+        )
+        self.final_norm = nn.RMSNorm(hidden_size)
+        self.output_size = hidden_size
+
+    def initial_state(self, batch_size, device=None):
+        z = lambda *shape: torch.zeros(*shape, device=device)
+        return {
+            "pos": torch.zeros(batch_size, dtype=torch.long, device=device),
+            "cache_len": torch.zeros(batch_size, dtype=torch.long, device=device),
+            "kv": [
+                (z(batch_size, self.window, self.d), z(batch_size, self.window, self.d))
+                for _ in self.blocks
+            ],
+        }
+
+    def _forward(self, inputs, state):
+        """inputs: [B, T, D_in] (one reset-free segment)."""
+        T = inputs.shape[1]
+        x = self.encoder(inputs)
+        positions = state["pos"][:, None] + torch.arange(T, device=inputs.device)[None]
+        new_kv = []
+        for block, (k_cache, v_cache) in zip(self.blocks, state["kv"]):
+            x, nk, nv = block.attend(x, positions, k_cache, v_cache, state["cache_len"])
+            new_kv.append((nk, nv))
+        next_state = {
+            "pos": state["pos"] + T,
+            "cache_len": torch.clamp(state["cache_len"] + T, max=self.window),
+            "kv": new_kv,
+        }
+        return self.final_norm(x), next_state
+
+    def step(self, inputs, prev_state):
+        out, state = self._forward(inputs[:, None], prev_state)
+        return out[:, 0], state
+
+    def unroll(self, inputs, reset, initial_state):
+        reset_any = reset.any(dim=0)  # [T]
+        boundaries = torch.nonzero(reset_any).squeeze(-1).tolist()
+
+        outputs = []
+        state = initial_state
+        pos = 0
+        T = inputs.shape[1]
+        for b in boundaries + [T]:
+            if pos < b:
+                out, state = self._forward(inputs[:, pos:b], state)
+                outputs.append(out)
+                pos = b
+            if b < T:
+                initial = self.initial_state(reset.shape[0], device=inputs.device)
+                state = _mask_state(reset[:, b], initial, state)
+        return torch.cat(outputs, dim=1) if len(outputs) > 1 else outputs[0], state
+
+
 class StateActionNetwork(Network):
     """Embeds StateAction structs, then runs the core network."""
 
@@ -266,11 +436,23 @@ def build_embed_network(
         embed_action=controller_embedding,
         num_names=num_names,
     )
-    core = TransformerLike(
-        input_size=embed_state_action.size,
-        hidden_size=network_config.hidden_size,
-        num_layers=network_config.num_layers,
-        ffw_multiplier=network_config.ffw_multiplier,
-        recurrent_layer=network_config.recurrent_layer,
-    )
+    name = getattr(network_config, "name", "tx_like")
+    if name == "tx_like":
+        core = TransformerLike(
+            input_size=embed_state_action.size,
+            hidden_size=network_config.hidden_size,
+            num_layers=network_config.num_layers,
+            ffw_multiplier=network_config.ffw_multiplier,
+            recurrent_layer=network_config.recurrent_layer,
+        )
+    elif name == "transformer":
+        core = TransformerCore(
+            input_size=embed_state_action.size,
+            hidden_size=network_config.hidden_size,
+            num_layers=network_config.num_layers,
+            num_heads=network_config.num_heads,
+            window=network_config.window,
+        )
+    else:
+        raise ValueError(f"unknown network name: {name}")
     return StateActionNetwork(embed_game, embed_state_action, core)

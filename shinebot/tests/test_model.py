@@ -12,7 +12,7 @@ from slippi_ai.types import Frames, StateAction
 from shinebot import configs, delay as delay_lib, embed as embed_lib
 from shinebot.data import loader
 from shinebot.heads import AutoRegressive
-from shinebot.networks import TransformerLike
+from shinebot.networks import TransformerCore, TransformerLike
 from shinebot.policy import build_policy
 
 DELAY = 4
@@ -96,9 +96,18 @@ def test_delay_slicing_indices():
     assert target_actions[0, 0] == DELAY + 1 and target_actions[0, -1] == UNROLL + DELAY
 
 
-def test_unroll_vs_step_equivalence():
+@pytest.mark.parametrize(
+    "make_net",
+    [
+        lambda: TransformerLike(input_size=8, hidden_size=16, num_layers=2),
+        lambda: TransformerCore(input_size=8, hidden_size=16, num_layers=2,
+                                num_heads=2, window=24),
+    ],
+    ids=["tx_like", "transformer"],
+)
+def test_unroll_vs_step_equivalence(make_net):
     torch.manual_seed(0)
-    net = TransformerLike(input_size=8, hidden_size=16, num_layers=2)
+    net = make_net()
     T, B = 100, 3
     inputs = torch.randn(B, T, 8)
     reset = torch.zeros(B, T, dtype=torch.bool)
@@ -225,3 +234,25 @@ def test_param_count_production_size():
     )
     n = sum(p.numel() for p in policy.parameters())
     assert 3e6 < n < 30e6, f"unexpected param count {n}"
+
+
+def test_transformer_window_horizon():
+    """Events older than `window` frames must not influence the output."""
+    torch.manual_seed(0)
+    net = TransformerCore(input_size=4, hidden_size=16, num_layers=1,
+                          num_heads=2, window=8)
+    net.eval()
+    B, T = 1, 30
+    inputs_a = torch.randn(B, T, 4)
+    inputs_b = inputs_a.clone()
+    inputs_b[:, 0] += 100.0  # perturb a frame far outside the window
+    reset = torch.zeros(B, T, dtype=torch.bool)
+
+    with torch.no_grad():
+        out_a, _ = net.unroll(inputs_a, reset, net.initial_state(B))
+        out_b, _ = net.unroll(inputs_b, reset, net.initial_state(B))
+
+    # last frame: frame 0 is 29 steps back, window is 8 -> identical outputs
+    torch.testing.assert_close(out_a[:, -1], out_b[:, -1])
+    # but frame 0 itself obviously differs
+    assert not torch.allclose(out_a[:, 0], out_b[:, 0])
