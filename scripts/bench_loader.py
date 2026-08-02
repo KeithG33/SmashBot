@@ -10,7 +10,7 @@ import time
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root", default="/home/kage/drive2/ShineBot/data/debug-fox/Root")
+    ap.add_argument("--root", default="/home/kage/drive2/ShineBot/data/full/Root")
     ap.add_argument("--batch_size", type=int, default=512)
     ap.add_argument("--unroll_length", type=int, default=80)
     ap.add_argument("--extra_frames", type=int, default=19)  # delay 18 + 1
@@ -25,7 +25,7 @@ def main() -> None:
     cfg = DataConfig(
         dataset=DatasetConfig(
             data_dir=f"{args.root}/Parsed",
-            meta_path=f"{args.root}/meta.json",
+            meta_path=f"{args.root}/meta-20k.json",
             allowed_characters="fox",
             allowed_opponents="all",
         ),

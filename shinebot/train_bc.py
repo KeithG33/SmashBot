@@ -6,8 +6,8 @@ eval/policy_loss), best-eval + latest checkpoints with resume, wandb logging,
 and tqdm/wandb progress reporting.
 
 Usage (from repo root):
-  .venv/bin/python -m shinebot.train_bc --tag debug-fox-v0
-  .venv/bin/python -m shinebot.train_bc --tag debug-fox-v0 --restore auto  # resume
+  .venv/bin/python -m shinebot.train_bc --runtime.tag exp-baseline
+  .venv/bin/python -m shinebot.train_bc --runtime.tag exp-baseline --runtime.restore auto
 """
 
 import contextlib
@@ -61,11 +61,10 @@ class TrainConfig:
 
     def __post_init__(self):
         if self.data.dataset.data_dir is None:
-            root = "/home/kage/drive2/ShineBot/data/debug-fox/Root"
+            root = "/home/kage/drive2/ShineBot/data/full/Root"
             self.data.dataset.data_dir = f"{root}/Parsed"
-            self.data.dataset.meta_path = f"{root}/meta.json"
-            self.data.dataset.allowed_characters = "fox"
-            self.data.dataset.allowed_opponents = "all"
+            # default: the seeded 20k experiment subset; big runs use meta.json
+            self.data.dataset.meta_path = f"{root}/meta-20k.json"
 
 
 def main(config: TrainConfig) -> None:

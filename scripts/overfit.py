@@ -18,7 +18,7 @@ import tree
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root", default="/home/kage/drive2/ShineBot/data/debug-fox/Root")
+    ap.add_argument("--root", default="/home/kage/drive2/ShineBot/data/full/Root")
     ap.add_argument("--num_games", type=int, default=4)
     ap.add_argument("--steps", type=int, default=2000)
     ap.add_argument("--batch_size", type=int, default=32)
@@ -38,7 +38,7 @@ def main() -> None:
 
     dataset_cfg = data_lib.DatasetConfig(
         data_dir=f"{args.root}/Parsed",
-        meta_path=f"{args.root}/meta.json",
+        meta_path=f"{args.root}/meta-20k.json",
         allowed_characters="fox",
         allowed_opponents="all",
         swap=False,  # one perspective per game: purest memorization test

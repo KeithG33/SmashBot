@@ -30,7 +30,7 @@ def to_torch(x, device):
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="/home/kage/drive2/ShineBot/runs/overfit.pt")
-    ap.add_argument("--root", default="/home/kage/drive2/ShineBot/data/debug-fox/Root")
+    ap.add_argument("--root", default="/home/kage/drive2/ShineBot/data/full/Root")
     ap.add_argument("--game_index", type=int, default=0, help="index into ckpt's game list")
     ap.add_argument("--max_frames", type=int, default=4000)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
