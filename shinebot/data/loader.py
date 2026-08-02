@@ -104,11 +104,11 @@ def make_sources(
 
 
 def batch_to_frames(batch: data_lib.Batch, network, pin: bool = False):
-    """Training-path glue: numpy Batch [B, T] -> encoded, time-major torch Frames.
+    """Training-path glue: numpy Batch -> encoded torch Frames, batch-major [B, T].
 
-    Mirrors slippi-ai's TrainManager.produce_frames: the p0 controller becomes
-    the action stream, the network's embedding encodes (discretizes) it, and
-    everything transposes to time-major.
+    Mirrors slippi-ai's TrainManager.produce_frames (minus their time-major
+    transpose — all ShineBot tensors are (batch, time, ...)): the p0 controller
+    becomes the action stream and the network's embedding encodes it.
     """
     from slippi_ai.types import Frames, StateAction
 
@@ -125,7 +125,6 @@ def batch_to_frames(batch: data_lib.Batch, network, pin: bool = False):
         is_resetting=batch.is_resetting,
         reward=batch.reward,
     )
-    frames = tree.map_structure(lambda x: np.asarray(x).swapaxes(0, 1), frames)
     return tree.map_structure(lambda x: _to_torch(np.ascontiguousarray(x), pin), frames)
 
 

@@ -1,6 +1,7 @@
 """PyTorch port of slippi-ai's recurrent cores (vendor: slippi_ai/tf/networks.py).
 
-All tensors are time-major: inputs [T, B, D], reset [T, B], states [B, ...].
+All sequence tensors are batch-major: inputs [B, T, D], reset [B, T]; recurrent
+states are batched with no time axis (LSTM tuples keep torch's [layers, B, H]).
 The data pipeline guarantees resets only at chunk boundaries, but `unroll`
 handles resets at arbitrary timesteps by segmenting the sequence, so each
 segment still runs as one cuDNN call.
@@ -19,12 +20,13 @@ def _mask_state(reset: torch.Tensor, initial, prev):
     """Replace state with initial where reset is True. reset: [B]."""
 
     def where(init: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
-        # states may have a leading layer dim: [B, H] or [L, B, H]
-        mask = reset
-        while mask.dim() < state.dim():
-            mask = mask.unsqueeze(-1)
-        if state.dim() == 3:  # [L, B, H]: batch is dim 1
+        # states are [B, H] or [layers, B, H] (torch RNN convention)
+        if state.dim() == 3:  # [layers, B, H]: batch is dim 1
             mask = reset.view(1, -1, 1)
+        else:
+            mask = reset
+            while mask.dim() < state.dim():
+                mask = mask.unsqueeze(-1)
         return torch.where(mask, init, state)
 
     return torch.utils._pytree.tree_map(where, initial, prev)
@@ -44,17 +46,17 @@ class Network(nn.Module, abc.ABC):
         return self.step(inputs, _mask_state(reset, initial, prev_state))
 
     def unroll(self, inputs, reset, initial_state):
-        """inputs: [T, B, D], reset: [T, B] -> (outputs [T, B, D'], final_state).
+        """inputs: [B, T, D], reset: [B, T] -> (outputs [B, T, D'], final_state).
 
         Default implementation steps one frame at a time; recurrent wrappers
         override with segmented cuDNN calls.
         """
         outputs = []
         state = initial_state
-        for t in range(inputs.shape[0]):
-            out, state = self.step_with_reset(inputs[t], reset[t], state)
+        for t in range(inputs.shape[1]):
+            out, state = self.step_with_reset(inputs[:, t], reset[:, t], state)
             outputs.append(out)
-        return torch.stack(outputs), state
+        return torch.stack(outputs, dim=1), state
 
 
 class FFWWrapper(Network):
@@ -78,12 +80,12 @@ class FFWWrapper(Network):
 
 
 class RecurrentWrapper(Network):
-    """Wraps nn.LSTM / nn.GRU (single layer, time-major)."""
+    """Wraps nn.LSTM / nn.GRU (single layer, batch_first)."""
 
     def __init__(self, core: nn.Module):
         super().__init__()
         assert isinstance(core, (nn.LSTM, nn.GRU))
-        assert not core.batch_first
+        assert core.batch_first
         self._core = core
 
     def initial_state(self, batch_size, device=None):
@@ -93,28 +95,28 @@ class RecurrentWrapper(Network):
         return h
 
     def step(self, inputs, prev_state):
-        out, next_state = self._core(inputs.unsqueeze(0), prev_state)
-        return out.squeeze(0), next_state
+        out, next_state = self._core(inputs.unsqueeze(1), prev_state)
+        return out.squeeze(1), next_state
 
     def unroll(self, inputs, reset, initial_state):
         # Segment at timesteps where any element resets; one cuDNN call each.
-        reset_any = reset.any(dim=1)
+        reset_any = reset.any(dim=0)  # [T]
         boundaries = torch.nonzero(reset_any).squeeze(-1).tolist()
 
         outputs = []
         state = initial_state
         pos = 0
-        T = inputs.shape[0]
+        T = inputs.shape[1]
         for b in boundaries + [T]:
             if pos < b:
-                out, state = self._core(inputs[pos:b], state)
+                out, state = self._core(inputs[:, pos:b], state)
                 outputs.append(out)
                 pos = b
             if b < T:
-                initial = self.initial_state(reset.shape[1], device=inputs.device)
-                state = _mask_state(reset[b], initial, state)
+                initial = self.initial_state(reset.shape[0], device=inputs.device)
+                state = _mask_state(reset[:, b], initial, state)
         # note: a boundary at t masks the state, then t joins the next segment
-        return torch.cat(outputs) if len(outputs) > 1 else outputs[0], state
+        return torch.cat(outputs, dim=1) if len(outputs) > 1 else outputs[0], state
 
 
 class ResidualWrapper(Network):
@@ -204,7 +206,11 @@ class TransformerLike(Sequential):
         layers: list[Network] = [FFWWrapper(nn.Linear(input_size, hidden_size))]
         for _ in range(num_layers):
             layers.append(
-                ResidualWrapper(RecurrentWrapper(recurrent_cls(hidden_size, hidden_size)))
+                ResidualWrapper(
+                    RecurrentWrapper(
+                        recurrent_cls(hidden_size, hidden_size, batch_first=True)
+                    )
+                )
             )
             layers.append(
                 FFWWrapper(

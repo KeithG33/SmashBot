@@ -1,7 +1,8 @@
 """Policy: embed -> tx_like core -> autoregressive controller head.
 
 PyTorch port of slippi_ai/tf/policies.py, using slippi-ai's Frames/StateAction
-NamedTuples with torch tensors as leaves. All sequence tensors are time-major.
+NamedTuples with torch tensors as leaves. All sequence tensors are batch-major
+(B, T, ...).
 """
 
 import typing as tp
@@ -18,9 +19,9 @@ from shinebot.networks import RecurrentState, StateActionNetwork
 
 
 class UnrollOutputs(tp.NamedTuple):
-    log_probs: torch.Tensor  # [T, B]
-    distances: tp.Any  # controller struct of [T, B]
-    value_loss: tp.Optional[torch.Tensor]  # [T, B]; None when value head disabled
+    log_probs: torch.Tensor  # [B, T]
+    distances: tp.Any  # controller struct of [B, T]
+    value_loss: tp.Optional[torch.Tensor]  # [B, T]; None when value head disabled
     value_metrics: dict
     final_state: RecurrentState
 
@@ -45,23 +46,23 @@ class Policy(nn.Module):
 
     def _value_outputs(
         self,
-        outputs: torch.Tensor,  # [T, B, H], t in [0, T-1]
+        outputs: torch.Tensor,  # [B, T, H], t in [0, T-1]
         last_input: StateAction,  # t = T
-        is_resetting: torch.Tensor,  # [T+1, B]
+        is_resetting: torch.Tensor,  # [B, T+1]
         final_state: RecurrentState,
-        rewards: torch.Tensor,  # [T, B]
+        rewards: torch.Tensor,  # [B, T]
         discount: float,
     ) -> tuple[torch.Tensor, dict]:
         if not self.train_value_head:
             outputs = outputs.detach()
         values = self.value_head(outputs).squeeze(-1)
         last_output, _ = self.network.step_with_reset(
-            last_input, is_resetting[-1], final_state
+            last_input, is_resetting[:, -1], final_state
         )
         last_value = self.value_head(last_output).squeeze(-1)
 
         discounts = torch.where(
-            is_resetting[1:], 0.0, torch.as_tensor(discount, device=rewards.device)
+            is_resetting[:, 1:], 0.0, torch.as_tensor(discount, device=rewards.device)
         )
         value_targets = delay_lib.discounted_returns(
             rewards=rewards, discounts=discounts, bootstrap=last_value
@@ -83,15 +84,15 @@ class Policy(nn.Module):
     ) -> UnrollOutputs:
         """Frames must already be delay-aligned (see delay.slice_delayed_frames)
         and include one extra overlap frame at the end."""
-        inputs = tree.map_structure(lambda t: t[:-1], frames.state_action)
-        last_input = tree.map_structure(lambda t: t[-1], frames.state_action)
+        inputs = tree.map_structure(lambda t: t[:, :-1], frames.state_action)
+        last_input = tree.map_structure(lambda t: t[:, -1], frames.state_action)
         outputs, final_state = self.network.unroll(
-            inputs, frames.is_resetting[:-1], initial_state
+            inputs, frames.is_resetting[:, :-1], initial_state
         )
 
         action = frames.state_action.action
-        prev_action = tree.map_structure(lambda t: t[:-1], action)
-        next_action = tree.map_structure(lambda t: t[1:], action)
+        prev_action = tree.map_structure(lambda t: t[:, :-1], action)
+        next_action = tree.map_structure(lambda t: t[:, 1:], action)
 
         distance_outputs = self.controller_head.distance(outputs, prev_action, next_action)
         policy_loss = sum(tree.flatten(distance_outputs.distance))
@@ -121,7 +122,7 @@ class Policy(nn.Module):
         discount: float = 0.99,
         value_cost: float = 0.5,
     ) -> tuple[torch.Tensor, RecurrentState, dict]:
-        """frames: [U + D + 1, B] raw (not yet delay-aligned)."""
+        """frames: [B, U + D + 1] raw (not yet delay-aligned)."""
         delayed = delay_lib.slice_delayed_frames(frames, self.delay)
         outputs = self.unroll(delayed, initial_state, discount=discount)
 

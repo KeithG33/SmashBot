@@ -48,7 +48,7 @@ def toy_frames():
 
 def test_imitation_loss_smoke(toy_frames):
     policy, frames = toy_frames
-    T, B = frames.is_resetting.shape
+    B, T = frames.is_resetting.shape
     assert T == UNROLL + DELAY + 1
     initial_state = policy.initial_state(B)
     loss, final_state, metrics = policy.imitation_loss(frames, initial_state)
@@ -63,14 +63,14 @@ def test_imitation_loss_smoke(toy_frames):
 def test_delay_slicing_indices():
     """Exact index semantics: state[k]=k, action[k]=k+D, reward[k]=k+D."""
     T, B = UNROLL + DELAY + 1, 2
-    idx = np.arange(T, dtype=np.float32)[:, None].repeat(B, 1)
-    idx_t = torch.from_numpy(idx)
+    idx = np.arange(T, dtype=np.float32)[None, :].repeat(B, 0)
+    idx_t = torch.from_numpy(idx)  # [B, T], value == time index
 
     frames = Frames(
         state_action=StateAction(state=idx_t.clone(), action=idx_t.clone(),
                                  name=idx_t.clone()),
-        is_resetting=torch.zeros(T, B, dtype=torch.bool),
-        reward=idx_t[:-1].clone(),
+        is_resetting=torch.zeros(B, T, dtype=torch.bool),
+        reward=idx_t[:, :-1].clone(),
     )
     # state is normally a Game struct; slice_delayed_frames reads state.stage
     # for the length, so use a minimal NamedTuple (tree-compatible).
@@ -83,27 +83,27 @@ def test_delay_slicing_indices():
     sliced = delay_lib.slice_delayed_frames(frames, DELAY)
 
     U1 = UNROLL + 1  # unroll length + overlap frame
-    assert torch.equal(sliced.state_action.state.stage, idx_t[:U1])
-    assert torch.equal(sliced.state_action.action, idx_t[DELAY:])
-    assert torch.equal(sliced.state_action.name, idx_t[DELAY:])
-    assert torch.equal(sliced.reward, idx_t[DELAY:-1])
+    assert torch.equal(sliced.state_action.state.stage, idx_t[:, :U1])
+    assert torch.equal(sliced.state_action.action, idx_t[:, DELAY:])
+    assert torch.equal(sliced.state_action.name, idx_t[:, DELAY:])
+    assert torch.equal(sliced.reward, idx_t[:, DELAY:-1])
     # states [0, U-1] predict actions [D+1, U+D] with prev actions [D, U+D-1]
-    inputs_state = sliced.state_action.state.stage[:-1]
-    prev_actions = sliced.state_action.action[:-1]
-    target_actions = sliced.state_action.action[1:]
-    assert inputs_state[0, 0] == 0 and inputs_state[-1, 0] == UNROLL - 1
-    assert prev_actions[0, 0] == DELAY and prev_actions[-1, 0] == UNROLL + DELAY - 1
-    assert target_actions[0, 0] == DELAY + 1 and target_actions[-1, 0] == UNROLL + DELAY
+    inputs_state = sliced.state_action.state.stage[:, :-1]
+    prev_actions = sliced.state_action.action[:, :-1]
+    target_actions = sliced.state_action.action[:, 1:]
+    assert inputs_state[0, 0] == 0 and inputs_state[0, -1] == UNROLL - 1
+    assert prev_actions[0, 0] == DELAY and prev_actions[0, -1] == UNROLL + DELAY - 1
+    assert target_actions[0, 0] == DELAY + 1 and target_actions[0, -1] == UNROLL + DELAY
 
 
 def test_unroll_vs_step_equivalence():
     torch.manual_seed(0)
     net = TransformerLike(input_size=8, hidden_size=16, num_layers=2)
     T, B = 100, 3
-    inputs = torch.randn(T, B, 8)
-    reset = torch.zeros(T, B, dtype=torch.bool)
-    reset[0] = True
-    reset[57, 1] = True  # mid-sequence reset for one element
+    inputs = torch.randn(B, T, 8)
+    reset = torch.zeros(B, T, dtype=torch.bool)
+    reset[:, 0] = True
+    reset[1, 57] = True  # mid-sequence reset for one element
 
     state = net.initial_state(B)
     unrolled, final_unroll = net.unroll(inputs, reset, state)
@@ -111,9 +111,9 @@ def test_unroll_vs_step_equivalence():
     state = net.initial_state(B)
     stepped = []
     for t in range(T):
-        out, state = net.step_with_reset(inputs[t], reset[t], state)
+        out, state = net.step_with_reset(inputs[:, t], reset[:, t], state)
         stepped.append(out)
-    stepped = torch.stack(stepped)
+    stepped = torch.stack(stepped, dim=1)
 
     torch.testing.assert_close(unrolled, stepped, atol=1e-5, rtol=1e-4)
     tree.map_structure(

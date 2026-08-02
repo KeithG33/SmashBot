@@ -9,9 +9,10 @@ their Policy.imitation_loss):
   [D, U+D-1]. The final hidden state comes from states [0, U-1]; state U
   would bootstrap the value function.
 
+All tensors are batch-major (B, T, ...); the time axis is dim 1.
 `slice_delayed_frames` performs exactly that slicing; the resulting Frames
 are then consumed by Policy.unroll, which shifts actions by one internally
-(prev = action[:-1], target = action[1:]).
+(prev = action[:, :-1], target = action[:, 1:]).
 """
 
 import typing as tp
@@ -23,32 +24,34 @@ from slippi_ai.types import Frames, StateAction
 
 
 def slice_delayed_frames(frames: Frames, delay: int) -> Frames:
-    """Aligns states with delayed actions. Input frames are time-major [T, B]."""
+    """Aligns states with delayed actions. Input frames are [B, T]."""
     state_action = frames.state_action
-    total_frames = state_action.state.stage.shape[0]
+    total_frames = state_action.state.stage.shape[1]
     unroll_length = total_frames - delay  # includes the +1 overlap frame
 
     return Frames(
         state_action=StateAction(
-            state=tree.map_structure(lambda t: t[:unroll_length], state_action.state),
-            action=tree.map_structure(lambda t: t[delay:], state_action.action),
-            name=state_action.name[delay:],
+            state=tree.map_structure(
+                lambda t: t[:, :unroll_length], state_action.state
+            ),
+            action=tree.map_structure(lambda t: t[:, delay:], state_action.action),
+            name=state_action.name[:, delay:],
         ),
-        is_resetting=frames.is_resetting[:unroll_length],
+        is_resetting=frames.is_resetting[:, :unroll_length],
         # Only use rewards that follow actions.
-        reward=frames.reward[delay:],
+        reward=frames.reward[:, delay:],
     )
 
 
 def discounted_returns(
-    rewards: torch.Tensor,  # [T, B]
-    discounts: torch.Tensor,  # [T, B]
+    rewards: torch.Tensor,  # [B, T]
+    discounts: torch.Tensor,  # [B, T]
     bootstrap: torch.Tensor,  # [B]
 ) -> torch.Tensor:
     """returns[t] = rewards[t] + discounts[t] * returns[t+1], seeded by bootstrap."""
     returns = torch.empty_like(rewards)
     acc = bootstrap
-    for t in reversed(range(rewards.shape[0])):
-        acc = rewards[t] + discounts[t] * acc
-        returns[t] = acc
+    for t in reversed(range(rewards.shape[1])):
+        acc = rewards[:, t] + discounts[:, t] * acc
+        returns[:, t] = acc
     return returns

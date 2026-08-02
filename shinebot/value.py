@@ -29,18 +29,18 @@ class ValueFunction(nn.Module):
 
     def loss(
         self,
-        frames: Frames,  # delay-sliced, [U+1, B]
+        frames: Frames,  # delay-sliced, [B, U+1]
         initial_state: RecurrentState,
         discount: float,
     ) -> tuple[torch.Tensor, RecurrentState, dict]:
-        inputs = tree.map_structure(lambda t: t[:-1], frames.state_action)
-        last_input = tree.map_structure(lambda t: t[-1], frames.state_action)
+        inputs = tree.map_structure(lambda t: t[:, :-1], frames.state_action)
+        last_input = tree.map_structure(lambda t: t[:, -1], frames.state_action)
         outputs, final_state = self.network.unroll(
-            inputs, frames.is_resetting[:-1], initial_state
+            inputs, frames.is_resetting[:, :-1], initial_state
         )
         values = self.head(outputs).squeeze(-1)
         last_output, _ = self.network.step_with_reset(
-            last_input, frames.is_resetting[-1], final_state
+            last_input, frames.is_resetting[:, -1], final_state
         )
         last_value = self.head(last_output).squeeze(-1)
 
@@ -51,7 +51,7 @@ class ValueFunction(nn.Module):
             last_value = last_value.float()
             rewards = frames.reward.float()
             discounts = torch.where(
-                frames.is_resetting[1:], 0.0,
+                frames.is_resetting[:, 1:], 0.0,
                 torch.as_tensor(discount, device=values.device),
             )
             targets = delay_lib.discounted_returns(
