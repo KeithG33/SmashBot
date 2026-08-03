@@ -14,8 +14,8 @@ from torch import nn
 
 from slippi_ai.types import Frames
 
-from shinebot import delay as delay_lib
-from shinebot.networks import RecurrentState, StateActionNetwork
+from smashbot import delay as delay_lib
+from smashbot.networks import RecurrentState, StateActionNetwork
 
 
 class ValueFunction(nn.Module):

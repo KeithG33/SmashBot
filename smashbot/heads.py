@@ -12,7 +12,7 @@ import typing as tp
 import torch
 from torch import nn
 
-from shinebot.embed import Embedding, StructEmbedding
+from smashbot.embed import Embedding, StructEmbedding
 
 
 class SampleOutputs(tp.NamedTuple):

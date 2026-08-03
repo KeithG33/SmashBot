@@ -39,8 +39,8 @@ def main() -> None:
     from slippi_ai import data as data_lib
     from slippi_ai.types import StateAction
 
-    from shinebot import configs, embed as embed_lib
-    from shinebot.policy import build_policy
+    from smashbot import configs, embed as embed_lib
+    from smashbot.policy import build_policy
 
     ckpt = torch.load(args.ckpt, weights_only=False)
     policy = build_policy(

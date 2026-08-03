@@ -32,9 +32,9 @@ def main() -> None:
 
     from slippi_ai import data as data_lib
 
-    from shinebot import configs, embed as embed_lib
-    from shinebot.data import loader
-    from shinebot.policy import build_policy
+    from smashbot import configs, embed as embed_lib
+    from smashbot.data import loader
+    from smashbot.policy import build_policy
 
     dataset_cfg = data_lib.DatasetConfig(
         data_dir=f"{args.root}/Parsed",

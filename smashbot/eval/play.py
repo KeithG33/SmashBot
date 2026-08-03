@@ -5,9 +5,9 @@ human with --opponent human (plug in a controller / configure inputs in the
 Dolphin window).
 
 Usage:
-  .venv/bin/python -m shinebot.eval.play                      # vs CPU 9, visible
-  .venv/bin/python -m shinebot.eval.play --opponent human
-  .venv/bin/python -m shinebot.eval.play --headless --max-frames 3600
+  .venv/bin/python -m smashbot.eval.play                      # vs CPU 9, visible
+  .venv/bin/python -m smashbot.eval.play --opponent human
+  .venv/bin/python -m smashbot.eval.play --headless --max-frames 3600
 """
 
 import argparse
@@ -20,10 +20,10 @@ import torch
 from slippi_ai import controller_lib
 from slippi_ai import dolphin as dolphin_lib
 
-from shinebot import configs, embed as embed_lib, saving
-from shinebot.eval.agent import DelayedAgent
-from shinebot.paths import EXIAI_APPIMAGE, MELEE_ISO, NETPLAY_APPIMAGE
-from shinebot.policy import build_policy
+from smashbot import configs, embed as embed_lib, saving
+from smashbot.eval.agent import DelayedAgent
+from smashbot.paths import EXIAI_APPIMAGE, MELEE_ISO, NETPLAY_APPIMAGE
+from smashbot.policy import build_policy
 
 
 def load_policy(ckpt_path: str, device: str):

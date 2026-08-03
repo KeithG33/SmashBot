@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "shinebot"
+name = "smashbot"
 version = "0.1.0"
 description = "ShineBot: a PyTorch replication of slippi-ai (SSBM imitation learning + RL)"
 requires-python = ">=3.12"
@@ -21,7 +21,7 @@ dependencies = [
 dev = ["pytest", "ruff"]
 
 [tool.setuptools.packages.find]
-include = ["shinebot*"]
+include = ["smashbot*"]
 
 [tool.ruff]
 line-length = 100

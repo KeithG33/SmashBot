@@ -11,8 +11,8 @@ import tree
 from slippi_ai import data as data_lib
 from slippi_ai.paths import TOY_DATASET
 
-from shinebot.configs import DataConfig
-from shinebot.data import loader
+from smashbot.configs import DataConfig
+from smashbot.data import loader
 
 DELAY = 3  # small delay for tests
 EXTRA_FRAMES = DELAY + 1

@@ -9,11 +9,11 @@ from slippi_ai import data as data_lib
 from slippi_ai.paths import TOY_DATASET
 from slippi_ai.types import Frames, StateAction
 
-from shinebot import configs, delay as delay_lib, embed as embed_lib
-from shinebot.data import loader
-from shinebot.heads import AutoRegressive
-from shinebot.networks import TransformerCore, TransformerLike
-from shinebot.policy import build_policy
+from smashbot import configs, delay as delay_lib, embed as embed_lib
+from smashbot.data import loader
+from smashbot.heads import AutoRegressive
+from smashbot.networks import TransformerCore, TransformerLike
+from smashbot.policy import build_policy
 
 DELAY = 4
 UNROLL = 12

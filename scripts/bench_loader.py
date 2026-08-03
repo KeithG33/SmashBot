@@ -19,8 +19,8 @@ def main() -> None:
     args = ap.parse_args()
 
     from slippi_ai.data import DatasetConfig
-    from shinebot.configs import DataConfig
-    from shinebot.data import loader
+    from smashbot.configs import DataConfig
+    from smashbot.data import loader
 
     cfg = DataConfig(
         dataset=DatasetConfig(

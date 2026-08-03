@@ -25,7 +25,7 @@ import tree
 from slippi_ai import data as data_lib
 from slippi_ai import nametags
 
-from shinebot.configs import DataConfig
+from smashbot.configs import DataConfig
 
 # torch has no uint16; actions/percents must widen.
 _DTYPE_MAP = {np.dtype(np.uint16): np.int32}

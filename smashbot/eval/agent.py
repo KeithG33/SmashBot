@@ -16,7 +16,7 @@ import tree
 from slippi_ai.types import Buttons, Controller, StateAction, Stick
 from slippi_db.parse_libmelee import Parser
 
-from shinebot.policy import Policy
+from smashbot.policy import Policy
 
 
 def _neutral_controller() -> Controller:

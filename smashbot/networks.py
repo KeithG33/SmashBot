@@ -428,7 +428,7 @@ def build_embed_network(
     num_names: int,
     network_config,
 ) -> StateActionNetwork:
-    from shinebot import embed as embed_lib
+    from smashbot import embed as embed_lib
 
     embed_game = embed_config.make_game_embedding()
     embed_state_action = embed_lib.get_state_action_embedding(

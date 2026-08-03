@@ -13,9 +13,9 @@ from torch import nn
 
 from slippi_ai.types import Frames, StateAction
 
-from shinebot import delay as delay_lib
-from shinebot.heads import ControllerHead, SampleOutputs
-from shinebot.networks import RecurrentState, StateActionNetwork
+from smashbot import delay as delay_lib
+from smashbot.heads import ControllerHead, SampleOutputs
+from smashbot.networks import RecurrentState, StateActionNetwork
 
 
 class UnrollOutputs(tp.NamedTuple):
@@ -179,7 +179,7 @@ def build_policy(
     policy_config,
     num_names: int,
 ) -> Policy:
-    from shinebot.networks import build_embed_network
+    from smashbot.networks import build_embed_network
 
     controller_embedding = controller_config.make_embedding()
     network = build_embed_network(
@@ -188,7 +188,7 @@ def build_policy(
         num_names=num_names,
         network_config=network_config,
     )
-    from shinebot.heads import AutoRegressive
+    from smashbot.heads import AutoRegressive
 
     head = AutoRegressive(
         embed_controller=controller_embedding,

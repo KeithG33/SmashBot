@@ -6,8 +6,8 @@ eval/policy_loss), best-eval + latest checkpoints with resume, wandb logging,
 and tqdm/wandb progress reporting.
 
 Usage (from repo root):
-  .venv/bin/python -m shinebot.train_bc --runtime.tag exp-baseline
-  .venv/bin/python -m shinebot.train_bc --runtime.tag exp-baseline --runtime.restore auto
+  .venv/bin/python -m smashbot.train_bc --runtime.tag exp-baseline
+  .venv/bin/python -m smashbot.train_bc --runtime.tag exp-baseline --runtime.restore auto
 """
 
 import contextlib
@@ -22,12 +22,12 @@ import torch
 import tree
 import tyro
 
-from shinebot import configs, embed as embed_lib, saving
-from shinebot.data import loader
-from shinebot.delay import slice_delayed_frames
-from shinebot.networks import build_embed_network
-from shinebot.policy import build_policy
-from shinebot.value import ValueFunction
+from smashbot import configs, embed as embed_lib, saving
+from smashbot.data import loader
+from smashbot.delay import slice_delayed_frames
+from smashbot.networks import build_embed_network
+from smashbot.policy import build_policy
+from smashbot.value import ValueFunction
 
 
 @dataclasses.dataclass
