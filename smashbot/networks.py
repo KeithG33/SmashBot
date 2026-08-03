@@ -393,16 +393,16 @@ class TransformerCore(Network):
 
 
 class SGUBlock(nn.Module):
-    """Transformer block with the attention sublayer replaced by a causal
-    Spatial Gating Unit (Toeplitz form == right-aligned window at every
-    position): norm -> project to (gate u, value v) -> v mixed by a causal
-    depthwise conv over the last `window` frames -> u * v_mixed -> out.
+    """aMLP-style causal Spatial Gating Unit (right-aligned window / Toeplitz):
+    norm -> project to (gate u, value v); v mixed by causal depthwise conv over
+    the last `window` frames; a causal windowed TINY ATTENTION (single head,
+    dk=64) feeds the gate per the aMLP variant: out = u * (v_mixed + attn).
 
-    Init follows the gMLP paper's near-identity trick: conv weights start at
-    zero with bias 1, so v_mixed==1 and the sublayer passes `u` through; the
-    zero-init out-projection then makes the whole sublayer identity at init.
-    Static, input-independent mixing -- the deliberate contrast to attention.
+    Identity at init: conv weights 0 with bias 1 (v_mixed==1), attention output
+    projection zero-init (a==0), sublayer out-projection zero-init.
     """
+
+    ATTN_DK = 64
 
     def __init__(self, d: int, window: int):
         super().__init__()
@@ -412,6 +412,12 @@ class SGUBlock(nn.Module):
         self.spatial = nn.Conv1d(d, d, kernel_size=window, groups=d)
         nn.init.zeros_(self.spatial.weight)
         nn.init.ones_(self.spatial.bias)
+
+        # tiny attention (aMLP): single head over the same causal window
+        self.attn_qkv = nn.Linear(d, 3 * self.ATTN_DK, bias=False)
+        self.attn_out = nn.Linear(self.ATTN_DK, d, bias=False)
+        nn.init.zeros_(self.attn_out.weight)
+
         self.mix_out = nn.Linear(d, d, bias=False)
         nn.init.zeros_(self.mix_out.weight)
 
@@ -421,26 +427,49 @@ class SGUBlock(nn.Module):
         self.down = nn.Linear(hidden, d, bias=False)
         nn.init.zeros_(self.down.weight)
 
-    def mix(self, x: torch.Tensor, v_cache: torch.Tensor):
-        """x: [B, T, d]; v_cache: [B, window-1, d] (older frames' v, zeros = no
-        history). Returns (out [B, T, d], new_cache)."""
-        u, v = self.uv(self.mix_norm(x)).chunk(2, dim=-1)
+    def mix(self, x, v_cache, kv_cache, cache_len):
+        """x: [B, T, d]; v_cache: [B, W-1, d]; kv_cache: [B, W-1, 2*dk];
+        cache_len: [B] valid entries. Returns (out, new_v_cache, new_kv_cache)."""
+        B, T, _ = x.shape
+        W = self.window
+        xn = self.mix_norm(x)
+        u, v = self.uv(xn).chunk(2, dim=-1)
+
+        # static mixing: causal depthwise conv over [cache || current]
         v_full = torch.cat([v_cache, v], dim=1)  # [B, W-1+T, d]
-        # causal depthwise conv: output t mixes v[t-W+1 .. t]
         v_mixed = self.spatial(v_full.transpose(1, 2)).transpose(1, 2)
-        x = x + self.mix_out(u * v_mixed)
+
+        # tiny attention over the same causal window
+        qkv = self.attn_qkv(xn)  # [B, T, 3*dk]
+        q, k_new, va_new = qkv.chunk(3, dim=-1)
+        kv_new = torch.cat([k_new, va_new], dim=-1)
+        kv_full = torch.cat([kv_cache, kv_new], dim=1)  # [B, W-1+T, 2*dk]
+        keys, vals = kv_full.chunk(2, dim=-1)
+
+        slot = torch.arange(W - 1, device=x.device)
+        cache_ok = slot[None, :] >= (W - 1 - cache_len)[:, None]  # [B, W-1]
+        t = torch.arange(T, device=x.device)
+        causal = t[None, :] <= t[:, None]  # [T, T]
+        mask = torch.cat(
+            [cache_ok[:, None, :].expand(B, T, W - 1),
+             causal[None].expand(B, T, T)], dim=2,
+        ).unsqueeze(1)  # [B, 1, T, W-1+T]
+        a = torch.nn.functional.scaled_dot_product_attention(
+            q.unsqueeze(1), keys.unsqueeze(1), vals.unsqueeze(1), attn_mask=mask
+        ).squeeze(1)  # [B, T, dk]
+
+        x = x + self.mix_out(u * (v_mixed + self.attn_out(a)))
 
         gate, up = self.gate_up(self.ffw_norm(x)).chunk(2, dim=-1)
         x = x + self.down(torch.nn.functional.silu(gate) * up)
 
-        new_cache = v_full[:, -(self.window - 1):]
-        return x, new_cache
+        return x, v_full[:, -(W - 1):], kv_full[:, -(W - 1):]
 
 
 class SGUCore(Network):
-    """Stack of SGU blocks. Recurrent state = per-layer ring of the last
-    window-1 v-vectors. Hard per-layer horizon of `window` frames (receptive
-    field stacks to ~layers*(window-1)+1 with depth)."""
+    """Stack of aMLP/SGU blocks. State per layer = ring of last window-1
+    v-vectors (conv) + kv pairs (tiny attention), plus a shared cache_len.
+    Hard per-layer horizon of `window` frames."""
 
     def __init__(
         self,
@@ -460,18 +489,30 @@ class SGUCore(Network):
         self.output_size = hidden_size
 
     def initial_state(self, batch_size, device=None):
-        return [
-            torch.zeros(batch_size, self.window - 1, self.d, device=device)
-            for _ in self.blocks
-        ]
+        z = lambda *shape: torch.zeros(*shape, device=device)
+        return {
+            "cache_len": torch.zeros(batch_size, dtype=torch.long, device=device),
+            "layers": [
+                (
+                    z(batch_size, self.window - 1, self.d),
+                    z(batch_size, self.window - 1, 2 * SGUBlock.ATTN_DK),
+                )
+                for _ in self.blocks
+            ],
+        }
 
     def _forward(self, inputs, state):
+        T = inputs.shape[1]
         x = self.encoder(inputs)
-        new_state = []
-        for block, cache in zip(self.blocks, state):
-            x, new_cache = block.mix(x, cache)
-            new_state.append(new_cache)
-        return self.final_norm(x), new_state
+        new_layers = []
+        for block, (v_cache, kv_cache) in zip(self.blocks, state["layers"]):
+            x, nv, nkv = block.mix(x, v_cache, kv_cache, state["cache_len"])
+            new_layers.append((nv, nkv))
+        next_state = {
+            "cache_len": torch.clamp(state["cache_len"] + T, max=self.window - 1),
+            "layers": new_layers,
+        }
+        return self.final_norm(x), next_state
 
     def step(self, inputs, prev_state):
         out, state = self._forward(inputs[:, None], prev_state)
