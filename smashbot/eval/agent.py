@@ -84,7 +84,10 @@ class DelayedAgent:
             self.hidden,
             temperature=self.temperature,
         )
-        self._prev_action = sampled.controller_state
+        # clone: retained across steps, and cudagraph replay reuses output buffers
+        self._prev_action = tree.map_structure(
+            lambda t: t.clone(), sampled.controller_state
+        )
 
         encoded_np = tree.map_structure(
             lambda t: t[0].cpu().numpy(), sampled.controller_state

@@ -59,6 +59,9 @@ def main() -> None:
     ap.add_argument("--gfx_backend", default="OGL", help="OGL | Vulkan | ''")
     ap.add_argument("--max_frames", type=int, default=0, help="0 = play forever")
     ap.add_argument("--temperature", type=float, default=None)
+    ap.add_argument("--compile", action="store_true",
+                    help="torch.compile(policy.sample, mode='reduce-overhead'); "
+                         "first ~100 frames are slow while compiling")
     ap.add_argument(
         "--name", default="Master Player",
         help="identity to condition on (looked up in the checkpoint's name_map)",
@@ -69,6 +72,27 @@ def main() -> None:
     args = ap.parse_args()
 
     policy, name_map, step = load_policy(args.ckpt, args.device)
+    if args.compile:
+        import tree
+
+        policy.sample = torch.compile(policy.sample, mode="reduce-overhead")
+        print("torch.compile enabled; warming up...")
+
+        def _to_t(x):
+            x = np.asarray(x)
+            if x.dtype == np.uint16:
+                x = x.astype(np.int32)
+            return torch.from_numpy(np.ascontiguousarray(x)).to(args.device)
+
+        from slippi_ai.types import StateAction as _SA
+
+        dummy = tree.map_structure(_to_t, policy.network.embed_state_action.dummy((1,)))
+        dummy_sa = _SA(state=dummy.state, action=dummy.action, name=dummy.name)
+        h = policy.initial_state(1, args.device)
+        t0 = time.perf_counter()
+        for _ in range(50):
+            _, h = policy.sample(dummy_sa, h)
+        print(f"warmup done in {time.perf_counter() - t0:.0f}s")
     if args.name in name_map:
         name_code = name_map[args.name]
     else:
