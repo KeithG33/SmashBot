@@ -53,6 +53,9 @@ class ControllerHeadConfig:
 
 @dataclasses.dataclass
 class ValueConfig:
+    # slippi-ai pattern: value = smaller instance of the POLICY's family.
+    # "match" mirrors the policy core's name/window/heads at num_layers depth.
+    name: str = "match"  # match | tx_like | transformer | sgu
     hidden_size: int = 512
     num_layers: int = 1
     reward_halflife: float = 4.0  # seconds; discount = 0.5 ** (1 / (halflife * 60))
