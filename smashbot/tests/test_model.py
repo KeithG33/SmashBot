@@ -12,7 +12,7 @@ from slippi_ai.types import Frames, StateAction
 from smashbot import configs, delay as delay_lib, embed as embed_lib
 from smashbot.data import loader
 from smashbot.heads import AutoRegressive
-from smashbot.networks import TransformerCore, TransformerLike
+from smashbot.networks import SGUCore, TransformerCore, TransformerLike
 from smashbot.policy import build_policy
 
 DELAY = 4
@@ -102,8 +102,9 @@ def test_delay_slicing_indices():
         lambda: TransformerLike(input_size=8, hidden_size=16, num_layers=2),
         lambda: TransformerCore(input_size=8, hidden_size=16, num_layers=2,
                                 num_heads=2, window=24),
+        lambda: SGUCore(input_size=8, hidden_size=16, num_layers=2, window=8),
     ],
-    ids=["tx_like", "transformer"],
+    ids=["tx_like", "transformer", "sgu"],
 )
 def test_unroll_vs_step_equivalence(make_net):
     torch.manual_seed(0)
@@ -256,3 +257,29 @@ def test_transformer_window_horizon():
     torch.testing.assert_close(out_a[:, -1], out_b[:, -1])
     # but frame 0 itself obviously differs
     assert not torch.allclose(out_a[:, 0], out_b[:, 0])
+
+
+def test_sgu_hard_window_cutoff():
+    """SGU's window is a strict per-layer horizon: with 1 layer / window 8,
+    a frame 8+ steps back must have EXACTLY zero influence."""
+    torch.manual_seed(0)
+    net = SGUCore(input_size=4, hidden_size=16, num_layers=1, window=8)
+    # zero-init makes mixing invisible; randomize so influence is observable
+    for b in net.blocks:
+        torch.nn.init.normal_(b.spatial.weight, std=0.5)
+        torch.nn.init.normal_(b.mix_out.weight, std=0.5)
+    net.eval()
+    B, T = 1, 20
+    inputs_a = torch.randn(B, T, 4)
+    inputs_b = inputs_a.clone()
+    inputs_b[:, 0] += 100.0
+    reset = torch.zeros(B, T, dtype=torch.bool)
+
+    with torch.no_grad():
+        out_a, _ = net.unroll(inputs_a, reset, net.initial_state(B))
+        out_b, _ = net.unroll(inputs_b, reset, net.initial_state(B))
+
+    # frame 0 influences outputs 0..7 (window 8), and NOTHING after
+    assert not torch.allclose(out_a[:, 7], out_b[:, 7])
+    torch.testing.assert_close(out_a[:, 8], out_b[:, 8])
+    torch.testing.assert_close(out_a[:, -1], out_b[:, -1])

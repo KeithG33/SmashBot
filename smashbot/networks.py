@@ -391,6 +391,111 @@ class TransformerCore(Network):
         return torch.cat(outputs, dim=1) if len(outputs) > 1 else outputs[0], state
 
 
+
+class SGUBlock(nn.Module):
+    """Transformer block with the attention sublayer replaced by a causal
+    Spatial Gating Unit (Toeplitz form == right-aligned window at every
+    position): norm -> project to (gate u, value v) -> v mixed by a causal
+    depthwise conv over the last `window` frames -> u * v_mixed -> out.
+
+    Init follows the gMLP paper's near-identity trick: conv weights start at
+    zero with bias 1, so v_mixed==1 and the sublayer passes `u` through; the
+    zero-init out-projection then makes the whole sublayer identity at init.
+    Static, input-independent mixing -- the deliberate contrast to attention.
+    """
+
+    def __init__(self, d: int, window: int):
+        super().__init__()
+        self.window = window
+        self.mix_norm = nn.RMSNorm(d)
+        self.uv = nn.Linear(d, 2 * d, bias=False)
+        self.spatial = nn.Conv1d(d, d, kernel_size=window, groups=d)
+        nn.init.zeros_(self.spatial.weight)
+        nn.init.ones_(self.spatial.bias)
+        self.mix_out = nn.Linear(d, d, bias=False)
+        nn.init.zeros_(self.mix_out.weight)
+
+        self.ffw_norm = nn.RMSNorm(d)
+        hidden = int(8 * d / 3 / 64) * 64
+        self.gate_up = nn.Linear(d, 2 * hidden, bias=False)
+        self.down = nn.Linear(hidden, d, bias=False)
+        nn.init.zeros_(self.down.weight)
+
+    def mix(self, x: torch.Tensor, v_cache: torch.Tensor):
+        """x: [B, T, d]; v_cache: [B, window-1, d] (older frames' v, zeros = no
+        history). Returns (out [B, T, d], new_cache)."""
+        u, v = self.uv(self.mix_norm(x)).chunk(2, dim=-1)
+        v_full = torch.cat([v_cache, v], dim=1)  # [B, W-1+T, d]
+        # causal depthwise conv: output t mixes v[t-W+1 .. t]
+        v_mixed = self.spatial(v_full.transpose(1, 2)).transpose(1, 2)
+        x = x + self.mix_out(u * v_mixed)
+
+        gate, up = self.gate_up(self.ffw_norm(x)).chunk(2, dim=-1)
+        x = x + self.down(torch.nn.functional.silu(gate) * up)
+
+        new_cache = v_full[:, -(self.window - 1):]
+        return x, new_cache
+
+
+class SGUCore(Network):
+    """Stack of SGU blocks. Recurrent state = per-layer ring of the last
+    window-1 v-vectors. Hard per-layer horizon of `window` frames (receptive
+    field stacks to ~layers*(window-1)+1 with depth)."""
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int = 512,
+        num_layers: int = 4,
+        window: int = 8,
+    ):
+        super().__init__()
+        self.d = hidden_size
+        self.window = window
+        self.encoder = nn.Linear(input_size, hidden_size)
+        self.blocks = nn.ModuleList(
+            [SGUBlock(hidden_size, window) for _ in range(num_layers)]
+        )
+        self.final_norm = nn.RMSNorm(hidden_size)
+        self.output_size = hidden_size
+
+    def initial_state(self, batch_size, device=None):
+        return [
+            torch.zeros(batch_size, self.window - 1, self.d, device=device)
+            for _ in self.blocks
+        ]
+
+    def _forward(self, inputs, state):
+        x = self.encoder(inputs)
+        new_state = []
+        for block, cache in zip(self.blocks, state):
+            x, new_cache = block.mix(x, cache)
+            new_state.append(new_cache)
+        return self.final_norm(x), new_state
+
+    def step(self, inputs, prev_state):
+        out, state = self._forward(inputs[:, None], prev_state)
+        return out[:, 0], state
+
+    def unroll(self, inputs, reset, initial_state):
+        reset_any = reset.any(dim=0)
+        boundaries = torch.nonzero(reset_any).squeeze(-1).tolist()
+
+        outputs = []
+        state = initial_state
+        pos = 0
+        T = inputs.shape[1]
+        for b in boundaries + [T]:
+            if pos < b:
+                out, state = self._forward(inputs[:, pos:b], state)
+                outputs.append(out)
+                pos = b
+            if b < T:
+                initial = self.initial_state(reset.shape[0], device=inputs.device)
+                state = _mask_state(reset[:, b], initial, state)
+        return torch.cat(outputs, dim=1) if len(outputs) > 1 else outputs[0], state
+
+
 class StateActionNetwork(Network):
     """Embeds StateAction structs, then runs the core network."""
 
@@ -451,6 +556,13 @@ def build_embed_network(
             hidden_size=network_config.hidden_size,
             num_layers=network_config.num_layers,
             num_heads=network_config.num_heads,
+            window=network_config.window,
+        )
+    elif name == "sgu":
+        core = SGUCore(
+            input_size=embed_state_action.size,
+            hidden_size=network_config.hidden_size,
+            num_layers=network_config.num_layers,
             window=network_config.window,
         )
     else:

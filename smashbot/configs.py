@@ -33,7 +33,7 @@ class PolicyConfig:
 
 @dataclasses.dataclass
 class NetworkConfig:
-    name: str = "tx_like"  # tx_like | transformer
+    name: str = "tx_like"  # tx_like | transformer | sgu
     hidden_size: int = 512
     num_layers: int = 3
     ffw_multiplier: int = 2
