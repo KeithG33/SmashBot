@@ -16,6 +16,7 @@ import time
 import melee
 import numpy as np
 import torch
+import torch._dynamo
 
 from slippi_ai import controller_lib
 from slippi_ai import dolphin as dolphin_lib
@@ -77,8 +78,6 @@ def main() -> None:
 
         policy.sample = torch.compile(policy.sample, mode="reduce-overhead")
         print("torch.compile enabled; warming up...")
-
-        import torch._dynamo
 
         torch._dynamo.config.recompile_limit = 128
 
