@@ -57,7 +57,11 @@ class DelayedAgent:
         )
         encoded_neutral = self._embed_controller.from_state(neutral)
         self._prev_action = tree.map_structure(
-            lambda x: torch.from_numpy(np.ascontiguousarray(x)).to(self.device),
+            lambda x: torch.from_numpy(
+                np.ascontiguousarray(
+                    x.astype(np.int64) if x.dtype.kind in "iu" else x
+                )
+            ).to(self.device),
             encoded_neutral,
         )
         self._queue = collections.deque(
@@ -73,7 +77,7 @@ class DelayedAgent:
         state = tree.map_structure(
             lambda x: torch.from_numpy(
                 np.ascontiguousarray(
-                    x.astype(np.int32) if x.dtype == np.uint16 else x
+                    x.astype(np.int64) if x.dtype.kind in "iu" else x
                 )
             ).to(self.device),
             state,
@@ -84,9 +88,11 @@ class DelayedAgent:
             self.hidden,
             temperature=self.temperature,
         )
-        # clone: retained across steps, and cudagraph replay reuses output buffers
+        # clone: retained across steps, and cudagraph replay reuses output buffers.
+        # int64 keeps dtypes uniform for dynamo guards (bools stay bool).
         self._prev_action = tree.map_structure(
-            lambda t: t.clone(), sampled.controller_state
+            lambda t: t.clone() if t.dtype == torch.bool else t.long().clone(),
+            sampled.controller_state,
         )
 
         encoded_np = tree.map_structure(

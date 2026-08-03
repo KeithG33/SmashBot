@@ -78,10 +78,14 @@ def main() -> None:
         policy.sample = torch.compile(policy.sample, mode="reduce-overhead")
         print("torch.compile enabled; warming up...")
 
+        import torch._dynamo
+
+        torch._dynamo.config.recompile_limit = 128
+
         def _to_t(x):
             x = np.asarray(x)
-            if x.dtype == np.uint16:
-                x = x.astype(np.int32)
+            if x.dtype.kind in "iu":
+                x = x.astype(np.int64)
             return torch.from_numpy(np.ascontiguousarray(x)).to(args.device)
 
         from slippi_ai.types import StateAction as _SA
