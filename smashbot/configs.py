@@ -58,6 +58,10 @@ class ValueConfig:
     name: str = "match"  # match | tx_like | transformer | sgu
     hidden_size: int = 512
     num_layers: int = 1
+    # 0 = inherit the policy's window (back-compat with old checkpoints).
+    # Long windows mildly hurt value estimation (uev 0.337 @W256 vs 0.325
+    # @W64), so big trains pass an explicit smaller window here.
+    window: int = 0
     reward_halflife: float = 4.0  # seconds; discount = 0.5 ** (1 / (halflife * 60))
 
 

@@ -113,7 +113,7 @@ def main(config: TrainConfig) -> None:
         hidden_size=config.value.hidden_size,
         num_layers=config.value.num_layers,
         num_heads=config.network.num_heads,
-        window=config.network.window,
+        window=config.value.window or config.network.window,
     )
     value_fn = ValueFunction(
         build_embed_network(
