@@ -109,6 +109,10 @@ def test_delay_slicing_indices():
 def test_unroll_vs_step_equivalence(make_net):
     torch.manual_seed(0)
     net = make_net()
+    # Cores zero-init their output projections (identity-at-init), which would
+    # make this test vacuous: randomize so every mixing path is exercised.
+    for p in net.parameters():
+        torch.nn.init.normal_(p, std=0.1)
     T, B = 100, 3
     inputs = torch.randn(B, T, 8)
     reset = torch.zeros(B, T, dtype=torch.bool)
@@ -242,6 +246,10 @@ def test_transformer_window_horizon():
     torch.manual_seed(0)
     net = TransformerCore(input_size=4, hidden_size=16, num_layers=1,
                           num_heads=2, window=8)
+    # zero-init output projections make attention invisible; randomize so the
+    # window is actually exercised
+    for p in net.parameters():
+        torch.nn.init.normal_(p, std=0.1)
     net.eval()
     B, T = 1, 30
     inputs_a = torch.randn(B, T, 4)
@@ -264,10 +272,10 @@ def test_sgu_hard_window_cutoff():
     a frame 8+ steps back must have EXACTLY zero influence."""
     torch.manual_seed(0)
     net = SGUCore(input_size=4, hidden_size=16, num_layers=1, window=8)
-    # zero-init makes mixing invisible; randomize so influence is observable
-    for b in net.blocks:
-        torch.nn.init.normal_(b.spatial.weight, std=0.5)
-        torch.nn.init.normal_(b.mix_out.weight, std=0.5)
+    # zero-init makes mixing invisible; randomize EVERYTHING (incl. the tiny
+    # attention, whose window leak a partial randomization once missed)
+    for p in net.parameters():
+        torch.nn.init.normal_(p, std=0.5)
     net.eval()
     B, T = 1, 20
     inputs_a = torch.randn(B, T, 4)

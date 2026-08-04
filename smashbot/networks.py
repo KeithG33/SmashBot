@@ -286,16 +286,22 @@ class TransformerBlock(nn.Module):
         keys = torch.cat([k_cache, k_flat], dim=1)  # [B, W+T, d]
         values = torch.cat([v_cache, v], dim=1)
 
-        # mask [B, 1, T, W+T]: cache slot w valid iff w >= W - cache_len[b];
-        # segment part is causal (key t' attendable by query t iff t' <= t).
+        # mask [B, 1, T, W+T]. A key is attendable iff it is causal AND at
+        # most `W` frames older than the query — the same horizon the step
+        # path's rolling cache enforces structurally. Cache slot w holds the
+        # frame W - w steps before the chunk (age t + W - w for query t), so
+        # it stays visible iff w >= t; chunk key t' has age t - t' <= W.
         slot = torch.arange(W, device=x.device)
-        cache_ok = slot[None, :] >= (W - cache_len)[:, None]  # [B, W]
         t = torch.arange(T, device=x.device)
-        causal = t[None, :] <= t[:, None]  # [T(query), T(key)]
+        cache_valid = slot[None, :] >= (W - cache_len)[:, None]  # [B, W]
+        cache_in_window = slot[None, :] >= t[:, None]  # [T, W]
+        causal_window = (t[None, :] <= t[:, None]) & (
+            t[:, None] - t[None, :] <= W
+        )  # [T(query), T(key)]
         mask = torch.cat(
             [
-                cache_ok[:, None, :].expand(B, T, W),
-                causal[None, :, :].expand(B, T, T),
+                cache_valid[:, None, :] & cache_in_window[None, :, :],
+                causal_window[None, :, :].expand(B, T, T),
             ],
             dim=2,
         ).unsqueeze(1)  # [B, 1, T, W+T]
@@ -453,13 +459,18 @@ class SGUBlock(nn.Module):
         kv_full = torch.cat([kv_cache, kv_new], dim=1)  # [B, W-1+T, 2*dk]
         keys, vals = kv_full.chunk(2, dim=-1)
 
+        # Same windowed-causal rule as the conv: key attendable iff at most
+        # W-1 frames older than the query (cache slot w ages out when w < t).
         slot = torch.arange(W - 1, device=x.device)
-        cache_ok = slot[None, :] >= (W - 1 - cache_len)[:, None]  # [B, W-1]
         t = torch.arange(T, device=x.device)
-        causal = t[None, :] <= t[:, None]  # [T, T]
+        cache_valid = slot[None, :] >= (W - 1 - cache_len)[:, None]  # [B, W-1]
+        cache_in_window = slot[None, :] >= t[:, None]  # [T, W-1]
+        causal_window = (t[None, :] <= t[:, None]) & (
+            t[:, None] - t[None, :] <= W - 1
+        )  # [T, T]
         mask = torch.cat(
-            [cache_ok[:, None, :].expand(B, T, W - 1),
-             causal[None].expand(B, T, T)], dim=2,
+            [cache_valid[:, None, :] & cache_in_window[None, :, :],
+             causal_window[None].expand(B, T, T)], dim=2,
         ).unsqueeze(1)  # [B, 1, T, W-1+T]
         a = torch.nn.functional.scaled_dot_product_attention(
             q.unsqueeze(1), keys.unsqueeze(1), vals.unsqueeze(1), attn_mask=mask
