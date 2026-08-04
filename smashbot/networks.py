@@ -437,7 +437,14 @@ class SGUBlock(nn.Module):
 
         # static mixing: causal depthwise conv over [cache || current]
         v_full = torch.cat([v_cache, v], dim=1)  # [B, W-1+T, d]
-        v_mixed = self.spatial(v_full.transpose(1, 2)).transpose(1, 2)
+        if T == 1:
+            # Grouped conv with one output position is just a per-channel
+            # weighted sum over the window; conv kernels handle B=1/groups=d
+            # badly (and defeat inductor fusion) on the play path.
+            w = self.spatial.weight.squeeze(1)  # [d, W]
+            v_mixed = (v_full * w.t()).sum(dim=1, keepdim=True) + self.spatial.bias
+        else:
+            v_mixed = self.spatial(v_full.transpose(1, 2)).transpose(1, 2)
 
         # tiny attention over the same causal window
         qkv = self.attn_qkv(xn)  # [B, T, 3*dk]
