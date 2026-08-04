@@ -540,11 +540,21 @@ class SGUCore(Network):
 class StateActionNetwork(Network):
     """Embeds StateAction structs, then runs the core network."""
 
-    def __init__(self, embed_game, embed_state_action, core: Network):
+    def __init__(self, embed_game, embed_state_action, core: Network, packed: bool = True):
         super().__init__()
+        from smashbot import embed as embed_lib
+
         self.embed_game = embed_game
         self.embed_state_action = embed_state_action
         self.core = core
+        self.packed_embed = (
+            embed_lib.PackedStructForward(embed_state_action) if packed else None
+        )
+
+    def embed_sa(self, state_action) -> torch.Tensor:
+        if self.packed_embed is not None:
+            return self.packed_embed(state_action)
+        return self.embed_state_action(state_action)
 
     def encode(self, state_action):
         """numpy Batch structs -> encoded numpy structs (data thread / inference)."""
@@ -557,15 +567,15 @@ class StateActionNetwork(Network):
         return self.core.initial_state(batch_size, device)
 
     def step(self, state_action, prev_state):
-        return self.core.step(self.embed_state_action(state_action), prev_state)
+        return self.core.step(self.embed_sa(state_action), prev_state)
 
     def step_with_reset(self, state_action, reset, prev_state):
         return self.core.step_with_reset(
-            self.embed_state_action(state_action), reset, prev_state
+            self.embed_sa(state_action), reset, prev_state
         )
 
     def unroll(self, state_action, reset, initial_state):
-        return self.core.unroll(self.embed_state_action(state_action), reset, initial_state)
+        return self.core.unroll(self.embed_sa(state_action), reset, initial_state)
 
 
 def build_embed_network(
@@ -608,4 +618,9 @@ def build_embed_network(
         )
     else:
         raise ValueError(f"unknown network name: {name}")
-    return StateActionNetwork(embed_game, embed_state_action, core)
+    return StateActionNetwork(
+        embed_game,
+        embed_state_action,
+        core,
+        packed=getattr(embed_config, "packed", True),
+    )

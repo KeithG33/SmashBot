@@ -597,6 +597,9 @@ class EmbedConfig:
     with_randall: bool = True
     with_fod: bool = True
     items: ItemsConfig = dataclasses.field(default_factory=ItemsConfig)
+    # Vectorized state-action forward (PackedStructForward); bitwise-identical
+    # to the per-leaf path, kill switch only.
+    packed: bool = True
 
     def make_game_embedding(self) -> StructEmbedding[Game]:
         return make_game_embedding(
@@ -623,3 +626,180 @@ def get_state_action_embedding(
             ),
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Packed fast-path forward.
+#
+# StructEmbedding.forward dispatches one-per-leaf into a zoo of tiny modules
+# (~150 ops for the full state-action embed), which dominates batch-1 play
+# latency and fragments torch.compile. PackedStructForward computes the exact
+# same output vector with a handful of vectorized ops. The embedding tree
+# stays the schema authority; this is a compiled view of it.
+# ---------------------------------------------------------------------------
+
+
+def _compose(fetch, getter, key):
+    def fetch_child(root, _fetch=fetch, _getter=getter, _key=key):
+        return _getter(_fetch(root), _key)
+
+    return fetch_child
+
+
+class _PackedSpec(nn.Module):
+    """Vectorized equivalent of a static set of scalar/one-hot leaves.
+
+    Holds only non-persistent buffers (column indices and per-leaf constants),
+    so it never appears in checkpoints.
+    """
+
+    def __init__(self, leaves: list, total_size: int):
+        super().__init__()
+        self.total_size = total_size
+        bools = [(f, e, o) for f, e, o in leaves if isinstance(e, BoolEmbedding)]
+        onehots = [(f, e, o) for f, e, o in leaves if isinstance(e, OneHotEmbedding)]
+        floats = [(f, e, o) for f, e, o in leaves if isinstance(e, FloatEmbedding)]
+        unknown = [e for _, e, _ in leaves if not isinstance(e, (BoolEmbedding, OneHotEmbedding, FloatEmbedding))]
+        if unknown:
+            raise TypeError(f"unsupported leaves in packed embedding: {unknown}")
+
+        def buf(name, values, dtype):
+            self.register_buffer(name, torch.tensor(values, dtype=dtype), persistent=False)
+
+        self._bool_fetch = [f for f, _, _ in bools]
+        buf("bool_cols", [o for _, _, o in bools], torch.long)
+        buf("bool_on", [e.on for _, e, _ in bools], torch.float32)
+        buf("bool_off", [e.off for _, e, _ in bools], torch.float32)
+
+        self._float_fetch = [f for f, _, _ in floats]
+        buf("float_cols", [o for _, _, o in floats], torch.long)
+        # Mirror FloatEmbedding.encode exactly: (+bias?) then (*scale?), then
+        # clamp guarded by truthiness (0.0 bounds disable clamping upstream).
+        buf("float_bias", [e.bias if e.bias is not None else 0.0 for _, e, _ in floats], torch.float32)
+        buf("float_scale", [e.scale if e.scale is not None else 1.0 for _, e, _ in floats], torch.float32)
+        buf("float_lo", [e.lower if e.lower else float("-inf") for _, e, _ in floats], torch.float32)
+        buf("float_hi", [e.upper if e.upper else float("inf") for _, e, _ in floats], torch.float32)
+
+        self._onehot_fetch = [f for f, _, _ in onehots]
+        buf("oh_offsets", [o for _, _, o in onehots], torch.long)
+        buf("oh_sizes", [e.size for _, e, _ in onehots], torch.long)
+        # EMPTY-policy leaves embed invalid ids as all-zeros; others are
+        # guaranteed in-range by from_state (we clamp defensively either way).
+        buf("oh_checked", [e.one_hot_policy is OneHotPolicy.EMPTY for _, e, _ in onehots], torch.bool)
+
+        fetches = self._bool_fetch or self._float_fetch or self._onehot_fetch
+        assert fetches, "packed spec must have at least one leaf"
+        self._shape_fetch = fetches[0]
+
+    def compute(self, struct) -> torch.Tensor:
+        lead = self._shape_fetch(struct).shape
+        out = torch.zeros(
+            *lead, self.total_size, dtype=torch.float32, device=self.bool_cols.device
+        )
+        if self._bool_fetch:
+            b = torch.stack([f(struct) for f in self._bool_fetch], dim=-1)
+            out.index_copy_(-1, self.bool_cols, torch.where(b, self.bool_on, self.bool_off))
+        if self._float_fetch:
+            x = torch.stack([f(struct).float() for f in self._float_fetch], dim=-1)
+            x = torch.clamp((x + self.float_bias) * self.float_scale, self.float_lo, self.float_hi)
+            out.index_copy_(-1, self.float_cols, x)
+        if self._onehot_fetch:
+            idx = torch.stack([f(struct).long() for f in self._onehot_fetch], dim=-1)
+            valid = (idx >= 0) & (idx < self.oh_sizes)
+            src = (valid | ~self.oh_checked).float()
+            dest = self.oh_offsets + torch.minimum(idx.clamp(min=0), self.oh_sizes - 1)
+            out.scatter_(-1, dest, src)
+        return out
+
+
+class PackedStructForward(nn.Module):
+    """Drop-in replacement for `root(struct)` producing the identical tensor.
+
+    Scalars go through two stacked vectorized paths, one-hots through a single
+    scatter, and slots sharing an MLPWrapper module (the 15 item slots) run as
+    one batched MLP call. Registers no parameters and only non-persistent
+    buffers: checkpoints and RNG streams are unaffected.
+    """
+
+    def __init__(self, root: StructEmbedding):
+        super().__init__()
+        leaves: list = []
+
+        def walk(emb, fetch):
+            if isinstance(emb, StructEmbedding):
+                for k, e in emb.embedding:
+                    if e.size == 0:
+                        continue
+                    walk(e, _compose(fetch, emb.getter, k))
+            else:
+                leaves.append((fetch, emb))
+
+        walk(root, lambda s: s)
+
+        offset = 0
+        main: list = []
+        mlp_groups: dict[int, dict] = {}
+        for fetch, emb in leaves:
+            if isinstance(emb, MLPWrapper):
+                grp = mlp_groups.setdefault(id(emb), {"emb": emb, "slots": []})
+                grp["slots"].append((fetch, offset))
+            else:
+                main.append((fetch, emb, offset))
+            offset += emb.size
+        assert offset == root.size, (offset, root.size)
+
+        self.spec = _PackedSpec(main, root.size)
+
+        group_specs = []
+        self._groups: list[dict] = []  # plain list: MLP modules stay registered
+        for grp in mlp_groups.values():  # under the original embedding only
+            emb, slots = grp["emb"], grp["slots"]
+            inner: Embedding = emb._embed
+            start = slots[0][1]
+            for i, (_, off) in enumerate(slots):
+                assert off == start + i * emb.size, "MLP slots must be contiguous"
+
+            inner_leaves: list = []
+            inner_off = 0
+            for slot_fetch, _ in slots:
+                base = inner_off
+
+                def walk_inner(e, fetch):
+                    nonlocal inner_off
+                    if isinstance(e, StructEmbedding):
+                        for k, sub in e.embedding:
+                            if sub.size == 0:
+                                continue
+                            walk_inner(sub, _compose(fetch, e.getter, k))
+                    elif isinstance(e, MLPWrapper):
+                        raise TypeError("nested MLPWrapper is not supported")
+                    else:
+                        inner_leaves.append((fetch, e, inner_off))
+                        inner_off += e.size
+
+                walk_inner(inner, slot_fetch)
+                assert inner_off - base == inner.size
+
+            spec = _PackedSpec(inner_leaves, len(slots) * inner.size)
+            group_specs.append(spec)
+            self._groups.append(
+                {
+                    "spec_idx": len(group_specs) - 1,
+                    "mlp": emb._mlp,
+                    "start": start,
+                    "k": len(slots),
+                    "in_size": inner.size,
+                    "out_size": emb.size,
+                }
+            )
+        self.group_specs = nn.ModuleList(group_specs)
+
+    def forward(self, struct) -> torch.Tensor:
+        out = self.spec.compute(struct)
+        for g in self._groups:
+            x = self.group_specs[g["spec_idx"]].compute(struct)
+            x = x.reshape(*x.shape[:-1], g["k"], g["in_size"])
+            y = g["mlp"](x)
+            width = g["k"] * g["out_size"]
+            out[..., g["start"] : g["start"] + width] = y.reshape(*y.shape[:-2], width)
+        return out
