@@ -218,3 +218,69 @@ def test_batch_steps_equivalence(monkeypatch):
         if isinstance(a, torch.Tensor) else None,
         a1.hidden, a4.hidden,
     )
+
+
+def _rand_raw_game(embed_game, shape, rng):
+    """Random RAW (pre-from_state) game struct with valid leaf ranges."""
+    from smashbot import embed as embed_lib
+
+    def gen(e):
+        if isinstance(e, embed_lib.StructEmbedding):
+            return e.builder({k: gen(sub) for k, sub in e.embedding})
+        if isinstance(e, embed_lib.MLPWrapper):
+            return gen(e._embed)
+        if isinstance(e, embed_lib.BoolEmbedding):
+            return rng.integers(0, 2, shape).astype(bool)
+        if isinstance(e, embed_lib.OneHotEmbedding):
+            return rng.integers(0, e.input_size, shape).astype(np.int64)
+        if isinstance(e, embed_lib.FloatEmbedding):
+            return rng.uniform(-100, 100, shape).astype(np.float32)
+        raise TypeError(e)
+
+    return gen(embed_game)
+
+
+def test_encoded_perspective_swap_commutes():
+    """swap(encode(game)) == encode(swap(game)) — the opponent view can be
+    built from the already-encoded struct (kills the second encode pass)."""
+    from smashbot import embed as embed_lib
+
+    embed_game = embed_lib.EmbedConfig().make_game_embedding()
+    rng = np.random.default_rng(0)
+    game = _rand_raw_game(embed_game, (5,), rng)
+
+    enc_then_swap = embed_game.from_state(game)
+    enc_then_swap = enc_then_swap._replace(
+        p0=enc_then_swap.p1, p1=enc_then_swap.p0
+    )
+    swap_then_enc = embed_game.from_state(
+        game._replace(p0=game.p1, p1=game.p0)
+    )
+    tree.map_structure(
+        lambda a, b: np.testing.assert_array_equal(a, b),
+        enc_then_swap, swap_then_enc,
+    )
+
+
+def test_worker_side_encode_matches_policy_encode():
+    """An independently-built embed tree (env process) must encode identically
+    to the policy's own (same EmbedConfig -> same schema)."""
+    from smashbot import embed as embed_lib
+    from smashbot.tests.test_ppo import _tiny_policy
+
+    policy = _tiny_policy(seed=0)
+    worker_embed = embed_lib.EmbedConfig().make_game_embedding()
+    rng = np.random.default_rng(1)
+    game = _rand_raw_game(worker_embed, (3,), rng)
+    tree.map_structure(
+        lambda a, b: np.testing.assert_array_equal(a, b),
+        policy.network.encode_game(game),
+        worker_embed.from_state(game),
+    )
+    # parser output has PYTHON-scalar leaves (bool/int/float), not arrays:
+    # the worker asarray-wraps before encoding — verify that shape works too
+    scalar_game = tree.map_structure(
+        lambda x: np.asarray(x.flat[0].item() if hasattr(x, "flat") else x),
+        _rand_raw_game(worker_embed, (), rng),
+    )
+    worker_embed.from_state(scalar_game)  # must not raise

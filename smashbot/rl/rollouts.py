@@ -139,12 +139,21 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", conn) -> None:
     a Pipe: sends per-frame payloads, receives {port: Controller} commands
     (None = shut down)."""
     import melee
+    import numpy as np
+    import tree as tree_lib
 
     from slippi_ai import controller_lib
     from slippi_ai import dolphin as dolphin_lib
     from slippi_db.parse_libmelee import Parser
 
+    from smashbot import embed as embed_lib
     from smashbot.eval import game as game_lib
+
+    # Encode (from_state: pure numpy typing/bucketing, no NN) worker-side so
+    # the 32 env processes parallelize it instead of the main loop. Must match
+    # the policy's embed schema — both use the default EmbedConfig (verified
+    # by test_worker_side_encode_matches_policy_encode).
+    embed_game = embed_lib.EmbedConfig().make_game_embedding()
 
     opp = game_lib.Opponent.parse(
         cfg.opponent if cfg.opponent.startswith("cpu")
@@ -170,7 +179,10 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", conn) -> None:
                         if games >= cfg.games_per_dolphin:
                             break
                     last_frame = gs.frame
-                    game = parser.get_game(gs)
+                    raw = tree_lib.map_structure(
+                        np.asarray, parser.get_game(gs)
+                    )
+                    game = embed_game.from_state(raw)
                     p1, p2 = gs.players[1], gs.players[2]
                     conn.send(
                         dict(
@@ -245,16 +257,17 @@ class DolphinRolloutWorker:
         return payloads
 
     def _encode(self, games: list) -> tp.Any:
+        """games: per-env structs ALREADY encoded by the env processes
+        (from_state runs worker-side); here we only stack and torch-ify."""
         import numpy as np
 
         device = self.student.device
         batched = tree.map_structure(lambda *xs: np.stack(xs), *games)
-        encoded = self.student.policy.network.encode_game(batched)
         return tree.map_structure(
             lambda x: torch.from_numpy(
                 np.ascontiguousarray(x.astype(np.int64) if x.dtype.kind in "iu" else x)
             ).to(device),
-            encoded,
+            batched,
         )
 
     @staticmethod
@@ -302,9 +315,9 @@ class DolphinRolloutWorker:
 
             controllers2 = None
             if self.opponent is not None:
-                opp_states = self._encode(
-                    [self._swap_perspective(g) for g in games]
-                )
+                # perspective swap commutes with encoding: build the opponent
+                # view from the encoded struct (pointer swap, no second pass)
+                opp_states = states._replace(p0=states.p1, p1=states.p0)
                 controllers2, _, _ = self.opponent.step(opp_states, resets_dev)
 
             for i, conn in enumerate(self._conns):
