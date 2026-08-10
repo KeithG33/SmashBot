@@ -216,6 +216,17 @@ def test_oversized_step_reverts():
         assert torch.equal(a, b), "revert must restore parameters exactly"
 
 
+def test_sequential_steps_carry_state():
+    """Two learner steps with carried recurrent state: the second must not
+    backward into the first chunk's freed graph (regression: carried value
+    state needed detaching)."""
+    learner, traj = _make_learner(ppo=PPOConfig(max_mean_actor_kl=1.0))
+    state = learner.initial_state(3)
+    state, _ = learner.step([traj], state)
+    state, metrics = learner.step([traj], state)  # crashed before the fix
+    assert np.isfinite(metrics["post_update"]["loss"])
+
+
 def test_teacher_stays_frozen():
     learner, traj = _make_learner(ppo=PPOConfig(max_mean_actor_kl=1.0))
     before = copy_params(learner.teacher)

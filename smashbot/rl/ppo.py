@@ -232,8 +232,12 @@ class Learner:
             actor_logits=actor_logits,
             actor_log_probs=actor_log_probs,
         )
+        # Detach carried recurrent states: the next chunk's backward must not
+        # reach into this chunk's (already-freed) graph.
+        detach = lambda t: t.detach() if isinstance(t, torch.Tensor) else t
         new_state = LearnerState(
-            teacher=teacher_out.final_state, value=value_out.final_state
+            teacher=tree.map_structure(detach, teacher_out.final_state),
+            value=tree.map_structure(detach, value_out.final_state),
         )
         return fixed, new_state, value_out.metrics
 
