@@ -99,12 +99,21 @@ class BatchedPolicyAgent:
             name=self._name.clone(),
         )
 
-        sampled, self.hidden = self.policy.sample(
+        sampled, hidden = self.policy.sample(
             StateAction(state=states, action=self._prev_action, name=self._name),
             self.hidden,
             temperature=self.temperature,
         )
-        record = record._replace(logits=sampled.logits)
+        # clone: fed back next frame, and compiled (cudagraph) replay reuses
+        # output buffers — same requirement as the play path
+        self.hidden = tree.map_structure(
+            lambda t: t.clone() if isinstance(t, torch.Tensor) else t, hidden
+        )
+        # clone: retained across steps in trajectory records, and compiled
+        # (cudagraph) replay reuses output buffers
+        record = record._replace(
+            logits=tree.map_structure(lambda t: t.clone(), sampled.logits)
+        )
 
         self._prev_action = tree.map_structure(
             lambda t: t.clone() if t.dtype == torch.bool else t.long().clone(),
