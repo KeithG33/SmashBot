@@ -17,8 +17,6 @@ here later via their reward lib.
 from __future__ import annotations
 
 import dataclasses
-import queue as queue_lib
-import threading
 import typing as tp
 
 import torch
@@ -134,23 +132,64 @@ class RolloutConfig:
     games_per_dolphin: int = 20
 
 
-class _EnvThread(threading.Thread):
-    """Owns one Dolphin; parses/encodes frames in, controllers out."""
+def _env_process_main(idx: int, cfg: "RolloutConfig", conn) -> None:
+    """One Dolphin per PROCESS (multiple libmelee Consoles cannot share a
+    process — the vendor's envs.py reaches the same conclusion). Speaks over
+    a Pipe: sends per-frame payloads, receives {port: Controller} commands
+    (None = shut down)."""
+    import melee
 
-    def __init__(self, idx: int, make_env, out_queue: queue_lib.Queue):
-        super().__init__(daemon=True)
-        self.idx = idx
-        self.make_env = make_env
-        self.out = out_queue
-        self.inbox: queue_lib.Queue = queue_lib.Queue(maxsize=1)
-        self.stop_flag = threading.Event()
+    from slippi_ai import controller_lib
+    from slippi_ai import dolphin as dolphin_lib
+    from slippi_db.parse_libmelee import Parser
 
-    def run(self) -> None:
-        try:
-            for payload in self.make_env(self.idx, self.inbox, self.stop_flag):
-                self.out.put((self.idx, payload))
-        except Exception as e:  # surfaced by the worker's gather loop
-            self.out.put((self.idx, e))
+    from smashbot.eval import game as game_lib
+
+    opp = game_lib.Opponent.parse(
+        cfg.opponent if cfg.opponent.startswith("cpu")
+        else f"cpu:9:{cfg.opponent_char}"  # placeholder; ckpt/teacher use AI
+    )
+    players = {
+        1: dolphin_lib.AI(character=melee.Character[cfg.bot_char.upper()]),
+        2: dolphin_lib.AI(character=melee.Character[cfg.opponent_char.upper()])
+        if cfg.opponent == "teacher" else opp.make_player(),
+    }
+    try:
+        while True:
+            dolphin = game_lib.make_dolphin(players, headless=True, stage=cfg.stage)
+            parser = Parser(ports=[1, 2])
+            games = 0
+            last_frame = None
+            try:
+                for gs in dolphin.iter_gamestates(skip_menu_frames=True):
+                    resetting = last_frame is not None and gs.frame < last_frame
+                    if resetting:
+                        parser = Parser(ports=[1, 2])
+                        games += 1
+                        if games >= cfg.games_per_dolphin:
+                            break
+                    last_frame = gs.frame
+                    game = parser.get_game(gs)
+                    p1, p2 = gs.players[1], gs.players[2]
+                    conn.send(
+                        dict(
+                            game=game,
+                            resetting=resetting,
+                            stocks=(int(p1.stock), int(p2.stock)),
+                            percent=(float(p1.percent), float(p2.percent)),
+                        )
+                    )
+                    controllers = conn.recv()
+                    if controllers is None:
+                        return
+                    for port, controller_state in controllers.items():
+                        controller_lib.send_controller(
+                            dolphin.controllers[port], controller_state
+                        )
+            finally:
+                dolphin.stop()
+    except (EOFError, BrokenPipeError, KeyboardInterrupt):
+        pass
 
 
 class DolphinRolloutWorker:
@@ -172,92 +211,48 @@ class DolphinRolloutWorker:
         self.opponent = opponent
         self.game_lib = game_lib
         self.assembler = ChunkAssembler(config.unroll_length, student.delay)
-        self._threads: list[_EnvThread] = []
-        self._gather: queue_lib.Queue = queue_lib.Queue()
-
-    def _make_env(self, idx: int, inbox: queue_lib.Queue, stop: threading.Event):
-        """Generator: yields (gamestate-derived payloads); receives controllers."""
-        import melee
-
-        from slippi_ai import controller_lib
-        from slippi_ai import dolphin as dolphin_lib
-        from slippi_db.parse_libmelee import Parser
-
-        cfg = self.config
-        opp = self.game_lib.Opponent.parse(
-            cfg.opponent if cfg.opponent.startswith("cpu")
-            else f"ckpt:_:{cfg.opponent_char}"
-        )
-        players = {
-            1: dolphin_lib.AI(character=melee.Character[cfg.bot_char.upper()]),
-            2: opp.make_player(),
-        }
-        while not stop.is_set():
-            dolphin = self.game_lib.make_dolphin(players, headless=True, stage=cfg.stage)
-            parser = Parser(ports=[1, 2])
-            games = 0
-            last_frame = None
-            try:
-                for gs in dolphin.iter_gamestates(skip_menu_frames=True):
-                    resetting = last_frame is not None and gs.frame < last_frame
-                    if resetting:
-                        parser = Parser(ports=[1, 2])
-                        games += 1
-                        if games >= cfg.games_per_dolphin:
-                            break
-                    last_frame = gs.frame
-                    game = parser.get_game(gs)
-                    p1, p2 = gs.players[1], gs.players[2]
-                    payload = dict(
-                        game=game,
-                        resetting=resetting,
-                        stocks=(int(p1.stock), int(p2.stock)),
-                        percent=(float(p1.percent), float(p2.percent)),
-                    )
-                    yield payload
-                    controllers = inbox.get()  # barrier: wait for batched step
-                    if controllers is None:
-                        return
-                    for port, controller_state in controllers.items():
-                        controller_lib.send_controller(
-                            dolphin.controllers[port], controller_state
-                        )
-            finally:
-                dolphin.stop()
+        self._procs: list = []
+        self._conns: list = []
 
     def _ensure_started(self) -> None:
-        if self._threads:
+        if self._procs:
             return
-        import numpy as np  # noqa: F401  (env threads use numpy via parser)
+        import multiprocessing as mp
 
+        ctx = mp.get_context("spawn")
         for i in range(self.config.num_envs):
-            t = _EnvThread(i, lambda idx, inbox, stop: self._make_env(idx, inbox, stop), self._gather)
-            self._threads.append(t)
-            t.start()
+            parent, child = ctx.Pipe()
+            # non-daemon: libmelee's slippstream forks its own child
+            p = ctx.Process(
+                target=_env_process_main, args=(i, self.config, child)
+            )
+            p.start()
+            self._procs.append(p)
+            self._conns.append(parent)
         self._frame_count = 0
         n = self.config.num_envs
         self._prev_stocks = torch.full((n, 2), 4.0)
         self._prev_percent = torch.zeros(n, 2)
 
     def _gather_all(self) -> list[dict]:
-        n = self.config.num_envs
-        payloads: dict[int, dict] = {}
-        while len(payloads) < n:
-            idx, payload = self._gather.get()
-            if isinstance(payload, Exception):
-                raise RuntimeError(f"env {idx} died") from payload
-            payloads[idx] = payload
-        return [payloads[i] for i in range(n)]
+        payloads = []
+        for i, conn in enumerate(self._conns):
+            try:
+                payloads.append(conn.recv())
+            except (EOFError, BrokenPipeError) as e:
+                raise RuntimeError(f"env {i} died") from e
+        return payloads
 
     def _encode(self, games: list) -> tp.Any:
         import numpy as np
 
+        device = self.student.device
         batched = tree.map_structure(lambda *xs: np.stack(xs), *games)
         encoded = self.student.policy.network.encode_game(batched)
         return tree.map_structure(
             lambda x: torch.from_numpy(
                 np.ascontiguousarray(x.astype(np.int64) if x.dtype.kind in "iu" else x)
-            ),
+            ).to(device),
             encoded,
         )
 
@@ -281,12 +276,13 @@ class DolphinRolloutWorker:
 
             stocks = torch.tensor([p["stocks"] for p in payloads], dtype=torch.float32)
             percent = torch.tensor([p["percent"] for p in payloads], dtype=torch.float32)
+            device = self.student.device
             if self._frame_count > 0:
                 self.assembler.push_reward(
                     compute_reward(
                         self._prev_stocks, stocks,
                         self._prev_percent, percent, resets,
-                    )
+                    ).to(device)
                 )
             self._prev_stocks, self._prev_percent = stocks, percent
 
@@ -305,22 +301,26 @@ class DolphinRolloutWorker:
                 )
                 controllers2, _ = self.opponent.step(opp_states)
 
-            for i, thread in enumerate(self._threads):
+            for i, conn in enumerate(self._conns):
                 cmd = {1: controllers1[i]}
                 if controllers2 is not None:
                     cmd[2] = controllers2[i]
-                thread.inbox.put(cmd)
+                conn.send(cmd)
 
-            self.assembler.push_frame(record, resets, snap)
+            self.assembler.push_frame(record, resets.to(device), snap)
             self._frame_count += 1
             if self.assembler.ready():
                 out.append(self.assembler.emit())
         return out
 
     def stop(self) -> None:
-        for t in self._threads:
-            t.stop_flag.set()
+        for conn in self._conns:
             try:
-                t.inbox.put_nowait(None)
-            except queue_lib.Full:
+                conn.send(None)
+            except (BrokenPipeError, OSError):
                 pass
+        for p in self._procs:
+            p.join(timeout=15)
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=5)
