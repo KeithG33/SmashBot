@@ -90,7 +90,8 @@ def test_batched_agent_matches_independent_runs(monkeypatch):
     for t in range(6):
         state1 = _rand_states(game_embed, (1,), rng)
         both = tree.map_structure(lambda x: torch.cat([x, x], dim=0), state1)
-        controllers, record = agent.step(both)
+        controllers, records, _ = agent.step(both)
+        (record,) = records  # batch_steps=1: one record per step
         # ...but the two identical envs see identical logits every frame
         tree.map_structure(
             lambda t_: torch.testing.assert_close(t_[0], t_[1]),
@@ -141,7 +142,8 @@ def test_assembled_trajectory_feeds_learner():
             asm.push_reward(torch.zeros(N))
         snap = agent.hidden_snapshot() if t % T == 0 else None
         states = _rand_states(game_embed, (N,), rng)
-        _, record = agent.step(states)
+        _, records, _ = agent.step(states)
+        (record,) = records
         asm.push_frame(record, torch.zeros(N, dtype=torch.bool), snap)
         if asm.ready():
             traj = asm.emit()
@@ -152,3 +154,67 @@ def test_assembled_trajectory_feeds_learner():
         _, metrics = learner._policy_loss(fixed)
     assert metrics["ratio_mean"] == pytest.approx(1.0, abs=1e-4)
     assert metrics["actor_kl_mean"] == pytest.approx(0.0, abs=1e-5)
+
+
+def test_batch_steps_equivalence(monkeypatch):
+    """batch_steps=4 must produce the same executed controllers, records, and
+    recurrent states as batch_steps=1 (greedy-patched so streams are
+    deterministic), including across a mid-buffer reset."""
+    from smashbot import embed as embed_lib
+    from smashbot.tests.test_ppo import _tiny_policy, _rand_states
+
+    monkeypatch.setattr(
+        embed_lib.OneHotEmbedding, "sample",
+        lambda self, logits, temperature=None: logits.argmax(-1).to(
+            {"uint8": torch.uint8, "int32": torch.int32}[np.dtype(self.dtype).name]
+        ),
+    )
+    monkeypatch.setattr(
+        embed_lib.BoolEmbedding, "sample",
+        lambda self, logits, temperature=None: logits.squeeze(-1) > 0,
+    )
+
+    torch.manual_seed(0)
+    policy = _tiny_policy(seed=0)  # delay=2... need delay >= batch_steps
+    policy.delay = 4
+    game_embed = dict(policy.network.embed_state_action.embedding)["state"]
+    N, S = 2, 4
+    rng = np.random.default_rng(11)
+    frames = [_rand_states(game_embed, (N,), rng) for _ in range(8)]
+    reset_seq = [torch.zeros(N, dtype=torch.bool) for _ in range(8)]
+    reset_seq[5][1] = True  # mid-buffer reset for env 1
+
+    a1 = BatchedPolicyAgent(policy, N, batch_steps=1)
+    a4 = BatchedPolicyAgent(policy, N, batch_steps=S)
+
+    recs1, recs4, exec1, exec4 = [], [], [], []
+    for t in range(8):
+        c1, r1, _ = a1.step(frames[t], reset_seq[t])
+        c4, r4, _ = a4.step(frames[t], reset_seq[t])
+        recs1 += r1
+        recs4 += r4
+        exec1.append(c1)
+        exec4.append(c4)
+
+    assert len(recs1) == 8 and len(recs4) == 8
+    for r1, r4 in zip(recs1, recs4):
+        tree.map_structure(
+            lambda a, b: torch.testing.assert_close(a, b), r1.logits, r4.logits
+        )
+        tree.map_structure(
+            lambda a, b: torch.testing.assert_close(a.float(), b.float()),
+            r1.prev_action, r4.prev_action,
+        )
+    for c1, c4 in zip(exec1, exec4):
+        for e1, e4 in zip(c1, c4):
+            tree.map_structure(
+                lambda a, b: np.testing.assert_allclose(
+                    np.asarray(a, dtype=np.float32), np.asarray(b, dtype=np.float32)
+                ),
+                e1, e4,
+            )
+    tree.map_structure(
+        lambda a, b: torch.testing.assert_close(a, b)
+        if isinstance(a, torch.Tensor) else None,
+        a1.hidden, a4.hidden,
+    )

@@ -36,6 +36,7 @@ class RuntimeConfig:
     log_interval: int = 1
     wandb_mode: str = "online"
     name: str = "Master Player"
+    compile: bool = True  # compile sample_n (the batched flush)
     device: str = "cpu"  # rollouts are CPU-bound; learner device
 
 
@@ -115,13 +116,19 @@ def main() -> None:
 
     learner = Learner(args.learner, policy, teacher, value_fn)
 
+    if args.runtime.compile:
+        mode = "reduce-overhead" if device == "cuda" else "default"
+        policy.sample_n = torch.compile(policy.sample_n, mode=mode)
+        teacher.sample_n = torch.compile(teacher.sample_n, mode=mode)
     student_agent = BatchedPolicyAgent(
-        policy, args.rollouts.num_envs, name_code=name_code, device=device
+        policy, args.rollouts.num_envs, name_code=name_code, device=device,
+        batch_steps=args.rollouts.batch_steps,
     )
     opponent_agent = None
     if args.rollouts.opponent == "teacher":
         opponent_agent = BatchedPolicyAgent(
-            teacher, args.rollouts.num_envs, name_code=name_code, device=device
+            teacher, args.rollouts.num_envs, name_code=name_code, device=device,
+            batch_steps=args.rollouts.batch_steps,
         )
     worker = DolphinRolloutWorker(args.rollouts, student_agent, opponent_agent)
 

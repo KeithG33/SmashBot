@@ -151,6 +151,49 @@ class Policy(nn.Module):
         return total_loss, outputs.final_state, metrics
 
     @torch.no_grad()
+    def sample_n(
+        self,
+        states: tp.Any,  # encoded Game struct, [B, S]
+        names: torch.Tensor,  # [B, S]
+        prev_action: tp.Any,  # controller struct [B] — action before frame 0
+        neutral_action: tp.Any,  # controller struct [B] — reset substitute
+        initial_state: RecurrentState,
+        is_resetting: torch.Tensor,  # [B, S]
+        temperature: tp.Optional[float] = None,
+    ) -> tuple[list, RecurrentState, list]:
+        """Sample S consecutive frames in one call (batch_steps): the
+        autoregressive prev-action feedback stays inside, so a torch.compile
+        of this method amortizes launch overhead over S frames. Mid-buffer
+        resets substitute the neutral prev-action and zero the recurrent
+        state (via sample's is_resetting)."""
+        S = names.shape[1]
+        hidden = initial_state
+        outs, used_prevs = [], []
+        for t in range(S):
+            reset_t = is_resetting[:, t]
+            prev_action = tree.map_structure(
+                lambda p, n: torch.where(
+                    reset_t.view(-1, *([1] * (p.dim() - 1))), n, p
+                ),
+                prev_action, neutral_action,
+            )
+            used_prevs.append(prev_action)
+            sa = StateAction(
+                state=tree.map_structure(lambda x: x[:, t], states),
+                action=prev_action,
+                name=names[:, t],
+            )
+            out, hidden = self.sample(
+                sa, hidden, is_resetting=reset_t, temperature=temperature
+            )
+            outs.append(out)
+            prev_action = tree.map_structure(
+                lambda x: x.clone() if x.dtype == torch.bool else x.long().clone(),
+                out.controller_state,
+            )
+        return outs, hidden, used_prevs
+
+    @torch.no_grad()
     def sample(
         self,
         state_action: StateAction,  # [B], encoded

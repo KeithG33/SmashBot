@@ -125,6 +125,7 @@ def compute_reward(
 class RolloutConfig:
     num_envs: int = 8
     unroll_length: int = 240  # 4s, slippi-ai's RL rollout length
+    batch_steps: int = 4  # frames per inference flush (slippi-ai RL default)
     opponent: str = "teacher"  # "teacher" | "cpu:<level>"
     bot_char: str = "FOX"
     opponent_char: str = "FOX"
@@ -266,17 +267,20 @@ class DolphinRolloutWorker:
         cfg = self.config
         out: list[Trajectory] = []
 
+        assert cfg.unroll_length % self.student.batch_steps == 0, (
+            "unroll_length must be a multiple of batch_steps so chunk "
+            "boundaries land on flush boundaries"
+        )
+        device = self.student.device
+        pending_resets: list[torch.Tensor] = []
+        records_pushed = getattr(self, "_records_pushed", 0)
+
         while len(out) < num_trajectories:
             payloads = self._gather_all()
             resets = torch.tensor([p["resetting"] for p in payloads])
-            for i in torch.nonzero(resets).flatten().tolist():
-                self.student.reset_env(i)
-                if self.opponent is not None:
-                    self.opponent.reset_env(i)
 
             stocks = torch.tensor([p["stocks"] for p in payloads], dtype=torch.float32)
             percent = torch.tensor([p["percent"] for p in payloads], dtype=torch.float32)
-            device = self.student.device
             if self._frame_count > 0:
                 self.assembler.push_reward(
                     compute_reward(
@@ -286,20 +290,20 @@ class DolphinRolloutWorker:
                 )
             self._prev_stocks, self._prev_percent = stocks, percent
 
-            snap = None
-            if self._frame_count % cfg.unroll_length == 0:
-                snap = self.student.hidden_snapshot()
-
             games = [p["game"] for p in payloads]
             states = self._encode(games)
-            controllers1, record = self.student.step(states)
+            resets_dev = resets.to(device)
+            pending_resets.append(resets_dev)
+            controllers1, records, hidden_before = self.student.step(
+                states, resets_dev
+            )
 
             controllers2 = None
             if self.opponent is not None:
                 opp_states = self._encode(
                     [self._swap_perspective(g) for g in games]
                 )
-                controllers2, _ = self.opponent.step(opp_states)
+                controllers2, _, _ = self.opponent.step(opp_states, resets_dev)
 
             for i, conn in enumerate(self._conns):
                 cmd = {1: controllers1[i]}
@@ -307,10 +311,22 @@ class DolphinRolloutWorker:
                     cmd[2] = controllers2[i]
                 conn.send(cmd)
 
-            self.assembler.push_frame(record, resets.to(device), snap)
+            for j, record in enumerate(records):
+                snap = None
+                if records_pushed % cfg.unroll_length == 0:
+                    # chunk boundary: the recurrent state before this flush is
+                    # the state before its first frame (j == 0 always, given
+                    # the unroll/batch_steps divisibility assert)
+                    snap = hidden_before
+                self.assembler.push_frame(record, pending_resets[j], snap)
+                records_pushed += 1
+            if records:
+                pending_resets = pending_resets[len(records):]
+
             self._frame_count += 1
             if self.assembler.ready():
                 out.append(self.assembler.emit())
+        self._records_pushed = records_pushed
         return out
 
     def stop(self) -> None:

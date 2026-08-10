@@ -43,6 +43,7 @@ class BatchedPolicyAgent:
         name_code: int = 0,
         temperature: float | None = None,
         device: str = "cpu",
+        batch_steps: int = 1,
     ):
         self.policy = policy
         self.num_envs = num_envs
@@ -69,6 +70,13 @@ class BatchedPolicyAgent:
             collections.deque([_neutral_controller()] * self.delay)
             for _ in range(num_envs)
         ]
+        assert self.delay >= batch_steps, (
+            "delay must cover batch_steps (queue runs batch_steps-1 short "
+            "between flushes)"
+        )
+        self.batch_steps = batch_steps
+        self._buf_states: list = []
+        self._buf_resets: list[torch.Tensor] = []
 
     def reset_env(self, i: int) -> None:
         """Fresh game in env i: zero its recurrent state, queue, and prev action."""
@@ -85,50 +93,77 @@ class BatchedPolicyAgent:
 
     @torch.no_grad()
     def step(
-        self, states: tp.Any
-    ) -> tuple[list[Controller], FrameRecord]:
-        """states: encoded Game struct batched [N, ...] (torch, on device).
+        self, states: tp.Any, resets: torch.Tensor | None = None
+    ) -> tuple[list[Controller], list[FrameRecord], tp.Any]:
+        """states: encoded Game struct batched [N, ...]; resets: [N] bool.
 
-        Returns the controllers each env must execute NOW (delayed by D
-        frames) and this frame's trajectory record.
+        Buffers the frame; every `batch_steps` frames one sample_n call
+        processes the buffer (amortizing launch overhead). Returns the
+        controllers to execute NOW (popped from the delay queue — instant,
+        never waits on inference), the flushed FrameRecords ([] between
+        flushes), and the recurrent snapshot from just before the flush
+        (None between flushes) for chunk-boundary bookkeeping.
         """
-        record = FrameRecord(
-            state=states,
-            prev_action=tree.map_structure(lambda t: t.clone(), self._prev_action),
-            logits=None,  # filled below
-            name=self._name.clone(),
-        )
+        if resets is None:
+            resets = torch.zeros(self.num_envs, dtype=torch.bool, device=self._name.device)
+        for i in torch.nonzero(resets).flatten().tolist():
+            self._queues[i] = collections.deque(
+                [_neutral_controller()] * self.delay
+            )
 
-        sampled, hidden = self.policy.sample(
-            StateAction(state=states, action=self._prev_action, name=self._name),
-            self.hidden,
-            temperature=self.temperature,
-        )
-        # clone: fed back next frame, and compiled (cudagraph) replay reuses
-        # output buffers — same requirement as the play path
-        self.hidden = tree.map_structure(
-            lambda t: t.clone() if isinstance(t, torch.Tensor) else t, hidden
-        )
-        # clone: retained across steps in trajectory records, and compiled
-        # (cudagraph) replay reuses output buffers
-        record = record._replace(
-            logits=tree.map_structure(lambda t: t.clone(), sampled.logits)
-        )
+        self._buf_states.append(states)
+        self._buf_resets.append(resets)
 
-        self._prev_action = tree.map_structure(
-            lambda t: t.clone() if t.dtype == torch.bool else t.long().clone(),
-            sampled.controller_state,
-        )
+        records: list[FrameRecord] = []
+        hidden_before = None
+        if len(self._buf_states) == self.batch_steps:
+            hidden_before = self.hidden_snapshot()
+            stack = lambda seq: tree.map_structure(
+                lambda *xs: torch.stack(xs, dim=1), *seq
+            )
+            outs, hidden, used_prevs = self.policy.sample_n(
+                states=stack(self._buf_states),
+                names=self._name[:, None].expand(-1, self.batch_steps),
+                prev_action=self._prev_action,
+                neutral_action=self._neutral_encoded,
+                initial_state=self.hidden,
+                is_resetting=torch.stack(self._buf_resets, dim=1),
+                temperature=self.temperature,
+            )
+            # clones: retained across flushes / fed back next flush, and
+            # compiled (cudagraph) replay reuses output buffers
+            self.hidden = tree.map_structure(
+                lambda t: t.clone() if isinstance(t, torch.Tensor) else t, hidden
+            )
+            self._prev_action = tree.map_structure(
+                lambda t: t.clone() if t.dtype == torch.bool else t.long().clone(),
+                outs[-1].controller_state,
+            )
+            for t, out in enumerate(outs):
+                records.append(
+                    FrameRecord(
+                        state=self._buf_states[t],
+                        prev_action=tree.map_structure(
+                            lambda x: x.clone() if x.dtype == torch.bool
+                            else x.long().clone(),
+                            used_prevs[t],
+                        ),
+                        logits=tree.map_structure(lambda x: x.clone(), out.logits),
+                        name=self._name.clone(),
+                    )
+                )
+                encoded_np = tree.map_structure(
+                    lambda x: x.cpu().numpy(), out.controller_state
+                )
+                decoded = self._embed_controller.decode(encoded_np)
+                for i in range(self.num_envs):
+                    self._queues[i].append(
+                        tree.map_structure(lambda x: x[i], decoded)
+                    )
+            self._buf_states, self._buf_resets = [], []
 
-        encoded_np = tree.map_structure(
-            lambda t: t.cpu().numpy(), sampled.controller_state
-        )
-        decoded = self._embed_controller.decode(encoded_np)
-        to_execute = []
-        for i in range(self.num_envs):
-            self._queues[i].append(tree.map_structure(lambda x: x[i], decoded))
-            to_execute.append(self._queues[i].popleft())
-        return to_execute, record
+        to_execute = [self._queues[i].popleft() for i in range(self.num_envs)]
+        return to_execute, records, hidden_before
 
     def hidden_snapshot(self) -> tp.Any:
         """Detached copy of the recurrent state (for Trajectory.initial_state)."""
