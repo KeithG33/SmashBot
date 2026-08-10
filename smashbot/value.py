@@ -18,6 +18,13 @@ from smashbot import delay as delay_lib
 from smashbot.networks import RecurrentState, StateActionNetwork
 
 
+class ValueOutputs(tp.NamedTuple):
+    loss: torch.Tensor  # scalar
+    advantages: torch.Tensor  # [B, U], detached (targets - values)
+    final_state: RecurrentState
+    metrics: dict
+
+
 class ValueFunction(nn.Module):
     def __init__(self, network: StateActionNetwork):
         super().__init__()
@@ -33,6 +40,15 @@ class ValueFunction(nn.Module):
         initial_state: RecurrentState,
         discount: float,
     ) -> tuple[torch.Tensor, RecurrentState, dict]:
+        out = self.outputs(frames, initial_state, discount)
+        return out.loss, out.final_state, out.metrics
+
+    def outputs(
+        self,
+        frames: Frames,  # delay-sliced, [B, U+1]
+        initial_state: RecurrentState,
+        discount: float,
+    ) -> ValueOutputs:
         inputs = tree.map_structure(lambda t: t[:, :-1], frames.state_action)
         last_input = tree.map_structure(lambda t: t[:, -1], frames.state_action)
         outputs, final_state = self.network.unroll(
@@ -57,7 +73,8 @@ class ValueFunction(nn.Module):
             targets = delay_lib.discounted_returns(
                 rewards=rewards, discounts=discounts, bootstrap=last_value
             ).detach()
-            loss = torch.square(targets - values).mean()
+            advantages = targets - values
+            loss = torch.square(advantages).mean()
             uev = loss / (targets.var() + 1e-8)
 
         metrics = {
@@ -66,4 +83,9 @@ class ValueFunction(nn.Module):
             "return_mean": targets.mean().item(),
             "reward_mean": frames.reward.mean().item(),
         }
-        return loss, final_state, metrics
+        return ValueOutputs(
+            loss=loss,
+            advantages=advantages.detach(),
+            final_state=final_state,
+            metrics=metrics,
+        )

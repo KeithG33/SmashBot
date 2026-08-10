@@ -24,6 +24,7 @@ class UnrollOutputs(tp.NamedTuple):
     value_loss: tp.Optional[torch.Tensor]  # [B, T]; None when value head disabled
     value_metrics: dict
     final_state: RecurrentState
+    logits: tp.Any = None  # controller struct of [B, T, ...]; used by RL
 
 
 class Policy(nn.Module):
@@ -113,6 +114,7 @@ class Policy(nn.Module):
             value_loss=value_loss,
             value_metrics=value_metrics,
             final_state=final_state,
+            logits=distance_outputs.logits,
         )
 
     def imitation_loss(

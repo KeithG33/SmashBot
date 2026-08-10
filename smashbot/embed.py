@@ -76,6 +76,14 @@ class Embedding(Generic[In, Out], nn.Module, abc.ABC):
         """Negative log-prob of the target sample."""
         raise NotImplementedError
 
+    def logits_entropy(self, logits: torch.Tensor) -> torch.Tensor:
+        """Entropy of the distribution parameterized by `logits`. [RL]"""
+        raise NotImplementedError
+
+    def logits_kl(self, p_logits: torch.Tensor, q_logits: torch.Tensor) -> torch.Tensor:
+        """KL(p || q) between distributions parameterized by logits. [RL]"""
+        raise NotImplementedError
+
 
 class BoolEmbedding(Embedding[bool, np.bool_]):
     size = 1
@@ -101,6 +109,19 @@ class BoolEmbedding(Embedding[bool, np.bool_]):
         if temperature is not None:
             logits = logits / temperature
         return torch.bernoulli(torch.sigmoid(logits)).bool()
+
+    def logits_entropy(self, logits: torch.Tensor) -> torch.Tensor:
+        x = logits.squeeze(-1)
+        p = torch.sigmoid(x)
+        # H = -p log p - (1-p) log(1-p), via logsigmoid for stability
+        return -(p * F.logsigmoid(x) + (1 - p) * F.logsigmoid(-x))
+
+    def logits_kl(self, p_logits: torch.Tensor, q_logits: torch.Tensor) -> torch.Tensor:
+        x, y = p_logits.squeeze(-1), q_logits.squeeze(-1)
+        p = torch.sigmoid(x)
+        return p * (F.logsigmoid(x) - F.logsigmoid(y)) + (1 - p) * (
+            F.logsigmoid(-x) - F.logsigmoid(-y)
+        )
 
 
 embed_bool = BoolEmbedding()
@@ -206,6 +227,15 @@ class OneHotEmbedding(Embedding[int, np.ndarray]):
             np.dtype(self.dtype).name
         ]
         return samples.to(torch_dtype)
+
+    def logits_entropy(self, logits: torch.Tensor) -> torch.Tensor:
+        logp = F.log_softmax(logits, dim=-1)
+        return -(logp.exp() * logp).sum(-1)
+
+    def logits_kl(self, p_logits: torch.Tensor, q_logits: torch.Tensor) -> torch.Tensor:
+        logp = F.log_softmax(p_logits, dim=-1)
+        logq = F.log_softmax(q_logits, dim=-1)
+        return (logp.exp() * (logp - logq)).sum(-1)
 
 
 NT = TypeVar("NT")
