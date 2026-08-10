@@ -125,7 +125,7 @@ def compute_reward(
 class RolloutConfig:
     num_envs: int = 8
     unroll_length: int = 240  # 4s, slippi-ai's RL rollout length
-    batch_steps: int = 4  # frames per inference flush (slippi-ai RL default)
+    batch_steps: int = 1  # frames per inference flush; measured best on this rig (see docs)
     opponent: str = "teacher"  # "teacher" | "cpu:<level>"
     bot_char: str = "FOX"
     opponent_char: str = "FOX"
@@ -272,7 +272,9 @@ class DolphinRolloutWorker:
             "boundaries land on flush boundaries"
         )
         device = self.student.device
-        pending_resets: list[torch.Tensor] = []
+        if not hasattr(self, "_pending_resets"):
+            self._pending_resets: list[torch.Tensor] = []
+        pending_resets = self._pending_resets
         records_pushed = getattr(self, "_records_pushed", 0)
 
         while len(out) < num_trajectories:
@@ -321,7 +323,7 @@ class DolphinRolloutWorker:
                 self.assembler.push_frame(record, pending_resets[j], snap)
                 records_pushed += 1
             if records:
-                pending_resets = pending_resets[len(records):]
+                del pending_resets[: len(records)]
 
             self._frame_count += 1
             if self.assembler.ready():

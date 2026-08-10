@@ -116,6 +116,47 @@ class BatchedPolicyAgent:
 
         records: list[FrameRecord] = []
         hidden_before = None
+        if self.batch_steps == 1:
+            # fast path: skip the sample_n wrapper (measured ~20% faster
+            # under reduce-overhead compile at S=1)
+            hidden_before = self.hidden_snapshot()
+            reset_t = resets
+            prev = tree.map_structure(
+                lambda pv, n: torch.where(
+                    reset_t.view(-1, *([1] * (pv.dim() - 1))), n, pv
+                ),
+                self._prev_action, self._neutral_encoded,
+            )
+            out, hidden = self.policy.sample(
+                StateAction(state=states, action=prev, name=self._name),
+                self.hidden, is_resetting=reset_t, temperature=self.temperature,
+            )
+            self.hidden = tree.map_structure(
+                lambda t: t.clone() if isinstance(t, torch.Tensor) else t, hidden
+            )
+            self._prev_action = tree.map_structure(
+                lambda t: t.clone() if t.dtype == torch.bool else t.long().clone(),
+                out.controller_state,
+            )
+            records.append(FrameRecord(
+                state=states,
+                prev_action=tree.map_structure(
+                    lambda x: x.clone() if x.dtype == torch.bool else x.long().clone(),
+                    prev,
+                ),
+                logits=tree.map_structure(lambda x: x.clone(), out.logits),
+                name=self._name.clone(),
+            ))
+            encoded_np = tree.map_structure(
+                lambda x: x.cpu().numpy(), out.controller_state
+            )
+            decoded = self._embed_controller.decode(encoded_np)
+            for i in range(self.num_envs):
+                self._queues[i].append(tree.map_structure(lambda x: x[i], decoded))
+            self._buf_states, self._buf_resets = [], []
+            to_execute = [self._queues[i].popleft() for i in range(self.num_envs)]
+            return to_execute, records, hidden_before
+
         if len(self._buf_states) == self.batch_steps:
             hidden_before = self.hidden_snapshot()
             stack = lambda seq: tree.map_structure(

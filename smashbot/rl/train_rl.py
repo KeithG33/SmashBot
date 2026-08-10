@@ -118,6 +118,8 @@ def main() -> None:
 
     if args.runtime.compile:
         mode = "reduce-overhead" if device == "cuda" else "default"
+        policy.sample = torch.compile(policy.sample, mode=mode)
+        teacher.sample = torch.compile(teacher.sample, mode=mode)
         policy.sample_n = torch.compile(policy.sample_n, mode=mode)
         teacher.sample_n = torch.compile(teacher.sample_n, mode=mode)
     student_agent = BatchedPolicyAgent(
