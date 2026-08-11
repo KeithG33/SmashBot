@@ -42,7 +42,7 @@ class RuntimeConfig:
     # teacher_check_interval learner steps; on change, safely reload the
     # frozen teacher in place (see rl/teacher_watch.py).
     teacher_watch: str = ""
-    teacher_check_interval: int = 20
+    teacher_check_interval: int = 80  # ~20 min at 64 envs (one step ~15s)
     device: str = "cpu"  # rollouts are CPU-bound; learner device
 
 
