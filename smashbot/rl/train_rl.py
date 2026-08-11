@@ -205,7 +205,19 @@ def main() -> None:
                     log["rl/" + k] = v
                 log["rl/frames_per_sec"] = frames / (time.time() - t0)
                 wandb.log(log, step=i)
-                print(f"[{i}] {log}")
+                print(
+                    f"[{i:4d}/{args.runtime.steps}] "
+                    f"win {log.get('rl/win_rate_recent', 0.5):.0%} "
+                    f"({log.get('rl/games_played', 0):.0f}g) "
+                    f"stocks {log.get('rl/avg_stock_diff', 0):+.2f} | "
+                    f"kill@{log.get('rl/avg_percent_at_kill', 0):.0f}% "
+                    f"die@{log.get('rl/avg_percent_at_death', 0):.0f}% | "
+                    f"tKL {log['rl/teacher_kl']:.4f} "
+                    f"aKL {log['rl/actor_kl_mean']:.5f} "
+                    f"{'REVERTED ' if log['rl/reverted'] else ''}| "
+                    f"{log['rl/frames_per_sec']:.0f} fps",
+                    flush=True,
+                )
 
             if (i + 1) % args.runtime.checkpoint_interval == 0:
                 _save_rl_checkpoint(
