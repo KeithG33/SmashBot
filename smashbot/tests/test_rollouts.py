@@ -379,7 +379,8 @@ def test_pool_partition_and_snapshots(tmp_path):
             assert s_.opponent_char in OPPONENT_CHARS  # Sheik allowed here
         else:
             assert s_.opponent_char in CPU_CHARS + OFF_ROSTER
-            assert s_.opponent_char != "SHEIK"  # CPUs cannot transform
+            # CPUs cannot be Sheik: proven live, 362/362 spawned Zelda
+            assert s_.opponent_char != "SHEIK"
         assert s_.opponent_char != "ZELDA"  # unpickable on netplay CSS
         assert s_.student_port in (1, 2)
     seats = Counter(s.student_port for s in specs)

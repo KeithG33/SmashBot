@@ -32,6 +32,10 @@ MAIN_12 = [
 # be Sheik (libmelee cannot force a CPU to transform), and Zelda is
 # unpickable on the netplay CSS entirely.
 OPPONENT_CHARS = list(MAIN_12)
+# CPU Sheik is IMPOSSIBLE (tested live: 362/362 attempts spawned Zelda —
+# the engine ignores held A on CPU-status ports, so the Zelda->Sheik
+# transform never triggers; libmelee's guard was right). Sheik matchup
+# coverage flows through the policy-opponent envs instead.
 CPU_CHARS = [c for c in MAIN_12 if c != "SHEIK"]
 # Rest of the CSS cast reachable by simple menuing (SHEIK reached via ZELDA
 # is already in MAIN_12 through the parser's lens; ZELDA herself included).

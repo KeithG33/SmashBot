@@ -246,6 +246,7 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
     # would silently splice into one stream.
     pending_reset = False
     pending_result = None
+    consecutive_misselects = 0
     try:
         while True:
             dolphin = game_lib.make_dolphin(players, headless=True, stage=cfg.stage)
@@ -292,8 +293,16 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
                         )
               except WrongCharacterSelected as e:
                 # menu cursor race under fast-forward (notably the Sheik/
-                # Zelda slot): scrap this Dolphin and retry with a fresh one
+                # Zelda slot): scrap this Dolphin and retry with a fresh one.
+                # BOUNDED: persistent misselection means the character is
+                # mechanically unpickable — die loudly, not loop forever
+                # (learned via 362 consecutive CPU-Sheik retries).
+                consecutive_misselects += 1
+                if consecutive_misselects >= 3:
+                    raise
                 print(f"menu misselection, retrying: {e}", flush=True)
+              else:
+                consecutive_misselects = 0
             finally:
                 dolphin.stop()
     except (EOFError, BrokenPipeError, KeyboardInterrupt):
