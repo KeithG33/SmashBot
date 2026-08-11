@@ -336,3 +336,24 @@ def test_teacher_watcher_and_hot_swap(tmp_path):
     assert after["teacher_kl"] > 0.01
     _, metrics = learner.step([traj], learner.initial_state(3))
     assert np.isfinite(metrics["post_update"]["loss"])
+
+
+def test_win_tracker_and_outcome_stats():
+    from smashbot.rl.rollouts import WinTracker, outcome_stats
+
+    wt = WinTracker(window=4)
+    for r in [1, 1, -1, 0, 1]:  # oldest win rolls out of the window
+        wt.add(r)
+    s = wt.stats()
+    assert s["games_played"] == 5
+    assert s["win_rate_recent"] == pytest.approx(2 / 3)  # window: 1,-1,0,1
+
+    # rewards: one kill (+1 with damage riding along), one death, some chip
+    rewards = torch.zeros(2, 3600)  # 2 envs x 1 minute
+    rewards[0, 100] = 1.12   # kill (+1) + 12% damage
+    rewards[1, 200] = -1.0   # death
+    rewards[0, 300] = 0.05   # 5% chip dealt
+    stats = outcome_stats(rewards)
+    assert stats["kills_per_min"] == pytest.approx(0.5)   # 1 kill / 2 env-min
+    assert stats["deaths_per_min"] == pytest.approx(0.5)
+    assert stats["net_damage_per_min"] == pytest.approx((12 + 5) / 2, abs=0.1)

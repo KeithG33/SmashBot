@@ -121,6 +121,52 @@ def compute_reward(
     return torch.where(is_resetting, torch.zeros_like(reward), reward)
 
 
+class WinTracker:
+    """Rolling win rate vs the CURRENT training opponent (teacher now,
+    snapshot pool later). Fixed-yardstick evals stay in the M8 batteries."""
+
+    def __init__(self, window: int = 100):
+        import collections
+
+        self.recent = collections.deque(maxlen=window)
+        self.wins = self.losses = self.draws = 0
+
+    def add(self, result: int) -> None:
+        self.recent.append(result)
+        if result > 0:
+            self.wins += 1
+        elif result < 0:
+            self.losses += 1
+        else:
+            self.draws += 1
+
+    def stats(self) -> dict:
+        games = self.wins + self.losses + self.draws
+        decided = [r for r in self.recent if r != 0]
+        return {
+            "games_played": games,
+            "win_rate_recent": (
+                sum(1 for r in decided if r > 0) / len(decided) if decided else 0.5
+            ),
+        }
+
+
+def outcome_stats(rewards: torch.Tensor) -> dict:
+    """Kills/deaths/damage rates from a chunk's reward tensor [N, T].
+    Kills/deaths are the +-1 events (threshold 0.5: damage terms are
+    0.01/percent and cannot reach it between deaths in one frame)."""
+    frames = rewards.numel()
+    minutes = frames / 3600.0
+    kills = (rewards > 0.5).sum().item()
+    deaths = (rewards < -0.5).sum().item()
+    net_damage = (rewards.sum().item() - (kills - deaths)) / 0.01
+    return {
+        "kills_per_min": kills / minutes,
+        "deaths_per_min": deaths / minutes,
+        "net_damage_per_min": net_damage / minutes,
+    }
+
+
 @dataclasses.dataclass
 class RolloutConfig:
     num_envs: int = 8
@@ -170,12 +216,17 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", conn) -> None:
             parser = Parser(ports=[1, 2])
             games = 0
             last_frame = None
+            last_stocks = None
             try:
                 for gs in dolphin.iter_gamestates(skip_menu_frames=True):
                     resetting = last_frame is not None and gs.frame < last_frame
+                    result = None
                     if resetting:
                         parser = Parser(ports=[1, 2])
                         games += 1
+                        if last_stocks is not None:
+                            a, b = last_stocks
+                            result = 1 if a > b else (-1 if b > a else 0)
                         if games >= cfg.games_per_dolphin:
                             break
                     last_frame = gs.frame
@@ -184,11 +235,13 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", conn) -> None:
                     )
                     game = embed_game.from_state(raw)
                     p1, p2 = gs.players[1], gs.players[2]
+                    last_stocks = (int(p1.stock), int(p2.stock))
                     conn.send(
                         dict(
                             game=game,
                             resetting=resetting,
-                            stocks=(int(p1.stock), int(p2.stock)),
+                            result=result,  # +1 bot won / -1 lost / 0 draw; None mid-game
+                            stocks=last_stocks,
                             percent=(float(p1.percent), float(p2.percent)),
                         )
                     )
@@ -224,6 +277,7 @@ class DolphinRolloutWorker:
         self.opponent = opponent
         self.game_lib = game_lib
         self.assembler = ChunkAssembler(config.unroll_length, student.delay)
+        self.win_tracker = WinTracker()
         self._procs: list = []
         self._conns: list = []
 
@@ -292,6 +346,9 @@ class DolphinRolloutWorker:
 
         while len(out) < num_trajectories:
             payloads = self._gather_all()
+            for p in payloads:
+                if p.get("result") is not None:
+                    self.win_tracker.add(p["result"])
             resets = torch.tensor([p["resetting"] for p in payloads])
 
             stocks = torch.tensor([p["stocks"] for p in payloads], dtype=torch.float32)

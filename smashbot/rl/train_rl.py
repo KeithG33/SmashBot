@@ -22,7 +22,7 @@ from smashbot.eval.game import load_policy, resolve_name_code
 from smashbot.networks import build_embed_network
 from smashbot.rl.agent import BatchedPolicyAgent
 from smashbot.rl.ppo import Learner, RLConfig
-from smashbot.rl.rollouts import DolphinRolloutWorker, RolloutConfig
+from smashbot.rl.rollouts import DolphinRolloutWorker, RolloutConfig, outcome_stats
 from smashbot.rl.teacher_watch import TeacherWatcher
 from smashbot.value import ValueFunction
 
@@ -182,6 +182,13 @@ def main() -> None:
                 })
                 log["rl/reverted"] = float(metrics["reverted"])
                 log["rl/teacher_swaps"] = teacher_swaps
+                for k, v in worker.win_tracker.stats().items():
+                    log["rl/" + k] = v
+                chunk_outcomes = outcome_stats(
+                    torch.cat([t.rewards for t in trajectories], 0)
+                )
+                for k, v in chunk_outcomes.items():
+                    log["rl/" + k] = v
                 log["rl/frames_per_sec"] = frames / (time.time() - t0)
                 wandb.log(log, step=i)
                 print(f"[{i}] {log}")
