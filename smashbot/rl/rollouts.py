@@ -212,6 +212,7 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
 
     from slippi_ai import controller_lib
     from slippi_ai import dolphin as dolphin_lib
+    from slippi_ai.dolphin import WrongCharacterSelected
     from slippi_db.parse_libmelee import Parser
 
     from smashbot import embed as embed_lib
@@ -253,6 +254,7 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
             last_frame = None
             last_stocks = None
             try:
+              try:
                 for gs in dolphin.iter_gamestates(skip_menu_frames=True):
                     boundary = last_frame is not None and gs.frame < last_frame
                     resetting = boundary or pending_reset
@@ -288,6 +290,10 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
                         controller_lib.send_controller(
                             dolphin.controllers[port], controller_state
                         )
+              except WrongCharacterSelected as e:
+                # menu cursor race under fast-forward (notably the Sheik/
+                # Zelda slot): scrap this Dolphin and retry with a fresh one
+                print(f"menu misselection, retrying: {e}", flush=True)
             finally:
                 dolphin.stop()
     except (EOFError, BrokenPipeError, KeyboardInterrupt):

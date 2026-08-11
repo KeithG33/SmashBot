@@ -26,16 +26,19 @@ MAIN_12 = [
     "FOX", "FALCO", "MARTH", "SHEIK", "JIGGLYPUFF", "CPTFALCON",
     "PEACH", "YOSHI", "POPO", "LUIGI", "PIKACHU", "SAMUS",
 ]
-# SHEIK is not directly selectable on the CSS (Zelda-transform) and libmelee's
-# menu navigation picks her only flakily (observed: expected SHEIK, got
-# YOSHI -> env death). Opponents sample from this list instead.
-OPPONENT_CHARS = [c for c in MAIN_12 if c != "SHEIK"]
+# Policy opponents can be any of the 12: Sheik works via the netplay CSS
+# Zelda slot (its Sheik/Zelda toggle defaults to Sheik); occasional menu
+# races are survived by the env-process retry guard. CPU opponents cannot
+# be Sheik (libmelee cannot force a CPU to transform), and Zelda is
+# unpickable on the netplay CSS entirely.
+OPPONENT_CHARS = list(MAIN_12)
+CPU_CHARS = [c for c in MAIN_12 if c != "SHEIK"]
 # Rest of the CSS cast reachable by simple menuing (SHEIK reached via ZELDA
 # is already in MAIN_12 through the parser's lens; ZELDA herself included).
 OFF_ROSTER = [
     "MARIO", "DOC", "LINK", "YLINK", "NESS", "BOWSER", "DK",
     "GANONDORF", "GAMEANDWATCH", "KIRBY", "MEWTWO", "PICHU",
-    "ROY", "ZELDA",
+    "ROY",
 ]
 
 
@@ -75,7 +78,7 @@ def make_partition(
     rng = random.Random(seed)
 
     def cpu_char() -> str:
-        pool = OPPONENT_CHARS if rng.random() < main12_prob else OFF_ROSTER
+        pool = CPU_CHARS if rng.random() < main12_prob else OFF_ROSTER
         return rng.choice(pool)
 
     specs: list[EnvSpec] = []
