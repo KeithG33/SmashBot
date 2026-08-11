@@ -53,6 +53,8 @@ def main() -> None:
     # CPU beats GPU for batch-1 inference (kernel-launch overhead dominates).
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--threads", type=int, default=8)
+    ap.add_argument("--profile", action="store_true",
+                    help="print per-stage agent timings with each report")
     args = ap.parse_args()
 
     # batch-1 CPU inference is fastest at ~8 threads: more threads add
@@ -101,6 +103,9 @@ def main() -> None:
             print(f"frame {frames}: step {mean_ms:.1f}ms | "
                   f"bot {p1.stock} stocks {p1.percent:.0f}% | "
                   f"opp {p2.stock} stocks {p2.percent:.0f}%")
+            if args.profile and hasattr(agent, "stage_ms"):
+                print("  stages: " + " ".join(
+                    f"{k}={v:.2f}ms" for k, v in agent.stage_ms.items()))
             if mean_ms > 12 and not args.headless:
                 print("WARNING: too slow for real-time play")
         return bool(args.max_frames and frames >= args.max_frames)

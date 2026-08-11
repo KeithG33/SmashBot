@@ -8,6 +8,7 @@ game are no-ops — exactly how the model saw the world during training.
 """
 
 import collections
+import time
 
 import numpy as np
 import torch
@@ -70,10 +71,16 @@ class DelayedAgent:
 
     @torch.no_grad()
     def step(self, gamestate) -> Controller:
-        """Consumes a live gamestate, returns the controller to execute NOW."""
+        """Consumes a live gamestate, returns the controller to execute NOW.
+
+        Per-stage wall times land in self.stage_ms (running means) for the
+        --profile flag in play.py."""
+        t0 = time.perf_counter()
         game = self.parser.get_game(gamestate)
         game = tree.map_structure(lambda x: np.asarray(x)[None], game)
+        t1 = time.perf_counter()
         state = self.policy.network.encode_game(game)
+        t2 = time.perf_counter()
         state = tree.map_structure(
             lambda x: torch.from_numpy(
                 np.ascontiguousarray(
@@ -82,6 +89,7 @@ class DelayedAgent:
             ).to(self.device),
             state,
         )
+        t3 = time.perf_counter()
 
         sampled, self.hidden = self.policy.sample(
             StateAction(state=state, action=self._prev_action, name=self._name),
@@ -95,8 +103,18 @@ class DelayedAgent:
             sampled.controller_state,
         )
 
+        t4 = time.perf_counter()
         encoded_np = tree.map_structure(
             lambda t: t[0].cpu().numpy(), sampled.controller_state
         )
         self._queue.append(self._embed_controller.decode(encoded_np))
+        t5 = time.perf_counter()
+        n = self._stage_count = getattr(self, "_stage_count", 0) + 1
+        stages = dict(parse=t1 - t0, encode=t2 - t1, to_torch=t3 - t2,
+                      sample=t4 - t3, decode=t5 - t4)
+        acc = getattr(self, "_stage_acc", {k: 0.0 for k in stages})
+        for k, v in stages.items():
+            acc[k] += v
+        self._stage_acc = acc
+        self.stage_ms = {k: 1e3 * v / n for k, v in acc.items()}
         return self._queue.popleft()
