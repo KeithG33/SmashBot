@@ -354,3 +354,46 @@ def test_game_tracker():
     assert st["avg_stock_diff"] == pytest.approx((2 - 1 + 0 + 4) / 4)
     assert st["avg_percent_at_kill"] == pytest.approx(70.0)
     assert st["avg_percent_at_death"] == pytest.approx(120.0)
+
+
+def test_pool_partition_and_snapshots(tmp_path):
+    from smashbot.rl.pool import EnvSpec, SnapshotPool, make_partition, MAIN_12
+
+    specs = make_partition(
+        64, cpu_envs=8, teacher_envs=16, snapshot_slots=5, seed=1
+    )
+    assert len(specs) == 64
+    kinds = [s.kind for s in specs]
+    assert kinds.count("cpu") == 8
+    assert kinds.count("teacher") == 16
+    assert kinds.count("snapshot") == 40
+    # slots evenly filled; policy opponents main-12 only; seats balanced
+    from collections import Counter
+
+    slots = Counter(s.group for s in specs if s.kind == "snapshot")
+    assert all(v == 8 for v in slots.values()) and len(slots) == 5
+    for s_ in specs:
+        if s_.kind != "cpu":
+            assert s_.opponent_char in MAIN_12
+        assert s_.student_port in (1, 2)
+    seats = Counter(s.student_port for s in specs)
+    assert abs(seats[1] - seats[2]) <= 2
+
+    import torch as t
+
+    class P(t.nn.Module):
+        def __init__(self, v):
+            super().__init__()
+            self.w = t.nn.Parameter(t.tensor([v]))
+
+    pool = SnapshotPool(str(tmp_path), slots=3, keep=4)
+    assert pool.assignments() == []
+    for step, v in enumerate([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]):
+        pool.save(P(v), step)
+    assert len(pool.archive) == 4  # keep=4 pruned oldest
+    import random as r
+
+    picks = pool.assignments(r.Random(0))
+    assert len(picks) == 3
+    assert picks[0] == pool.archive[-1]  # slot 0 = latest
+    assert len(set(picks)) == 3  # without replacement when possible

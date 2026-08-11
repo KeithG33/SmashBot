@@ -177,14 +177,21 @@ class RolloutConfig:
     num_envs: int = 8
     unroll_length: int = 240  # 4s, slippi-ai's RL rollout length
     batch_steps: int = 1  # frames per inference flush; measured best on this rig (see docs)
-    opponent: str = "teacher"  # "teacher" | "cpu:<level>"
     bot_char: str = "FOX"
-    opponent_char: str = "FOX"
     stage: str = "FINAL_DESTINATION"
     games_per_dolphin: int = 20
+    # Opponent pool partition (see rl/pool.py). Defaults replicate the
+    # simple all-teacher setup; production: cpu_envs=8, teacher_envs=16,
+    # snapshot_slots=5 at num_envs=64.
+    cpu_envs: int = 0
+    teacher_envs: int = 8
+    snapshot_slots: int = 0
+    main12_prob: float = 0.6
+    snapshot_interval: int = 500  # learner steps between student snapshots
+    partition_seed: int = 0
 
 
-def _env_process_main(idx: int, cfg: "RolloutConfig", conn) -> None:
+def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
     """One Dolphin per PROCESS (multiple libmelee Consoles cannot share a
     process — the vendor's envs.py reaches the same conclusion). Speaks over
     a Pipe: sends per-frame payloads, receives {port: Controller} commands
@@ -216,14 +223,21 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", conn) -> None:
     # by test_worker_side_encode_matches_policy_encode).
     embed_game = embed_lib.EmbedConfig().make_game_embedding()
 
-    opp = game_lib.Opponent.parse(
-        cfg.opponent if cfg.opponent.startswith("cpu")
-        else f"cpu:9:{cfg.opponent_char}"  # placeholder; ckpt/teacher use AI
-    )
+    opp_port = 3 - spec.student_port
+    if spec.kind == "cpu":
+        opponent_player = dolphin_lib.CPU(
+            character=melee.Character[spec.opponent_char.upper()],
+            level=spec.cpu_level,
+        )
+    else:
+        opponent_player = dolphin_lib.AI(
+            character=melee.Character[spec.opponent_char.upper()]
+        )
     players = {
-        1: dolphin_lib.AI(character=melee.Character[cfg.bot_char.upper()]),
-        2: dolphin_lib.AI(character=melee.Character[cfg.opponent_char.upper()])
-        if cfg.opponent == "teacher" else opp.make_player(),
+        spec.student_port: dolphin_lib.AI(
+            character=melee.Character[cfg.bot_char.upper()]
+        ),
+        opp_port: opponent_player,
     }
     # Carried across Dolphin recycles: the new instance's first frame must
     # still announce the game boundary (fresh recurrent state, zeroed reward)
@@ -288,18 +302,39 @@ class DolphinRolloutWorker:
         self,
         config: RolloutConfig,
         student: BatchedPolicyAgent,
-        opponent: BatchedPolicyAgent | None,  # None -> in-game CPU opponent
+        opponents: dict | None = None,  # {"teacher": agent, ("slot", i): agent}
+        specs: list | None = None,  # per-env EnvSpec; default from make_partition
     ):
         # Imported lazily: this class needs Dolphin, the rest of the module
         # doesn't.
         from smashbot.eval import game as game_lib
 
+        from smashbot.rl.pool import make_partition
+
         self.config = config
         self.student = student
-        self.opponent = opponent
+        self.specs = specs or make_partition(
+            config.num_envs, config.cpu_envs, config.teacher_envs,
+            config.snapshot_slots, config.main12_prob, config.partition_seed,
+        )
+        assert len(self.specs) == config.num_envs
+        self.opponents = opponents or {}
+        # group name -> env index list (fixed membership = stable batch shapes)
+        self.groups: dict = {}
+        for i, spec in enumerate(self.specs):
+            if spec.kind == "teacher":
+                self.groups.setdefault("teacher", []).append(i)
+            elif spec.kind == "snapshot":
+                self.groups.setdefault(("slot", spec.group), []).append(i)
+        for name, idx in self.groups.items():
+            assert name in self.opponents, f"no agent supplied for group {name}"
+            assert self.opponents[name].num_envs == len(idx)
+        self.seat2 = torch.tensor(
+            [sp.student_port == 2 for sp in self.specs]
+        )
         self.game_lib = game_lib
         self.assembler = ChunkAssembler(config.unroll_length, student.delay)
-        self.game_tracker = GameTracker()
+        self.trackers = {k: GameTracker() for k in ("cpu", "teacher", "snapshot")}
         self._procs: list = []
         self._conns: list = []
 
@@ -313,7 +348,7 @@ class DolphinRolloutWorker:
             parent, child = ctx.Pipe()
             # non-daemon: libmelee's slippstream forks its own child
             p = ctx.Process(
-                target=_env_process_main, args=(i, self.config, child)
+                target=_env_process_main, args=(i, self.config, self.specs[i], child)
             )
             p.start()
             self._procs.append(p)
@@ -368,13 +403,20 @@ class DolphinRolloutWorker:
 
         while len(out) < num_trajectories:
             payloads = self._gather_all()
-            for p in payloads:
+            for i, p in enumerate(payloads):
                 if p.get("final_stocks") is not None:
-                    self.game_tracker.add_game(p["final_stocks"])
+                    a, b = p["final_stocks"]  # (port1, port2)
+                    if self.specs[i].student_port == 2:
+                        a, b = b, a
+                    self.trackers[self.specs[i].kind].add_game((a, b))
             resets = torch.tensor([p["resetting"] for p in payloads])
 
             stocks = torch.tensor([p["stocks"] for p in payloads], dtype=torch.float32)
             percent = torch.tensor([p["percent"] for p in payloads], dtype=torch.float32)
+            # payloads are (port1, port2); flip seat-2 rows -> (student, opp)
+            flip = self.seat2
+            stocks[flip] = stocks[flip].flip(-1)
+            percent[flip] = percent[flip].flip(-1)
             if self._frame_count > 0:
                 self.assembler.push_reward(
                     compute_reward(
@@ -386,31 +428,54 @@ class DolphinRolloutWorker:
                 for i in range(len(payloads)):
                     if resets[i]:
                         continue  # boundary artifacts belong to no game
+                    tracker = self.trackers[self.specs[i].kind]
                     if stocks[i, 0] < self._prev_stocks[i, 0]:
-                        self.game_tracker.add_death(float(self._prev_percent[i, 0]))
+                        tracker.add_death(float(self._prev_percent[i, 0]))
                     if stocks[i, 1] < self._prev_stocks[i, 1]:
-                        self.game_tracker.add_kill(float(self._prev_percent[i, 1]))
+                        tracker.add_kill(float(self._prev_percent[i, 1]))
             self._prev_stocks, self._prev_percent = stocks, percent
 
             games = [p["game"] for p in payloads]
-            states = self._encode(games)
+            encoded = self._encode(games)
+            # perspective swap commutes with encoding: both seat views are
+            # pointer swaps of one encoded struct. The parser fixes p0=port1;
+            # each agent must see ITSELF as p0, so seat-2 envs get the
+            # swapped view (per-leaf where over the seat mask).
+            swapped = encoded._replace(p0=encoded.p1, p1=encoded.p0)
+            seat2 = self.seat2.to(device)
+
+            def mix(a, b):  # a where seat2 else b, per leaf
+                return tree.map_structure(
+                    lambda x, y: torch.where(
+                        seat2.view(-1, *([1] * (x.dim() - 1))), x, y
+                    ),
+                    a, b,
+                )
+
+            student_view = mix(swapped, encoded)
+            opponent_view = mix(encoded, swapped)
             resets_dev = resets.to(device)
             pending_resets.append(resets_dev)
             controllers1, records, hidden_before = self.student.step(
-                states, resets_dev
+                student_view, resets_dev
             )
 
-            controllers2 = None
-            if self.opponent is not None:
-                # perspective swap commutes with encoding: build the opponent
-                # view from the encoded struct (pointer swap, no second pass)
-                opp_states = states._replace(p0=states.p1, p1=states.p0)
-                controllers2, _, _ = self.opponent.step(opp_states, resets_dev)
+            opp_controllers: dict[int, tp.Any] = {}
+            for name, idx in self.groups.items():
+                agent = self.opponents[name]
+                sel = torch.tensor(idx, device=device)
+                group_view = tree.map_structure(
+                    lambda x: x.index_select(0, sel), opponent_view
+                )
+                ctrls, _, _ = agent.step(group_view, resets_dev[sel])
+                for j, env_i in enumerate(idx):
+                    opp_controllers[env_i] = ctrls[j]
 
             for i, conn in enumerate(self._conns):
-                cmd = {1: controllers1[i]}
-                if controllers2 is not None:
-                    cmd[2] = controllers2[i]
+                port = self.specs[i].student_port
+                cmd = {port: controllers1[i]}
+                if i in opp_controllers:
+                    cmd[3 - port] = opp_controllers[i]
                 conn.send(cmd)
 
             for j, record in enumerate(records):

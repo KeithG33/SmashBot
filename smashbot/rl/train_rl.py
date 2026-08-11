@@ -151,13 +151,50 @@ def main() -> None:
         policy, args.rollouts.num_envs, name_code=name_code, device=device,
         batch_steps=args.rollouts.batch_steps,
     )
-    opponent_agent = None
-    if args.rollouts.opponent == "teacher":
-        opponent_agent = BatchedPolicyAgent(
-            teacher, args.rollouts.num_envs, name_code=name_code, device=device,
-            batch_steps=args.rollouts.batch_steps,
+
+    from smashbot.rl.pool import SnapshotPool, make_partition
+
+    rcfg = args.rollouts
+    specs = make_partition(
+        rcfg.num_envs, rcfg.cpu_envs, rcfg.teacher_envs,
+        rcfg.snapshot_slots, rcfg.main12_prob, rcfg.partition_seed,
+    )
+    opponents = {}
+    slot_policies = []
+    counts = {}
+    for spec in specs:
+        key = "teacher" if spec.kind == "teacher" else (
+            ("slot", spec.group) if spec.kind == "snapshot" else None
         )
-    worker = DolphinRolloutWorker(args.rollouts, student_agent, opponent_agent)
+        if key is not None:
+            counts[key] = counts.get(key, 0) + 1
+    if "teacher" in counts:
+        opponents["teacher"] = BatchedPolicyAgent(
+            teacher, counts["teacher"], name_code=name_code, device=device,
+            batch_steps=rcfg.batch_steps,
+        )
+    for key, n in counts.items():
+        if key == "teacher":
+            continue
+        slot_policy, _, _ = load_policy(args.ckpt, device)  # init = teacher
+        slot_policy.train_value_head = False
+        slot_policy.requires_grad_(False)
+        slot_policy.eval()
+        if args.runtime.compile:
+            mode = "reduce-overhead" if device == "cuda" else "default"
+            slot_policy.sample = torch.compile(slot_policy.sample, mode=mode)
+        slot_policies.append((key[1], slot_policy))
+        opponents[key] = BatchedPolicyAgent(
+            slot_policy, n, name_code=name_code, device=device,
+            batch_steps=rcfg.batch_steps,
+        )
+    snapshot_pool = SnapshotPool(
+        f"{args.runtime.run_dir}/{args.runtime.tag}/snapshots",
+        slots=rcfg.snapshot_slots,
+    )
+    worker = DolphinRolloutWorker(
+        args.rollouts, student_agent, opponents=opponents, specs=specs
+    )
 
     import wandb
 
@@ -173,6 +210,22 @@ def main() -> None:
     t0 = time.time()
     try:
         for i in range(start_step, args.runtime.steps):
+            if (
+                rcfg.snapshot_slots
+                and i > 0
+                and i % rcfg.snapshot_interval == 0
+            ):
+                snapshot_pool.save(policy, i)
+                import random as _random
+
+                assigns = snapshot_pool.assignments(_random.Random(i))
+                for slot, slot_policy in slot_policies:
+                    if slot < len(assigns):
+                        slot_policy.load_state_dict(
+                            torch.load(assigns[slot], map_location=device)
+                        )
+                print(f"[{i}] snapshot saved; slots refreshed")
+
             if i > 0 and i % args.runtime.teacher_check_interval == 0:
                 new_teacher = watcher.poll()
                 if new_teacher is not None:
@@ -201,17 +254,24 @@ def main() -> None:
                 })
                 log["rl/reverted"] = float(metrics["reverted"])
                 log["rl/teacher_swaps"] = teacher_swaps
-                for k, v in worker.game_tracker.stats().items():
-                    log["rl/" + k] = v
+                for kind, tracker in worker.trackers.items():
+                    for k, v in tracker.stats().items():
+                        log[f"rl/{kind}/{k}"] = v
                 log["rl/frames_per_sec"] = frames / (time.time() - t0)
                 wandb.log(log, step=i)
+                games = sum(
+                    log.get(f"rl/{k}/games_played", 0)
+                    for k in ("cpu", "teacher", "snapshot")
+                )
                 print(
                     f"[{i:4d}/{args.runtime.steps}] "
-                    f"win {log.get('rl/win_rate_recent', 0.5):.0%} "
-                    f"({log.get('rl/games_played', 0):.0f}g) "
-                    f"stocks {log.get('rl/avg_stock_diff', 0):+.2f} | "
-                    f"kill@{log.get('rl/avg_percent_at_kill', 0):.0f}% "
-                    f"die@{log.get('rl/avg_percent_at_death', 0):.0f}% | "
+                    f"T:{log.get('rl/teacher/win_rate_recent', 0.5):.0%}"
+                    f"/{log.get('rl/teacher/avg_stock_diff', 0):+.1f} "
+                    f"S:{log.get('rl/snapshot/win_rate_recent', 0.5):.0%} "
+                    f"C:{log.get('rl/cpu/win_rate_recent', 0.5):.0%} "
+                    f"({games:.0f}g) | "
+                    f"kill@{log.get('rl/teacher/avg_percent_at_kill', 0):.0f}% "
+                    f"die@{log.get('rl/teacher/avg_percent_at_death', 0):.0f}% | "
                     f"tKL {log['rl/teacher_kl']:.4f} "
                     f"aKL {log['rl/actor_kl_mean']:.5f} "
                     f"{'REVERTED ' if log['rl/reverted'] else ''}| "
