@@ -55,6 +55,10 @@ def main() -> None:
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--profile", action="store_true",
                     help="print per-stage agent timings with each report")
+    ap.add_argument("--pin-cores", type=int, default=8,
+                    help="pin inference to the first N cores AFTER Dolphin "
+                         "spawns (Dolphin keeps the full mask) to cut cache/"
+                         "scheduler contention; 0 disables")
     args = ap.parse_args()
 
     # batch-1 CPU inference is fastest at ~8 threads: more threads add
@@ -89,6 +93,10 @@ def main() -> None:
         policy, own_port=1, opponent_port=2, name_code=name_code,
         console_delay=0, temperature=args.temperature, device=args.device,
     )
+    if args.pin_cores and args.device == "cpu":
+        import os
+
+        os.sched_setaffinity(0, set(range(args.pin_cores)))
 
     frames = 0
     step_times: list[float] = []
@@ -106,8 +114,9 @@ def main() -> None:
             if args.profile and hasattr(agent, "stage_ms"):
                 print("  stages: " + " ".join(
                     f"{k}={v:.2f}ms" for k, v in agent.stage_ms.items()))
-            if mean_ms > 12 and not args.headless:
-                print("WARNING: too slow for real-time play")
+            if mean_ms > 16.0 and not args.headless:
+                print("WARNING: at/over the 16.7ms frame budget — "
+                      "inputs may drop")
         return bool(args.max_frames and frames >= args.max_frames)
 
     try:
