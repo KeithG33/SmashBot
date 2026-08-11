@@ -168,6 +168,10 @@ class _Fixed(tp.NamedTuple):
     teacher_logits: tp.Any  # controller struct, [B, T]
     actor_logits: tp.Any  # controller struct, [B, T]
     actor_log_probs: torch.Tensor  # [B, T]
+    valid: torch.Tensor  # [B, T] float; 0 where position t's target is the
+    # reset-substituted neutral at t+1 (a fictional action the actor never
+    # sampled — the AR head's teacher-forcing chains diverge there and the
+    # position carries no legitimate learning signal)
 
 
 class Learner:
@@ -260,6 +264,7 @@ class Learner:
             teacher_logits=teacher_out.logits,
             actor_logits=actor_logits,
             actor_log_probs=actor_log_probs,
+            valid=(~traj.is_resetting[:, 1:]).float(),
         )
         # Detach carried recurrent states: the next chunk's backward must not
         # reach into this chunk's (already-freed) graph.
@@ -276,9 +281,12 @@ class Learner:
             fixed.frames, fixed.initial_policy_state, discount=cfg.discount
         )
 
+        valid = fixed.valid
+        n_valid = valid.sum().clamp(min=1.0)
         log_rhos = out.log_probs - fixed.actor_log_probs
-        raw_abs_max = log_rhos.detach().abs().max().item()
-        anomalies = int((log_rhos.detach().abs() > cfg.ppo.log_rho_clamp).sum().item())
+        masked_abs = (log_rhos.detach().abs() * valid)
+        raw_abs_max = masked_abs.max().item()
+        anomalies = int((masked_abs > cfg.ppo.log_rho_clamp).sum().item())
         if anomalies:
             self._dump_anomaly(log_rhos, fixed)
             log_rhos = torch.clamp(
@@ -296,22 +304,24 @@ class Learner:
         actor_kl = self._ops.kl(fixed.actor_logits, out.logits)
         entropy = self._ops.entropy(out.logits)
 
-        loss = (
+        per_pos = (
             -cfg.policy_gradient_weight * surrogate
             + cfg.ppo.beta * actor_kl
             + cfg.kl_teacher_weight * teacher_kl
             + cfg.reverse_kl_teacher_weight * reverse_teacher_kl
             - cfg.entropy_weight * entropy
-        ).mean()
+        )
+        loss = (per_pos * valid).sum() / n_valid
 
+        vmean = lambda t: ((t * valid).sum() / n_valid).item()
         metrics = {
             "loss": loss.item(),
-            "surrogate": surrogate.mean().item(),
-            "teacher_kl": teacher_kl.mean().item(),
-            "actor_kl_mean": actor_kl.mean().item(),
-            "actor_kl_max": actor_kl.max().item(),
-            "entropy": entropy.mean().item(),
-            "ratio_mean": log_rhos.exp().mean().item(),
+            "surrogate": vmean(surrogate),
+            "teacher_kl": vmean(teacher_kl),
+            "actor_kl_mean": vmean(actor_kl),
+            "actor_kl_max": (actor_kl * valid).max().item(),
+            "entropy": vmean(entropy),
+            "ratio_mean": vmean(log_rhos.exp() * valid + (1 - valid)),
             "log_rho_abs_max": raw_abs_max,
             "anomalous_samples": anomalies,
         }

@@ -397,3 +397,49 @@ def test_pool_partition_and_snapshots(tmp_path):
     assert len(picks) == 3
     assert picks[0] == pool.archive[-1]  # slot 0 = latest
     assert len(set(picks)) == 3  # without replacement when possible
+
+
+def test_reset_target_positions_masked():
+    """Regression (rl-ab-base2 NaN): at t = reset-1 the stream's next-action
+    is the reset-substituted neutral — a fictional target the actor never
+    sampled, whose AR teacher-forcing chain diverges from the recorded
+    logits. Those positions must be masked out: fresh learner over a rollout
+    CONTAINING resets keeps ratio ~= 1 with zero anomalous samples."""
+    torch.manual_seed(0)
+    policy = _tiny_policy(seed=0)
+    teacher = _tiny_policy(seed=0)
+    learner = Learner(
+        RLConfig(ppo=PPOConfig(max_mean_actor_kl=1.0)), policy, teacher,
+        _tiny_value(),
+    )
+    N, T = 2, 6
+    agent = BatchedPolicyAgent(policy, num_envs=N)
+    asm = ChunkAssembler(unroll_length=T, delay=policy.delay)
+    rng = np.random.default_rng(5)
+    game_embed = dict(policy.network.embed_state_action.embedding)["state"]
+
+    t = 0
+    traj = None
+    while traj is None:
+        resets = torch.zeros(N, dtype=torch.bool)
+        if t in (2, 4):
+            resets[t % N] = True  # mid-chunk game boundaries
+        if t > 0:
+            asm.push_reward(torch.zeros(N))
+        snap = agent.hidden_snapshot() if t % T == 0 else None
+        _, records, _ = agent.step(_rand_states(game_embed, (N,), rng), resets)
+        (record,) = records
+        asm.push_frame(record, resets, snap)
+        if asm.ready():
+            traj = asm.emit()
+        t += 1
+
+    assert traj.is_resetting.any(), "test must exercise resets"
+    fixed, _, _ = learner._fixed_pass(traj, learner.initial_state(N))
+    # the masked positions exist
+    assert fixed.valid.min().item() == 0.0
+    with torch.no_grad():
+        _, metrics = learner._policy_loss(fixed)
+    assert metrics["anomalous_samples"] == 0
+    assert metrics["ratio_mean"] == pytest.approx(1.0, abs=1e-3)
+    assert metrics["actor_kl_mean"] == pytest.approx(0.0, abs=1e-4)
