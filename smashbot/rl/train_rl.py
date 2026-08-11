@@ -23,6 +23,7 @@ from smashbot.networks import build_embed_network
 from smashbot.rl.agent import BatchedPolicyAgent
 from smashbot.rl.ppo import Learner, RLConfig
 from smashbot.rl.rollouts import DolphinRolloutWorker, RolloutConfig
+from smashbot.rl.teacher_watch import TeacherWatcher
 from smashbot.value import ValueFunction
 
 
@@ -37,6 +38,11 @@ class RuntimeConfig:
     wandb_mode: str = "online"
     name: str = "Master Player"
     compile: bool = True  # compile sample_n (the batched flush)
+    # Hot-swappable teacher: poll this path (default: the --ckpt file) every
+    # teacher_check_interval learner steps; on change, safely reload the
+    # frozen teacher in place (see rl/teacher_watch.py).
+    teacher_watch: str = ""
+    teacher_check_interval: int = 20
     device: str = "cpu"  # rollouts are CPU-bound; learner device
 
 
@@ -143,9 +149,22 @@ def main() -> None:
 
     run_dir = f"{args.runtime.run_dir}/{args.runtime.tag}"
     state = learner.initial_state(args.rollouts.num_envs, device)
+    watcher = TeacherWatcher(args.runtime.teacher_watch or args.ckpt)
+    teacher_swaps = 0
     t0 = time.time()
     try:
         for i in range(args.runtime.steps):
+            if i > 0 and i % args.runtime.teacher_check_interval == 0:
+                new_teacher = watcher.poll()
+                if new_teacher is not None:
+                    teacher.load_state_dict(new_teacher)  # in-place copy
+                    state = state._replace(
+                        teacher=teacher.initial_state(
+                            args.rollouts.num_envs, device
+                        )
+                    )
+                    teacher_swaps += 1
+                    print(f"[{i}] TEACHER SWAPPED (#{teacher_swaps})")
             trajectories = worker.collect(args.runtime.trajectories_per_step)
             state, metrics = learner.step(trajectories, state)
 
@@ -162,6 +181,7 @@ def main() -> None:
                     "rl/value_" + k: v for k, v in metrics["value"].items()
                 })
                 log["rl/reverted"] = float(metrics["reverted"])
+                log["rl/teacher_swaps"] = teacher_swaps
                 log["rl/frames_per_sec"] = frames / (time.time() - t0)
                 wandb.log(log, step=i)
                 print(f"[{i}] {log}")

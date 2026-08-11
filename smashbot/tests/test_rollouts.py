@@ -284,3 +284,55 @@ def test_worker_side_encode_matches_policy_encode():
         _rand_raw_game(worker_embed, (), rng),
     )
     worker_embed.from_state(scalar_game)  # must not raise
+
+
+def test_teacher_watcher_and_hot_swap(tmp_path):
+    """Watcher ignores unchanged/torn files, loads complete updates; swapping
+    the learner's teacher in place changes teacher_kl and survives a step."""
+    import os
+    import time as time_lib
+
+    from smashbot.rl.teacher_watch import TeacherWatcher
+    from smashbot.tests.test_ppo import _make_learner
+
+    learner, traj = _make_learner(ppo=PPOConfig(max_mean_actor_kl=1.0))
+    path = tmp_path / "best.pt"
+
+    def write_ckpt(policy):
+        tmp = str(path) + ".tmp"
+        torch.save({"state": {"policy": policy.state_dict()}}, tmp)
+        os.replace(tmp, path)
+
+    write_ckpt(learner.teacher)
+    watcher = TeacherWatcher(str(path), settle_seconds=0.05)
+    assert watcher.poll() is None  # unchanged since construction
+
+    # a DIFFERENT teacher lands (atomic replace)
+    from smashbot.tests.test_ppo import _tiny_policy
+    other = _tiny_policy(seed=123)
+    time_lib.sleep(0.02)
+    write_ckpt(other)
+    sd = watcher.poll()
+    assert sd is not None
+    assert watcher.poll() is None  # consumed; no re-trigger
+
+    # torn write: partial garbage without atomic replace -> skipped, no raise
+    with open(path, "wb") as f:
+        f.write(b"partial garbage")
+    assert watcher.poll() is None
+
+    # hot swap: teacher_kl was ~0 (teacher == policy init); after swapping in
+    # a different teacher it must be > 0, and a learner step still runs
+    state = learner.initial_state(3)
+    fixed, _, _ = learner._fixed_pass(traj, state)
+    with torch.no_grad():
+        _, before = learner._policy_loss(fixed)
+    learner.teacher.load_state_dict(sd)
+    state = state._replace(teacher=learner.teacher.initial_state(3))
+    fixed, state, _ = learner._fixed_pass(traj, learner.initial_state(3))
+    with torch.no_grad():
+        _, after = learner._policy_loss(fixed)
+    assert before["teacher_kl"] == pytest.approx(0.0, abs=1e-5)
+    assert after["teacher_kl"] > 0.01
+    _, metrics = learner.step([traj], learner.initial_state(3))
+    assert np.isfinite(metrics["post_update"]["loss"])
