@@ -43,6 +43,7 @@ class RuntimeConfig:
     # frozen teacher in place (see rl/teacher_watch.py).
     teacher_watch: str = ""
     teacher_check_interval: int = 80  # ~20 min at 64 envs (one step ~15s)
+    restore: str = ""  # RL checkpoint path, or "auto" for <run_dir>/<tag>/latest.pt
     device: str = "cpu"  # rollouts are CPU-bound; learner device
 
 
@@ -93,6 +94,8 @@ def _save_rl_checkpoint(
             "state": {
                 "policy": policy.state_dict(),
                 "value": value_fn.state_dict(),
+                "policy_opt": _save_rl_checkpoint.policy_opt.state_dict(),
+                "value_opt": _save_rl_checkpoint.value_opt.state_dict(),
                 "name_map": name_map,
                 "step": step,
                 "teacher_ckpt": teacher,
@@ -121,6 +124,22 @@ def main() -> None:
     print(f"teacher/init: {args.ckpt} (BC step {step}); conditioning code {name_code}")
 
     learner = Learner(args.learner, policy, teacher, value_fn)
+
+    start_step = 0
+    if args.runtime.restore:
+        rpath = args.runtime.restore
+        if rpath == "auto":
+            rpath = f"{args.runtime.run_dir}/{args.runtime.tag}/latest.pt"
+        rl_ckpt = saving.load_checkpoint(rpath)
+        policy.load_state_dict(rl_ckpt["state"]["policy"])
+        value_fn.load_state_dict(rl_ckpt["state"]["value"])
+        if "policy_opt" in rl_ckpt["state"]:
+            learner.policy_optimizer.load_state_dict(rl_ckpt["state"]["policy_opt"])
+            learner.value_optimizer.load_state_dict(rl_ckpt["state"]["value_opt"])
+        start_step = rl_ckpt["state"]["step"] + 1
+        print(f"restored RL run from {rpath} at step {start_step}")
+    _save_rl_checkpoint.policy_opt = learner.policy_optimizer
+    _save_rl_checkpoint.value_opt = learner.value_optimizer
 
     if args.runtime.compile:
         mode = "reduce-overhead" if device == "cuda" else "default"
@@ -153,7 +172,7 @@ def main() -> None:
     teacher_swaps = 0
     t0 = time.time()
     try:
-        for i in range(args.runtime.steps):
+        for i in range(start_step, args.runtime.steps):
             if i > 0 and i % args.runtime.teacher_check_interval == 0:
                 new_teacher = watcher.poll()
                 if new_teacher is not None:

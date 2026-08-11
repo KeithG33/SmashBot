@@ -12,6 +12,10 @@ Two layers:
 Rewards are computed directly from gamestate deltas (stocks/percent), zeroed
 at game boundaries; slippi-ai's shaping penalties (ledge/stall) can be added
 here later via their reward lib.
+
+NOTE: env processes use the multiprocessing 'spawn' context, which re-imports
+the caller's __main__ — any script that builds a DolphinRolloutWorker MUST
+guard its entrypoint with `if __name__ == "__main__":`.
 """
 
 from __future__ import annotations
@@ -211,6 +215,12 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", conn) -> None:
         2: dolphin_lib.AI(character=melee.Character[cfg.opponent_char.upper()])
         if cfg.opponent == "teacher" else opp.make_player(),
     }
+    # Carried across Dolphin recycles: the new instance's first frame must
+    # still announce the game boundary (fresh recurrent state, zeroed reward)
+    # and deliver the final game's result — otherwise two different games
+    # would silently splice into one stream.
+    pending_reset = False
+    pending_result = None
     try:
         while True:
             dolphin = game_lib.make_dolphin(players, headless=True, stage=cfg.stage)
@@ -220,14 +230,17 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", conn) -> None:
             last_stocks = None
             try:
                 for gs in dolphin.iter_gamestates(skip_menu_frames=True):
-                    resetting = last_frame is not None and gs.frame < last_frame
-                    result = None
-                    if resetting:
-                        parser = Parser(ports=[1, 2])
+                    boundary = last_frame is not None and gs.frame < last_frame
+                    resetting = boundary or pending_reset
+                    result = pending_result if pending_reset else None
+                    pending_reset, pending_result = False, None
+                    if boundary:
                         games += 1
                         result = last_stocks  # ended game's final (bot, opp)
                         if games >= cfg.games_per_dolphin:
+                            pending_reset, pending_result = True, result
                             break
+                        parser = Parser(ports=[1, 2])
                     last_frame = gs.frame
                     raw = tree_lib.map_structure(
                         np.asarray, parser.get_game(gs)
