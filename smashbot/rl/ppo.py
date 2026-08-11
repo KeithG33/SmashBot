@@ -52,6 +52,10 @@ class PPOConfig:
     # eps=1e-2 regime needs it rescaled to the actual ratio spread (~0.02).
     dclamp_alpha: float = 0.0
     dclamp_beta: float = 0.02
+    # Anomaly armor: |log ratio| beyond this is data corruption, not policy
+    # drift (one update moves aKL ~1e-5; e^10 is impossible drift). Clamped
+    # for the surrogate; occurrences logged + first few dumped for forensics.
+    log_rho_clamp: float = 10.0
 
 
 @dataclasses.dataclass
@@ -62,7 +66,7 @@ class RLConfig:
     reverse_kl_teacher_weight: float = 0.0
     entropy_weight: float = 0.0
     reward_halflife: float = 4.0  # seconds
-    max_grad_norm: float = 0.0  # 0 = no clipping
+    max_grad_norm: float = 1.0  # 0 = no clipping
     ppo: PPOConfig = dataclasses.field(default_factory=PPOConfig)
 
     @property
@@ -273,6 +277,13 @@ class Learner:
         )
 
         log_rhos = out.log_probs - fixed.actor_log_probs
+        raw_abs_max = log_rhos.detach().abs().max().item()
+        anomalies = int((log_rhos.detach().abs() > cfg.ppo.log_rho_clamp).sum().item())
+        if anomalies:
+            self._dump_anomaly(log_rhos, fixed)
+            log_rhos = torch.clamp(
+                log_rhos, -cfg.ppo.log_rho_clamp, cfg.ppo.log_rho_clamp
+            )
         surrogate = clipped_surrogate(
             log_rhos, fixed.advantages, cfg.ppo.epsilon,
             dclamp_alpha=cfg.ppo.dclamp_alpha, dclamp_beta=cfg.ppo.dclamp_beta,
@@ -301,8 +312,35 @@ class Learner:
             "actor_kl_max": actor_kl.max().item(),
             "entropy": entropy.mean().item(),
             "ratio_mean": log_rhos.exp().mean().item(),
+            "log_rho_abs_max": raw_abs_max,
+            "anomalous_samples": anomalies,
         }
         return loss, metrics
+
+    _anomaly_dumps = 0
+
+    def _dump_anomaly(self, log_rhos: torch.Tensor, fixed: _Fixed) -> None:
+        """Forensics for corrupted samples: where in the batch/time, near
+        resets?, magnitudes. First 3 occurrences save full tensors."""
+        bad = (log_rhos.detach().abs() > self.config.ppo.log_rho_clamp)
+        idx = bad.nonzero()[:8].tolist()
+        near_reset = fixed.frames.is_resetting.any(dim=1)
+        print(f"ANOMALY: {bad.sum().item()} samples |log_rho|>"
+              f"{self.config.ppo.log_rho_clamp} at (env,t)={idx}; "
+              f"env-has-reset={[bool(near_reset[e]) for e, _ in idx]}")
+        if Learner._anomaly_dumps < 3:
+            Learner._anomaly_dumps += 1
+            import time as _time
+
+            path = f"/tmp/smashbot-anomaly-{int(_time.time())}.pt"
+            torch.save(
+                {"log_rhos": log_rhos.detach().cpu(),
+                 "actor_log_probs": fixed.actor_log_probs.cpu(),
+                 "advantages": fixed.advantages.cpu(),
+                 "is_resetting": fixed.frames.is_resetting.cpu()},
+                path,
+            )
+            print(f"ANOMALY: dumped {path}")
 
     def step(
         self, trajectories: tp.Sequence[Trajectory], state: LearnerState
@@ -331,6 +369,10 @@ class Learner:
             batch_metrics = []
             for fixed in fixed_list:
                 loss, metrics = self._policy_loss(fixed)
+                if not torch.isfinite(loss):
+                    print("NONFINITE LOSS: skipping minibatch")
+                    batch_metrics.append(metrics)
+                    continue
                 (loss / len(fixed_list)).backward()
                 batch_metrics.append(metrics)
             if cfg.max_grad_norm > 0:
@@ -360,8 +402,10 @@ def _mean_dicts(dicts: tp.Sequence[dict]) -> dict:
     out = {}
     for key in dicts[0]:
         vals = [d[key] for d in dicts]
-        if key == "actor_kl_max":
+        if key in ("actor_kl_max", "log_rho_abs_max"):
             out[key] = max(vals)
+        elif key == "anomalous_samples":
+            out[key] = sum(vals)
         else:
             out[key] = sum(vals) / len(vals)
     return out
