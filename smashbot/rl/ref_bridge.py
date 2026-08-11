@@ -1,10 +1,13 @@
 """Bridge to a slippi-ai (TensorFlow) reference opponent — e.g. medium-v2 —
 running in the venv-ref subprocess (scripts/ref_server.py).
 
-STATUS: scaffolding, not yet live-tested; worker integration (EnvSpec kind
-"reference", raw-game payload forwarding) lands with the first live test.
-Nothing imports this module unless a pool config sets ref_envs > 0, so it
-is inert for the A/B runs.
+LIVE-VERIFIED in the rollout worker (2-env smoke, ~16ms/tick at batch 1).
+Nothing imports this module unless a pool config sets ref_envs > 0.
+
+The worker uses the split send()/recv() pair so the TF subprocess computes
+concurrently with our GPU groups' inference — only recv() blocks, and only
+for whatever TF time wasn't hidden. step() = send+recv for simple callers
+(batteries, tests).
 """
 
 from __future__ import annotations
@@ -45,14 +48,23 @@ class RefBridge:
         self.proc.stdin.write(payload)
         self.proc.stdin.flush()
 
-    def step(self, games: list, needs_reset: list) -> list:
-        """games: RAW parsed slippi-ai Game structs (their encoding happens
-        server-side); returns per-env controller states."""
+    def send(self, games: list, needs_reset: list) -> None:
+        """Fire an inference request without waiting; pair with recv().
+        games: RAW parsed slippi-ai Game structs (their encoding happens
+        server-side)."""
         self._write({"games": games, "needs_reset": needs_reset})
+
+    def recv(self) -> list:
+        """Block until the reply for the last send(); returns per-env
+        controller states."""
         reply = self._read()
         if reply is None:
             raise RuntimeError("ref server died")
         return reply["controllers"]
+
+    def step(self, games: list, needs_reset: list) -> list:
+        self.send(games, needs_reset)
+        return self.recv()
 
     def stop(self) -> None:
         try:

@@ -498,25 +498,24 @@ class DolphinRolloutWorker:
             opponent_view = mix(encoded, swapped)
             resets_dev = resets.to(device)
             pending_resets.append(resets_dev)
-            controllers1, records, hidden_before = self.student.step(
-                student_view, resets_dev
-            )
-
-            opp_controllers: dict[int, tp.Any] = {}
+            # Fire the reference request first: the TF subprocess computes
+            # while we run student + opponent inference on the GPU, so only
+            # the un-hidden remainder shows up as stall in recv() below.
+            ref_stall = 0.0
             if self.ref_bridge is not None:
                 import time as time_lib
 
                 t0 = time_lib.perf_counter()
                 ref_games = [payloads[i]["raw_game"] for i in self.ref_idx]
                 ref_resets = [bool(resets[i]) for i in self.ref_idx]
-                ref_ctrls = self.ref_bridge.step(ref_games, ref_resets)
-                self.ref_step_ms = 0.9 * self.ref_step_ms + 0.1 * (
-                    1e3 * (time_lib.perf_counter() - t0)
-                )
-                for j, env_i in enumerate(self.ref_idx):
-                    opp_controllers[env_i] = tree.map_structure(
-                        lambda x: x[j], ref_ctrls
-                    )
+                self.ref_bridge.send(ref_games, ref_resets)
+                ref_stall += time_lib.perf_counter() - t0
+
+            controllers1, records, hidden_before = self.student.step(
+                student_view, resets_dev
+            )
+
+            opp_controllers: dict[int, tp.Any] = {}
             for name, idx in self.groups.items():
                 agent = self.opponents[name]
                 sel = torch.tensor(idx, device=device)
@@ -526,6 +525,21 @@ class DolphinRolloutWorker:
                 ctrls, _, _ = agent.step(group_view, resets_dev[sel])
                 for j, env_i in enumerate(idx):
                     opp_controllers[env_i] = ctrls[j]
+
+            if self.ref_bridge is not None:
+                import time as time_lib
+
+                t0 = time_lib.perf_counter()
+                ref_ctrls = self.ref_bridge.recv()
+                ref_stall += time_lib.perf_counter() - t0
+                # ref_step_ms = time actually stalled, not TF's compute time
+                self.ref_step_ms = 0.9 * self.ref_step_ms + 0.1 * (
+                    1e3 * ref_stall
+                )
+                for j, env_i in enumerate(self.ref_idx):
+                    opp_controllers[env_i] = tree.map_structure(
+                        lambda x: x[j], ref_ctrls
+                    )
 
             for i, conn in enumerate(self._conns):
                 port = self.specs[i].student_port
