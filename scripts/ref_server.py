@@ -39,10 +39,22 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--path", required=True)
     ap.add_argument("--batch-size", type=int, required=True)
+    ap.add_argument("--name", default=None,
+                    help="conditioning name (imitation states require one)")
     args = ap.parse_args()
+
+    import os
+
+    # Claim the protocol channel BEFORE any TF import: stray library prints
+    # to stdout would corrupt the pickle stream, so fd-1 gets repointed at
+    # stderr and the protocol keeps a private dup of the original stdout.
+    proto_out = os.fdopen(os.dup(1), "wb")
+    os.dup2(2, 1)
+    sys.stdout = sys.stderr
 
     # TF imports deferred until after arg parsing for fast failure
     import numpy as np
+    import tree
 
     from slippi_ai import eval_lib, saving
 
@@ -51,14 +63,17 @@ def main() -> None:
     print(f"ref agent: type={summary.type} delay={summary.delay} "
           f"chars={summary.characters}", file=sys.stderr, flush=True)
 
-    agent = eval_lib.build_basic_agent(
+    agent = eval_lib.build_delayed_agent(
         state=state,
-        batch_size=args.batch_size,
         console_delay=0,
+        name=args.name,
+        batch_size=args.batch_size,
     )
+    if hasattr(agent, "warmup") and callable(agent.warmup):
+        agent.warmup()
 
     stdin = sys.stdin.buffer
-    stdout = sys.stdout.buffer
+    stdout = proto_out
     write_msg(stdout, {"ready": True, "delay": summary.delay})
     while True:
         msg = read_msg(stdin)
@@ -66,9 +81,7 @@ def main() -> None:
             return
         games = msg["games"]
         needs_reset = np.asarray(msg["needs_reset"], dtype=bool)
-        batched = eval_lib.utils.batch_nest_nt(games) if hasattr(
-            eval_lib, "utils"
-        ) else games
+        batched = tree.map_structure(lambda *xs: np.stack(xs), *games)
         sampled = agent.step(batched, needs_reset)
         controllers = agent.decode_controller(sampled.controller_state)
         write_msg(stdout, {"controllers": controllers})
