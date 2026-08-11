@@ -121,50 +121,51 @@ def compute_reward(
     return torch.where(is_resetting, torch.zeros_like(reward), reward)
 
 
-class WinTracker:
-    """Rolling win rate vs the CURRENT training opponent (teacher now,
-    snapshot pool later). Fixed-yardstick evals stay in the M8 batteries."""
+class GameTracker:
+    """Game-outcome metrics vs the CURRENT training opponent (teacher now,
+    snapshot pool later); fixed-yardstick evals stay in the M8 batteries.
 
-    def __init__(self, window: int = 100):
+    Time-free by design: a win is a win at 2 minutes or 7. Tracks rolling
+    win rate, average final stock differential (-4..+4 dominance scale),
+    average opponent percent at our kills (low = early kills, strong punish
+    game), and average own percent at our deaths (high = hard to kill)."""
+
+    def __init__(self, window: int = 100, event_window: int = 200):
         import collections
 
-        self.recent = collections.deque(maxlen=window)
+        self.diffs = collections.deque(maxlen=window)  # per finished game
+        self.kill_percents = collections.deque(maxlen=event_window)
+        self.death_percents = collections.deque(maxlen=event_window)
         self.wins = self.losses = self.draws = 0
 
-    def add(self, result: int) -> None:
-        self.recent.append(result)
-        if result > 0:
+    def add_game(self, final_stocks: tuple[int, int]) -> None:
+        bot, opp = final_stocks
+        self.diffs.append(bot - opp)
+        if bot > opp:
             self.wins += 1
-        elif result < 0:
+        elif opp > bot:
             self.losses += 1
         else:
             self.draws += 1
 
+    def add_kill(self, opp_percent: float) -> None:
+        self.kill_percents.append(opp_percent)
+
+    def add_death(self, own_percent: float) -> None:
+        self.death_percents.append(own_percent)
+
     def stats(self) -> dict:
-        games = self.wins + self.losses + self.draws
-        decided = [r for r in self.recent if r != 0]
+        mean = lambda xs: float(sum(xs) / len(xs)) if xs else 0.0
+        decided = [d for d in self.diffs if d != 0]
         return {
-            "games_played": games,
+            "games_played": self.wins + self.losses + self.draws,
             "win_rate_recent": (
-                sum(1 for r in decided if r > 0) / len(decided) if decided else 0.5
+                sum(1 for d in decided if d > 0) / len(decided) if decided else 0.5
             ),
+            "avg_stock_diff": mean(self.diffs),
+            "avg_percent_at_kill": mean(self.kill_percents),
+            "avg_percent_at_death": mean(self.death_percents),
         }
-
-
-def outcome_stats(rewards: torch.Tensor) -> dict:
-    """Kills/deaths/damage rates from a chunk's reward tensor [N, T].
-    Kills/deaths are the +-1 events (threshold 0.5: damage terms are
-    0.01/percent and cannot reach it between deaths in one frame)."""
-    frames = rewards.numel()
-    minutes = frames / 3600.0
-    kills = (rewards > 0.5).sum().item()
-    deaths = (rewards < -0.5).sum().item()
-    net_damage = (rewards.sum().item() - (kills - deaths)) / 0.01
-    return {
-        "kills_per_min": kills / minutes,
-        "deaths_per_min": deaths / minutes,
-        "net_damage_per_min": net_damage / minutes,
-    }
 
 
 @dataclasses.dataclass
@@ -224,9 +225,7 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", conn) -> None:
                     if resetting:
                         parser = Parser(ports=[1, 2])
                         games += 1
-                        if last_stocks is not None:
-                            a, b = last_stocks
-                            result = 1 if a > b else (-1 if b > a else 0)
+                        result = last_stocks  # ended game's final (bot, opp)
                         if games >= cfg.games_per_dolphin:
                             break
                     last_frame = gs.frame
@@ -240,7 +239,7 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", conn) -> None:
                         dict(
                             game=game,
                             resetting=resetting,
-                            result=result,  # +1 bot won / -1 lost / 0 draw; None mid-game
+                            final_stocks=result,  # ended game's (bot, opp); None mid-game
                             stocks=last_stocks,
                             percent=(float(p1.percent), float(p2.percent)),
                         )
@@ -277,7 +276,7 @@ class DolphinRolloutWorker:
         self.opponent = opponent
         self.game_lib = game_lib
         self.assembler = ChunkAssembler(config.unroll_length, student.delay)
-        self.win_tracker = WinTracker()
+        self.game_tracker = GameTracker()
         self._procs: list = []
         self._conns: list = []
 
@@ -347,8 +346,8 @@ class DolphinRolloutWorker:
         while len(out) < num_trajectories:
             payloads = self._gather_all()
             for p in payloads:
-                if p.get("result") is not None:
-                    self.win_tracker.add(p["result"])
+                if p.get("final_stocks") is not None:
+                    self.game_tracker.add_game(p["final_stocks"])
             resets = torch.tensor([p["resetting"] for p in payloads])
 
             stocks = torch.tensor([p["stocks"] for p in payloads], dtype=torch.float32)
@@ -360,6 +359,14 @@ class DolphinRolloutWorker:
                         self._prev_percent, percent, resets,
                     ).to(device)
                 )
+            if self._frame_count > 0:
+                for i in range(len(payloads)):
+                    if resets[i]:
+                        continue  # boundary artifacts belong to no game
+                    if stocks[i, 0] < self._prev_stocks[i, 0]:
+                        self.game_tracker.add_death(float(self._prev_percent[i, 0]))
+                    if stocks[i, 1] < self._prev_stocks[i, 1]:
+                        self.game_tracker.add_kill(float(self._prev_percent[i, 1]))
             self._prev_stocks, self._prev_percent = stocks, percent
 
             games = [p["game"] for p in payloads]

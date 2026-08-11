@@ -338,22 +338,19 @@ def test_teacher_watcher_and_hot_swap(tmp_path):
     assert np.isfinite(metrics["post_update"]["loss"])
 
 
-def test_win_tracker_and_outcome_stats():
-    from smashbot.rl.rollouts import WinTracker, outcome_stats
+def test_game_tracker():
+    from smashbot.rl.rollouts import GameTracker
 
-    wt = WinTracker(window=4)
-    for r in [1, 1, -1, 0, 1]:  # oldest win rolls out of the window
-        wt.add(r)
-    s = wt.stats()
-    assert s["games_played"] == 5
-    assert s["win_rate_recent"] == pytest.approx(2 / 3)  # window: 1,-1,0,1
-
-    # rewards: one kill (+1 with damage riding along), one death, some chip
-    rewards = torch.zeros(2, 3600)  # 2 envs x 1 minute
-    rewards[0, 100] = 1.12   # kill (+1) + 12% damage
-    rewards[1, 200] = -1.0   # death
-    rewards[0, 300] = 0.05   # 5% chip dealt
-    stats = outcome_stats(rewards)
-    assert stats["kills_per_min"] == pytest.approx(0.5)   # 1 kill / 2 env-min
-    assert stats["deaths_per_min"] == pytest.approx(0.5)
-    assert stats["net_damage_per_min"] == pytest.approx((12 + 5) / 2, abs=0.1)
+    gt = GameTracker(window=4)
+    for fs in [(3, 0), (2, 0), (0, 1), (0, 0), (4, 0)]:  # oldest rolls out
+        gt.add_game(fs)
+    gt.add_kill(45.0)
+    gt.add_kill(95.0)
+    gt.add_death(120.0)
+    st = gt.stats()
+    assert st["games_played"] == 5
+    # window: (2,0)W (0,1)L (0,0)D (4,0)W -> decided 3, wins 2
+    assert st["win_rate_recent"] == pytest.approx(2 / 3)
+    assert st["avg_stock_diff"] == pytest.approx((2 - 1 + 0 + 4) / 4)
+    assert st["avg_percent_at_kill"] == pytest.approx(70.0)
+    assert st["avg_percent_at_death"] == pytest.approx(120.0)
