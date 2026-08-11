@@ -184,7 +184,7 @@ class RolloutConfig:
     # simple all-teacher setup; production: cpu_envs=8, teacher_envs=16,
     # snapshot_slots=5 at num_envs=64.
     cpu_envs: int = 0
-    teacher_envs: int = 8
+    teacher_envs: int = -1  # -1 = all envs not assigned to cpu/snapshots
     snapshot_slots: int = 0
     main12_prob: float = 0.6
     snapshot_interval: int = 500  # learner steps between student snapshots

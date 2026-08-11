@@ -57,10 +57,17 @@ def make_partition(
     """Fixed env partition. Snapshot envs are split evenly across slots
     (num_envs - cpu - teacher must divide evenly); seats alternate so each
     kind is port-balanced."""
+    if teacher_envs < 0:  # default: teacher takes every env not otherwise used
+        assert snapshot_slots == 0, "specify teacher_envs explicitly with slots"
+        teacher_envs = num_envs - cpu_envs
     snap_envs = num_envs - cpu_envs - teacher_envs
     assert snap_envs >= 0 and (
         snapshot_slots == 0 or snap_envs % snapshot_slots == 0
     ), "snapshot envs must divide evenly across slots"
+    assert snapshot_slots > 0 or snap_envs == 0, (
+        "leftover envs with no snapshot slots — set teacher_envs/cpu_envs "
+        "to cover num_envs"
+    )
     rng = random.Random(seed)
 
     def cpu_char() -> str:
