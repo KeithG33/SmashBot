@@ -64,14 +64,15 @@ def make_partition(
     snapshot_slots: int,
     main12_prob: float = 0.6,
     seed: int = 0,
+    ref_envs: int = 0,
 ) -> list[EnvSpec]:
     """Fixed env partition. Snapshot envs are split evenly across slots
     (num_envs - cpu - teacher must divide evenly); seats alternate so each
     kind is port-balanced."""
     if teacher_envs < 0:  # default: teacher takes every env not otherwise used
         assert snapshot_slots == 0, "specify teacher_envs explicitly with slots"
-        teacher_envs = num_envs - cpu_envs
-    snap_envs = num_envs - cpu_envs - teacher_envs
+        teacher_envs = num_envs - cpu_envs - ref_envs
+    snap_envs = num_envs - cpu_envs - teacher_envs - ref_envs
     assert snap_envs >= 0 and (
         snapshot_slots == 0 or snap_envs % snapshot_slots == 0
     ), "snapshot envs must divide evenly across slots"
@@ -91,6 +92,11 @@ def make_partition(
     for i in range(teacher_envs):
         specs.append(
             EnvSpec("teacher", -1, 1 + (i % 2), rng.choice(OPPONENT_CHARS))
+        )
+    for i in range(ref_envs):
+        # reference agent (e.g. medium-v2) plays the main 12 (user-verified)
+        specs.append(
+            EnvSpec("reference", -1, 1 + (i % 2), rng.choice(OPPONENT_CHARS))
         )
     per_slot = snap_envs // snapshot_slots if snapshot_slots else 0
     for slot in range(snapshot_slots):

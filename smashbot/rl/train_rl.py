@@ -258,10 +258,17 @@ def main() -> None:
                     for k, v in tracker.stats().items():
                         log[f"rl/{kind}/{k}"] = v
                 log["rl/frames_per_sec"] = frames / (time.time() - t0)
+                if worker.ref_idx:
+                    log["rl/ref_step_ms"] = worker.ref_step_ms
                 wandb.log(log, step=i)
                 games = sum(
                     log.get(f"rl/{k}/games_played", 0)
-                    for k in ("cpu", "teacher", "snapshot")
+                    for k in ("cpu", "teacher", "snapshot", "reference")
+                )
+                ref_bit = (
+                    f"R:{log.get('rl/reference/win_rate_recent', 0.5):.0%} "
+                    f"({worker.ref_step_ms:.1f}ms) "
+                    if worker.ref_idx else ""
                 )
                 print(
                     f"[{i:4d}/{args.runtime.steps}] "
@@ -269,6 +276,7 @@ def main() -> None:
                     f"/{log.get('rl/teacher/avg_stock_diff', 0):+.1f} "
                     f"S:{log.get('rl/snapshot/win_rate_recent', 0.5):.0%} "
                     f"C:{log.get('rl/cpu/win_rate_recent', 0.5):.0%} "
+                    f"{ref_bit}"
                     f"({games:.0f}g) | "
                     f"kill@{log.get('rl/teacher/avg_percent_at_kill', 0):.0f}% "
                     f"die@{log.get('rl/teacher/avg_percent_at_death', 0):.0f}% | "

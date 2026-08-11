@@ -189,6 +189,9 @@ class RolloutConfig:
     main12_prob: float = 0.6
     snapshot_interval: int = 500  # learner steps between student snapshots
     partition_seed: int = 0
+    # Reference opponent (slippi-ai medium-v2 via venv-ref subprocess).
+    ref_envs: int = 0
+    ref_ckpt: str = "/home/kage/drive2/ShineBot/models/medium-v2"
 
 
 def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
@@ -273,6 +276,15 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
                         np.asarray, parser.get_game(gs)
                     )
                     game = embed_game.from_state(raw)
+                    # reference opponents (slippi-ai models) do their own
+                    # encoding server-side and need the RAW struct, seen
+                    # from THEIR side (p0 = the reference agent's player)
+                    raw_for_ref = None
+                    if spec.kind == "reference":
+                        raw_for_ref = (
+                            raw if spec.student_port == 2
+                            else raw._replace(p0=raw.p1, p1=raw.p0)
+                        )
                     p1, p2 = gs.players[1], gs.players[2]
                     last_stocks = (int(p1.stock), int(p2.stock))
                     conn.send(
@@ -280,6 +292,7 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
                             game=game,
                             resetting=resetting,
                             final_stocks=result,  # ended game's (bot, opp); None mid-game
+                            raw_game=raw_for_ref,
                             stocks=last_stocks,
                             percent=(float(p1.percent), float(p2.percent)),
                         )
@@ -331,25 +344,39 @@ class DolphinRolloutWorker:
         self.specs = specs or make_partition(
             config.num_envs, config.cpu_envs, config.teacher_envs,
             config.snapshot_slots, config.main12_prob, config.partition_seed,
+            ref_envs=config.ref_envs,
         )
         assert len(self.specs) == config.num_envs
         self.opponents = opponents or {}
         # group name -> env index list (fixed membership = stable batch shapes)
         self.groups: dict = {}
+        self.ref_idx: list[int] = []
         for i, spec in enumerate(self.specs):
             if spec.kind == "teacher":
                 self.groups.setdefault("teacher", []).append(i)
             elif spec.kind == "snapshot":
                 self.groups.setdefault(("slot", spec.group), []).append(i)
+            elif spec.kind == "reference":
+                self.ref_idx.append(i)
         for name, idx in self.groups.items():
             assert name in self.opponents, f"no agent supplied for group {name}"
             assert self.opponents[name].num_envs == len(idx)
+        self.ref_bridge = None
+        self.ref_step_ms = 0.0
+        if self.ref_idx:
+            from smashbot.rl.ref_bridge import RefBridge
+
+            self.ref_bridge = RefBridge(
+                batch_size=len(self.ref_idx), ckpt=config.ref_ckpt
+            )
         self.seat2 = torch.tensor(
             [sp.student_port == 2 for sp in self.specs]
         )
         self.game_lib = game_lib
         self.assembler = ChunkAssembler(config.unroll_length, student.delay)
-        self.trackers = {k: GameTracker() for k in ("cpu", "teacher", "snapshot")}
+        self.trackers = {
+            k: GameTracker() for k in ("cpu", "teacher", "snapshot", "reference")
+        }
         self._procs: list = []
         self._conns: list = []
 
@@ -476,6 +503,20 @@ class DolphinRolloutWorker:
             )
 
             opp_controllers: dict[int, tp.Any] = {}
+            if self.ref_bridge is not None:
+                import time as time_lib
+
+                t0 = time_lib.perf_counter()
+                ref_games = [payloads[i]["raw_game"] for i in self.ref_idx]
+                ref_resets = [bool(resets[i]) for i in self.ref_idx]
+                ref_ctrls = self.ref_bridge.step(ref_games, ref_resets)
+                self.ref_step_ms = 0.9 * self.ref_step_ms + 0.1 * (
+                    1e3 * (time_lib.perf_counter() - t0)
+                )
+                for j, env_i in enumerate(self.ref_idx):
+                    opp_controllers[env_i] = tree.map_structure(
+                        lambda x: x[j], ref_ctrls
+                    )
             for name, idx in self.groups.items():
                 agent = self.opponents[name]
                 sel = torch.tensor(idx, device=device)
@@ -512,6 +553,8 @@ class DolphinRolloutWorker:
         return out
 
     def stop(self) -> None:
+        if self.ref_bridge is not None:
+            self.ref_bridge.stop()
         for conn in self._conns:
             try:
                 conn.send(None)

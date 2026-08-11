@@ -450,3 +450,21 @@ def test_reset_target_positions_masked():
     assert metrics["anomalous_samples"] == 0
     assert metrics["ratio_mean"] == pytest.approx(1.0, abs=1e-3)
     assert metrics["actor_kl_mean"] == pytest.approx(0.0, abs=1e-4)
+
+
+def test_pool_partition_reference_envs():
+    from smashbot.rl.pool import MAIN_12, make_partition
+
+    specs = make_partition(
+        num_envs=16, cpu_envs=4, teacher_envs=-1, snapshot_slots=0,
+        seed=3, ref_envs=4,
+    )
+    kinds = [s.kind for s in specs]
+    assert kinds.count("cpu") == 4
+    assert kinds.count("reference") == 4
+    assert kinds.count("teacher") == 8
+    refs = [s for s in specs if s.kind == "reference"]
+    # medium-v2 plays exactly the main 12 (verified from its checkpoint)
+    assert all(s.opponent_char in MAIN_12 for s in refs)
+    # both seats represented so the student isn't port-biased vs the ref
+    assert {s.student_port for s in refs} == {1, 2}
