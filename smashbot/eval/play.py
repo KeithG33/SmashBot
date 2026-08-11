@@ -17,6 +17,7 @@ import argparse
 
 import melee
 import numpy as np
+import torch
 
 from slippi_ai import dolphin as dolphin_lib
 
@@ -51,7 +52,13 @@ def main() -> None:
     )
     # CPU beats GPU for batch-1 inference (kernel-launch overhead dominates).
     ap.add_argument("--device", default="cpu")
+    ap.add_argument("--threads", type=int, default=8)
     args = ap.parse_args()
+
+    # batch-1 CPU inference is fastest at ~8 threads: more threads add
+    # sync overhead to tiny ops (measured: 8T 10.9ms vs 24T ~14ms compiled)
+    if args.device == "cpu":
+        torch.set_num_threads(args.threads)
 
     policy, name_map, step = game_lib.load_policy(args.ckpt, args.device)
     if args.compile:
