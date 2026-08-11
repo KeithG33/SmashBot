@@ -26,6 +26,10 @@ MAIN_12 = [
     "FOX", "FALCO", "MARTH", "SHEIK", "JIGGLYPUFF", "CPTFALCON",
     "PEACH", "YOSHI", "POPO", "LUIGI", "PIKACHU", "SAMUS",
 ]
+# SHEIK is not directly selectable on the CSS (Zelda-transform) and libmelee's
+# menu navigation picks her only flakily (observed: expected SHEIK, got
+# YOSHI -> env death). Opponents sample from this list instead.
+OPPONENT_CHARS = [c for c in MAIN_12 if c != "SHEIK"]
 # Rest of the CSS cast reachable by simple menuing (SHEIK reached via ZELDA
 # is already in MAIN_12 through the parser's lens; ZELDA herself included).
 OFF_ROSTER = [
@@ -71,19 +75,21 @@ def make_partition(
     rng = random.Random(seed)
 
     def cpu_char() -> str:
-        pool = MAIN_12 if rng.random() < main12_prob else OFF_ROSTER
+        pool = OPPONENT_CHARS if rng.random() < main12_prob else OFF_ROSTER
         return rng.choice(pool)
 
     specs: list[EnvSpec] = []
     for i in range(cpu_envs):
         specs.append(EnvSpec("cpu", -1, 1 + (i % 2), cpu_char()))
     for i in range(teacher_envs):
-        specs.append(EnvSpec("teacher", -1, 1 + (i % 2), rng.choice(MAIN_12)))
+        specs.append(
+            EnvSpec("teacher", -1, 1 + (i % 2), rng.choice(OPPONENT_CHARS))
+        )
     per_slot = snap_envs // snapshot_slots if snapshot_slots else 0
     for slot in range(snapshot_slots):
         for i in range(per_slot):
             specs.append(
-                EnvSpec("snapshot", slot, 1 + (i % 2), rng.choice(MAIN_12))
+                EnvSpec("snapshot", slot, 1 + (i % 2), rng.choice(OPPONENT_CHARS))
             )
     return specs
 

@@ -372,9 +372,12 @@ def test_pool_partition_and_snapshots(tmp_path):
 
     slots = Counter(s.group for s in specs if s.kind == "snapshot")
     assert all(v == 8 for v in slots.values()) and len(slots) == 5
+    from smashbot.rl.pool import OPPONENT_CHARS
+
     for s_ in specs:
         if s_.kind != "cpu":
-            assert s_.opponent_char in MAIN_12
+            assert s_.opponent_char in OPPONENT_CHARS
+        assert s_.opponent_char != "SHEIK"  # CSS-unreachable, flaky menuing
         assert s_.student_port in (1, 2)
     seats = Counter(s.student_port for s in specs)
     assert abs(seats[1] - seats[2]) <= 2
