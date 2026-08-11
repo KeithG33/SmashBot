@@ -189,6 +189,16 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", conn) -> None:
     process — the vendor's envs.py reaches the same conclusion). Speaks over
     a Pipe: sends per-frame payloads, receives {port: Controller} commands
     (None = shut down)."""
+    import os
+    import sys
+
+    # Dolphin banners/spam would hit the parent terminal on every boot and
+    # recycle; redirect this process (and its Dolphin child, via fd
+    # inheritance) to a per-env log where real errors remain findable.
+    _log = open(f"/tmp/smashbot-env-{idx}.log", "a", buffering=1)
+    os.dup2(_log.fileno(), sys.stdout.fileno())
+    os.dup2(_log.fileno(), sys.stderr.fileno())
+
     import melee
     import numpy as np
     import tree as tree_lib
