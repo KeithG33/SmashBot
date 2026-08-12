@@ -194,6 +194,10 @@ class RolloutConfig:
     # Boot each Dolphin's replacement in the background during its final game
     # (recycle hot-swap); the spare parks at intro menus until swapped in.
     double_buffer: bool = True
+    # Reference envs are served by ceil(ref_envs / ref_shard_size) parallel
+    # TF server processes: shorter per-process bursts dodge scheduler
+    # preemption under Dolphin load, and shards compute concurrently.
+    ref_shard_size: int = 16
     # Reference opponent (slippi-ai medium-v2 via venv-ref subprocess).
     ref_envs: int = 0
     ref_ckpt: str = "/home/kage/drive2/ShineBot/models/medium-v2"
@@ -419,14 +423,29 @@ class DolphinRolloutWorker:
         for name, idx in self.groups.items():
             assert name in self.opponents, f"no agent supplied for group {name}"
             assert self.opponents[name].num_envs == len(idx)
-        self.ref_bridge = None
+        # list of (bridge, env_indices) shards; empty when no ref envs
+        self.ref_bridges: list = []
         self.ref_step_ms = 0.0
         if self.ref_idx:
+            from concurrent.futures import ThreadPoolExecutor
+
             from smashbot.rl.ref_bridge import RefBridge
 
-            self.ref_bridge = RefBridge(
-                batch_size=len(self.ref_idx), ckpt=config.ref_ckpt
-            )
+            size = max(1, config.ref_shard_size)
+            shards = [
+                self.ref_idx[i : i + size]
+                for i in range(0, len(self.ref_idx), size)
+            ]
+            threads = 8 if len(shards) == 1 else 6
+            with ThreadPoolExecutor(len(shards)) as ex:  # parallel TF loads
+                bridges = list(ex.map(
+                    lambda sh: RefBridge(
+                        batch_size=len(sh), ckpt=config.ref_ckpt,
+                        threads=threads,
+                    ),
+                    shards,
+                ))
+            self.ref_bridges = list(zip(bridges, shards))
         self.seat2 = torch.tensor(
             [sp.student_port == 2 for sp in self.specs]
         )
@@ -560,13 +579,15 @@ class DolphinRolloutWorker:
             # while we run student + opponent inference on the GPU, so only
             # the un-hidden remainder shows up as stall in recv() below.
             ref_stall = 0.0
-            if self.ref_bridge is not None:
+            if self.ref_bridges:
                 import time as time_lib
 
                 t0 = time_lib.perf_counter()
-                ref_games = [payloads[i]["raw_game"] for i in self.ref_idx]
-                ref_resets = [bool(resets[i]) for i in self.ref_idx]
-                self.ref_bridge.send(ref_games, ref_resets)
+                for bridge, idxs in self.ref_bridges:
+                    bridge.send(
+                        [payloads[i]["raw_game"] for i in idxs],
+                        [bool(resets[i]) for i in idxs],
+                    )
                 ref_stall += time_lib.perf_counter() - t0
 
             controllers1, records, hidden_before = self.student.step(
@@ -584,20 +605,21 @@ class DolphinRolloutWorker:
                 for j, env_i in enumerate(idx):
                     opp_controllers[env_i] = ctrls[j]
 
-            if self.ref_bridge is not None:
+            if self.ref_bridges:
                 import time as time_lib
 
                 t0 = time_lib.perf_counter()
-                ref_ctrls = self.ref_bridge.recv()
+                for bridge, idxs in self.ref_bridges:
+                    ref_ctrls = bridge.recv()
+                    for j, env_i in enumerate(idxs):
+                        opp_controllers[env_i] = tree.map_structure(
+                            lambda x, _j=j: x[_j], ref_ctrls
+                        )
                 ref_stall += time_lib.perf_counter() - t0
                 # ref_step_ms = time actually stalled, not TF's compute time
                 self.ref_step_ms = 0.9 * self.ref_step_ms + 0.1 * (
                     1e3 * ref_stall
                 )
-                for j, env_i in enumerate(self.ref_idx):
-                    opp_controllers[env_i] = tree.map_structure(
-                        lambda x: x[j], ref_ctrls
-                    )
 
             for i, conn in enumerate(self._conns):
                 port = self.specs[i].student_port
@@ -625,8 +647,8 @@ class DolphinRolloutWorker:
         return out
 
     def stop(self) -> None:
-        if self.ref_bridge is not None:
-            self.ref_bridge.stop()
+        for bridge, _ in self.ref_bridges:
+            bridge.stop()
         for conn in self._conns:
             try:
                 conn.send(None)
