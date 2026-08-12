@@ -6,7 +6,8 @@
 set -u
 cd /home/kage/smashbot_workspace/SmashBot
 while true; do
-  OMP_NUM_THREADS=1 .venv/bin/python -m smashbot.rl.train_rl \
+  OMP_NUM_THREADS=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    .venv/bin/python -m smashbot.rl.train_rl \
     --ckpt /home/kage/drive2/ShineBot/models/mega-best.pt \
     --runtime.tag rl-pool-v2 --runtime.steps 20000 \
     --runtime.device cuda --runtime.checkpoint-interval 100 \
