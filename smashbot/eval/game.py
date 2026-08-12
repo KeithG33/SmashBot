@@ -137,6 +137,7 @@ def make_dolphin(
     gfx_backend: str = "OGL",
     online_delay: int = 0,
     mute: bool = False,
+    copy_home_config: bool = False,
 ) -> dolphin_lib.Dolphin:
     """One Dolphin. Headless uses the ExiAI build (Null video, fast-forward);
     visible play uses the standard netplay build."""
