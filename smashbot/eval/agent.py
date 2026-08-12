@@ -121,39 +121,54 @@ class DelayedAgent:
 
 
 class AsyncDelayedAgent(DelayedAgent):
-    """DelayedAgent with inference moved off the frame-critical path.
+    """DelayedAgent with inference fully off the frame-critical path.
 
-    The Slippi build frame-syncs with the bot: it will not emulate frame N+1
-    until frame N's inputs arrive, so with the sync agent the frame period is
-    emulation + inference IN SERIES (measured: ~8ms + ~14ms = 45fps live).
-
-    Here step() returns a controller immediately (queue pop) and computes the
-    new sample on a background thread during the NEXT frame's emulation. The
-    output sequence is IDENTICAL to the sync agent's (join-before-pop: the
-    sample from frame N is enqueued by frame N+1, and it isn't executed until
-    frame N+delay, delay >= 1) — the bot's play is unchanged, Dolphin just
-    never waits. Requires effective delay >= 1 (we run 18).
+    The Slippi build frame-syncs with the bot, so with the sync agent every
+    frame costs emulation + inference IN SERIES (~45fps live). Here step()
+    hands the frame to a persistent compute thread and immediately pops the
+    action queue — it never waits on inference. The compute thread processes
+    frames strictly in order at its own pace; occasional slow samples (page
+    faults, allocator spikes) simply lag a frame or two behind and catch up,
+    absorbed by the delay queue's slack (delay=18 frames ~ 300ms of cushion).
+    The emitted action sequence is IDENTICAL to the sync agent's, frame for
+    frame (equivalence + spike tests assert it); only the arrival timing of
+    queue entries differs, which the pre-filled delay queue makes invisible.
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         assert self.delay >= 1, "async agent needs >= 1 frame of delay"
-        self._worker = None
-        self._wait_acc = 0.0
-        self._wait_n = 0
 
     def reset(self) -> None:
-        # finish any in-flight compute before wiping state it writes to
-        w = getattr(self, "_worker", None)
-        if w is not None:
-            w.join()
-            self._worker = None
+        import queue as queue_lib
+        import threading
+
+        # stop any prior worker before wiping the state it writes
+        if getattr(self, "_in_q", None) is not None:
+            self._in_q.put(None)
+            self._thread.join()
         super().reset()
+        # thread-safe handoff queues; _queue (deque from super) holds the
+        # delay-queue prefill and receives computed actions in order
+        self._in_q = queue_lib.Queue()
+        self._out_ready = threading.Semaphore(len(self._queue))
+        self._wait_acc = 0.0
+        self._wait_n = 0
+        self._thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self._thread.start()
+
+    def _worker_loop(self) -> None:
+        while True:
+            game = self._in_q.get()
+            if game is None:
+                return
+            self._compute(game)
+            self._out_ready.release()
+            self._in_q.task_done()
 
     def _compute(self, game) -> None:
-        """encode -> sample -> enqueue; runs on the background thread.
-        Sequenced by join-before-launch, so self.hidden/_prev_action/_queue
-        are never touched concurrently."""
+        """encode -> sample -> enqueue; runs only on the worker thread, which
+        processes frames strictly in order (single consumer)."""
         game = tree.map_structure(lambda x: np.asarray(x)[None], game)
         state = self.policy.network.encode_game(game)
         state = tree.map_structure(
@@ -181,18 +196,18 @@ class AsyncDelayedAgent(DelayedAgent):
         )
         self._queue.append(self._embed_controller.decode(encoded_np))
 
-    def step(self, gamestate) -> Controller:
-        import threading
+    def drain(self) -> None:
+        """Block until every submitted frame has been computed (tests)."""
+        self._in_q.join()
 
+    def step(self, gamestate) -> Controller:
+        # parse on the caller: the Parser is stateful and frame-ordered
+        game = self.parser.get_game(gamestate)
+        self._in_q.put(game)
+        # blocks ONLY if compute has lagged a full `delay` frames (~300ms)
         t0 = time.perf_counter()
-        if self._worker is not None:
-            self._worker.join()  # a_{N-1}: normally already done
+        self._out_ready.acquire()
         self._wait_acc += time.perf_counter() - t0
         self._wait_n += 1
-        self.stage_ms = {"join_wait": 1e3 * self._wait_acc / self._wait_n}
-        # parse synchronously: the Parser is stateful and frame-ordered
-        game = self.parser.get_game(gamestate)
-        out = self._queue.popleft()
-        self._worker = threading.Thread(target=self._compute, args=(game,))
-        self._worker.start()
-        return out
+        self.stage_ms = {"queue_wait": 1e3 * self._wait_acc / self._wait_n}
+        return self._queue.popleft()

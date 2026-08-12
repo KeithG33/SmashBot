@@ -548,10 +548,92 @@ def test_async_delayed_agent_matches_sync(monkeypatch):
 
     outs_sync = [sync.step(None) for _ in range(12)]
     outs_async = [awa.step(None) for _ in range(12)]
-    awa._worker.join()
+    awa.drain()
 
     for a, b in zip(outs_sync, outs_async):
         tree.map_structure(
             lambda x, y: np.testing.assert_array_equal(np.asarray(x), np.asarray(y)),
             a, b,
         )
+
+
+def test_async_agent_absorbs_slow_samples(monkeypatch):
+    """Inference spikes must neither block step() nor change the emitted
+    sequence: the pipeline lags and catches up inside the delay-queue slack."""
+    import time as time_lib
+
+    from smashbot import embed as embed_lib
+    from smashbot.eval.agent import AsyncDelayedAgent, DelayedAgent
+    from smashbot.tests.test_ppo import _tiny_policy
+
+    monkeypatch.setattr(
+        embed_lib.OneHotEmbedding, "sample",
+        lambda self, logits, temperature=None: logits.argmax(-1).to(
+            {"uint8": torch.uint8, "int32": torch.int32}[np.dtype(self.dtype).name]
+        ),
+    )
+    monkeypatch.setattr(
+        embed_lib.BoolEmbedding, "sample",
+        lambda self, logits, temperature=None: logits.squeeze(-1) > 0,
+    )
+
+    def make(cls, spike):
+        torch.manual_seed(0)
+        policy = _tiny_policy(seed=0)
+        policy.delay = 6
+        if spike:
+            orig = policy.sample
+
+            calls = {"n": 0}
+
+            def slow_sample(*a, **k):
+                calls["n"] += 1
+                if calls["n"] % 3 == 0:
+                    time_lib.sleep(0.03)  # 30ms spike, every 3rd frame
+                return orig(*a, **k)
+
+            policy.sample = slow_sample
+        return cls(policy, own_port=1, opponent_port=2, device="cpu")
+
+    import sys
+    sys.path.insert(0, "/tmp/claude-1000/-home-kage-smashbot-workspace/622f61f0-32b7-4321-b892-7040871af8a8/scratchpad")
+    from test_ref_bridge import rand_raw_game
+
+    class StubParser:
+        def __init__(self, seq):
+            self.seq, self.i = seq, 0
+
+        def get_game(self, _gs):
+            g = self.seq[self.i % len(self.seq)]
+            self.i += 1
+            return g
+
+    embed_game = embed_lib.EmbedConfig().make_game_embedding()
+    rng = np.random.default_rng(9)
+    frames = [rand_raw_game(embed_game, rng) for _ in range(10)]
+
+    sync = make(DelayedAgent, spike=False)
+    awa = make(AsyncDelayedAgent, spike=True)  # spikes ONLY on async side
+    sync.parser = StubParser(frames)
+    awa.parser = StubParser(frames)
+
+    outs_sync = [sync.step(None) for _ in range(10)]
+    step_times = []
+    outs_async = []
+    for _ in range(10):
+        t0 = time_lib.perf_counter()
+        outs_async.append(awa.step(None))
+        step_times.append(time_lib.perf_counter() - t0)
+        time_lib.sleep(0.0167)  # real frame cadence: compute catches up here
+    awa.drain()
+
+    # identical sequence despite 30ms spikes on every 3rd sample
+    for a, b in zip(outs_sync, outs_async):
+        tree.map_structure(
+            lambda x, y: np.testing.assert_array_equal(
+                np.asarray(x), np.asarray(y)
+            ),
+            a, b,
+        )
+    # and step() never blocked on a spike (queue slack absorbed the lag)
+    assert max(step_times) < 0.02, f"step blocked: {max(step_times)*1e3:.1f}ms"
