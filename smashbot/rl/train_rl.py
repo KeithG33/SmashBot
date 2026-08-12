@@ -132,7 +132,7 @@ def main() -> None:
         rpath = args.runtime.restore
         if rpath == "auto":
             rpath = f"{args.runtime.run_dir}/{args.runtime.tag}/latest.pt"
-            if not os_lib.exists(rpath):
+            if not os_lib.path.exists(rpath):
                 rpath = ""  # supervisor-friendly: no checkpoint = fresh start
                 print("restore auto: no checkpoint yet, starting fresh")
         if rpath:
