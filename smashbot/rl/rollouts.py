@@ -191,6 +191,9 @@ class RolloutConfig:
     partition_seed: int = 0
     headless: bool = True  # False: rendered window at normal speed (watch mode)
     log_tag: str = ""  # namespaces /tmp/smashbot-env-*.log between runs
+    # Boot each Dolphin's replacement in the background during its final game
+    # (recycle hot-swap); the spare parks at intro menus until swapped in.
+    double_buffer: bool = True
     # Reference opponent (slippi-ai medium-v2 via venv-ref subprocess).
     ref_envs: int = 0
     ref_ckpt: str = "/home/kage/drive2/ShineBot/models/medium-v2"
@@ -253,9 +256,44 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
     pending_reset = False
     pending_result = None
     consecutive_misselects = 0
+
+    # Double buffering: during a Dolphin's LAST game, boot its replacement in
+    # a background thread. The spare is only CONSTRUCTED (process up, ISO
+    # loaded, idle at intro menus — menus don't advance without inputs, so
+    # nothing progresses unattended); menu navigation still happens at swap,
+    # via the normal iter_gamestates path with its misselect guard. Hides the
+    # 10-15s boot that otherwise stalls the whole worker barrier per recycle.
+    import threading
+
+    spare = {"dolphin": None, "thread": None}
+    old_stops: list[threading.Thread] = []
+
+    def _boot_spare() -> None:
+        try:
+            spare["dolphin"] = game_lib.make_dolphin(
+                players, headless=cfg.headless, stage=cfg.stage
+            )
+        except Exception as e:  # fall back to a cold boot at swap time
+            print(f"spare boot failed (cold boot at swap): {e}", flush=True)
+            spare["dolphin"] = None
+
+    def _start_spare() -> None:
+        if cfg.double_buffer and spare["thread"] is None:
+            spare["thread"] = threading.Thread(target=_boot_spare, daemon=True)
+            spare["thread"].start()
+
+    def _take_spare():
+        if spare["thread"] is None:
+            return None
+        spare["thread"].join()
+        d, spare["dolphin"], spare["thread"] = spare["dolphin"], None, None
+        if d is not None:
+            print("recycle: swapped to pre-booted spare", flush=True)
+        return d
+
     try:
         while True:
-            dolphin = game_lib.make_dolphin(
+            dolphin = _take_spare() or game_lib.make_dolphin(
                 players, headless=cfg.headless, stage=cfg.stage
             )
             parser = Parser(ports=[1, 2])
@@ -276,6 +314,8 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
                             pending_reset, pending_result = True, result
                             break
                         parser = Parser(ports=[1, 2])
+                    if games >= cfg.games_per_dolphin - 1:
+                        _start_spare()  # entering this Dolphin's final game
                     last_frame = gs.frame
                     raw = tree_lib.map_structure(
                         np.asarray, parser.get_game(gs)
@@ -322,9 +362,22 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
               else:
                 consecutive_misselects = 0
             finally:
-                dolphin.stop()
+                # Recycle path: stop the old Dolphin off-thread so the swap
+                # isn't gated on process teardown. Threads are non-daemon, so
+                # even on the shutdown path the interpreter waits for the
+                # kills to finish before exiting (no zombie Dolphins).
+                t = threading.Thread(target=dolphin.stop)
+                t.start()
+                old_stops.append(t)
     except (EOFError, BrokenPipeError, KeyboardInterrupt):
         pass
+    finally:
+        if spare["thread"] is not None:
+            spare["thread"].join()
+            if spare["dolphin"] is not None:
+                spare["dolphin"].stop()
+        for t in old_stops:
+            t.join(timeout=15)
 
 
 class DolphinRolloutWorker:
