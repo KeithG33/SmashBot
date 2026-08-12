@@ -372,9 +372,21 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
             games = 0
             last_frame = None
             last_stocks = None
+            # New-game gate: a pre-booted spare idles at the title screen,
+            # where Melee's ATTRACT-MODE DEMO auto-plays after a timeout —
+            # demo frames are "in-game" frames with garbage ports/fields
+            # (live-caught: NaN states -> multinomial assert at the first
+            # 128-env swap wave). Drop frames until a REAL game start
+            # (frame counter resets to INITIAL_FRAME=-123, i.e. < 0).
+            # Cold boots' first frame IS -123, so this is a no-op for them.
+            game_started = False
             try:
               try:
                 for gs in dolphin.iter_gamestates(skip_menu_frames=True):
+                    if not game_started:
+                        if gs.frame > 0:
+                            continue  # attract-mode demo frame: discard
+                        game_started = True
                     boundary = last_frame is not None and gs.frame < last_frame
                     resetting = boundary or pending_reset
                     result = pending_result if pending_reset else None
@@ -393,6 +405,16 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
                         np.asarray, parser.get_game(gs)
                     )
                     game = embed_game.from_state(raw)
+                    # armor at the source: never ship a nonfinite frame
+                    finite = all(
+                        np.all(np.isfinite(leaf))
+                        for leaf in tree_lib.flatten(game)
+                        if np.issubdtype(np.asarray(leaf).dtype, np.floating)
+                    )
+                    if not finite:
+                        print(f"nonfinite frame dropped (frame {gs.frame})",
+                              flush=True)
+                        continue
                     # reference opponents (slippi-ai models) do their own
                     # encoding server-side and need the RAW struct, seen
                     # from THEIR side (p0 = the reference agent's player)

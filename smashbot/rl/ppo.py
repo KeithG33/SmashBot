@@ -262,10 +262,20 @@ class Learner:
         n_valid = valid.sum().clamp(min=1.0)
         log_rhos = out.log_probs - fixed.actor_log_probs
         masked_abs = (log_rhos.detach().abs() * valid)
-        raw_abs_max = masked_abs.max().item()
-        anomalies = int((masked_abs > cfg.ppo.log_rho_clamp).sum().item())
+        # NaN comparisons are False, so nonfinite values would sail through
+        # a plain >clamp check uncounted (live-caught via attract-mode demo
+        # frames). Count them as anomalies and scrub before clamping.
+        nonfinite = int((~torch.isfinite(masked_abs)).sum().item())
+        raw_abs_max = torch.nan_to_num(masked_abs).max().item()
+        anomalies = nonfinite + int(
+            (torch.nan_to_num(masked_abs) > cfg.ppo.log_rho_clamp).sum().item()
+        )
         if anomalies:
             self._dump_anomaly(log_rhos, fixed)
+            log_rhos = torch.nan_to_num(
+                log_rhos, nan=0.0,
+                posinf=cfg.ppo.log_rho_clamp, neginf=-cfg.ppo.log_rho_clamp,
+            )
             log_rhos = torch.clamp(
                 log_rhos, -cfg.ppo.log_rho_clamp, cfg.ppo.log_rho_clamp
             )
