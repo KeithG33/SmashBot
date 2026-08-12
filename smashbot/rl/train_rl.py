@@ -177,7 +177,9 @@ def main() -> None:
     counts = {}
     for spec in specs:
         key = "teacher" if spec.kind == "teacher" else (
-            ("slot", spec.group) if spec.kind == "snapshot" else None
+            ("slot", spec.group) if spec.kind == "snapshot" else (
+                "reference" if spec.kind == "reference" else None
+            )
         )
         if key is not None:
             counts[key] = counts.get(key, 0) + 1
@@ -186,8 +188,26 @@ def main() -> None:
             teacher, counts["teacher"], name_code=name_code, device=device,
             batch_steps=rcfg.batch_steps,
         )
+    if "reference" in counts:
+        # the ported medium-v2 (see scripts/port_ref_model.py): verified
+        # 6.3e-13 vs TF at fp64. Delay 21 and its own name_map ride along
+        # in the checkpoint; condition on ITS "Master Player" code.
+        ref_policy, ref_names, _ = load_policy(rcfg.ref_ckpt, device)
+        ref_policy.train_value_head = False
+        ref_policy.requires_grad_(False)
+        ref_policy.eval()
+        if args.runtime.compile:
+            mode = "reduce-overhead" if device == "cuda" else "default"
+            ref_policy.sample = torch.compile(ref_policy.sample, mode=mode)
+        ref_code = resolve_name_code(ref_names, "Master Player")
+        opponents["reference"] = BatchedPolicyAgent(
+            ref_policy, counts["reference"], name_code=ref_code,
+            device=device, batch_steps=rcfg.batch_steps,
+        )
+        print(f"reference: {rcfg.ref_ckpt} (delay {ref_policy.delay}, "
+              f"name code {ref_code})")
     for key, n in counts.items():
-        if key == "teacher":
+        if key in ("teacher", "reference"):
             continue
         slot_policy, _, _ = load_policy(args.ckpt, device)  # init = teacher
         slot_policy.train_value_head = False
@@ -271,8 +291,6 @@ def main() -> None:
                     for k, v in tracker.stats().items():
                         log[f"rl/{kind}/{k}"] = v
                 log["rl/frames_per_sec"] = frames / (time.time() - t0)
-                if worker.ref_idx:
-                    log["rl/ref_step_ms"] = worker.ref_step_ms
                 wandb.log(log, step=i)
                 games = sum(
                     log.get(f"rl/{k}/games_played", 0)
@@ -280,7 +298,6 @@ def main() -> None:
                 )
                 ref_bit = (
                     f"R:{log.get('rl/reference/win_rate_recent', 0.5):.0%} "
-                    f"({worker.ref_step_ms:.1f}ms) "
                     if worker.ref_idx else ""
                 )
                 print(

@@ -198,12 +198,8 @@ class RolloutConfig:
     # path, since fixed via _drain_old_stops). Opt in for short/tended runs;
     # re-earn trust before any week-long run relies on it.
     double_buffer: bool = False
-    # Reference envs are served by ceil(ref_envs / ref_shard_size) parallel
-    # TF server processes. Default 2x16: at 7 slots the GPU window hid the
-    # bridge either way (fps tie), but the production 4-slot config shrank
-    # the window and sharding pulled measurably ahead (647 vs 634 @ step 10,
-    # gap growing). Window size and bridge layout are coupled — re-measure
-    # if the slot count changes again.
+    # (historical: ref_shard_size tuned the retired in-worker TF bridge;
+    # kept so old commands don't break. The worker ignores it now.)
     ref_shard_size: int = 16
     # Watchdog: max seconds the barrier waits on one env's payload before
     # crashing loudly (a supervisor/--runtime.restore auto turns that crash
@@ -211,7 +207,7 @@ class RolloutConfig:
     env_timeout: float = 300.0
     # Reference opponent (slippi-ai medium-v2 via venv-ref subprocess).
     ref_envs: int = 0
-    ref_ckpt: str = "/home/kage/drive2/ShineBot/models/medium-v2"
+    ref_ckpt: str = "/home/kage/drive2/ShineBot/models/medium-v2-torch.pt"
 
 
 def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
@@ -335,18 +331,19 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
                 t.join(timeout=5)
         old_stops[:] = [(t, p) for t, p in old_stops if t.is_alive()]
 
-    class BootTimeout(Exception):
+    class AlarmTimeout(Exception):
         pass
+
+    def _alarm_handler(*_):
+        raise AlarmTimeout()
+
+    signal.signal(signal.SIGALRM, _alarm_handler)
 
     def _cold_boot():
         """Boot with a hard deadline: a Dolphin that wedges during startup
         (port collision, dead handshake) must become a bounded retry, not an
         infinite hang. SIGALRM is safe here: env-process main thread."""
         _drain_old_stops()
-        signal.signal(
-            signal.SIGALRM,
-            lambda *_: (_ for _ in ()).throw(BootTimeout("dolphin boot")),
-        )
         signal.alarm(180)
         try:
             return game_lib.make_dolphin(
@@ -356,6 +353,7 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
             signal.alarm(0)
 
     consecutive_boot_failures = 0
+    consecutive_wedges = 0
     try:
         while True:
             try:
@@ -384,7 +382,40 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
             game_started = False
             try:
               try:
-                for gs in dolphin.iter_gamestates(skip_menu_frames=True):
+                # Dolphin can freeze silently mid-game (live-caught: env 17,
+                # zero log output, console.step never returned). Guard every
+                # frame fetch with an alarm: legit silent stretches (boot +
+                # menus + rematch) stay under ~60s, so 120s = wedged. On
+                # trip: SIGKILL this Dolphin, mark the game aborted (reset,
+                # no result), and boot a fresh one. Bounded: 3 wedges with
+                # no completed game in between = something systemic, die
+                # loudly (the worker watchdog is the outer backstop).
+                gs_iter = iter(dolphin.iter_gamestates(skip_menu_frames=True))
+                while True:
+                    signal.alarm(120)
+                    try:
+                        gs = next(gs_iter)
+                    except AlarmTimeout:
+                        consecutive_wedges += 1
+                        print(f"DOLPHIN WEDGED mid-stream "
+                              f"({consecutive_wedges}/3); killing it",
+                              flush=True)
+                        if consecutive_wedges >= 3:
+                            raise RuntimeError(
+                                "dolphin wedged 3x without a completed game"
+                            )
+                        pid = _dolphin_pid(dolphin)
+                        if pid is not None:
+                            try:
+                                os.kill(pid, signal.SIGKILL)
+                            except OSError:
+                                pass
+                        pending_reset, pending_result = True, None
+                        break
+                    except StopIteration:
+                        break
+                    finally:
+                        signal.alarm(0)
                     if not game_started:
                         if gs.frame > 0:
                             continue  # attract-mode demo frame: discard
@@ -395,6 +426,7 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
                     pending_reset, pending_result = False, None
                     if boundary:
                         games += 1
+                        consecutive_wedges = 0
                         result = last_stocks  # ended game's final (bot, opp)
                         if games >= cfg.games_per_dolphin:
                             pending_reset, pending_result = True, result
@@ -417,15 +449,6 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
                         print(f"nonfinite frame dropped (frame {gs.frame})",
                               flush=True)
                         continue
-                    # reference opponents (slippi-ai models) do their own
-                    # encoding server-side and need the RAW struct, seen
-                    # from THEIR side (p0 = the reference agent's player)
-                    raw_for_ref = None
-                    if spec.kind == "reference":
-                        raw_for_ref = (
-                            raw if spec.student_port == 2
-                            else raw._replace(p0=raw.p1, p1=raw.p0)
-                        )
                     p1, p2 = gs.players[1], gs.players[2]
                     last_stocks = (int(p1.stock), int(p2.stock))
                     conn.send(
@@ -433,7 +456,6 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
                             game=game,
                             resetting=resetting,
                             final_stocks=result,  # ended game's (bot, opp); None mid-game
-                            raw_game=raw_for_ref,
                             stocks=last_stocks,
                             percent=(float(p1.percent), float(p2.percent)),
                         )
@@ -512,33 +534,15 @@ class DolphinRolloutWorker:
             elif spec.kind == "snapshot":
                 self.groups.setdefault(("slot", spec.group), []).append(i)
             elif spec.kind == "reference":
+                # served in-process by the ported torch checkpoint (see
+                # scripts/port_ref_model.py) — same path as teacher/slots.
+                # The TF RefBridge remains available for eval batteries.
+                self.groups.setdefault("reference", []).append(i)
                 self.ref_idx.append(i)
         for name, idx in self.groups.items():
             assert name in self.opponents, f"no agent supplied for group {name}"
             assert self.opponents[name].num_envs == len(idx)
-        # list of (bridge, env_indices) shards; empty when no ref envs
-        self.ref_bridges: list = []
-        self.ref_step_ms = 0.0
-        if self.ref_idx:
-            from concurrent.futures import ThreadPoolExecutor
 
-            from smashbot.rl.ref_bridge import RefBridge
-
-            size = max(1, config.ref_shard_size)
-            shards = [
-                self.ref_idx[i : i + size]
-                for i in range(0, len(self.ref_idx), size)
-            ]
-            threads = 8 if len(shards) == 1 else 6
-            with ThreadPoolExecutor(len(shards)) as ex:  # parallel TF loads
-                bridges = list(ex.map(
-                    lambda sh: RefBridge(
-                        batch_size=len(sh), ckpt=config.ref_ckpt,
-                        threads=threads,
-                    ),
-                    shards,
-                ))
-            self.ref_bridges = list(zip(bridges, shards))
         self.seat2 = torch.tensor(
             [sp.student_port == 2 for sp in self.specs]
         )
@@ -682,21 +686,6 @@ class DolphinRolloutWorker:
             opponent_view = mix(encoded, swapped)
             resets_dev = resets.to(device)
             pending_resets.append(resets_dev)
-            # Fire the reference request first: the TF subprocess computes
-            # while we run student + opponent inference on the GPU, so only
-            # the un-hidden remainder shows up as stall in recv() below.
-            ref_stall = 0.0
-            if self.ref_bridges:
-                import time as time_lib
-
-                t0 = time_lib.perf_counter()
-                for bridge, idxs in self.ref_bridges:
-                    bridge.send(
-                        [payloads[i]["raw_game"] for i in idxs],
-                        [bool(resets[i]) for i in idxs],
-                    )
-                ref_stall += time_lib.perf_counter() - t0
-
             controllers1, records, hidden_before = self.student.step(
                 student_view, resets_dev
             )
@@ -711,22 +700,6 @@ class DolphinRolloutWorker:
                 ctrls, _, _ = agent.step(group_view, resets_dev[sel])
                 for j, env_i in enumerate(idx):
                     opp_controllers[env_i] = ctrls[j]
-
-            if self.ref_bridges:
-                import time as time_lib
-
-                t0 = time_lib.perf_counter()
-                for bridge, idxs in self.ref_bridges:
-                    ref_ctrls = bridge.recv()
-                    for j, env_i in enumerate(idxs):
-                        opp_controllers[env_i] = tree.map_structure(
-                            lambda x, _j=j: x[_j], ref_ctrls
-                        )
-                ref_stall += time_lib.perf_counter() - t0
-                # ref_step_ms = time actually stalled, not TF's compute time
-                self.ref_step_ms = 0.9 * self.ref_step_ms + 0.1 * (
-                    1e3 * ref_stall
-                )
 
             for i, conn in enumerate(self._conns):
                 port = self.specs[i].student_port
@@ -754,8 +727,6 @@ class DolphinRolloutWorker:
         return out
 
     def stop(self) -> None:
-        for bridge, _ in self.ref_bridges:
-            bridge.stop()
         for conn in self._conns:
             try:
                 conn.send(None)
