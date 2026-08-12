@@ -10,7 +10,7 @@ while true; do
     .venv/bin/python -m smashbot.rl.train_rl \
     --ckpt /home/kage/drive2/ShineBot/models/mega-best.pt \
     --runtime.tag rl-pool-v2 --runtime.steps 20000 \
-    --runtime.device cuda --runtime.checkpoint-interval 100 \
+    --runtime.device cuda --runtime.checkpoint-interval 50 \
     --learner.learning-rate 3e-5 \
     --rollouts.num-envs 128 --rollouts.cpu-envs 8 --rollouts.teacher-envs 32 \
     --rollouts.ref-envs 32 --rollouts.snapshot-slots 4 \
