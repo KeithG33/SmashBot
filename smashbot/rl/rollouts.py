@@ -195,9 +195,10 @@ class RolloutConfig:
     # (recycle hot-swap); the spare parks at intro menus until swapped in.
     double_buffer: bool = True
     # Reference envs are served by ceil(ref_envs / ref_shard_size) parallel
-    # TF server processes: shorter per-process bursts dodge scheduler
-    # preemption under Dolphin load, and shards compute concurrently.
-    ref_shard_size: int = 16
+    # TF server processes. Default = one bridge (production A/B at 128 envs:
+    # single vs 2x16 was a tie in fps, so the simpler config wins; sharding
+    # stays available for boxes where TF contention actually bites).
+    ref_shard_size: int = 32
     # Reference opponent (slippi-ai medium-v2 via venv-ref subprocess).
     ref_envs: int = 0
     ref_ckpt: str = "/home/kage/drive2/ShineBot/models/medium-v2"
