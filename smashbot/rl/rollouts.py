@@ -226,6 +226,14 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
     os.dup2(_log.fileno(), sys.stdout.fileno())
     os.dup2(_log.fileno(), sys.stderr.fileno())
 
+    import faulthandler
+    import signal as _sig
+
+    # On SIGUSR1 (sent by the worker watchdog before it gives up), dump this
+    # process's exact python stack to the env log — no more guessing where a
+    # silent env is stuck.
+    faulthandler.register(_sig.SIGUSR1, file=_log, all_threads=True)
+
     import melee
     import numpy as np
     import tree as tree_lib
@@ -601,10 +609,20 @@ class DolphinRolloutWorker:
             try:
                 if not conn.poll(max(0.0, deadline - time_lib.monotonic())):
                     tag = f"-{self.config.log_tag}" if self.config.log_tag else ""
+                    # capture WHERE it is stuck: SIGUSR1 -> faulthandler dumps
+                    # the env's python stack into its log before we die
+                    import os as os_lib
+                    import signal as sig_lib
+
+                    try:
+                        os_lib.kill(self._procs[i].pid, sig_lib.SIGUSR1)
+                        time_lib.sleep(2.0)
+                    except (OSError, IndexError):
+                        pass
                     raise RuntimeError(
                         f"env {i} silent for {self.config.env_timeout}s "
-                        f"(spec={self.specs[i]}); see "
-                        f"/tmp/smashbot-env{tag}-{i}.log"
+                        f"(spec={self.specs[i]}); its python stack was just "
+                        f"dumped to /tmp/smashbot-env{tag}-{i}.log"
                     )
                 payloads.append(conn.recv())
             except (EOFError, BrokenPipeError) as e:
