@@ -494,3 +494,64 @@ def test_snapshot_pool_exponential_thinning(tmp_path):
     assert min(old_gaps) > 100
     # NOT FIFO: old region spans deep history, not just the recent stretch
     assert steps[3] - steps[0] > 2000
+
+
+def test_async_delayed_agent_matches_sync(monkeypatch):
+    """AsyncDelayedAgent must emit the IDENTICAL controller sequence as the
+    sync DelayedAgent — same policy, same frames, greedy-patched sampling.
+    (The async agent overlaps compute with emulation; behavior must not
+    change by even one frame.)"""
+    from smashbot import embed as embed_lib
+    from smashbot.eval.agent import AsyncDelayedAgent, DelayedAgent
+    from smashbot.tests.test_ppo import _tiny_policy
+
+    monkeypatch.setattr(
+        embed_lib.OneHotEmbedding, "sample",
+        lambda self, logits, temperature=None: logits.argmax(-1).to(
+            {"uint8": torch.uint8, "int32": torch.int32}[np.dtype(self.dtype).name]
+        ),
+    )
+    monkeypatch.setattr(
+        embed_lib.BoolEmbedding, "sample",
+        lambda self, logits, temperature=None: logits.squeeze(-1) > 0,
+    )
+
+    def make(cls):
+        torch.manual_seed(0)
+        policy = _tiny_policy(seed=0)
+        policy.delay = 4
+        agent = cls(policy, own_port=1, opponent_port=2, device="cpu")
+        return agent
+
+    sync, awa = make(DelayedAgent), make(AsyncDelayedAgent)
+
+    # bypass the libmelee Parser: feed identical raw games directly
+    class StubParser:
+        def __init__(self, seq):
+            self.seq = seq
+            self.i = 0
+
+        def get_game(self, _gs):
+            g = self.seq[self.i % len(self.seq)]
+            self.i += 1
+            return g
+
+    import sys
+    sys.path.insert(0, "/tmp/claude-1000/-home-kage-smashbot-workspace/622f61f0-32b7-4321-b892-7040871af8a8/scratchpad")
+    from test_ref_bridge import rand_raw_game
+
+    embed_game = embed_lib.EmbedConfig().make_game_embedding()
+    rng = np.random.default_rng(5)
+    frames = [rand_raw_game(embed_game, rng) for _ in range(12)]
+    sync.parser = StubParser(frames)
+    awa.parser = StubParser(frames)
+
+    outs_sync = [sync.step(None) for _ in range(12)]
+    outs_async = [awa.step(None) for _ in range(12)]
+    awa._worker.join()
+
+    for a, b in zip(outs_sync, outs_async):
+        tree.map_structure(
+            lambda x, y: np.testing.assert_array_equal(np.asarray(x), np.asarray(y)),
+            a, b,
+        )

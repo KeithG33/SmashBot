@@ -22,6 +22,7 @@ import torch
 from slippi_ai import dolphin as dolphin_lib
 
 from smashbot.eval import game as game_lib
+from smashbot.eval import agent as agent_lib
 from smashbot.eval.agent import DelayedAgent
 
 # re-exported for backwards compatibility (older scripts import from play)
@@ -40,6 +41,10 @@ def main() -> None:
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--fullscreen", action="store_true", help="default is windowed")
     ap.add_argument("--gfx_backend", default="OGL", help="OGL | Vulkan | ''")
+    ap.add_argument("--async_agent", action="store_true",
+                    help="compute inference on a background thread (60fps "
+                         "with the frame-synced Slippi build; identical bot "
+                         "behavior — see AsyncDelayedAgent)")
     ap.add_argument("--online_delay", type=int, default=0,
                     help="Slippi rollback input delay (frames). >0 decouples "
                          "frame rate from inference latency (Dolphin stops "
@@ -97,7 +102,8 @@ def main() -> None:
         gfx_backend=args.gfx_backend,
         online_delay=args.online_delay,
     )
-    agent = DelayedAgent(
+    agent_cls = agent_lib.AsyncDelayedAgent if args.async_agent else DelayedAgent
+    agent = agent_cls(
         policy, own_port=1, opponent_port=2, name_code=name_code,
         console_delay=args.online_delay, temperature=args.temperature,
         device=args.device,
