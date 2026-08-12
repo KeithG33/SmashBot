@@ -140,14 +140,6 @@ def main() -> None:
         except (AttributeError, OSError, ValueError) as e:
             print(f"could not pin dolphin ({e}); shared cores")
 
-    # GC pauses are frame drops at 60fps: collect once post-warmup, then
-    # freeze survivors and disable cyclic GC (refcounting still reclaims
-    # the per-frame numpy/tensor churn; a play session leaks ~nothing).
-    import gc
-
-    gc.collect()
-    gc.freeze()
-    gc.disable()
 
     frames = 0
     step_times: list[float] = []
