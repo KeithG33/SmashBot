@@ -193,7 +193,11 @@ class RolloutConfig:
     log_tag: str = ""  # namespaces /tmp/smashbot-env-*.log between runs
     # Boot each Dolphin's replacement in the background during its final game
     # (recycle hot-swap); the spare parks at intro menus until swapped in.
-    double_buffer: bool = True
+    # OFF by default: worth only ~5% at pool-era fps, and its async teardown
+    # caused the 2026-08-12 overnight hang (port race on the misselect-retry
+    # path, since fixed via _drain_old_stops). Opt in for short/tended runs;
+    # re-earn trust before any week-long run relies on it.
+    double_buffer: bool = False
     # Reference envs are served by ceil(ref_envs / ref_shard_size) parallel
     # TF server processes. Default 2x16: at 7 slots the GPU window hid the
     # bridge either way (fps tie), but the production 4-slot config shrank
