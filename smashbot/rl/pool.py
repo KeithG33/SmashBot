@@ -139,20 +139,22 @@ class SnapshotPool:
         """Exponential retention: the newest `recent` snapshots are kept
         densely; beyond the cap, evict from whichever OLD region is densest
         relative to its age (span-covered / age score), so retained old
-        snapshots end up roughly exponentially spaced in step-age. (No
-        special pin on the earliest snapshot: the frozen teacher in the
-        pool is already a permanent early-style anchor.)"""
+        snapshots end up roughly exponentially spaced in step-age. Eviction
+        is interior-only: making the head evictable degenerates the whole
+        scheme to FIFO (measured — span/age always prefers the oldest), so
+        the earliest snapshot persists as the log-spacing anchor. It rarely
+        actually serves games: assignments() recency bias keeps ancient
+        snapshots to a tiny fraction of slot picks."""
         recent = min(8, self.keep // 2)
         while len(self.archive) > self.keep:
             olds = self.archive[:-recent] if recent else list(self.archive)
-            if len(olds) < 2:
+            if len(olds) < 3:
                 victim = self.archive[0]
             else:
                 latest = self._step_of(self.archive[-1])
                 victim, best = None, None
-                for j in range(len(olds) - 1):
-                    left = olds[j - 1] if j > 0 else olds[j]
-                    span = self._step_of(olds[j + 1]) - self._step_of(left)
+                for j in range(1, len(olds) - 1):
+                    span = self._step_of(olds[j + 1]) - self._step_of(olds[j - 1])
                     age = latest - self._step_of(olds[j]) + 1
                     score = span / age
                     if best is None or score < best:

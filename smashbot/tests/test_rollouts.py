@@ -485,11 +485,12 @@ def test_snapshot_pool_exponential_thinning(tmp_path):
     steps = [SnapshotPool._step_of(p) for p in pool.archive]
     assert len(steps) == 12
     assert steps == sorted(steps)
+    assert steps[0] == 0  # log-spacing anchor (interior-only eviction)
     assert steps[-1] == 5900  # latest always present
     recents = steps[-8:]
     assert recents == list(range(5200, 6000, 100))  # dense recent window
     old_gaps = [b - a for a, b in zip(steps[:-8], steps[1:-7])]
     # old region thinned: strictly sparser than the recent window's spacing
     assert min(old_gaps) > 100
-    # gaps grow with age (roughly exponential spacing, allowing thinning slop)
-    assert old_gaps[0] >= old_gaps[-1]
+    # NOT FIFO: old region spans deep history, not just the recent stretch
+    assert steps[3] - steps[0] > 2000
