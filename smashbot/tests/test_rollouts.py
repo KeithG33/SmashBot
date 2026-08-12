@@ -468,3 +468,28 @@ def test_pool_partition_reference_envs():
     assert all(s.opponent_char in MAIN_12 for s in refs)
     # both seats represented so the student isn't port-biased vs the ref
     assert {s.student_port for s in refs} == {1, 2}
+
+
+def test_snapshot_pool_exponential_thinning(tmp_path):
+    import torch as _torch
+
+    from smashbot.rl.pool import SnapshotPool
+
+    class Stub:
+        def state_dict(self):
+            return {"w": _torch.zeros(1)}
+
+    pool = SnapshotPool(str(tmp_path), slots=3, keep=12)
+    for step in range(0, 6000, 100):
+        pool.save(Stub(), step)
+    steps = [SnapshotPool._step_of(p) for p in pool.archive]
+    assert len(steps) == 12
+    assert steps == sorted(steps)
+    assert steps[0] == 0  # earliest style never evicted
+    assert steps[-1] == 5900  # latest always present
+    recents = steps[-8:]
+    assert recents == list(range(5200, 6000, 100))  # dense recent window
+    old_gaps = [b - a for a, b in zip(steps[:-8], steps[1:-7])]
+    # old region thinned: strictly sparser than the recent window's spacing
+    assert min(old_gaps) > 100
+    assert sum(old_gaps) == 5200  # telescopes oldest -> first recent

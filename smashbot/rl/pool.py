@@ -128,13 +128,38 @@ class SnapshotPool:
         torch.save(policy.state_dict(), tmp)
         os.replace(tmp, path)
         self.archive.append(path)
+        self._thin()
+        return path
+
+    @staticmethod
+    def _step_of(path: str) -> int:
+        return int(os.path.basename(path).split("-")[1].split(".")[0])
+
+    def _thin(self) -> None:
+        """Exponential retention: the newest `recent` snapshots are kept
+        densely; beyond the cap, evict from whichever OLD region is densest
+        relative to its age (span/age score). The very first snapshot is
+        never evicted (earliest style stays in rotation forever); retained
+        old snapshots end up roughly exponentially spaced in step-age."""
+        recent = min(8, self.keep // 2)
         while len(self.archive) > self.keep:
-            old = self.archive.pop(0)
+            olds = self.archive[:-recent] if recent else list(self.archive)
+            if len(olds) < 3:
+                victim = self.archive[0]
+            else:
+                latest = self._step_of(self.archive[-1])
+                victim, best = None, None
+                for j in range(1, len(olds) - 1):
+                    span = self._step_of(olds[j + 1]) - self._step_of(olds[j - 1])
+                    age = latest - self._step_of(olds[j]) + 1
+                    score = span / age
+                    if best is None or score < best:
+                        victim, best = olds[j], score
+            self.archive.remove(victim)
             try:
-                os.remove(old)
+                os.remove(victim)
             except OSError:
                 pass
-        return path
 
     def assignments(self, rng: random.Random | None = None) -> list[str]:
         """One archive path per slot (slot 0 = latest; others recency-biased

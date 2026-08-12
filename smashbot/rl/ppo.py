@@ -45,13 +45,6 @@ class PPOConfig:
     epsilon: float = 1e-2  # log-space clip: ratio confined to [e^-eps, e^eps]
     beta: float = 0.0  # weight of KL(actor || policy)
     max_mean_actor_kl: float = 1e-4  # revert the update above this
-    # DClamp-PPO (arXiv:2511.02577): steeper loss slope (alpha > 1) against
-    # ratios drifting in the STRICT WRONG direction (below 1-dclamp_beta for
-    # A>0, above 1+dclamp_beta for A<0). 0 disables. NOTE: the paper tunes
-    # dclamp_beta ~0.2-0.4 for eps=0.2 multi-epoch PPO; our log-space
-    # eps=1e-2 regime needs it rescaled to the actual ratio spread (~0.02).
-    dclamp_alpha: float = 0.0
-    dclamp_beta: float = 0.02
     # Anomaly armor: |log ratio| beyond this is data corruption, not policy
     # drift (one update moves aKL ~1e-5; e^10 is impossible drift). Clamped
     # for the surrogate; occurrences logged + first few dumped for forensics.
@@ -111,27 +104,11 @@ def clipped_surrogate(
     log_rhos: torch.Tensor,
     advantages: torch.Tensor,
     epsilon: float,
-    dclamp_alpha: float = 0.0,
-    dclamp_beta: float = 0.02,
 ) -> torch.Tensor:
-    """PPO objective (to maximize), clipped in log space: min(r*A, clip(r)*A).
-
-    With dclamp_alpha > 1, adds DClamp-PPO's third min-term (arXiv:2511.02577):
-    f(w) = alpha*w - (alpha-1)*(1 -+ dclamp_beta), a slope-alpha line active
-    only where the ratio has drifted in the strict wrong direction, pulling
-    it back toward 1 harder than PPO's slope-1 default."""
+    """PPO objective (to maximize), clipped in log space: min(r*A, clip(r)*A)."""
     rhos = torch.exp(log_rhos)
     clipped_rhos = torch.exp(torch.clamp(log_rhos, -epsilon, epsilon))
-    objs = torch.minimum(rhos * advantages, clipped_rhos * advantages)
-    if dclamp_alpha > 1.0:
-        a, b = dclamp_alpha, dclamp_beta
-        intercept = torch.where(
-            advantages > 0,
-            -(a - 1) * (1 - b),
-            -(a - 1) * (1 + b),
-        )
-        objs = torch.minimum(objs, (a * rhos + intercept) * advantages)
-    return objs
+    return torch.minimum(rhos * advantages, clipped_rhos * advantages)
 
 
 class _StructOps:
@@ -294,7 +271,6 @@ class Learner:
             )
         surrogate = clipped_surrogate(
             log_rhos, fixed.advantages, cfg.ppo.epsilon,
-            dclamp_alpha=cfg.ppo.dclamp_alpha, dclamp_beta=cfg.ppo.dclamp_beta,
         )
 
         # Forward KL to the teacher (expectation under the student's states):

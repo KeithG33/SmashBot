@@ -189,6 +189,8 @@ class RolloutConfig:
     main12_prob: float = 0.6
     snapshot_interval: int = 500  # learner steps between student snapshots
     partition_seed: int = 0
+    headless: bool = True  # False: rendered window at normal speed (watch mode)
+    log_tag: str = ""  # namespaces /tmp/smashbot-env-*.log between runs
     # Reference opponent (slippi-ai medium-v2 via venv-ref subprocess).
     ref_envs: int = 0
     ref_ckpt: str = "/home/kage/drive2/ShineBot/models/medium-v2"
@@ -205,7 +207,8 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
     # Dolphin banners/spam would hit the parent terminal on every boot and
     # recycle; redirect this process (and its Dolphin child, via fd
     # inheritance) to a per-env log where real errors remain findable.
-    _log = open(f"/tmp/smashbot-env-{idx}.log", "a", buffering=1)
+    _tag = f"-{cfg.log_tag}" if cfg.log_tag else ""
+    _log = open(f"/tmp/smashbot-env{_tag}-{idx}.log", "a", buffering=1)
     os.dup2(_log.fileno(), sys.stdout.fileno())
     os.dup2(_log.fileno(), sys.stderr.fileno())
 
@@ -252,7 +255,9 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
     consecutive_misselects = 0
     try:
         while True:
-            dolphin = game_lib.make_dolphin(players, headless=True, stage=cfg.stage)
+            dolphin = game_lib.make_dolphin(
+                players, headless=cfg.headless, stage=cfg.stage
+            )
             parser = Parser(ports=[1, 2])
             games = 0
             last_frame = None

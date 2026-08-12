@@ -155,9 +155,12 @@ def main() -> None:
     from smashbot.rl.pool import SnapshotPool, make_partition
 
     rcfg = args.rollouts
+    if not rcfg.log_tag:
+        rcfg.log_tag = args.runtime.tag
     specs = make_partition(
         rcfg.num_envs, rcfg.cpu_envs, rcfg.teacher_envs,
         rcfg.snapshot_slots, rcfg.main12_prob, rcfg.partition_seed,
+        ref_envs=rcfg.ref_envs,
     )
     opponents = {}
     slot_policies = []
