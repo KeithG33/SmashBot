@@ -361,9 +361,11 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
             try:
                 dolphin = _take_spare() or _cold_boot()
                 consecutive_boot_failures = 0
-            except BootTimeout:
+            except (BootTimeout, dolphin_lib.ConnectFailed) as e:
+                # transient boot flakes (slow boot, console connect refusal
+                # during a 128-wide boot storm) are retriable, not fatal
                 consecutive_boot_failures += 1
-                print(f"BOOT TIMEOUT ({consecutive_boot_failures}/3)",
+                print(f"BOOT FAILURE ({consecutive_boot_failures}/3): {e}",
                       flush=True)
                 if consecutive_boot_failures >= 3:
                     raise
