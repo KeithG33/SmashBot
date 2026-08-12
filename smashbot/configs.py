@@ -38,6 +38,9 @@ class NetworkConfig:
     num_layers: int = 3
     ffw_multiplier: int = 2
     recurrent_layer: str = "lstm"  # or "gru" (tx_like only)
+    # LayerNorm epsilon in tx_like ResBlocks. slippi-ai's LayerNorm has no
+    # epsilon, so checkpoints ported from TF use 0.0; ours keep torch's 1e-5.
+    ln_eps: float = 1e-5
     # transformer only:
     num_heads: int = 8
     window: int = 256  # KV-cache length (frames of memory carried at play time)

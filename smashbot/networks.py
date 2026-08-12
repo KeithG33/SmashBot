@@ -177,13 +177,21 @@ class Sequential(Network):
 class ResBlock(nn.Module):
     """Pre-LayerNorm residual FFW block with zero-initialized output."""
 
-    def __init__(self, residual_size: int, hidden_size: int | None = None, activation="relu"):
+    def __init__(
+        self,
+        residual_size: int,
+        hidden_size: int | None = None,
+        activation="relu",
+        ln_eps: float = 1e-5,
+    ):
         super().__init__()
         out = nn.Linear(hidden_size or residual_size, residual_size)
         nn.init.zeros_(out.weight)
         nn.init.zeros_(out.bias)
         self.block = nn.Sequential(
-            nn.LayerNorm(residual_size),
+            # slippi-ai's hand-rolled LayerNorm has no epsilon; checkpoints
+            # ported from TF set ln_eps=0.0 for exact equivalence.
+            nn.LayerNorm(residual_size, eps=ln_eps),
             nn.Linear(residual_size, hidden_size or residual_size),
             {"relu": nn.ReLU(), "gelu": nn.GELU()}[activation],
             out,
@@ -204,6 +212,7 @@ class TransformerLike(Sequential):
         ffw_multiplier: int = 2,
         recurrent_layer: str = "lstm",
         activation: str = "gelu",
+        ln_eps: float = 1e-5,
     ):
         recurrent_cls = {"lstm": nn.LSTM, "gru": nn.GRU}[recurrent_layer]
 
@@ -218,7 +227,12 @@ class TransformerLike(Sequential):
             )
             layers.append(
                 FFWWrapper(
-                    ResBlock(hidden_size, hidden_size * ffw_multiplier, activation)
+                    ResBlock(
+                        hidden_size,
+                        hidden_size * ffw_multiplier,
+                        activation,
+                        ln_eps=ln_eps,
+                    )
                 )
             )
         super().__init__(layers)
@@ -618,6 +632,7 @@ def build_embed_network(
             num_layers=network_config.num_layers,
             ffw_multiplier=network_config.ffw_multiplier,
             recurrent_layer=network_config.recurrent_layer,
+            ln_eps=getattr(network_config, "ln_eps", 1e-5),
         )
     elif name == "transformer":
         core = TransformerCore(
