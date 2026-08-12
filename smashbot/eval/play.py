@@ -40,6 +40,13 @@ def main() -> None:
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--fullscreen", action="store_true", help="default is windowed")
     ap.add_argument("--gfx_backend", default="OGL", help="OGL | Vulkan | ''")
+    ap.add_argument("--online_delay", type=int, default=0,
+                    help="Slippi rollback input delay (frames). >0 decouples "
+                         "frame rate from inference latency (Dolphin stops "
+                         "waiting on the bot each frame); the agent's delay "
+                         "queue compensates, so bot behavior is unchanged. "
+                         "Human inputs gain the same N frames of latency — "
+                         "netplay feel. Use 2-3 if the game runs slow.")
     ap.add_argument("--max_frames", type=int, default=0, help="0 = play forever")
     ap.add_argument("--temperature", type=float, default=None)
     ap.add_argument("--compile", action="store_true",
@@ -88,10 +95,12 @@ def main() -> None:
         stage=args.stage,
         fullscreen=args.fullscreen,
         gfx_backend=args.gfx_backend,
+        online_delay=args.online_delay,
     )
     agent = DelayedAgent(
         policy, own_port=1, opponent_port=2, name_code=name_code,
-        console_delay=0, temperature=args.temperature, device=args.device,
+        console_delay=args.online_delay, temperature=args.temperature,
+        device=args.device,
     )
     if args.pin_cores and args.device == "cpu":
         import os

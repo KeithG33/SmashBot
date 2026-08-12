@@ -135,6 +135,7 @@ def make_dolphin(
     stage: str = "FINAL_DESTINATION",
     fullscreen: bool = False,
     gfx_backend: str = "OGL",
+    online_delay: int = 0,
 ) -> dolphin_lib.Dolphin:
     """One Dolphin. Headless uses the ExiAI build (Null video, fast-forward);
     visible play uses the standard netplay build."""
@@ -163,7 +164,7 @@ def make_dolphin(
         iso=str(MELEE_ISO),
         players=players,
         headless=headless,
-        online_delay=0,
+        online_delay=online_delay,
         emulation_speed=0 if headless else 1,
         **console_kwargs,
     )
