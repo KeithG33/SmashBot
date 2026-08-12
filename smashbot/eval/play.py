@@ -111,7 +111,28 @@ def main() -> None:
     if args.pin_cores and args.device == "cpu":
         import os
 
+        # Disjoint core sets: bot inference on the first N cores, Dolphin
+        # (emulation + render threads) on the rest. Shared cores caused
+        # collision spikes -> periodic frame drops at otherwise-58fps.
         os.sched_setaffinity(0, set(range(args.pin_cores)))
+        try:
+            dolphin_pid = dolphin.console._process.pid
+            os.sched_setaffinity(
+                dolphin_pid, set(range(args.pin_cores, os.cpu_count()))
+            )
+            print(f"cores: bot 0-{args.pin_cores - 1}, dolphin "
+                  f"{args.pin_cores}-{os.cpu_count() - 1}")
+        except (AttributeError, OSError) as e:
+            print(f"could not pin dolphin ({e}); shared cores")
+
+    # GC pauses are frame drops at 60fps: collect once post-warmup, then
+    # freeze survivors and disable cyclic GC (refcounting still reclaims
+    # the per-frame numpy/tensor churn; a play session leaks ~nothing).
+    import gc
+
+    gc.collect()
+    gc.freeze()
+    gc.disable()
 
     frames = 0
     step_times: list[float] = []
