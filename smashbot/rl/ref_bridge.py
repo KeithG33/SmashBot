@@ -24,12 +24,26 @@ DEFAULT_REF_CKPT = "/home/kage/drive2/ShineBot/models/medium-v2"
 class RefBridge:
     """Owns the ref-server subprocess; one instance per reference env group."""
 
-    def __init__(self, batch_size: int, ckpt: str = DEFAULT_REF_CKPT):
+    def __init__(
+        self, batch_size: int, ckpt: str = DEFAULT_REF_CKPT, threads: int = 8
+    ):
+        import os
+
+        # The training env pins OMP_NUM_THREADS=1 for torch; the TF subprocess
+        # must NOT inherit that or batch inference runs near single-core
+        # (measured: 20-50ms/tick at batch 32 vs plentiful idle cores).
+        env = {
+            **os.environ,
+            "OMP_NUM_THREADS": str(threads),
+            "TF_NUM_INTRAOP_THREADS": str(threads),
+            "TF_NUM_INTEROP_THREADS": "2",
+        }
         self.proc = subprocess.Popen(
             [REF_PYTHON, REF_SERVER, "--path", ckpt,
              "--batch-size", str(batch_size)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
+            env=env,
         )
         hello = self._read()
         assert hello and hello.get("ready"), f"ref server failed: {hello}"
