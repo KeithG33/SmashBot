@@ -406,6 +406,20 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
                             )
                         pid = _dolphin_pid(dolphin)
                         if pid is not None:
+                            # forensics before the kill: what was Dolphin
+                            # stuck on? (kernel wait-channel per thread)
+                            try:
+                                for tid in os.listdir(f"/proc/{pid}/task"):
+                                    base = f"/proc/{pid}/task/{tid}"
+                                    with open(f"{base}/wchan") as fh:
+                                        wchan = fh.read().strip()
+                                    with open(f"{base}/stat") as fh:
+                                        state = fh.read().split()[2]
+                                    print(f"  wedged tid {tid}: "
+                                          f"state={state} wchan={wchan}",
+                                          flush=True)
+                            except OSError:
+                                pass
                             try:
                                 os.kill(pid, signal.SIGKILL)
                             except OSError:
