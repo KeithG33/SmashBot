@@ -114,15 +114,26 @@ def main() -> None:
         # Disjoint core sets: bot inference on the first N cores, Dolphin
         # (emulation + render threads) on the rest. Shared cores caused
         # collision spikes -> periodic frame drops at otherwise-58fps.
-        os.sched_setaffinity(0, set(range(args.pin_cores)))
+        bot_cores = set(range(args.pin_cores))
+        os.sched_setaffinity(0, bot_cores)
         try:
+            # Exclude the bot cores AND their SMT siblings from Dolphin's
+            # set: a Dolphin thread on a sibling shares the physical core
+            # with mid-inference work (measured as rare frame stutter).
+            siblings = set()
+            for c in bot_cores:
+                path = (f"/sys/devices/system/cpu/cpu{c}/topology/"
+                        "thread_siblings_list")
+                with open(path) as f:
+                    for part in f.read().strip().replace("-", ",").split(","):
+                        siblings.add(int(part))
+            dolphin_cores = set(range(os.cpu_count())) - bot_cores - siblings
             dolphin_pid = dolphin.console._process.pid
-            os.sched_setaffinity(
-                dolphin_pid, set(range(args.pin_cores, os.cpu_count()))
-            )
-            print(f"cores: bot 0-{args.pin_cores - 1}, dolphin "
-                  f"{args.pin_cores}-{os.cpu_count() - 1}")
-        except (AttributeError, OSError) as e:
+            os.sched_setaffinity(dolphin_pid, dolphin_cores)
+            print(f"cores: bot {sorted(bot_cores)}, dolphin gets "
+                  f"{len(dolphin_cores)} cpus (SMT siblings "
+                  f"{sorted(siblings - bot_cores)} excluded)")
+        except (AttributeError, OSError, ValueError) as e:
             print(f"could not pin dolphin ({e}); shared cores")
 
     # GC pauses are frame drops at 60fps: collect once post-warmup, then
