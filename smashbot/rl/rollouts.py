@@ -201,6 +201,10 @@ class RolloutConfig:
     # gap growing). Window size and bridge layout are coupled — re-measure
     # if the slot count changes again.
     ref_shard_size: int = 16
+    # Watchdog: max seconds the barrier waits on one env's payload before
+    # crashing loudly (a supervisor/--runtime.restore auto turns that crash
+    # into a ~20min self-heal instead of a silent overnight hang).
+    env_timeout: float = 300.0
     # Reference opponent (slippi-ai medium-v2 via venv-ref subprocess).
     ref_envs: int = 0
     ref_ckpt: str = "/home/kage/drive2/ShineBot/models/medium-v2"
@@ -270,10 +274,17 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
     # nothing progresses unattended); menu navigation still happens at swap,
     # via the normal iter_gamestates path with its misselect guard. Hides the
     # 10-15s boot that otherwise stalls the whole worker barrier per recycle.
+    import signal
     import threading
 
     spare = {"dolphin": None, "thread": None}
-    old_stops: list[threading.Thread] = []
+    old_stops: list = []  # (thread, dolphin_pid) pairs
+
+    def _dolphin_pid(d) -> int | None:
+        try:
+            return d.console._process.pid
+        except AttributeError:
+            return None
 
     def _boot_spare() -> None:
         try:
@@ -292,17 +303,67 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
     def _take_spare():
         if spare["thread"] is None:
             return None
-        spare["thread"].join()
+        spare["thread"].join(timeout=120)
+        if spare["thread"].is_alive():
+            # wedged spare boot: abandon it (daemon thread) and cold-boot
+            print("WARNING: spare boot wedged; abandoning it", flush=True)
+            spare["thread"] = None
+            spare["dolphin"] = None
+            return None
         d, spare["dolphin"], spare["thread"] = spare["dolphin"], None, None
         if d is not None:
             print("recycle: swapped to pre-booted spare", flush=True)
         return d
 
-    try:
-        while True:
-            dolphin = _take_spare() or game_lib.make_dolphin(
+    def _drain_old_stops(timeout: float = 20.0) -> None:
+        """Cold boots must not overlap a dying Dolphin: the previous instance
+        can still hold ports (seen live: retry Dolphin failed its spectator-
+        server bind and wedged mid-boot, hanging the whole worker barrier).
+        Wait for pending stops; SIGKILL any Dolphin whose stop() is stuck."""
+        for t, pid in old_stops:
+            t.join(timeout)
+            if t.is_alive() and pid is not None:
+                print(f"stop() stuck; SIGKILL dolphin pid {pid}", flush=True)
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                t.join(timeout=5)
+        old_stops[:] = [(t, p) for t, p in old_stops if t.is_alive()]
+
+    class BootTimeout(Exception):
+        pass
+
+    def _cold_boot():
+        """Boot with a hard deadline: a Dolphin that wedges during startup
+        (port collision, dead handshake) must become a bounded retry, not an
+        infinite hang. SIGALRM is safe here: env-process main thread."""
+        _drain_old_stops()
+        signal.signal(
+            signal.SIGALRM,
+            lambda *_: (_ for _ in ()).throw(BootTimeout("dolphin boot")),
+        )
+        signal.alarm(180)
+        try:
+            return game_lib.make_dolphin(
                 players, headless=cfg.headless, stage=cfg.stage
             )
+        finally:
+            signal.alarm(0)
+
+    consecutive_boot_failures = 0
+    try:
+        while True:
+            try:
+                dolphin = _take_spare() or _cold_boot()
+                consecutive_boot_failures = 0
+            except BootTimeout:
+                consecutive_boot_failures += 1
+                print(f"BOOT TIMEOUT ({consecutive_boot_failures}/3)",
+                      flush=True)
+                if consecutive_boot_failures >= 3:
+                    raise
+                continue
             parser = Parser(ports=[1, 2])
             games = 0
             last_frame = None
@@ -369,22 +430,23 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
               else:
                 consecutive_misselects = 0
             finally:
-                # Recycle path: stop the old Dolphin off-thread so the swap
-                # isn't gated on process teardown. Threads are non-daemon, so
-                # even on the shutdown path the interpreter waits for the
-                # kills to finish before exiting (no zombie Dolphins).
+                # Recycle path: stop the old Dolphin off-thread so a SPARE
+                # swap isn't gated on teardown. Cold boots drain these first
+                # (_drain_old_stops), so teardown/boot never overlap except
+                # in the validated healthy-spare case. Non-daemon: shutdown
+                # waits for the kills (no zombie Dolphins).
+                pid = _dolphin_pid(dolphin)
                 t = threading.Thread(target=dolphin.stop)
                 t.start()
-                old_stops.append(t)
+                old_stops.append((t, pid))
     except (EOFError, BrokenPipeError, KeyboardInterrupt):
         pass
     finally:
         if spare["thread"] is not None:
-            spare["thread"].join()
+            spare["thread"].join(timeout=60)
             if spare["dolphin"] is not None:
                 spare["dolphin"].stop()
-        for t in old_stops:
-            t.join(timeout=15)
+        _drain_old_stops()
 
 
 class DolphinRolloutWorker:
@@ -481,9 +543,23 @@ class DolphinRolloutWorker:
         self._prev_percent = torch.zeros(n, 2)
 
     def _gather_all(self) -> list[dict]:
+        """Barrier recv with a watchdog: one silent env must crash the run
+        loudly (env index + spec + log path), never hang it. Learned the hard
+        way — a wedged Dolphin boot froze a 128-env run overnight at step 36
+        with zero symptoms beyond a stopped ticker."""
+        import time as time_lib
+
+        deadline = time_lib.monotonic() + self.config.env_timeout
         payloads = []
         for i, conn in enumerate(self._conns):
             try:
+                if not conn.poll(max(0.0, deadline - time_lib.monotonic())):
+                    tag = f"-{self.config.log_tag}" if self.config.log_tag else ""
+                    raise RuntimeError(
+                        f"env {i} silent for {self.config.env_timeout}s "
+                        f"(spec={self.specs[i]}); see "
+                        f"/tmp/smashbot-env{tag}-{i}.log"
+                    )
                 payloads.append(conn.recv())
             except (EOFError, BrokenPipeError) as e:
                 raise RuntimeError(f"env {i} died") from e

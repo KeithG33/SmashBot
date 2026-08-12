@@ -127,17 +127,27 @@ def main() -> None:
 
     start_step = 0
     if args.runtime.restore:
+        import os as os_lib
+
         rpath = args.runtime.restore
         if rpath == "auto":
             rpath = f"{args.runtime.run_dir}/{args.runtime.tag}/latest.pt"
-        rl_ckpt = saving.load_checkpoint(rpath)
-        policy.load_state_dict(rl_ckpt["state"]["policy"])
-        value_fn.load_state_dict(rl_ckpt["state"]["value"])
-        if "policy_opt" in rl_ckpt["state"]:
-            learner.policy_optimizer.load_state_dict(rl_ckpt["state"]["policy_opt"])
-            learner.value_optimizer.load_state_dict(rl_ckpt["state"]["value_opt"])
-        start_step = rl_ckpt["state"]["step"] + 1
-        print(f"restored RL run from {rpath} at step {start_step}")
+            if not os_lib.exists(rpath):
+                rpath = ""  # supervisor-friendly: no checkpoint = fresh start
+                print("restore auto: no checkpoint yet, starting fresh")
+        if rpath:
+            rl_ckpt = saving.load_checkpoint(rpath)
+            policy.load_state_dict(rl_ckpt["state"]["policy"])
+            value_fn.load_state_dict(rl_ckpt["state"]["value"])
+            if "policy_opt" in rl_ckpt["state"]:
+                learner.policy_optimizer.load_state_dict(
+                    rl_ckpt["state"]["policy_opt"]
+                )
+                learner.value_optimizer.load_state_dict(
+                    rl_ckpt["state"]["value_opt"]
+                )
+            start_step = rl_ckpt["state"]["step"] + 1
+            print(f"restored RL run from {rpath} at step {start_step}")
     _save_rl_checkpoint.policy_opt = learner.policy_optimizer
     _save_rl_checkpoint.value_opt = learner.value_optimizer
 
