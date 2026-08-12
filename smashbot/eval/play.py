@@ -44,10 +44,6 @@ def main() -> None:
     ap.add_argument("--mute", action="store_true",
                     help="disable Dolphin audio (Pulse underruns can cause "
                          "frame-pacing stutter)")
-    ap.add_argument("--copy_home_config", action="store_true",
-                    help="run Dolphin with a copy of your real config "
-                         "(~/.config/SlippiOnline): your internal res, "
-                         "graphics settings, etc.")
     ap.add_argument("--async_agent", action="store_true",
                     help="compute inference on a background thread (60fps "
                          "with the frame-synced Slippi build; identical bot "
