@@ -136,6 +136,7 @@ def make_dolphin(
     fullscreen: bool = False,
     gfx_backend: str = "OGL",
     online_delay: int = 0,
+    mute: bool = False,
 ) -> dolphin_lib.Dolphin:
     """One Dolphin. Headless uses the ExiAI build (Null video, fast-forward);
     visible play uses the standard netplay build."""
@@ -159,6 +160,10 @@ def make_dolphin(
         console_kwargs["fullscreen"] = fullscreen
         if gfx_backend:
             console_kwargs["gfx_backend"] = gfx_backend
+        if mute:
+            # Pulse underruns ("Dropping OutputStream") disturb Dolphin's
+            # frame pacing; muting removes the audio path entirely.
+            console_kwargs["disable_audio"] = True
     return dolphin_lib.Dolphin(
         path=str(path),
         iso=str(MELEE_ISO),
@@ -166,6 +171,7 @@ def make_dolphin(
         headless=headless,
         online_delay=online_delay,
         emulation_speed=0 if headless else 1,
+        copy_home_directory=copy_home_config,
         **console_kwargs,
     )
 

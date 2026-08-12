@@ -41,6 +41,13 @@ def main() -> None:
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--fullscreen", action="store_true", help="default is windowed")
     ap.add_argument("--gfx_backend", default="OGL", help="OGL | Vulkan | ''")
+    ap.add_argument("--mute", action="store_true",
+                    help="disable Dolphin audio (Pulse underruns can cause "
+                         "frame-pacing stutter)")
+    ap.add_argument("--copy_home_config", action="store_true",
+                    help="run Dolphin with a copy of your real config "
+                         "(~/.config/SlippiOnline): your internal res, "
+                         "graphics settings, etc.")
     ap.add_argument("--async_agent", action="store_true",
                     help="compute inference on a background thread (60fps "
                          "with the frame-synced Slippi build; identical bot "
@@ -101,6 +108,7 @@ def main() -> None:
         fullscreen=args.fullscreen,
         gfx_backend=args.gfx_backend,
         online_delay=args.online_delay,
+        mute=args.mute,
     )
     agent_cls = agent_lib.AsyncDelayedAgent if args.async_agent else DelayedAgent
     agent = agent_cls(
