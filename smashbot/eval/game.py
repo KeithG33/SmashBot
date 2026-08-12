@@ -139,13 +139,14 @@ def make_dolphin(
     """One Dolphin. Headless uses the ExiAI build (Null video, fast-forward);
     visible play uses the standard netplay build."""
     console_kwargs: dict = {"stage": melee.Stage[stage.upper()]}
-    if headless:
-        # Slippi builds open slippi.gg/online/enable in a browser when their
-        # (fresh temp) user dir has no linked account. Harmless for local
-        # direct-mode games, but 32 headless Dolphins == 32 browser tabs.
-        import os
+    # Slippi builds open slippi.gg/online/enable in a browser when their
+    # (fresh temp) user dir has no linked account. All our games are local
+    # direct-mode (headless fleets AND rendered watch sessions), so no-op
+    # xdg-open for every Dolphin we spawn.
+    import os
 
-        os.environ["BROWSER"] = "true"  # xdg-open no-op for child processes
+    os.environ["BROWSER"] = "true"
+    if headless:
         path = EXIAI_APPIMAGE
     else:
         path = NETPLAY_APPIMAGE
