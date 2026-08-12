@@ -13,7 +13,7 @@ while true; do
     --learner.learning-rate 3e-5 \
     --rollouts.num-envs 128 --rollouts.cpu-envs 8 --rollouts.teacher-envs 32 \
     --rollouts.ref-envs 32 --rollouts.snapshot-slots 4 \
-    --rollouts.ref-shard-size 16 --rollouts.double-buffer False \
+    --rollouts.ref-shard-size 16 --rollouts.no-double-buffer \
     --runtime.restore auto
   code=$?
   if [ $code -eq 0 ]; then echo "run completed (steps done)"; break; fi
