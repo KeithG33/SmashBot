@@ -195,10 +195,12 @@ class RolloutConfig:
     # (recycle hot-swap); the spare parks at intro menus until swapped in.
     double_buffer: bool = True
     # Reference envs are served by ceil(ref_envs / ref_shard_size) parallel
-    # TF server processes. Default = one bridge (production A/B at 128 envs:
-    # single vs 2x16 was a tie in fps, so the simpler config wins; sharding
-    # stays available for boxes where TF contention actually bites).
-    ref_shard_size: int = 32
+    # TF server processes. Default 2x16: at 7 slots the GPU window hid the
+    # bridge either way (fps tie), but the production 4-slot config shrank
+    # the window and sharding pulled measurably ahead (647 vs 634 @ step 10,
+    # gap growing). Window size and bridge layout are coupled — re-measure
+    # if the slot count changes again.
+    ref_shard_size: int = 16
     # Reference opponent (slippi-ai medium-v2 via venv-ref subprocess).
     ref_envs: int = 0
     ref_ckpt: str = "/home/kage/drive2/ShineBot/models/medium-v2"
