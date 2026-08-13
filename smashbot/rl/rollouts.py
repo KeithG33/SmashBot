@@ -484,6 +484,18 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
                         if games >= cfg.games_per_dolphin:
                             pending_reset, pending_result = True, result
                             break
+                        if cfg.redraw_chars:
+                            # per-GAME character rotation: the vendor's menu
+                            # helper and misselect guard both read
+                            # player.character LIVE each menu pass, so
+                            # mutating it between games retargets the next
+                            # rematch CSS pick — no recycle needed.
+                            nc = _draw_char()
+                            players[opp_port].character = (
+                                melee.Character[nc.upper()]
+                            )
+                            print(f"game end: opponent redrawn -> {nc}",
+                                  flush=True)
                         parser = Parser(ports=[1, 2])
                     if games >= cfg.games_per_dolphin - 1:
                         _start_spare()  # entering this Dolphin's final game
