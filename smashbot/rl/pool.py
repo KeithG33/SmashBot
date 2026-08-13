@@ -126,7 +126,19 @@ class SnapshotPool:
         self.slots = slots
         self.keep = keep
         os.makedirs(directory, exist_ok=True)
-        self.archive: list[str] = []
+        # Adopt snapshots already on disk (restarts must not amnesia the
+        # league: without this, every resume served only its own boot's
+        # saves and orphaned the older ghosts).
+        import glob
+
+        self.archive: list[str] = sorted(
+            glob.glob(os.path.join(directory, "snapshot-*.pt")),
+            key=self._step_of,
+        )
+        if self.archive:
+            print(f"snapshot archive: adopted {len(self.archive)} existing "
+                  f"(steps {self._step_of(self.archive[0])}-"
+                  f"{self._step_of(self.archive[-1])})", flush=True)
 
     def save(self, policy, step: int) -> str:
         path = os.path.join(self.dir, f"snapshot-{step:07d}.pt")
