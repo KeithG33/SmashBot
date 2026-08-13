@@ -252,22 +252,42 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
     # by test_worker_side_encode_matches_policy_encode).
     embed_game = embed_lib.EmbedConfig().make_game_embedding()
 
+    import random as random_lib
+
+    from smashbot.rl.pool import CPU_CHARS, OFF_ROSTER, OPPONENT_CHARS
+
     opp_port = 3 - spec.student_port
-    if spec.kind == "cpu":
-        opponent_player = dolphin_lib.CPU(
-            character=melee.Character[spec.opponent_char.upper()],
-            level=spec.cpu_level,
-        )
-    else:
-        opponent_player = dolphin_lib.AI(
-            character=melee.Character[spec.opponent_char.upper()]
-        )
-    players = {
-        spec.student_port: dolphin_lib.AI(
-            character=melee.Character[cfg.bot_char.upper()]
-        ),
-        opp_port: opponent_player,
-    }
+    # Per-env deterministic RNG for opponent-character redraws at each
+    # Dolphin recycle: matchups rotate over the run instead of being frozen
+    # by the boot-time draw (the first Dolphin still uses the partition's
+    # stratified char, preserving guaranteed full-roster coverage at boot).
+    char_rng = random_lib.Random((cfg.partition_seed << 16) ^ idx)
+
+    def _draw_char() -> str:
+        if spec.kind == "cpu":
+            pool = (CPU_CHARS if char_rng.random() < cfg.main12_prob
+                    else OFF_ROSTER)
+            return char_rng.choice(pool)
+        return char_rng.choice(OPPONENT_CHARS)
+
+    def _build_players(opp_char: str) -> dict:
+        if spec.kind == "cpu":
+            opponent_player = dolphin_lib.CPU(
+                character=melee.Character[opp_char.upper()],
+                level=spec.cpu_level,
+            )
+        else:
+            opponent_player = dolphin_lib.AI(
+                character=melee.Character[opp_char.upper()]
+            )
+        return {
+            spec.student_port: dolphin_lib.AI(
+                character=melee.Character[cfg.bot_char.upper()]
+            ),
+            opp_port: opponent_player,
+        }
+
+    players = _build_players(spec.opponent_char)
     # Carried across Dolphin recycles: the new instance's first frame must
     # still announce the game boundary (fresh recurrent state, zeroed reward)
     # and deliver the final game's result — otherwise two different games
@@ -362,8 +382,15 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
 
     consecutive_boot_failures = 0
     consecutive_wedges = 0
+    first_boot = True
     try:
         while True:
+            if not first_boot:
+                new_char = _draw_char()
+                players.clear()
+                players.update(_build_players(new_char))
+                print(f"recycle: opponent redrawn -> {new_char}", flush=True)
+            first_boot = False
             try:
                 dolphin = _take_spare() or _cold_boot()
                 consecutive_boot_failures = 0

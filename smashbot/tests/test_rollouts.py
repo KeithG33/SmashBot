@@ -637,3 +637,20 @@ def test_async_agent_absorbs_slow_samples(monkeypatch):
         )
     # and step() never blocked on a spike (queue slack absorbed the lag)
     assert max(step_times) < 0.02, f"step blocked: {max(step_times)*1e3:.1f}ms"
+
+
+def test_partition_guarantees_full_roster_per_policy_kind():
+    """Stratified draws: every policy-opponent group (teacher/reference/
+    snapshot) must cover all 12 characters when it has >= 12 envs (pure
+    random draws left holes — live-audited: a 32-env group missed PEACH
+    for an entire run)."""
+    from smashbot.rl.pool import MAIN_12, make_partition
+
+    for seed in range(5):
+        specs = make_partition(128, 8, 32, 4, ref_envs=32, seed=seed)
+        by_kind: dict = {}
+        for sp in specs:
+            by_kind.setdefault(sp.kind, set()).add(sp.opponent_char)
+        for kind in ("teacher", "reference", "snapshot"):
+            missing = [c for c in MAIN_12 if c not in by_kind[kind]]
+            assert not missing, f"seed {seed} {kind} missing {missing}"

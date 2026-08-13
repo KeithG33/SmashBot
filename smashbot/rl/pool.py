@@ -86,23 +86,29 @@ def make_partition(
         pool = CPU_CHARS if rng.random() < main12_prob else OFF_ROSTER
         return rng.choice(pool)
 
+    def stratified(n: int) -> list[str]:
+        """All 12 guaranteed once (when n >= 12), remainder random, order
+        shuffled — pure random draws left holes (live-audited: Phillip's
+        32-env group drew zero PEACH for an entire run)."""
+        chars = list(OPPONENT_CHARS) if n >= len(OPPONENT_CHARS) else []
+        chars += [rng.choice(OPPONENT_CHARS) for _ in range(n - len(chars))]
+        rng.shuffle(chars)
+        return chars
+
     specs: list[EnvSpec] = []
     for i in range(cpu_envs):
         specs.append(EnvSpec("cpu", -1, 1 + (i % 2), cpu_char()))
-    for i in range(teacher_envs):
-        specs.append(
-            EnvSpec("teacher", -1, 1 + (i % 2), rng.choice(OPPONENT_CHARS))
-        )
-    for i in range(ref_envs):
+    for i, ch in enumerate(stratified(teacher_envs)):
+        specs.append(EnvSpec("teacher", -1, 1 + (i % 2), ch))
+    for i, ch in enumerate(stratified(ref_envs)):
         # reference agent (e.g. medium-v2) plays the main 12 (user-verified)
-        specs.append(
-            EnvSpec("reference", -1, 1 + (i % 2), rng.choice(OPPONENT_CHARS))
-        )
+        specs.append(EnvSpec("reference", -1, 1 + (i % 2), ch))
     per_slot = snap_envs // snapshot_slots if snapshot_slots else 0
+    snap_chars = stratified(per_slot * snapshot_slots)
     for slot in range(snapshot_slots):
         for i in range(per_slot):
             specs.append(
-                EnvSpec("snapshot", slot, 1 + (i % 2), rng.choice(OPPONENT_CHARS))
+                EnvSpec("snapshot", slot, 1 + (i % 2), snap_chars.pop())
             )
     return specs
 
