@@ -237,3 +237,50 @@ def test_teacher_stays_frozen():
 
 def copy_params(module) -> list[torch.Tensor]:
     return [p.detach().clone() for p in module.parameters()]
+
+
+def test_nonfinite_gradients_never_reach_weights():
+    """A batch that produces NaN gradients (even with finite loss) must be
+    skipped entirely — step 705 of rl-pool-v3 NaN'd every policy weight
+    because only the LOSS was checked. Poison a gradient mid-update via a
+    backward hook and assert weights stay finite and unchanged."""
+    import copy as copy_lib
+
+    torch.manual_seed(0)
+    policy = _tiny_policy(seed=0)
+    teacher = _tiny_policy(seed=0)
+    value = _tiny_value()
+    learner = Learner(
+        RLConfig(ppo=PPOConfig(max_mean_actor_kl=1e9)), policy, teacher, value
+    )
+
+    param = next(policy.parameters())
+    param.register_hook(lambda g: g * float("nan"))
+
+    from smashbot.tests.test_rollouts import _fake_record  # noqa: F401
+    from smashbot.rl.rollouts import ChunkAssembler
+    from smashbot.rl.agent import BatchedPolicyAgent
+
+    N, T = 2, 5
+    agent = BatchedPolicyAgent(policy, num_envs=N)
+    asm = ChunkAssembler(unroll_length=T, delay=policy.delay)
+    rng = np.random.default_rng(3)
+    game_embed = dict(policy.network.embed_state_action.embedding)["state"]
+    t, traj = 0, None
+    while traj is None:
+        if t > 0:
+            asm.push_reward(torch.zeros(N))
+        snap = agent.hidden_snapshot() if t % T == 0 else None
+        states = _rand_states(game_embed, (N,), rng)
+        _, records, _ = agent.step(states)
+        asm.push_frame(records[0], torch.zeros(N, dtype=torch.bool), snap)
+        if asm.ready():
+            traj = asm.emit()
+        t += 1
+
+    before = copy_lib.deepcopy(policy.state_dict())
+    state = learner.initial_state(N)
+    learner.step([traj], state)
+    for k, v in policy.state_dict().items():
+        assert torch.isfinite(v.float()).all(), f"nonfinite weight {k}"
+        assert torch.equal(v, before[k]), f"weights changed despite NaN grads: {k}"

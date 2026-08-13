@@ -222,7 +222,15 @@ class Learner:
         )
         self.value_optimizer.zero_grad(set_to_none=True)
         value_out.loss.backward()
-        self.value_optimizer.step()
+        value_grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.value_function.parameters(), float("inf")
+        )
+        if not torch.isfinite(value_grad_norm):
+            print(f"NONFINITE VALUE GRAD NORM ({value_grad_norm}): "
+                  "skipping value update", flush=True)
+            self.value_optimizer.zero_grad(set_to_none=True)
+        else:
+            self.value_optimizer.step()
 
         # Unroll position t (t = 0..T-1) predicts the action sampled at frame
         # t: its actor logits are logits[t], and the sampled action itself is
@@ -371,11 +379,20 @@ class Learner:
                     continue
                 (loss / len(fixed_list)).backward()
                 batch_metrics.append(metrics)
-            if cfg.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    self.policy.parameters(), cfg.max_grad_norm
-                )
-            self.policy_optimizer.step()
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.policy.parameters(),
+                cfg.max_grad_norm if cfg.max_grad_norm > 0 else float("inf"),
+            )
+            if not torch.isfinite(grad_norm):
+                # A finite loss can still yield nonfinite GRADIENTS (inf-inf
+                # cancellation, 0*log0 subgradients); clip_grad_norm_ does
+                # not sanitize NaN. One such step nan'd every policy weight
+                # live (step 705, rl-pool-v3). Skip the update entirely.
+                print(f"NONFINITE GRAD NORM ({grad_norm}): skipping update",
+                      flush=True)
+                self.policy_optimizer.zero_grad(set_to_none=True)
+            else:
+                self.policy_optimizer.step()
             epoch_metrics.append(_mean_dicts(batch_metrics))
 
         # Post-update measurement (and trust-region backstop).
