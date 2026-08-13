@@ -23,9 +23,14 @@ This is the Self-Imitation Learning / MARWIL family, pointed at opponent data:
   "imitation caps you at Phillip": it doesn't, with advantage weighting).
 - **AWR / AWAC** (Peng et al. 2019; Nair et al. 2020): same exponential
   advantage weighting as the general offline/off-policy actor update.
-- **Mimicking To Dominate** (2023) and opponent-aware league training
-  (NeurIPS 2023) support opponent-imitation improving competitive-game RL on
-  top of AlphaStar-style leagues.
+- **Mimicking To Dominate** (2023): a SIBLING branch, not an ancestor — uses
+  imitation to PREDICT opponents' actions (opponent modeling as an auxiliary,
+  jointly trained with the policy; SOTA claims on SMACv2). Distinct mechanism
+  from harvesting opponent actions into our own policy, but suggests a cheap
+  complementary experiment: an auxiliary opponent-action-prediction head to
+  shape representations, with zero imitation-cap risk.
+- Opponent-aware league training (NeurIPS 2023) extends AlphaStar-style
+  leagues with opponent-conditioned robustness — league-design branch.
 
 Why not importance-sampled off-policy PG (V-trace-style) instead: IS ratios
 truncate exactly where our policy and the opponent's disagree most — which is
