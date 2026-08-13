@@ -191,6 +191,10 @@ class RolloutConfig:
     partition_seed: int = 0
     headless: bool = True  # False: rendered window at normal speed (watch mode)
     log_tag: str = ""  # namespaces /tmp/smashbot-env-*.log between runs
+    # Redraw the opponent character at each Dolphin recycle. Flag-gated:
+    # its first production firing correlated with the step-706 NaN crash
+    # (under investigation); off = the proven fixed-char recycle path.
+    redraw_chars: bool = True
     # Boot each Dolphin's replacement in the background during its final game
     # (recycle hot-swap); the spare parks at intro menus until swapped in.
     # OFF by default: worth only ~5% at pool-era fps, and its async teardown
@@ -385,7 +389,7 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
     first_boot = True
     try:
         while True:
-            if not first_boot:
+            if not first_boot and cfg.redraw_chars:
                 new_char = _draw_char()
                 players.clear()
                 players.update(_build_players(new_char))
