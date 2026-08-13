@@ -394,7 +394,7 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
             try:
                 dolphin = _take_spare() or _cold_boot()
                 consecutive_boot_failures = 0
-            except (BootTimeout, dolphin_lib.ConnectFailed) as e:
+            except (AlarmTimeout, dolphin_lib.ConnectFailed) as e:
                 # transient boot flakes (slow boot, console connect refusal
                 # during a 128-wide boot storm) are retriable, not fatal
                 consecutive_boot_failures += 1
