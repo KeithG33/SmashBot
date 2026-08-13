@@ -197,8 +197,10 @@ def main() -> None:
         ref_policy.requires_grad_(False)
         ref_policy.eval()
         if args.runtime.compile:
-            mode = "reduce-overhead" if device == "cuda" else "default"
-            ref_policy.sample = torch.compile(ref_policy.sample, mode=mode)
+            # "default" mode: no CUDA-graph private pools. The learner peak
+            # runs the GPU at its edge (2x 76MB-OOM at 22.4GB); opponent
+            # policies trade a few ms/tick for ~1GB of headroom.
+            ref_policy.sample = torch.compile(ref_policy.sample, mode="default")
         ref_code = resolve_name_code(ref_names, "Master Player")
         opponents["reference"] = BatchedPolicyAgent(
             ref_policy, counts["reference"], name_code=ref_code,
@@ -214,8 +216,9 @@ def main() -> None:
         slot_policy.requires_grad_(False)
         slot_policy.eval()
         if args.runtime.compile:
-            mode = "reduce-overhead" if device == "cuda" else "default"
-            slot_policy.sample = torch.compile(slot_policy.sample, mode=mode)
+            slot_policy.sample = torch.compile(
+                slot_policy.sample, mode="default"  # headroom > launch overhead
+            )
         slot_policies.append((key[1], slot_policy))
         opponents[key] = BatchedPolicyAgent(
             slot_policy, n, name_code=name_code, device=device,
