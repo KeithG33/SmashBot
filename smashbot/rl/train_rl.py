@@ -274,8 +274,11 @@ def main() -> None:
             state, metrics = learner.step(trajectories, state)
 
             if i % args.runtime.log_interval == 0:
+                # frames THIS BOOT only: after a restore, i includes the
+                # restored steps but t0 is boot time — crediting them made
+                # fps read ~80k until the ghost frames washed out.
                 frames = (
-                    (i + 1) * args.runtime.trajectories_per_step
+                    (i + 1 - start_step) * args.runtime.trajectories_per_step
                     * args.rollouts.num_envs * args.rollouts.unroll_length
                 )
                 log = {
