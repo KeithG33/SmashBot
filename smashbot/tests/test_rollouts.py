@@ -654,3 +654,25 @@ def test_partition_guarantees_full_roster_per_policy_kind():
         for kind in ("teacher", "reference", "snapshot"):
             missing = [c for c in MAIN_12 if c not in by_kind[kind]]
             assert not missing, f"seed {seed} {kind} missing {missing}"
+
+
+def test_tracker_ema_and_persistence():
+    """EMA updates on decided games only, matches hand-rolled math, and
+    round-trips through state()/load_state (the part that survives
+    restarts — the windows are boot-local by design)."""
+    from smashbot.rl.rollouts import GameTracker
+
+    t = GameTracker(ema_alpha=0.5)
+    t.add_game((4, 0))   # win  -> ema seeds at 1.0
+    t.add_game((0, 4))   # loss -> 0.5*1.0 + 0.5*0 = 0.5
+    t.add_game((2, 2))   # draw -> win_ema untouched
+    t.add_game((4, 1))   # win  -> 0.5*0.5 + 0.5*1 = 0.75
+    assert t.win_ema == pytest.approx(0.75)
+    assert t.stats()["win_rate_ema"] == pytest.approx(0.75)
+
+    t2 = GameTracker()
+    t2.load_state(t.state())
+    assert t2.win_ema == pytest.approx(0.75)
+    assert t2.wins == 2 and t2.losses == 1 and t2.draws == 1
+    t2.add_game((0, 4))
+    assert t2.win_ema == pytest.approx(0.75 * 0.5)  # alpha restored too

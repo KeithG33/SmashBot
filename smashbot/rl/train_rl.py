@@ -99,6 +99,7 @@ def _save_rl_checkpoint(
                 "name_map": name_map,
                 "step": step,
                 "teacher_ckpt": teacher,
+                "trackers": _save_rl_checkpoint.tracker_states(),
             },
             "best_eval_loss": None,
             "version": saving.VERSION,
@@ -126,6 +127,7 @@ def main() -> None:
     learner = Learner(args.learner, policy, teacher, value_fn)
 
     start_step = 0
+    restored_trackers = None
     if args.runtime.restore:
         import os as os_lib
 
@@ -147,6 +149,7 @@ def main() -> None:
                     rl_ckpt["state"]["value_opt"]
                 )
             start_step = rl_ckpt["state"]["step"] + 1
+            restored_trackers = rl_ckpt["state"].get("trackers")
             print(f"restored RL run from {rpath} at step {start_step}")
     _save_rl_checkpoint.policy_opt = learner.policy_optimizer
     _save_rl_checkpoint.value_opt = learner.value_optimizer
@@ -231,6 +234,14 @@ def main() -> None:
     worker = DolphinRolloutWorker(
         args.rollouts, student_agent, opponents=opponents, specs=specs
     )
+    if restored_trackers:
+        for kind, st in restored_trackers.items():
+            if kind in worker.trackers:
+                worker.trackers[kind].load_state(st)
+        print(f"tracker EMAs restored for {sorted(restored_trackers)}")
+    _save_rl_checkpoint.tracker_states = lambda: {
+        k: t.state() for k, t in worker.trackers.items()
+    }
 
     import wandb
 

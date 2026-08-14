@@ -134,23 +134,54 @@ class GameTracker:
     average opponent percent at our kills (low = early kills, strong punish
     game), and average own percent at our deaths (high = hard to kill)."""
 
-    def __init__(self, window: int = 100, event_window: int = 200):
+    def __init__(self, window: int = 100, event_window: int = 200,
+                 ema_alpha: float = 0.02):
         import collections
 
         self.diffs = collections.deque(maxlen=window)  # per finished game
         self.kill_percents = collections.deque(maxlen=event_window)
         self.death_percents = collections.deque(maxlen=event_window)
         self.wins = self.losses = self.draws = 0
+        # EMA companion to the window: smoother (no window-exit jumps) and
+        # persistable across restarts via state()/load_state — the window
+        # resets every boot; the EMA rides in the RL checkpoint.
+        self.ema_alpha = ema_alpha
+        self.win_ema: float | None = None
+        self.diff_ema: float | None = None
 
     def add_game(self, final_stocks: tuple[int, int]) -> None:
         bot, opp = final_stocks
-        self.diffs.append(bot - opp)
+        diff = bot - opp
+        self.diffs.append(diff)
         if bot > opp:
             self.wins += 1
         elif opp > bot:
             self.losses += 1
         else:
             self.draws += 1
+        if diff != 0:  # EMA over decided games, matching win_rate_recent
+            outcome = 1.0 if diff > 0 else 0.0
+            a = self.ema_alpha
+            self.win_ema = (outcome if self.win_ema is None
+                            else (1 - a) * self.win_ema + a * outcome)
+        a = self.ema_alpha
+        self.diff_ema = (float(diff) if self.diff_ema is None
+                         else (1 - a) * self.diff_ema + a * diff)
+
+    def state(self) -> dict:
+        """Persistable summary state (EMAs + lifetime counters); the raw
+        windows are boot-local by design."""
+        return {"win_ema": self.win_ema, "diff_ema": self.diff_ema,
+                "wins": self.wins, "losses": self.losses,
+                "draws": self.draws, "ema_alpha": self.ema_alpha}
+
+    def load_state(self, st: dict) -> None:
+        self.win_ema = st.get("win_ema")
+        self.diff_ema = st.get("diff_ema")
+        self.wins = st.get("wins", 0)
+        self.losses = st.get("losses", 0)
+        self.draws = st.get("draws", 0)
+        self.ema_alpha = st.get("ema_alpha", self.ema_alpha)
 
     def add_kill(self, opp_percent: float) -> None:
         self.kill_percents.append(opp_percent)
@@ -169,6 +200,8 @@ class GameTracker:
             "avg_stock_diff": mean(self.diffs),
             "avg_percent_at_kill": mean(self.kill_percents),
             "avg_percent_at_death": mean(self.death_percents),
+            "win_rate_ema": self.win_ema if self.win_ema is not None else 0.5,
+            "stock_diff_ema": self.diff_ema if self.diff_ema is not None else 0.0,
         }
 
 
