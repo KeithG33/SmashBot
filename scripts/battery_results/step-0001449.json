@@ -1,0 +1,68 @@
+{
+  "student_ckpt": "/home/kage/drive2/ShineBot/runs/rl-pool-v3/latest.pt",
+  "student_rl_step": 1449,
+  "timestamp": "2026-08-13T18:32:03",
+  "char_slate": [
+    "FOX",
+    "FALCO",
+    "MARTH",
+    "SHEIK",
+    "PEACH",
+    "CPTFALCON",
+    "JIGGLYPUFF",
+    "SAMUS"
+  ],
+  "config": {
+    "num_envs": 6,
+    "unroll_length": 240,
+    "batch_steps": 1,
+    "bot_char": "FOX",
+    "stage": "FINAL_DESTINATION",
+    "games_per_dolphin": 200,
+    "cpu_envs": 0,
+    "teacher_envs": 3,
+    "snapshot_slots": 0,
+    "main12_prob": 0.6,
+    "snapshot_interval": 500,
+    "partition_seed": 0,
+    "headless": true,
+    "log_tag": "battery",
+    "redraw_chars": false,
+    "double_buffer": false,
+    "ref_shard_size": 16,
+    "env_timeout": 300.0,
+    "ref_envs": 3,
+    "ref_ckpt": "/home/kage/drive2/ShineBot/models/medium-v2-torch.pt",
+    "envs": 6,
+    "games_per_side": 3,
+    "max_minutes": 25.0,
+    "device": "cuda",
+    "yardstick_teacher": "/home/kage/drive2/ShineBot/models/yardstick-teacher-887500.pt",
+    "yardstick_phillip": "/home/kage/drive2/ShineBot/models/medium-v2-torch.pt",
+    "student_mode": "ckpt",
+    "config_from": "",
+    "elapsed_seconds": 948.4
+  },
+  "results": {
+    "teacher": {
+      "games": 3,
+      "wins": 2,
+      "losses": 1,
+      "draws": 0,
+      "win_rate": 0.6666666666666666,
+      "avg_stock_diff": 0.6666666666666666,
+      "avg_percent_at_kill": 111.059463818868,
+      "avg_percent_at_death": 132.63111114501953
+    },
+    "phillip": {
+      "games": 3,
+      "wins": 0,
+      "losses": 3,
+      "draws": 0,
+      "win_rate": 0.0,
+      "avg_stock_diff": -2.3333333333333335,
+      "avg_percent_at_kill": 133.05777655707465,
+      "avg_percent_at_death": 100.22003757252412
+    }
+  }
+}
