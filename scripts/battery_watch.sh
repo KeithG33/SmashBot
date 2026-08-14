@@ -31,6 +31,7 @@ while true; do
             OMP_NUM_THREADS=4 "$PY" "$ROOT/scripts/battery.py" \
                 --snapshot "$snap" \
                 --config-from "$RUN_DIR/latest.pt" \
+                --device cpu \
                 || echo "[battery_watch] battery FAILED for $snap (will retry next cycle)"
         fi
     done
