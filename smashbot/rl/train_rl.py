@@ -313,16 +313,18 @@ def main() -> None:
                     log.get(f"rl/{k}/games_played", 0)
                     for k in ("cpu", "teacher", "snapshot", "reference")
                 )
+                # ticker shows the EMAs (restart-proof); the 100-game window
+                # stays in wandb as */win_rate_recent for fast-read comparison
                 ref_bit = (
-                    f"R:{log.get('rl/reference/win_rate_recent', 0.5):.0%} "
+                    f"R:{log.get('rl/reference/win_rate_ema', 0.5):.0%} "
                     if worker.ref_idx else ""
                 )
                 print(
                     f"[{i:4d}/{args.runtime.steps}] "
-                    f"T:{log.get('rl/teacher/win_rate_recent', 0.5):.0%}"
-                    f"/{log.get('rl/teacher/avg_stock_diff', 0):+.1f} "
-                    f"S:{log.get('rl/snapshot/win_rate_recent', 0.5):.0%} "
-                    f"C:{log.get('rl/cpu/win_rate_recent', 0.5):.0%} "
+                    f"T:{log.get('rl/teacher/win_rate_ema', 0.5):.0%}"
+                    f"/{log.get('rl/teacher/stock_diff_ema', 0):+.1f} "
+                    f"S:{log.get('rl/snapshot/win_rate_ema', 0.5):.0%} "
+                    f"C:{log.get('rl/cpu/win_rate_ema', 0.5):.0%} "
                     f"{ref_bit}"
                     f"({games:.0f}g) | "
                     f"kill@{log.get('rl/teacher/avg_percent_at_kill', 0):.0f}% "
