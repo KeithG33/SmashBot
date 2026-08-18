@@ -681,9 +681,9 @@ def test_tracker_ema_and_persistence():
     assert t2.wins == 2 and t2.losses == 1 and t2.draws == 1
     assert "ema_alpha" not in t.state()  # values persist, alpha doesn't
     t2.add_game((0, 4))
-    # continues at the tracker's OWN alpha (0.01), not the persisted run's
-    assert t2.win_ema == pytest.approx(0.75 * 0.99)
+    # continues at the tracker's OWN alpha (0.008), not the persisted run's
+    assert t2.win_ema == pytest.approx(0.75 * 0.992)
     # legacy checkpoints carrying an alpha are ignored gracefully
     t3 = GameTracker()
     t3.load_state({"win_ema": 0.6, "ema_alpha": 0.5, "wins": 1})
-    assert t3.ema_alpha == 0.01 and t3.win_ema == 0.6
+    assert t3.ema_alpha == 0.008 and t3.win_ema == 0.6
