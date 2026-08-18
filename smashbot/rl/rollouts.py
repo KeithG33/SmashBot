@@ -27,7 +27,7 @@ import torch
 import tree
 
 from smashbot.rl.agent import BatchedPolicyAgent, FrameRecord
-from smashbot.rl.ppo import ActionData, Trajectory
+from smashbot.rl.ppo import ActionData, Trajectory, slice_trajectory_rows
 
 
 class ChunkAssembler:
@@ -134,8 +134,13 @@ class GameTracker:
     average opponent percent at our kills (low = early kills, strong punish
     game), and average own percent at our deaths (high = hard to kill)."""
 
+    # ema_alpha 0.01 ~ a 200-game horizon: at 120 envs a 100-game horizon is
+    # less than one wave of concurrent games, so the ticker EMA wobbled with
+    # single-batch luck (~±5pp); 200 games reads ~±3.5pp. Persisted tracker
+    # state stores the EMA VALUES only, so restored checkpoints pick up the
+    # new alpha automatically.
     def __init__(self, window: int = 100, event_window: int = 200,
-                 ema_alpha: float = 0.02):
+                 ema_alpha: float = 0.01):
         import collections
 
         self.diffs = collections.deque(maxlen=window)  # per finished game
@@ -169,11 +174,13 @@ class GameTracker:
                          else (1 - a) * self.diff_ema + a * diff)
 
     def state(self) -> dict:
-        """Persistable summary state (EMAs + lifetime counters); the raw
-        windows are boot-local by design."""
+        """Persistable summary state (EMA VALUES + lifetime counters); the
+        raw windows are boot-local by design. ema_alpha is deliberately NOT
+        persisted: the horizon is a code-level tuning knob, so restored
+        checkpoints pick up the current default automatically."""
         return {"win_ema": self.win_ema, "diff_ema": self.diff_ema,
                 "wins": self.wins, "losses": self.losses,
-                "draws": self.draws, "ema_alpha": self.ema_alpha}
+                "draws": self.draws}
 
     def load_state(self, st: dict) -> None:
         self.win_ema = st.get("win_ema")
@@ -181,7 +188,6 @@ class GameTracker:
         self.wins = st.get("wins", 0)
         self.losses = st.get("losses", 0)
         self.draws = st.get("draws", 0)
-        self.ema_alpha = st.get("ema_alpha", self.ema_alpha)
 
     def add_kill(self, opp_percent: float) -> None:
         self.kill_percents.append(opp_percent)
@@ -245,6 +251,26 @@ class RolloutConfig:
     # Reference opponent (slippi-ai medium-v2 via venv-ref subprocess).
     ref_envs: int = 0
     ref_ckpt: str = "/home/kage/drive2/ShineBot/models/medium-v2-torch.pt"
+    # Student character whitelist: the student seat's character is drawn
+    # per-game uniformly from this list (len==1 = exactly the fixed-char
+    # behavior; the default ["FOX"] defers to the legacy bot_char flag —
+    # see pool.student_whitelist). It also gates second-seat harvesting:
+    # an opponent seat is harvested for imitation only while its current
+    # character is whitelisted.
+    char_whitelist: list[str] = dataclasses.field(
+        default_factory=lambda: ["FOX"]
+    )
+    # Self-play envs: BOTH seats driven by the current student policy (one
+    # batched forward — no second policy copy). Each contributes 2 on-policy
+    # PPO trajectories, so it costs 2 units of the num_envs trajectory
+    # budget while booting ONE Dolphin: dolphins = num_envs - self_envs.
+    # 0 = dormant (today's behavior).
+    self_envs: int = 0
+    # PFSP opponent prioritization (AlphaStar f_hard) for snapshot slot
+    # assignment; False = the original recency-biased sampling. Selection
+    # only — zero effect on losses or memory.
+    pfsp: bool = True
+    pfsp_p: float = 1.0
 
 
 def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
@@ -291,7 +317,9 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
 
     import random as random_lib
 
-    from smashbot.rl.pool import CPU_CHARS, OFF_ROSTER, OPPONENT_CHARS
+    from smashbot.rl.pool import (
+        CPU_CHARS, OFF_ROSTER, OPPONENT_CHARS, student_whitelist,
+    )
 
     opp_port = 3 - spec.student_port
     # Per-env deterministic RNG for opponent-character redraws at each
@@ -299,15 +327,27 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
     # by the boot-time draw (the first Dolphin still uses the partition's
     # stratified char, preserving guaranteed full-roster coverage at boot).
     char_rng = random_lib.Random((cfg.partition_seed << 16) ^ idx)
+    # Student-seat whitelist draws use their OWN rng stream so a multi-char
+    # whitelist never perturbs the opponent redraw sequence (and vice versa).
+    whitelist = student_whitelist(cfg.char_whitelist, cfg.bot_char)
+    student_rng = random_lib.Random(((cfg.partition_seed + 0x51EC7) << 16) ^ idx)
 
     def _draw_char() -> str:
         if spec.kind == "cpu":
             pool = (CPU_CHARS if char_rng.random() < cfg.main12_prob
                     else OFF_ROSTER)
             return char_rng.choice(pool)
+        if spec.kind == "self":  # second student seat: whitelist only
+            return char_rng.choice(whitelist)
         return char_rng.choice(OPPONENT_CHARS)
 
-    def _build_players(opp_char: str) -> dict:
+    def _draw_student_char() -> str:
+        # len==1: exactly the fixed-character behavior, zero rng draws.
+        if len(whitelist) == 1:
+            return whitelist[0]
+        return student_rng.choice(whitelist)
+
+    def _build_players(opp_char: str, student_char: str) -> dict:
         if spec.kind == "cpu":
             opponent_player = dolphin_lib.CPU(
                 character=melee.Character[opp_char.upper()],
@@ -319,12 +359,18 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
             )
         return {
             spec.student_port: dolphin_lib.AI(
-                character=melee.Character[cfg.bot_char.upper()]
+                character=melee.Character[student_char.upper()]
             ),
             opp_port: opponent_player,
         }
 
-    players = _build_players(spec.opponent_char)
+    players = _build_players(spec.opponent_char, _draw_student_char())
+    # Character actually playing the CURRENT game on the opponent seat.
+    # Per-game redraws mutate `players` BETWEEN games and take effect at the
+    # NEXT rematch CSS pass, so the char is "armed" one boundary before it
+    # plays: cur <- armed at each boundary, then armed <- fresh draw.
+    cur_opp_char = spec.opponent_char
+    armed_opp_char = spec.opponent_char
     # Carried across Dolphin recycles: the new instance's first frame must
     # still announce the game boundary (fresh recurrent state, zeroed reward)
     # and deliver the final game's result — otherwise two different games
@@ -425,7 +471,9 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
             if not first_boot and cfg.redraw_chars:
                 new_char = _draw_char()
                 players.clear()
-                players.update(_build_players(new_char))
+                players.update(_build_players(new_char, _draw_student_char()))
+                # fresh Dolphin: its first CSS pass uses the new draw directly
+                cur_opp_char = armed_opp_char = new_char
                 print(f"recycle: opponent redrawn -> {new_char}", flush=True)
             first_boot = False
             try:
@@ -514,6 +562,8 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
                         games += 1
                         consecutive_wedges = 0
                         result = last_stocks  # ended game's final (bot, opp)
+                        # the game starting NOW plays the previously armed char
+                        cur_opp_char = armed_opp_char
                         if games >= cfg.games_per_dolphin:
                             pending_reset, pending_result = True, result
                             break
@@ -527,8 +577,16 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
                             players[opp_port].character = (
                                 melee.Character[nc.upper()]
                             )
+                            armed_opp_char = nc
                             print(f"game end: opponent redrawn -> {nc}",
                                   flush=True)
+                            if len(whitelist) > 1:
+                                sc = _draw_student_char()
+                                players[spec.student_port].character = (
+                                    melee.Character[sc.upper()]
+                                )
+                                print(f"game end: student redrawn -> {sc}",
+                                      flush=True)
                         parser = Parser(ports=[1, 2])
                     if games >= cfg.games_per_dolphin - 1:
                         _start_spare()  # entering this Dolphin's final game
@@ -553,9 +611,12 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
                         dict(
                             game=game,
                             resetting=resetting,
-                            final_stocks=result,  # ended game's (bot, opp); None mid-game
+                            final_stocks=result,  # ended game's (port1, port2); None mid-game
                             stocks=last_stocks,
                             percent=(float(p1.percent), float(p2.percent)),
+                            # opponent seat's char in the CURRENT game — the
+                            # worker's imitation-harvest whitelist gate
+                            opp_char=cur_opp_char,
                         )
                     )
                     controllers = conn.recv()
@@ -598,8 +659,15 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
 
 
 class DolphinRolloutWorker:
-    """N Dolphins, one batched student agent (port 1), one batched opponent
-    agent (port 2) when self-playing; sync-barrier frame loop."""
+    """N Dolphins, one batched student agent covering every student-driven
+    seat (each env's student seat + BOTH seats of self-play envs — one wide
+    forward, no second policy copy), plus batched opponent agents; sync-
+    barrier frame loop.
+
+    Learner-row layout: rows 0..D-1 are the D dolphins' primary (student)
+    seats; rows D.. are the second seats of self-play dolphins. Row count is
+    always config.num_envs (= the trajectory/memory budget), while the
+    dolphin count is num_envs - self_envs."""
 
     def __init__(
         self,
@@ -607,21 +675,41 @@ class DolphinRolloutWorker:
         student: BatchedPolicyAgent,
         opponents: dict | None = None,  # {"teacher": agent, ("slot", i): agent}
         specs: list | None = None,  # per-env EnvSpec; default from make_partition
+        harvest_imitation: bool = False,  # collect whitelisted ref seats
     ):
         # Imported lazily: this class needs Dolphin, the rest of the module
         # doesn't.
         from smashbot.eval import game as game_lib
 
-        from smashbot.rl.pool import make_partition
+        from smashbot.rl.pool import make_partition, student_whitelist
 
         self.config = config
         self.student = student
+        whitelist = student_whitelist(config.char_whitelist, config.bot_char)
+        self._whitelist = set(whitelist)
         self.specs = specs or make_partition(
             config.num_envs, config.cpu_envs, config.teacher_envs,
             config.snapshot_slots, config.main12_prob, config.partition_seed,
-            ref_envs=config.ref_envs,
+            ref_envs=config.ref_envs, self_envs=config.self_envs,
+            char_whitelist=whitelist,
         )
-        assert len(self.specs) == config.num_envs
+        # Memory-neutral arithmetic (hard OOM constraint): each self-play
+        # dolphin feeds TWO learner rows, so dolphins = num_envs - self_envs
+        # and the learner batch stays exactly num_envs trajectories.
+        self.self_idx = [
+            i for i, sp in enumerate(self.specs) if sp.kind == "self"
+        ]
+        self.num_dolphins = len(self.specs)
+        self.num_rows = self.num_dolphins + len(self.self_idx)
+        assert self.num_rows == config.num_envs, (
+            f"specs must cover num_envs learner rows: {self.num_dolphins} "
+            f"dolphins + {len(self.self_idx)} self seats != {config.num_envs}"
+        )
+        if specs is None:
+            assert len(self.self_idx) == config.self_envs
+        assert student.num_envs == self.num_rows, (
+            "student agent must cover every learner row"
+        )
         self.opponents = opponents or {}
         # group name -> env index list (fixed membership = stable batch shapes)
         self.groups: dict = {}
@@ -641,14 +729,46 @@ class DolphinRolloutWorker:
             assert name in self.opponents, f"no agent supplied for group {name}"
             assert self.opponents[name].num_envs == len(idx)
 
+        # dolphin-level seat mask (for the opponent-view mix)
         self.seat2 = torch.tensor(
             [sp.student_port == 2 for sp in self.specs]
+        )
+        # row-level maps: which dolphin, which port, which kind per row
+        self._row_dolphin = torch.tensor(
+            list(range(self.num_dolphins)) + self.self_idx
+        )
+        row_ports = [sp.student_port for sp in self.specs] + [
+            3 - self.specs[i].student_port for i in self.self_idx
+        ]
+        self.row_seat2 = torch.tensor([p == 2 for p in row_ports])
+        self._self_row_of = {
+            d: self.num_dolphins + j for j, d in enumerate(self.self_idx)
+        }
+        self.row_kinds = [sp.kind for sp in self.specs] + (
+            ["self"] * len(self.self_idx)
         )
         self.game_lib = game_lib
         self.assembler = ChunkAssembler(config.unroll_length, student.delay)
         self.trackers = {
-            k: GameTracker() for k in ("cpu", "teacher", "snapshot", "reference")
+            k: GameTracker()
+            for k in ("cpu", "teacher", "snapshot", "reference", "self")
         }
+        # snapshot-game callback for PFSP payoff attribution:
+        # (slot, student_won) per decided snapshot game; wired by train_rl.
+        self.on_snapshot_game: tp.Optional[tp.Callable[[int, bool], None]] = None
+        # Imitation harvest (Phillip's seat while his char is whitelisted):
+        # a second assembler over the reference group's own FrameRecords.
+        self.harvest_imitation = harvest_imitation and bool(self.ref_idx)
+        if self.harvest_imitation:
+            ref_agent = self.opponents["reference"]
+            self._imit_assembler = ChunkAssembler(
+                config.unroll_length, ref_agent.delay
+            )
+            self._imit_elig: list[torch.Tensor] = []  # [R] per pushed record
+            self._imit_pending: list = []  # (resets[R], elig[R]) per frame
+            self._ref_embed = ref_agent._embed_controller
+            self._stu_embed = student._embed_controller
+            self._student_name_code = int(student._name[0].item())
         self._procs: list = []
         self._conns: list = []
 
@@ -658,7 +778,7 @@ class DolphinRolloutWorker:
         import multiprocessing as mp
 
         ctx = mp.get_context("spawn")
-        for i in range(self.config.num_envs):
+        for i in range(self.num_dolphins):
             parent, child = ctx.Pipe()
             # non-daemon: libmelee's slippstream forks its own child
             p = ctx.Process(
@@ -668,7 +788,7 @@ class DolphinRolloutWorker:
             self._procs.append(p)
             self._conns.append(parent)
         self._frame_count = 0
-        n = self.config.num_envs
+        n = self.num_rows
         self._prev_stocks = torch.full((n, 2), 4.0)
         self._prev_percent = torch.zeros(n, 2)
 
@@ -723,11 +843,43 @@ class DolphinRolloutWorker:
     def _swap_perspective(game):
         return game._replace(p0=game.p1, p1=game.p0)
 
+    def _reencode_record(self, rec: FrameRecord) -> FrameRecord:
+        """Reference-seat record -> student-schema record: actions re-encoded
+        through the STUDENT's controller embedding (the ref checkpoint may
+        discretize differently) and the name conditioned on the student's
+        code (the ref's name codes index a different vocabulary)."""
+        import numpy as np
+
+        # records store actions widened to int64/bool; decode expects each
+        # leaf embedding's native dtype (uint8/int32) back
+        encoded_np = self._ref_embed.map(
+            lambda e, x: x.astype(getattr(e, "dtype", x.dtype)),
+            tree.map_structure(lambda x: x.cpu().numpy(), rec.prev_action),
+        )
+        raw = self._ref_embed.decode(encoded_np)
+        prev = tree.map_structure(
+            lambda x: torch.from_numpy(
+                np.ascontiguousarray(
+                    x.astype(np.int64) if x.dtype.kind in "iu" else x
+                )
+            ).to(self.student.device),
+            self._stu_embed.from_state(raw),
+        )
+        return FrameRecord(
+            state=rec.state,
+            prev_action=prev,
+            logits=rec.logits,  # ref-schema; unused by the imitation loss
+            name=torch.full_like(rec.name, self._student_name_code),
+        )
+
     def collect(self, num_trajectories: int) -> list[Trajectory]:
-        """Run the sync-barrier loop until N trajectory chunks are assembled."""
+        """Run the sync-barrier loop until N PPO trajectory chunks are
+        assembled; any imitation chunks harvested along the way (reference
+        seats with whitelisted chars) are appended after them."""
         self._ensure_started()
         cfg = self.config
         out: list[Trajectory] = []
+        imit_out: list[Trajectory] = []
 
         assert cfg.unroll_length % self.student.batch_steps == 0, (
             "unroll_length must be a multiple of batch_steps so chunk "
@@ -738,32 +890,53 @@ class DolphinRolloutWorker:
             self._pending_resets: list[torch.Tensor] = []
         pending_resets = self._pending_resets
         records_pushed = getattr(self, "_records_pushed", 0)
+        row_dolphin = self._row_dolphin
 
         while len(out) < num_trajectories:
             payloads = self._gather_all()
             for i, p in enumerate(payloads):
                 if p.get("final_stocks") is not None:
                     a, b = p["final_stocks"]  # (port1, port2)
-                    if self.specs[i].student_port == 2:
+                    sp = self.specs[i]
+                    if sp.kind == "self":
+                        # both seats are the student: track the PORT-1 seat's
+                        # win rate (a ~50% health metric, not a skill signal)
+                        self.trackers["self"].add_game((a, b))
+                        continue
+                    if sp.student_port == 2:
                         a, b = b, a
-                    self.trackers[self.specs[i].kind].add_game((a, b))
-            resets = torch.tensor([p["resetting"] for p in payloads])
+                    self.trackers[sp.kind].add_game((a, b))
+                    if (
+                        sp.kind == "snapshot"
+                        and self.on_snapshot_game is not None
+                        and a != b
+                    ):
+                        self.on_snapshot_game(sp.group, a > b)
+            resets_d = torch.tensor([p["resetting"] for p in payloads])
+            resets = resets_d[row_dolphin]  # row-level
 
-            stocks = torch.tensor([p["stocks"] for p in payloads], dtype=torch.float32)
-            percent = torch.tensor([p["percent"] for p in payloads], dtype=torch.float32)
-            # payloads are (port1, port2); flip seat-2 rows -> (student, opp)
-            flip = self.seat2
+            stocks_d = torch.tensor([p["stocks"] for p in payloads], dtype=torch.float32)
+            percent_d = torch.tensor([p["percent"] for p in payloads], dtype=torch.float32)
+            # payloads are (port1, port2) per dolphin; expand to learner rows
+            # and flip seat-2 rows -> (own seat, other seat)
+            stocks = stocks_d[row_dolphin]
+            percent = percent_d[row_dolphin]
+            flip = self.row_seat2
             stocks[flip] = stocks[flip].flip(-1)
             percent[flip] = percent[flip].flip(-1)
             if self._frame_count > 0:
-                self.assembler.push_reward(
-                    compute_reward(
-                        self._prev_stocks, stocks,
-                        self._prev_percent, percent, resets,
-                    ).to(device)
-                )
+                reward = compute_reward(
+                    self._prev_stocks, stocks,
+                    self._prev_percent, percent, resets,
+                ).to(device)
+                self.assembler.push_reward(reward)
+                if self.harvest_imitation:
+                    # the reference seat's reward is the zero-sum mirror of
+                    # the student seat's (both terms are antisymmetric)
+                    ref_rows = torch.tensor(self.ref_idx, device=device)
+                    self._imit_assembler.push_reward(-reward[ref_rows])
             if self._frame_count > 0:
-                for i in range(len(payloads)):
+                for i in range(self.num_dolphins):
                     if resets[i]:
                         continue  # boundary artifacts belong to no game
                     tracker = self.trackers[self.specs[i].kind]
@@ -782,16 +955,23 @@ class DolphinRolloutWorker:
             swapped = encoded._replace(p0=encoded.p1, p1=encoded.p0)
             seat2 = self.seat2.to(device)
 
-            def mix(a, b):  # a where seat2 else b, per leaf
+            def mix(a, b, mask):  # a where mask else b, per leaf
                 return tree.map_structure(
                     lambda x, y: torch.where(
-                        seat2.view(-1, *([1] * (x.dim() - 1))), x, y
+                        mask.view(-1, *([1] * (x.dim() - 1))), x, y
                     ),
                     a, b,
                 )
 
-            student_view = mix(swapped, encoded)
-            opponent_view = mix(encoded, swapped)
+            opponent_view = mix(encoded, swapped, seat2)
+            # learner rows: primary seats of every dolphin + the second seat
+            # of each self-play dolphin, all served by ONE student forward
+            rows_dev = row_dolphin.to(device)
+            rowsel = lambda s: tree.map_structure(
+                lambda x: x.index_select(0, rows_dev), s
+            )
+            row_seat2 = self.row_seat2.to(device)
+            student_view = mix(rowsel(swapped), rowsel(encoded), row_seat2)
             resets_dev = resets.to(device)
             pending_resets.append(resets_dev)
             controllers1, records, hidden_before = self.student.step(
@@ -799,20 +979,25 @@ class DolphinRolloutWorker:
             )
 
             opp_controllers: dict[int, tp.Any] = {}
+            ref_records: list[FrameRecord] = []
             for name, idx in self.groups.items():
                 agent = self.opponents[name]
                 sel = torch.tensor(idx, device=device)
                 group_view = tree.map_structure(
                     lambda x: x.index_select(0, sel), opponent_view
                 )
-                ctrls, _, _ = agent.step(group_view, resets_dev[sel])
+                ctrls, g_records, _ = agent.step(group_view, resets_dev[sel])
+                if name == "reference" and self.harvest_imitation:
+                    ref_records = g_records
                 for j, env_i in enumerate(idx):
                     opp_controllers[env_i] = ctrls[j]
 
             for i, conn in enumerate(self._conns):
                 port = self.specs[i].student_port
                 cmd = {port: controllers1[i]}
-                if i in opp_controllers:
+                if i in self._self_row_of:
+                    cmd[3 - port] = controllers1[self._self_row_of[i]]
+                elif i in opp_controllers:
                     cmd[3 - port] = opp_controllers[i]
                 conn.send(cmd)
 
@@ -828,11 +1013,52 @@ class DolphinRolloutWorker:
             if records:
                 del pending_resets[: len(records)]
 
+            if self.harvest_imitation:
+                self._harvest_step(payloads, resets_d, ref_records, imit_out)
+
             self._frame_count += 1
             if self.assembler.ready():
                 out.append(self.assembler.emit())
         self._records_pushed = records_pushed
-        return out
+        return out + imit_out
+
+    def _harvest_step(
+        self,
+        payloads: list[dict],
+        resets_d: torch.Tensor,
+        ref_records: list[FrameRecord],
+        imit_out: list[Trajectory],
+    ) -> None:
+        """Per-frame imitation bookkeeping: buffer the reference seats'
+        eligibility (char whitelisted this game?) and resets, feed the ref
+        agent's flushed records into the imitation assembler, and emit
+        whole-chunk-eligible rows as kind="imitation" trajectories."""
+        device = self.student.device
+        elig = torch.tensor(
+            [payloads[i].get("opp_char") in self._whitelist
+             for i in self.ref_idx]
+        )
+        self._imit_pending.append(
+            (resets_d[torch.tensor(self.ref_idx)], elig)
+        )
+        for j, rec in enumerate(ref_records):
+            frame_resets, frame_elig = self._imit_pending[j]
+            self._imit_assembler.push_frame(
+                self._reencode_record(rec), frame_resets.to(device), None
+            )
+            self._imit_elig.append(frame_elig)
+        if ref_records:
+            del self._imit_pending[: len(ref_records)]
+        if self._imit_assembler.ready():
+            traj = self._imit_assembler.emit()._replace(kind="imitation")
+            T = self.config.unroll_length
+            window = torch.stack(self._imit_elig[: T + 1], dim=1)  # [R, T+1]
+            self._imit_elig = self._imit_elig[T:]
+            # conservative gate: harvest a row only if the reference seat's
+            # char was whitelisted for the ENTIRE chunk
+            rows = window.all(dim=1).nonzero().flatten().tolist()
+            if rows:
+                imit_out.append(slice_trajectory_rows(traj, rows))
 
     def stop(self) -> None:
         for conn in self._conns:

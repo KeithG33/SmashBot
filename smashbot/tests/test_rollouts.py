@@ -357,7 +357,7 @@ def test_game_tracker():
 
 
 def test_pool_partition_and_snapshots(tmp_path):
-    from smashbot.rl.pool import EnvSpec, SnapshotPool, make_partition, MAIN_12
+    from smashbot.rl.pool import SnapshotPool, make_partition
 
     specs = make_partition(
         64, cpu_envs=8, teacher_envs=16, snapshot_slots=5, seed=1
@@ -659,8 +659,13 @@ def test_partition_guarantees_full_roster_per_policy_kind():
 def test_tracker_ema_and_persistence():
     """EMA updates on decided games only, matches hand-rolled math, and
     round-trips through state()/load_state (the part that survives
-    restarts — the windows are boot-local by design)."""
+    restarts — the windows are boot-local by design). Only the EMA VALUES
+    persist: alpha is a code-level knob, so a restored tracker uses the
+    CURRENT default horizon (200 games, alpha 0.01), not the one that
+    produced the checkpoint."""
     from smashbot.rl.rollouts import GameTracker
+
+    assert GameTracker().ema_alpha == 0.01  # ~200-game horizon (default)
 
     t = GameTracker(ema_alpha=0.5)
     t.add_game((4, 0))   # win  -> ema seeds at 1.0
@@ -674,5 +679,11 @@ def test_tracker_ema_and_persistence():
     t2.load_state(t.state())
     assert t2.win_ema == pytest.approx(0.75)
     assert t2.wins == 2 and t2.losses == 1 and t2.draws == 1
+    assert "ema_alpha" not in t.state()  # values persist, alpha doesn't
     t2.add_game((0, 4))
-    assert t2.win_ema == pytest.approx(0.75 * 0.5)  # alpha restored too
+    # continues at the tracker's OWN alpha (0.01), not the persisted run's
+    assert t2.win_ema == pytest.approx(0.75 * 0.99)
+    # legacy checkpoints carrying an alpha are ignored gracefully
+    t3 = GameTracker()
+    t3.load_state({"win_ema": 0.6, "ema_alpha": 0.5, "wins": 1})
+    assert t3.ema_alpha == 0.01 and t3.win_ema == 0.6
