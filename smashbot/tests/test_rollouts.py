@@ -668,21 +668,21 @@ def test_tracker_ema_and_persistence():
     assert GameTracker().ema_alpha == 0.008  # ~250-game horizon (default)
 
     t = GameTracker(ema_alpha=0.5)
-    t.add_game((4, 0))   # win  -> ema seeds at 1.0
-    t.add_game((0, 4))   # loss -> 0.5*1.0 + 0.5*0 = 0.5
+    t.add_game((4, 0))   # win  -> seeds from the 0.5 PRIOR: 0.5*0.5+0.5*1 = 0.75
+    t.add_game((0, 4))   # loss -> 0.5*0.75 + 0.5*0 = 0.375
     t.add_game((2, 2))   # draw -> win_ema untouched
-    t.add_game((4, 1))   # win  -> 0.5*0.5 + 0.5*1 = 0.75
-    assert t.win_ema == pytest.approx(0.75)
-    assert t.stats()["win_rate_ema"] == pytest.approx(0.75)
+    t.add_game((4, 1))   # win  -> 0.5*0.375 + 0.5*1 = 0.6875
+    assert t.win_ema == pytest.approx(0.6875)
+    assert t.stats()["win_rate_ema"] == pytest.approx(0.6875)
 
     t2 = GameTracker()
     t2.load_state(t.state())
-    assert t2.win_ema == pytest.approx(0.75)
+    assert t2.win_ema == pytest.approx(0.6875)
     assert t2.wins == 2 and t2.losses == 1 and t2.draws == 1
     assert "ema_alpha" not in t.state()  # values persist, alpha doesn't
     t2.add_game((0, 4))
     # continues at the tracker's OWN alpha (0.008), not the persisted run's
-    assert t2.win_ema == pytest.approx(0.75 * 0.992)
+    assert t2.win_ema == pytest.approx(0.6875 * 0.992)
     # legacy checkpoints carrying an alpha are ignored gracefully
     t3 = GameTracker()
     t3.load_state({"win_ema": 0.6, "ema_alpha": 0.5, "wins": 1})

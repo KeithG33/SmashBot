@@ -167,11 +167,14 @@ class GameTracker:
         if diff != 0:  # EMA over decided games, matching win_rate_recent
             outcome = 1.0 if diff > 0 else 0.0
             a = self.ema_alpha
-            self.win_ema = (outcome if self.win_ema is None
-                            else (1 - a) * self.win_ema + a * outcome)
+            # seed at the 0.5 prior, not the first outcome: an extreme seed
+            # takes ~200 games to wash out at this alpha (live-caught: SP:
+            # read 0% for hours after its first game happened to be a loss)
+            prev = 0.5 if self.win_ema is None else self.win_ema
+            self.win_ema = (1 - a) * prev + a * outcome
         a = self.ema_alpha
-        self.diff_ema = (float(diff) if self.diff_ema is None
-                         else (1 - a) * self.diff_ema + a * diff)
+        prev_d = 0.0 if self.diff_ema is None else self.diff_ema
+        self.diff_ema = (1 - a) * prev_d + a * diff
 
     def state(self) -> dict:
         """Persistable summary state (EMA VALUES + lifetime counters); the
