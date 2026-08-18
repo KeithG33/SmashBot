@@ -363,6 +363,28 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
     # by test_worker_side_encode_matches_policy_encode).
     embed_game = embed_lib.EmbedConfig().make_game_embedding()
 
+    # MENU-HELPER GUARD (root cause of the pause bug): the vendor Dolphin
+    # loop runs melee's menu helper on any frame whose state parses as a
+    # menu — a single mid-game misparse lets it mash START into a LIVE game,
+    # pausing it (and the policy cannot unpause: START isn't in its action
+    # space). Pause also STALLS gamestate delivery (pause screen classifies
+    # as menu and is skipped), so no in-band armor can see it; a permanently
+    # paused game starves the frame alarm into a SIGKILL ("mystery wedge").
+    # Fix: suppress the helper until the menu state persists ~0.25s — real
+    # menu phases (boot CSS, postgame) run hundreds of consecutive helper
+    # calls, a misparse runs one or two. The env loop resets the counter on
+    # every delivered in-game frame.
+    _menu_calls = {"n": 0}
+    _orig_menu_helper = melee.MenuHelper.menu_helper_simple
+
+    def _guarded_menu_helper(self, gamestate, controller, *a, **kw):
+        _menu_calls["n"] += 1
+        if _menu_calls["n"] < 30:
+            return
+        return _orig_menu_helper(self, gamestate, controller, *a, **kw)
+
+    melee.MenuHelper.menu_helper_simple = _guarded_menu_helper
+
     import random as random_lib
     import time
 
@@ -642,6 +664,9 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
                         if gs.frame > 0:
                             continue  # attract-mode demo frame: discard
                         game_started = True
+                    # a delivered frame is an in-game frame (skip_menu_frames
+                    # above): re-arm the menu-helper guard
+                    _menu_calls["n"] = 0
                     # PAUSE ARMOR: the policy CANNOT press START (not in
                     # LEGAL_BUTTONS), but the vendor menu helper mashes it —
                     # one mid-game frame misparsed as a menu pauses the game
