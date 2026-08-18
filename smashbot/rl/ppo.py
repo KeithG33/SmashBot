@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import random
 import typing as tp
 
 import torch
@@ -61,6 +62,21 @@ class RLConfig:
     reward_halflife: float = 4.0  # seconds
     max_grad_norm: float = 1.0  # 0 = no clipping
     ppo: PPOConfig = dataclasses.field(default_factory=PPOConfig)
+    # --- opponent advantage imitation (docs/idea-opponent-learning.md) ---
+    # Memory-neutral substitution: up to imitation_slots harvested opponent
+    # trajectories per step REPLACE randomly-chosen PPO trajectories (never
+    # self-play seats; teacher/cpu first, then snapshot) so the learner batch
+    # never exceeds num_envs trajectories. 0 = fully dormant.
+    imitation_slots: int = 0
+    # MARWIL/AWR weighting: w = clip(exp(A_norm / beta), max=w_cap).
+    imitation_beta: float = 1.0
+    imitation_w_cap: float = 20.0
+    # Loss coefficient: lambda_t * L_opp added to the policy loss; 0 = the
+    # actor-side term is entirely absent (critic still trains on harvested
+    # states when slots > 0). Decays linearly from imitation_lambda to
+    # imitation_lambda * imitation_lambda_final_frac across runtime.steps.
+    imitation_lambda: float = 0.0
+    imitation_lambda_final_frac: float = 0.2
 
     @property
     def discount(self) -> float:
@@ -91,6 +107,33 @@ class Trajectory(tp.NamedTuple):
     rewards: torch.Tensor  # [B, T]
     is_resetting: torch.Tensor  # [B, T+1]
     initial_state: RecurrentState  # policy recurrent state at chunk start
+    # Learner routing tag: "ppo" (on-policy student data, including both
+    # seats of self-play envs) or "imitation" (harvested opponent seat, e.g.
+    # Phillip's — states/actions/rewards from HIS seat, initial_state None).
+    kind: str = "ppo"
+
+
+def slice_trajectory_rows(traj: Trajectory, rows: tp.Sequence[int]) -> Trajectory:
+    """Row (env-dim) subset of a Trajectory; initial_state may be None."""
+    sel = torch.as_tensor(list(rows), dtype=torch.int64)
+
+    def take(t):
+        if isinstance(t, torch.Tensor):
+            return t.index_select(0, sel.to(t.device))
+        return t
+
+    return Trajectory(
+        states=tree.map_structure(take, traj.states),
+        name=take(traj.name),
+        actions=tree.map_structure(take, traj.actions),
+        rewards=take(traj.rewards),
+        is_resetting=take(traj.is_resetting),
+        initial_state=(
+            None if traj.initial_state is None
+            else tree.map_structure(take, traj.initial_state)
+        ),
+        kind=traj.kind,
+    )
 
 
 class LearnerState(tp.NamedTuple):
@@ -151,6 +194,34 @@ class _Fixed(tp.NamedTuple):
     # position carries no legitimate learning signal)
 
 
+def imitation_weights(
+    advantages: torch.Tensor,  # [B, T], will be detached
+    valid: torch.Tensor,  # [B, T] float mask
+    beta: float,
+    w_cap: float,
+) -> torch.Tensor:
+    """MARWIL/AWR weighting for opponent-advantage imitation.
+
+    A is detached, normalized over the VALID positions of this imitation
+    minibatch, then w = clip(exp(A_norm / beta), max=w_cap). Returns [B, T]
+    detached weights (unmasked; the loss applies `valid` itself)."""
+    adv = advantages.detach()
+    n = valid.sum().clamp(min=1.0)
+    mean = (adv * valid).sum() / n
+    var = (torch.square(adv - mean) * valid).sum() / n
+    a_norm = (adv - mean) / (var.sqrt() + 1e-8)
+    return torch.exp(a_norm / beta).clamp(max=w_cap)
+
+
+class _ImitFixed(tp.NamedTuple):
+    """Per-imitation-trajectory quantities fixed across PPO epochs."""
+
+    frames: Frames
+    weights: torch.Tensor  # [B, T], detached
+    valid: torch.Tensor  # [B, T] float
+    rows: int
+
+
 class Learner:
     """PPO + KL-to-teacher. The teacher is frozen; policy and value train."""
 
@@ -177,6 +248,9 @@ class Learner:
             value_function.parameters(), lr=config.learning_rate
         )
         self._ops = _StructOps(policy.controller_head.controller_embedding)
+        # Substitution/slot RNG (imitation row picks + PPO row drops);
+        # seeded for reproducibility, reseedable in tests.
+        self._subst_rng = random.Random(0)
 
     def initial_state(self, batch_size: int, device=None) -> LearnerState:
         return LearnerState(
@@ -346,8 +420,155 @@ class Learner:
             )
             print(f"ANOMALY: dumped {path}")
 
+    # ------------------------------------------------ opponent imitation
+
+    def lambda_at(self, progress: float) -> float:
+        """Imitation coefficient at run fraction `progress` in [0, 1]:
+        linear decay from imitation_lambda to
+        imitation_lambda * imitation_lambda_final_frac."""
+        cfg = self.config
+        progress = min(max(progress, 0.0), 1.0)
+        return cfg.imitation_lambda * (
+            1.0 - (1.0 - cfg.imitation_lambda_final_frac) * progress
+        )
+
+    def _imitation_fixed(self, traj: Trajectory) -> tp.Optional[_ImitFixed]:
+        """Fixed pass for one harvested opponent trajectory: critic update on
+        its states (targets = discounted returns G_t along the opponent's
+        seat), and detached MARWIL weights w from A = G - V. Returns None
+        (trajectory dropped) on nonfinite inputs — anomaly armor."""
+        frames = self._frames(traj)
+        finite = all(
+            bool(torch.isfinite(leaf).all())
+            for leaf in tree.flatten(frames)
+            if isinstance(leaf, torch.Tensor) and torch.is_floating_point(leaf)
+        )
+        if not finite:
+            print("NONFINITE IMITATION INPUT: dropping trajectory", flush=True)
+            return None
+        batch_size = traj.rewards.shape[0]
+        device = traj.rewards.device
+        # Our policy/critic never ran over the opponent's stream during the
+        # rollout, so there is no carried recurrent state: start from zeros.
+        value_out = self.value_function.outputs(
+            frames, self.value_function.initial_state(batch_size, device),
+            discount=self.config.discount,
+        )
+        # The critic trains on these states with G_t targets (same guard as
+        # the on-policy value update).
+        self.value_optimizer.zero_grad(set_to_none=True)
+        value_out.loss.backward()
+        value_grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.value_function.parameters(), float("inf")
+        )
+        if not torch.isfinite(value_grad_norm):
+            print(f"NONFINITE IMITATION VALUE GRAD NORM ({value_grad_norm}): "
+                  "skipping value update", flush=True)
+            self.value_optimizer.zero_grad(set_to_none=True)
+        else:
+            self.value_optimizer.step()
+
+        valid = (~traj.is_resetting[:, 1:]).float()
+        weights = imitation_weights(
+            value_out.advantages, valid,
+            self.config.imitation_beta, self.config.imitation_w_cap,
+        )
+        if not torch.isfinite(weights).all():
+            print("NONFINITE IMITATION WEIGHTS: dropping trajectory",
+                  flush=True)
+            return None
+        return _ImitFixed(
+            frames=frames, weights=weights, valid=valid, rows=batch_size
+        )
+
+    def _imitation_policy_loss(self, imf: _ImitFixed) -> torch.Tensor:
+        """L_opp = -(w * log pi(a_opp|s)).mean() over valid positions —
+        log pi via the same teacher-forced unroll path PPO uses."""
+        batch_size = imf.valid.shape[0]
+        out = self.policy.unroll(
+            imf.frames,
+            self.policy.initial_state(batch_size, imf.valid.device),
+            discount=self.config.discount,
+        )
+        n_valid = imf.valid.sum().clamp(min=1.0)
+        return -(imf.weights * out.log_probs * imf.valid).sum() / n_valid
+
+    @staticmethod
+    def _slice_fixed(fixed: _Fixed, rows: tp.Sequence[int]) -> _Fixed:
+        """Row (env-dim) subset of a fixed pass, for PPO-row substitution."""
+        sel = torch.as_tensor(list(rows), dtype=torch.int64)
+
+        def take(t):
+            if isinstance(t, torch.Tensor):
+                return t.index_select(0, sel.to(t.device))
+            return t
+
+        return _Fixed(*(tree.map_structure(take, field) for field in fixed))
+
+    def _plan_substitution(
+        self,
+        imit_trajs: list[Trajectory],
+        num_rows: int,
+        row_kinds: tp.Optional[tp.Sequence[str]],
+    ) -> tuple[list[_ImitFixed], tp.Optional[list[int]], dict]:
+        """Memory-neutral batching: pick <= imitation_slots imitation rows and
+        an equal count of PPO rows to drop (never self-play seats; teacher/
+        cpu first, then snapshot), keeping the learner's policy-pass row
+        total exactly num_rows."""
+        cfg = self.config
+        kinds = list(row_kinds) if row_kinds is not None else ["teacher"] * num_rows
+        assert len(kinds) == num_rows, "row_kinds must match the PPO batch"
+        tier1 = [i for i, k in enumerate(kinds) if k in ("cpu", "teacher")]
+        tier2 = [i for i, k in enumerate(kinds) if k == "snapshot"]
+        avail = sum(t.rewards.shape[0] for t in imit_trajs)
+        budget = min(cfg.imitation_slots, avail, len(tier1) + len(tier2))
+
+        imit_fixed: list[_ImitFixed] = []
+        used = 0
+        for traj in imit_trajs:
+            take = min(traj.rewards.shape[0], budget - used)
+            if take <= 0:
+                break
+            if take < traj.rewards.shape[0]:
+                rows = sorted(self._subst_rng.sample(
+                    range(traj.rewards.shape[0]), take
+                ))
+                traj = slice_trajectory_rows(traj, rows)
+            imf = self._imitation_fixed(traj)
+            if imf is not None:
+                imit_fixed.append(imf)
+                used += imf.rows
+        if used == 0:
+            return [], None, {}
+
+        self._subst_rng.shuffle(tier1)
+        self._subst_rng.shuffle(tier2)
+        dropped = (tier1 + tier2)[:used]
+        assert all(kinds[i] != "self" for i in dropped)
+        keep_rows = [i for i in range(num_rows) if i not in set(dropped)]
+        assert len(keep_rows) + used == num_rows
+
+        n = sum(imf.valid.sum().clamp(min=1.0) for imf in imit_fixed)
+        w_mean = sum(
+            (imf.weights * imf.valid).sum() for imf in imit_fixed
+        ) / n
+        w_max = max(
+            (imf.weights * imf.valid).max().item() for imf in imit_fixed
+        )
+        stats = {
+            "traj_count": used,
+            "w_mean": w_mean.item(),
+            "w_max": w_max,
+            "substituted_rows": sorted(dropped),
+        }
+        return imit_fixed, keep_rows, stats
+
     def step(
-        self, trajectories: tp.Sequence[Trajectory], state: LearnerState
+        self,
+        trajectories: tp.Sequence[Trajectory],
+        state: LearnerState,
+        progress: float = 0.0,
+        row_kinds: tp.Optional[tp.Sequence[str]] = None,
     ) -> tuple[LearnerState, dict]:
         """One PPO update over a batch of trajectory chunks (minibatches).
 
@@ -355,30 +576,73 @@ class Learner:
         ppo.num_epochs gradient passes over all chunks, then a no-grad pass to
         measure post-update actor KL — reverting the update if it moved the
         policy beyond ppo.max_mean_actor_kl.
+
+        Trajectories tagged kind="imitation" are routed to the opponent-
+        advantage-imitation path (up to imitation_slots rows, substituting an
+        equal number of PPO rows out of the policy pass — see
+        _plan_substitution); ignored while imitation_slots == 0. `progress`
+        (run fraction, for lambda decay) and `row_kinds` (per-row env kinds
+        of the PPO batch) only matter when imitation is active.
         """
         cfg = self.config
+        ppo_trajs = [
+            t for t in trajectories if getattr(t, "kind", "ppo") != "imitation"
+        ]
+        imit_trajs = [
+            t for t in trajectories if getattr(t, "kind", "ppo") == "imitation"
+        ]
 
         fixed_list: list[_Fixed] = []
         value_metrics: list[dict] = []
-        for traj in trajectories:
+        for traj in ppo_trajs:
             fixed, state, vm = self._fixed_pass(traj, state)
             fixed_list.append(fixed)
             value_metrics.append(vm)
 
+        imit_fixed: list[_ImitFixed] = []
+        keep_rows: tp.Optional[list[int]] = None
+        imit_stats: dict = {}
+        if cfg.imitation_slots > 0 and imit_trajs and fixed_list:
+            imit_fixed, keep_rows, imit_stats = self._plan_substitution(
+                imit_trajs, fixed_list[0].valid.shape[0], row_kinds
+            )
+        lambda_t = self.lambda_at(progress)
+        # The k dropped rows leave the POLICY pass only: the fixed passes
+        # above already ran full-batch (carried teacher/value states stay
+        # exact), and the imitation unroll adds the k rows back, so the
+        # per-backward activation footprint never exceeds num_envs rows.
+        train_fixed = (
+            [self._slice_fixed(f, keep_rows) for f in fixed_list]
+            if keep_rows is not None else fixed_list
+        )
+
         snapshot = copy.deepcopy(self.policy.state_dict())
 
         epoch_metrics: list[dict] = []
+        imit_loss_val = 0.0
         for _ in range(cfg.ppo.num_epochs):
             self.policy_optimizer.zero_grad(set_to_none=True)
             batch_metrics = []
-            for fixed in fixed_list:
+            for fixed in train_fixed:
                 loss, metrics = self._policy_loss(fixed)
                 if not torch.isfinite(loss):
                     print("NONFINITE LOSS: skipping minibatch")
                     batch_metrics.append(metrics)
                     continue
-                (loss / len(fixed_list)).backward()
+                (loss / len(train_fixed)).backward()
                 batch_metrics.append(metrics)
+            if imit_fixed and lambda_t > 0.0:
+                imit_losses = []
+                for imf in imit_fixed:
+                    iloss = self._imitation_policy_loss(imf)
+                    if not torch.isfinite(iloss):
+                        print("NONFINITE IMITATION LOSS: skipping minibatch",
+                              flush=True)
+                        continue
+                    (lambda_t * iloss / len(imit_fixed)).backward()
+                    imit_losses.append(iloss.item())
+                if imit_losses:
+                    imit_loss_val = sum(imit_losses) / len(imit_losses)
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 self.policy.parameters(),
                 cfg.max_grad_norm if cfg.max_grad_norm > 0 else float("inf"),
@@ -397,7 +661,7 @@ class Learner:
 
         # Post-update measurement (and trust-region backstop).
         with torch.no_grad():
-            post = _mean_dicts([self._policy_loss(f)[1] for f in fixed_list])
+            post = _mean_dicts([self._policy_loss(f)[1] for f in train_fixed])
         reverted = post["actor_kl_mean"] > cfg.ppo.max_mean_actor_kl
         if reverted:
             self.policy.load_state_dict(snapshot)
@@ -408,6 +672,10 @@ class Learner:
             "value": _mean_dicts(value_metrics),
             "reverted": reverted,
         }
+        if imit_stats:
+            metrics["imitation"] = dict(
+                imit_stats, loss=imit_loss_val, **{"lambda": lambda_t}
+            )
         return state, metrics
 
 
