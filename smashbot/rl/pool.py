@@ -146,6 +146,15 @@ def make_partition(
     return specs
 
 
+# Special (non-snapshot) league members that can compete for snapshot slots
+# when the league_teacher/league_cpu flags fold them into the PFSP league.
+# Their payoff rows live in pfsp.json under these string keys, exactly like
+# ghost rows live under snapshot paths — and they are NEVER pruned (neither
+# by thinning, which only touches archive paths, nor by the load-time prune,
+# so toggling the flags across restarts loses no data).
+LEAGUE_MEMBER_KEYS = ("teacher", "cpu")
+
+
 def f_hard(x: float, p: float = 1.0) -> float:
     """AlphaStar PFSP hardness weighting: f_hard(x) = (1 - x)^p where x is
     the student's estimated win rate vs the candidate. x=1 (fully beaten)
@@ -178,6 +187,9 @@ class SnapshotPool:
         # alphas track only the last minutes of a stint; slower ones lag
         # across student versions. Char mixture averages out at this horizon.
         payoff_ema_alpha: float = 0.01,
+        # Special league members ("teacher"/"cpu") folded into the candidate
+        # set for non-latest slots; empty = snapshots only (today's league).
+        league_members: tp.Sequence[str] = (),
     ):
         self.dir = directory
         self.slots = slots
@@ -185,6 +197,16 @@ class SnapshotPool:
         self.pfsp = pfsp
         self.pfsp_p = pfsp_p
         self.payoff_ema_alpha = payoff_ema_alpha
+        assert all(m in LEAGUE_MEMBER_KEYS for m in league_members), (
+            f"unknown league members {list(league_members)}; "
+            f"valid: {LEAGUE_MEMBER_KEYS}"
+        )
+        assert pfsp or not league_members, (
+            "league members (teacher/cpu) need PFSP win-rate prioritization "
+            "to earn/lose serving time — enable pfsp=True (the recency "
+            "sampler has no notion of them)"
+        )
+        self.league_members = list(league_members)
         os.makedirs(directory, exist_ok=True)
         # Adopt snapshots already on disk (restarts must not amnesia the
         # league: without this, every resume served only its own boot's
@@ -211,7 +233,9 @@ class SnapshotPool:
                 table = json.load(f)
         except (OSError, ValueError):
             return
-        existing = set(self.archive)
+        # keep rows for surviving snapshots AND the special league members
+        # (special rows persist regardless of the current league flags)
+        existing = set(self.archive) | set(LEAGUE_MEMBER_KEYS)
         self.payoff = {
             path: entry for path, entry in table.items() if path in existing
         }
@@ -226,7 +250,8 @@ class SnapshotPool:
         os.replace(tmp, self._payoff_path)
 
     def record_result(self, path: str, won: bool) -> None:
-        """One decided game vs the snapshot at `path` (won = student won)."""
+        """One decided game vs the member keyed by `path` — a snapshot path
+        or a special league member key (won = student won)."""
         entry = self.payoff.setdefault(
             path, {"wins": 0, "games": 0, "win_ema": None}
         )
@@ -299,16 +324,24 @@ class SnapshotPool:
                 self._save_payoff()
 
     def assignments(self, rng: random.Random | None = None) -> list[str]:
-        """One archive path per slot (slot 0 = latest; others sampled without
-        replacement where possible — PFSP f_hard weights by default, the
-        original exponential recency bias with pfsp=False). Empty archive
-        -> []."""
+        """One member key per slot: an archive path, or a special league
+        member ("teacher"/"cpu") when league_members is set. Slot 0 = ALWAYS
+        the latest snapshot; the rest sampled without replacement where
+        possible — PFSP f_hard weights by default, the original exponential
+        recency bias with pfsp=False. Without-replacement sampling is also
+        what caps each special member at ONE slot per epoch (they are single
+        members, not pools). Empty archive -> [] (league members only start
+        serving once a first snapshot anchors slot 0)."""
         if not self.archive:
             return []
         rng = rng or random.Random()
         picks = [self.archive[-1]]
         candidates = list(self.archive[:-1])
         if self.pfsp:
+            # special members compete for the non-latest slots exactly like
+            # ghosts: fresh rows sit at the 0.5 prior (f_hard weight 0.5)
+            # until their first serving stint measures them
+            candidates += self.league_members
             # PFSP (AlphaStar f_hard): weight by how much the student still
             # struggles vs each snapshot; beaten snapshots fade out.
             while len(picks) < self.slots and candidates:
@@ -329,3 +362,42 @@ class SnapshotPool:
         while len(picks) < self.slots:
             picks.append(self.archive[-1])  # early training: duplicate latest
         return picks
+
+
+def apply_assignments(
+    assigns: tp.Sequence[str],
+    slot_policies: tp.Sequence[tuple[int, tp.Any]],
+    teacher_module,
+    worker,
+    slot_keys: dict[int, str],
+    device: str = "cpu",
+) -> None:
+    """Route one epoch's slot assignments into the serving machinery.
+
+    - snapshot path: load from disk into the slot policy (instant hot-swap,
+      today's behavior); the slot serves kind "snapshot".
+    - "teacher": copy the LIVE teacher module's CURRENT weights into the slot
+      policy (in-memory state_dict copy, no disk). Staleness bound: if the
+      teacher watcher hot-swaps the module mid-epoch, this slot keeps serving
+      its copy until the next snapshot_interval refresh re-copies it.
+    - "cpu": only record the desired kind — Dolphin CPU ports cannot hot-swap
+      mid-game, so each env adopts policy<->cpu at its NEXT recycle boundary
+      (rollouts._env_process_main). slot_keys/slot_serving are deliberately
+      left on the PREVIOUS member: attribution must follow what each env is
+      ACTUALLY serving, and not-yet-adopted envs still serve the old policy.
+    """
+    for slot, slot_policy in slot_policies:
+        if slot >= len(assigns):
+            continue
+        key = assigns[slot]
+        if key == "cpu":
+            worker.slot_desired[slot] = "cpu"
+            continue
+        if key == "teacher":
+            slot_policy.load_state_dict(teacher_module.state_dict())
+            worker.slot_serving[slot] = "teacher"
+        else:
+            slot_policy.load_state_dict(torch.load(key, map_location=device))
+            worker.slot_serving[slot] = "snapshot"
+        worker.slot_desired[slot] = "policy"
+        slot_keys[slot] = key

@@ -116,6 +116,9 @@ class _FakeEnvs:
         self.opp_chars = opp_chars or {}
         self.t = 0
         self.final_stocks = {}  # dolphin -> (p1, p2) to deliver next frame
+        # dolphin -> "cpu": env-reported ACTUAL serving (league_cpu lazy
+        # adoption); results delivered while flipped report that serving
+        self.serving = {}
 
     def install(self, monkeypatch):
         w = self.worker
@@ -132,6 +135,7 @@ class _FakeEnvs:
         for i in range(self.worker.num_dolphins):
             raw = _rand_raw_game(self.embed_game, (), self.rng)
             fs = self.final_stocks.pop(i, None)
+            serving = self.serving.get(i, "policy")
             payloads.append(dict(
                 game=self.embed_game.from_state(raw),
                 resetting=fs is not None,
@@ -140,6 +144,8 @@ class _FakeEnvs:
                 # port-2 seat takes 1% per frame: port-1-seat reward +0.01
                 percent=(0.0, float(self.t)),
                 opp_char=self.opp_chars.get(i, "FOX"),
+                opp_serving=serving,
+                result_serving=serving if fs is not None else None,
             ))
         self.t += 1
         return payloads
@@ -162,8 +168,15 @@ def _make_worker(monkeypatch, num_envs, seed=0, opp_chars=None,
     )
     opponents = {}
     counts = {}
+    slot_counts = {}
     for sp in specs:
         counts[sp.kind] = counts.get(sp.kind, 0) + 1
+        if sp.kind == "snapshot":
+            slot_counts[sp.group] = slot_counts.get(sp.group, 0) + 1
+    for g, n in slot_counts.items():
+        opponents[("slot", g)] = BatchedPolicyAgent(
+            _tiny_policy(seed=3 + g), n, name_code=1
+        )
     if counts.get("teacher"):
         opponents["teacher"] = BatchedPolicyAgent(
             _tiny_policy(seed=1), counts["teacher"], name_code=1
@@ -705,3 +718,314 @@ def test_compute_reward_is_zero_sum_mirror():
     )
     torch.testing.assert_close(r1, -r2)
     assert torch.equal(r1[6:], torch.zeros(2))  # resets zero both seats
+
+
+# ------------------------------------- league members (teacher / lvl-9 CPU)
+
+
+def test_league_flags_default_off_golden(tmp_path):
+    """Flags-off golden: no league members, and SnapshotPool assignments are
+    byte-identical with and without the (empty) league_members argument.
+    (Partitions are covered by test_partition_default_noop_golden — the
+    league flags never touch make_partition.)"""
+    from smashbot.rl.pool import SnapshotPool
+
+    assert RolloutConfig().league_members() == []
+
+    pool_a = SnapshotPool(str(tmp_path / "a"), slots=3)
+    pool_b = SnapshotPool(str(tmp_path / "b"), slots=3, league_members=())
+    for s in range(0, 600, 100):
+        pool_a.save(_Stub(), s)
+        pool_b.save(_Stub(), s)
+        pool_a.record_result(pool_a.archive[-1], s % 200 == 0)
+        pool_b.record_result(pool_b.archive[-1], s % 200 == 0)
+    for seed in range(25):
+        a = pool_a.assignments(random.Random(seed))
+        b = pool_b.assignments(random.Random(seed))
+        assert [os.path.basename(p) for p in a] == [
+            os.path.basename(p) for p in b
+        ]
+
+
+def test_league_flag_asserts():
+    """Loud config validation: league flag with a nonzero fixed partition,
+    or without pfsp, must fail with an actionable message."""
+    with pytest.raises(AssertionError, match="teacher_envs=0"):
+        RolloutConfig(league_teacher=True, teacher_envs=16).league_members()
+    with pytest.raises(AssertionError, match="teacher_envs=0"):
+        RolloutConfig(league_teacher=True).league_members()  # default -1
+    with pytest.raises(AssertionError, match="cpu_envs=0"):
+        RolloutConfig(
+            league_cpu=True, cpu_envs=4, teacher_envs=0
+        ).league_members()
+    with pytest.raises(AssertionError, match="pfsp"):
+        RolloutConfig(
+            league_teacher=True, teacher_envs=0, pfsp=False
+        ).league_members()
+    # SnapshotPool enforces the pfsp dependency independently
+    from smashbot.rl.pool import SnapshotPool
+
+    with pytest.raises(AssertionError, match="pfsp"):
+        SnapshotPool("/tmp/never-used", slots=2, pfsp=False,
+                     league_members=("teacher",))
+    # valid combos pass
+    assert RolloutConfig(
+        league_teacher=True, league_cpu=True, teacher_envs=0, cpu_envs=0
+    ).league_members() == ["teacher", "cpu"]
+
+
+def test_league_teacher_candidates_and_fhard(tmp_path):
+    """"teacher" joins the candidate set for non-latest slots, starts at the
+    0.5 prior, and fades out via f_hard as the student's win_ema vs it
+    rises. Slot 0 stays the latest snapshot always."""
+    from smashbot.rl.pool import SnapshotPool
+
+    pool = SnapshotPool(str(tmp_path), slots=2, league_members=("teacher",))
+    latest = pool.save(_Stub(), 100)
+    # archive of one: the only non-latest candidate is the teacher
+    assert pool.assignments(random.Random(0)) == [latest, "teacher"]
+
+    pool.save(_Stub(), 200)  # a second snapshot: teacher vs ghost
+    latest = pool.archive[-1]
+
+    def teacher_share(n=400):
+        c = 0
+        for s in range(n):
+            picks = pool.assignments(random.Random(s))
+            assert picks[0] == latest  # slot 0 ALWAYS the latest
+            c += picks[1] == "teacher"
+        return c / n
+
+    prior_share = teacher_share()  # fresh row: 0.5 prior, ~even with ghost
+    assert 0.35 < prior_share < 0.65
+    for _ in range(300):
+        pool.record_result("teacher", True)  # student now dominates
+    beaten_share = teacher_share()
+    assert beaten_share < prior_share * 0.6  # weight dropped with win_ema
+    assert pool.win_estimate("teacher") > 0.9
+
+
+def test_league_members_at_most_one_slot_each(tmp_path):
+    """Without-replacement sampling: a special member can hold at most ONE
+    slot per epoch even when slots outnumber candidates (padding duplicates
+    the latest snapshot, never the members)."""
+    from smashbot.rl.pool import SnapshotPool
+
+    pool = SnapshotPool(
+        str(tmp_path), slots=5, league_members=("teacher", "cpu")
+    )
+    latest = None
+    for s in (100, 200):
+        latest = pool.save(_Stub(), s)
+    for seed in range(100):
+        picks = pool.assignments(random.Random(seed))
+        assert len(picks) == 5 and picks[0] == latest
+        assert picks.count("teacher") <= 1
+        assert picks.count("cpu") <= 1
+        # padding uses the latest snapshot
+        assert picks.count(latest) >= 2
+
+
+def test_apply_assignments_teacher_copy_and_cpu_lazy(tmp_path):
+    """Slot refresh routing: a "teacher" assignment copies the LIVE teacher
+    module's weights (state_dict copy — later teacher mutations must NOT
+    propagate until the next refresh); "cpu" only records the desired kind
+    and leaves attribution on the previous member (lazy adoption)."""
+    from smashbot.rl.pool import apply_assignments
+
+    class _Worker:
+        def __init__(self):
+            self.slot_serving = {}
+            self.slot_desired = {}
+
+    torch.manual_seed(0)
+    teacher = torch.nn.Linear(3, 2)
+    slot0, slot1 = torch.nn.Linear(3, 2), torch.nn.Linear(3, 2)
+    ghost = torch.nn.Linear(3, 2)
+    snap = str(tmp_path / "snapshot-0000100.pt")
+    torch.save(ghost.state_dict(), snap)
+
+    w, keys = _Worker(), {}
+    apply_assignments([snap, "teacher"], [(0, slot0), (1, slot1)],
+                      teacher, w, keys)
+    torch.testing.assert_close(slot0.weight, ghost.weight)
+    torch.testing.assert_close(slot1.weight, teacher.weight)
+    assert keys == {0: snap, 1: "teacher"}
+    assert w.slot_serving == {0: "snapshot", 1: "teacher"}
+    assert w.slot_desired == {0: "policy", 1: "policy"}
+
+    # the copy is a snapshot of the live module, not a reference: a teacher
+    # hot-swap mid-epoch leaves the serving slot on its copy until refresh
+    with torch.no_grad():
+        teacher.weight.add_(1.0)
+    assert not torch.equal(slot1.weight, teacher.weight)
+
+    # "cpu": desired flips; serving/keys stay on the previous member so
+    # results from not-yet-adopted envs keep attributing correctly
+    apply_assignments([snap, "cpu"], [(1, slot1)], teacher, w, keys)
+    assert w.slot_desired[1] == "cpu"
+    assert w.slot_serving[1] == "teacher" and keys[1] == "teacher"
+
+    # short assignment list (early training): out-of-range slots untouched
+    apply_assignments([snap], [(0, slot0), (1, slot1)], teacher, w, keys)
+    assert w.slot_desired[1] == "cpu"
+
+
+def test_league_payoff_persistence_and_thinning(tmp_path):
+    """Special member rows persist in pfsp.json exactly like ghost rows,
+    survive thinning (which only evicts archive paths), and survive a
+    reload WITHOUT the league flags (toggling flags loses no data)."""
+    from smashbot.rl.pool import SnapshotPool
+
+    pool = SnapshotPool(str(tmp_path), slots=2, keep=4,
+                        league_members=("teacher", "cpu"))
+    for s in range(0, 800, 100):
+        pool.save(_Stub(), s)
+    for _ in range(6):
+        pool.record_result("teacher", True)
+        pool.record_result("cpu", False)
+    assert len(pool.archive) == 4  # thinning ran
+    assert pool.payoff["teacher"]["games"] == 6
+    assert pool.payoff["cpu"]["games"] == 6
+    assert pool.win_estimate("teacher") == pytest.approx(1.0)
+    assert pool.win_estimate("cpu") == pytest.approx(0.0)
+
+    # round-trip through a league-flag-less pool: rows kept, not pruned
+    fresh = SnapshotPool(str(tmp_path), slots=2, keep=4)
+    assert fresh.win_estimate("teacher") == pytest.approx(
+        pool.win_estimate("teacher")
+    )
+    assert fresh.payoff["cpu"]["games"] == 6
+    # and its assignments ignore the members (flags off = ghosts only)
+    for seed in range(25):
+        assert "teacher" not in fresh.assignments(random.Random(seed))
+
+
+def test_league_cpu_lazy_adoption_worker(monkeypatch):
+    """Worker-level league_cpu mechanics: the desired kind is piggybacked on
+    the command dicts, envs adopt only when THEY report cpu serving,
+    attribution (trackers + on_snapshot_game) follows actual serving before
+    and after, and a fully-cpu slot is excluded from opponent inference
+    without breaking the collect() row bookkeeping."""
+    worker, envs = _make_worker(
+        monkeypatch, num_envs=4, teacher_envs=2, snapshot_slots=1,
+        cpu_envs=0, league_cpu=True,
+    )
+    slot_envs = [i for i, sp in enumerate(worker.specs)
+                 if sp.kind == "snapshot"]
+    assert slot_envs == [2, 3]
+    calls = []
+    worker.on_snapshot_game = lambda s, w, k: calls.append((s, w, k))
+
+    def cmds(i):
+        got = worker._conns[i].sent[-1]
+        return got
+
+    # phase 1: desired=policy (default): slot envs get both seats' inputs
+    # plus the opp_kind marker; teacher envs are untouched
+    envs.final_stocks[2] = (4, 0)  # port1 (student) wins on a slot env
+    worker.collect(1)
+    for i in slot_envs:
+        port = worker.specs[i].student_port
+        assert set(cmds(i)) == {port, 3 - port, "opp_kind"}
+        assert cmds(i)["opp_kind"] == "policy"
+    for i in (0, 1):
+        port = worker.specs[i].student_port
+        assert set(cmds(i)) == {port, 3 - port}
+    assert worker.trackers["snapshot"].wins == 1
+    assert calls == [(0, True, "snapshot")]
+
+    # phase 1b: the slot's policy holds live-teacher weights: games log
+    # under the teacher kind for ticker/wandb continuity
+    worker.slot_serving[0] = "teacher"
+    envs.final_stocks[3] = (0, 4)
+    worker.collect(1)
+    tracked = (worker.trackers["teacher"].wins,
+               worker.trackers["teacher"].losses)
+    assert tracked == ((1, 0) if worker.specs[3].student_port == 2
+                       else (0, 1))
+    assert calls[-1][2] == "teacher"
+    worker.slot_serving[0] = "snapshot"
+
+    # phase 2: refresh desires cpu — envs have NOT adopted yet: inputs still
+    # flow to the opponent seat, results still attribute to the snapshot
+    worker.slot_desired[0] = "cpu"
+    envs.final_stocks[2] = (4, 0)
+    worker.collect(1)
+    for i in slot_envs:
+        port = worker.specs[i].student_port
+        assert set(cmds(i)) == {port, 3 - port, "opp_kind"}
+        assert cmds(i)["opp_kind"] == "cpu"
+    assert worker.trackers["snapshot"].wins == 2
+    assert worker.trackers["cpu"].wins == 0
+    assert calls[-1] == (0, True, "snapshot")
+
+    # phase 3: env 2 adopts at its recycle; env 3 hasn't — mixed slot still
+    # runs the (full-batch) policy, but the cpu env gets no opponent input
+    envs.serving[2] = "cpu"
+    envs.final_stocks[2] = (4, 0)  # port-1 student wins
+    envs.final_stocks[3] = (0, 4)  # env 3 seats the student on port 2
+    worker.collect(1)
+    p2 = worker.specs[2].student_port
+    assert set(cmds(2)) == {p2, "opp_kind"}
+    p3 = worker.specs[3].student_port
+    assert set(cmds(3)) == {p3, 3 - p3, "opp_kind"}
+    assert worker.trackers["cpu"].wins == 1  # env 2's game: actual cpu
+    assert worker.trackers["snapshot"].wins == 3  # env 3: still policy
+    assert {calls[-1], calls[-2]} == {(0, True, "cpu"), (0, True, "snapshot")}
+
+    # phase 4: whole slot serving cpu: opponent inference skipped for the
+    # slot, and collect() still yields well-formed full-budget trajectories
+    envs.serving[3] = "cpu"
+    step_calls = []
+    slot_agent = worker.opponents[("slot", 0)]
+    orig_step = slot_agent.step
+    slot_agent.step = lambda *a, **k: (
+        step_calls.append(1) or orig_step(*a, **k)
+    )
+    trajs = worker.collect(2)
+    assert not step_calls  # no brain to run
+    assert len(trajs) == 2
+    for t in trajs:
+        assert t.rewards.shape[0] == 4  # full learner-row budget
+        assert torch.isfinite(t.rewards).all()
+        for leaf in tree.flatten(t.actions.logits):
+            if leaf.is_floating_point():
+                assert torch.isfinite(leaf).all()
+    for i in slot_envs:
+        port = worker.specs[i].student_port
+        assert set(cmds(i)) == {port, "opp_kind"}
+    # teacher group still ran and got inputs
+    for i in (0, 1):
+        port = worker.specs[i].student_port
+        assert set(cmds(i)) == {port, 3 - port}
+
+
+def test_league_composed_with_self_play(monkeypatch):
+    """league_teacher + league_cpu + self_envs + ref_envs compose: partition
+    arithmetic holds (rows == num_envs, dolphins == num_envs - self_envs)
+    and collect() runs clean with slots serving cpu."""
+    worker, envs = _make_worker(
+        monkeypatch, num_envs=12, cpu_envs=0, teacher_envs=0,
+        snapshot_slots=2, ref_envs=2, self_envs=2,
+        league_teacher=True, league_cpu=True,
+        char_whitelist=["FOX", "FALCO"],
+    )
+    assert worker.num_dolphins == 10 and worker.num_rows == 12
+    kinds = [sp.kind for sp in worker.specs]
+    assert kinds.count("snapshot") == 6 and kinds.count("teacher") == 0
+    assert kinds.count("cpu") == 0
+    assert worker.row_kinds.count("self") == 4  # both seats of 2 dolphins
+
+    # one slot flips to cpu mid-run; self-play rows keep their mirror
+    worker.slot_desired[0] = "cpu"
+    for i, sp in enumerate(worker.specs):
+        if sp.kind == "snapshot" and sp.group == 0:
+            envs.serving[i] = "cpu"
+    (traj,) = worker.collect(1)
+    assert traj.rewards.shape[0] == 12
+    assert torch.isfinite(traj.rewards).all()
+    for d in worker.self_idx:
+        torch.testing.assert_close(
+            traj.rewards[d], -traj.rewards[worker._self_row_of[d]]
+        )

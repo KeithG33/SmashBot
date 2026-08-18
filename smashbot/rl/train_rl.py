@@ -11,6 +11,7 @@ and the config/name_map (RL checkpoints stay play.py-compatible).
 from __future__ import annotations
 
 import dataclasses
+import os
 import time
 
 import torch
@@ -164,11 +165,18 @@ def main() -> None:
         batch_steps=args.rollouts.batch_steps,
     )
 
-    from smashbot.rl.pool import SnapshotPool, make_partition, student_whitelist
+    from smashbot.rl.pool import (
+        SnapshotPool, apply_assignments, make_partition, student_whitelist,
+    )
 
     rcfg = args.rollouts
     if not rcfg.log_tag:
         rcfg.log_tag = args.runtime.tag
+    # league flags (teacher / lvl-9 CPU as PFSP members): validate up front —
+    # loud assert beats 120 Dolphins booting into a mispartitioned run
+    league = rcfg.league_members()
+    if league:
+        print(f"league members via PFSP slots: {league}")
     specs = make_partition(
         rcfg.num_envs, rcfg.cpu_envs, rcfg.teacher_envs,
         rcfg.snapshot_slots, rcfg.main12_prob, rcfg.partition_seed,
@@ -231,19 +239,23 @@ def main() -> None:
         f"{args.runtime.run_dir}/{args.runtime.tag}/snapshots",
         slots=rcfg.snapshot_slots,
         pfsp=rcfg.pfsp, pfsp_p=rcfg.pfsp_p,
+        league_members=league,
     )
     worker = DolphinRolloutWorker(
         args.rollouts, student_agent, opponents=opponents, specs=specs,
         harvest_imitation=args.learner.imitation_slots > 0,
     )
-    # PFSP payoff attribution: the worker knows env->slot; we know
-    # slot->snapshot-path from the last refresh.
-    slot_paths: dict[int, str] = {}
+    # PFSP payoff attribution: the worker knows env->slot and what each env
+    # ACTUALLY served (lazy cpu adoption included); we know slot->member-key
+    # (snapshot path / "teacher") from the last refresh.
+    slot_keys: dict[int, str] = {}
 
-    def _on_snapshot_game(slot: int, won: bool) -> None:
-        path = slot_paths.get(slot)
-        if path:
-            snapshot_pool.record_result(path, won)
+    def _on_snapshot_game(slot: int, won: bool, kind: str = "snapshot") -> None:
+        # kind follows actual serving: "cpu" games credit the cpu member's
+        # row even while the slot's desired member has already moved on
+        key = "cpu" if kind == "cpu" else slot_keys.get(slot)
+        if key:
+            snapshot_pool.record_result(key, won)
 
     worker.on_snapshot_game = _on_snapshot_game
     if restored_trackers:
@@ -278,13 +290,19 @@ def main() -> None:
                 import random as _random
 
                 assigns = snapshot_pool.assignments(_random.Random(i))
-                for slot, slot_policy in slot_policies:
-                    if slot < len(assigns):
-                        slot_policy.load_state_dict(
-                            torch.load(assigns[slot], map_location=device)
-                        )
-                        slot_paths[slot] = assigns[slot]
-                print(f"[{i}] snapshot saved; slots refreshed")
+                # snapshot paths hot-swap instantly; "teacher" copies the
+                # LIVE teacher module's weights (stale at most until the
+                # next refresh if the watcher swaps mid-epoch); "cpu" only
+                # flips the desired kind — envs adopt at recycle
+                apply_assignments(
+                    assigns, slot_policies, teacher, worker, slot_keys,
+                    device,
+                )
+                served = [
+                    os.path.basename(k) if os.sep in k else k
+                    for k in assigns
+                ]
+                print(f"[{i}] snapshot saved; slots refreshed -> {served}")
 
             if i > 0 and i % args.runtime.teacher_check_interval == 0:
                 new_teacher = watcher.poll()
@@ -328,9 +346,13 @@ def main() -> None:
                     log["rl/imitation/w_max"] = im["w_max"]
                     log["rl/imitation/traj_count"] = im["traj_count"]
                     log["rl/imitation/lambda"] = im["lambda"]
-                for slot, path in slot_paths.items():
+                for slot, key in slot_keys.items():
                     log[f"rl/pfsp/slot{slot}_winrate"] = (
-                        snapshot_pool.win_estimate(path)
+                        snapshot_pool.win_estimate(key)
+                    )
+                for member in league:
+                    log[f"rl/pfsp/{member}_winrate"] = (
+                        snapshot_pool.win_estimate(member)
                     )
                 for kind, tracker in worker.trackers.items():
                     for k, v in tracker.stats().items():

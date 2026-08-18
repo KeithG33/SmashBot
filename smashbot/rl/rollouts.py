@@ -271,6 +271,40 @@ class RolloutConfig:
     # only — zero effect on losses or memory.
     pfsp: bool = True
     pfsp_p: float = 1.0
+    # League membership for the teacher / CPU lvl-9 (dormant by default):
+    # instead of fixed teacher_envs/cpu_envs partitions, the member joins the
+    # PFSP candidate set and competes for non-latest snapshot slots via
+    # f_hard — it serves only while the payoff table says it's worth serving.
+    # Requires that kind's fixed env count be 0 (move the envs into snapshot
+    # slots) and pfsp=True. See league_members().
+    league_teacher: bool = False
+    league_cpu: bool = False
+
+    def league_members(self) -> list[str]:
+        """Special league member keys enabled by the flags; validates the
+        config (loud asserts — a silently ignored flag would strand envs)."""
+        members = []
+        if self.league_teacher:
+            assert self.teacher_envs == 0, (
+                f"league_teacher folds the teacher into the PFSP league — "
+                f"set teacher_envs=0 (got {self.teacher_envs}) and move "
+                f"those envs into the snapshot slots"
+            )
+            members.append("teacher")
+        if self.league_cpu:
+            assert self.cpu_envs == 0, (
+                f"league_cpu folds the lvl-9 CPU into the PFSP league — "
+                f"set cpu_envs=0 (got {self.cpu_envs}) and move those envs "
+                f"into the snapshot slots"
+            )
+            members.append("cpu")
+        if members:
+            assert self.pfsp, (
+                "league_teacher/league_cpu require pfsp=True: league members "
+                "earn/lose serving time through the payoff table, which the "
+                "recency sampler never consults"
+            )
+        return members
 
 
 def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
@@ -332,12 +366,25 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
     whitelist = student_whitelist(cfg.char_whitelist, cfg.bot_char)
     student_rng = random_lib.Random(((cfg.partition_seed + 0x51EC7) << 16) ^ idx)
 
+    # Kind ACTUALLY serving on the opponent seat. Normally fixed (= spec.kind
+    # for the whole run); under league_cpu a snapshot-slot env can be asked
+    # (via the "opp_kind" command key) to flip policy<->cpu — Dolphin players
+    # are only built at (re)boot and a CPU port cannot hot-swap mid-game, so
+    # the flip is adopted LAZILY at the next recycle boundary. Until then the
+    # env keeps serving its previous kind and reports what it serves, so
+    # attribution follows reality, not the desired assignment.
+    cur_kind = spec.kind
+    desired_kind = None  # latest "policy"/"cpu" wish from the worker
+
     def _draw_char() -> str:
-        if spec.kind == "cpu":
+        if cur_kind == "cpu":
+            # CPU opponents draw 60/40 main12/off-roster; CPU-Sheik is
+            # impossible (engine ignores the transform on CPU ports), hence
+            # CPU_CHARS
             pool = (CPU_CHARS if char_rng.random() < cfg.main12_prob
                     else OFF_ROSTER)
             return char_rng.choice(pool)
-        if spec.kind == "self":  # second student seat: whitelist only
+        if cur_kind == "self":  # second student seat: whitelist only
             return char_rng.choice(whitelist)
         return char_rng.choice(OPPONENT_CHARS)
 
@@ -348,7 +395,7 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
         return student_rng.choice(whitelist)
 
     def _build_players(opp_char: str, student_char: str) -> dict:
-        if spec.kind == "cpu":
+        if cur_kind == "cpu":
             opponent_player = dolphin_lib.CPU(
                 character=melee.Character[opp_char.upper()],
                 level=spec.cpu_level,
@@ -377,6 +424,10 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
     # would silently splice into one stream.
     pending_reset = False
     pending_result = None
+    # serving label ("policy"/"cpu") of the game that produced
+    # pending_result: a result carried across a recycle must attribute to
+    # the kind that PLAYED it, even if the recycle just adopted a new kind
+    pending_result_kind = None
     consecutive_misselects = 0
 
     # Double buffering: during a Dolphin's LAST game, boot its replacement in
@@ -468,7 +519,20 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
     first_boot = True
     try:
         while True:
-            if not first_boot and cfg.redraw_chars:
+            # Recycle boundary = the ONLY place a desired policy<->cpu flip
+            # is adopted: players are built fresh right below, exactly like a
+            # cold boot. A kind change forces a redraw even with redraw_chars
+            # off — the sitting char may be illegal for the new kind
+            # (CPU-Sheik) and the player object type (AI vs CPU) changes.
+            kind_changed = False
+            if desired_kind is not None:
+                want = "cpu" if desired_kind == "cpu" else spec.kind
+                if want != cur_kind:
+                    cur_kind = want
+                    kind_changed = True
+                    print(f"recycle: opponent kind adopted -> {cur_kind}",
+                          flush=True)
+            if not first_boot and (cfg.redraw_chars or kind_changed):
                 new_char = _draw_char()
                 players.clear()
                 players.update(_build_players(new_char, _draw_student_char()))
@@ -545,6 +609,7 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
                             except OSError:
                                 pass
                         pending_reset, pending_result = True, None
+                        pending_result_kind = None
                         break
                     except StopIteration:
                         break
@@ -554,18 +619,23 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
                         if gs.frame > 0:
                             continue  # attract-mode demo frame: discard
                         game_started = True
+                    serving = "cpu" if cur_kind == "cpu" else "policy"
                     boundary = last_frame is not None and gs.frame < last_frame
                     resetting = boundary or pending_reset
                     result = pending_result if pending_reset else None
+                    result_kind = pending_result_kind if pending_reset else None
                     pending_reset, pending_result = False, None
+                    pending_result_kind = None
                     if boundary:
                         games += 1
                         consecutive_wedges = 0
                         result = last_stocks  # ended game's final (bot, opp)
+                        result_kind = serving  # kind is fixed within a dolphin
                         # the game starting NOW plays the previously armed char
                         cur_opp_char = armed_opp_char
                         if games >= cfg.games_per_dolphin:
                             pending_reset, pending_result = True, result
+                            pending_result_kind = serving
                             break
                         if cfg.redraw_chars:
                             # per-GAME character rotation: the vendor's menu
@@ -617,12 +687,25 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
                             # opponent seat's char in the CURRENT game — the
                             # worker's imitation-harvest whitelist gate
                             opp_char=cur_opp_char,
+                            # what the opponent seat ACTUALLY serves right
+                            # now / served in the game `result` came from
+                            # (league_cpu lazy adoption: may differ from the
+                            # worker's desired kind until the next recycle)
+                            opp_serving=serving,
+                            result_serving=result_kind,
                         )
                     )
                     controllers = conn.recv()
                     if controllers is None:
                         return
+                    # league_cpu: the worker piggybacks its desired serving
+                    # kind on the command dict; stash it for the next recycle
+                    desired = controllers.pop("opp_kind", None)
+                    if desired is not None:
+                        desired_kind = desired
                     for port, controller_state in controllers.items():
+                        if cur_kind == "cpu" and port == opp_port:
+                            continue  # engine AI drives this port; no inputs
                         controller_lib.send_controller(
                             dolphin.controllers[port], controller_state
                         )
@@ -685,6 +768,18 @@ class DolphinRolloutWorker:
 
         self.config = config
         self.student = student
+        # validates the league flags (env counts must be 0, pfsp required)
+        self._league = config.league_members()
+        self._league_cpu = config.league_cpu
+        # League serving state, written by the slot refresh
+        # (pool.apply_assignments); empty dicts = today's behavior exactly.
+        # slot_serving: what the slot's POLICY currently embodies
+        # ("snapshot" | "teacher") — policy<->policy swaps are instant.
+        # slot_desired: desired serving kind ("policy" | "cpu") — cpu flips
+        # are adopted lazily per env at its next recycle boundary, so actual
+        # serving is read from each env's payload, never from this dict.
+        self.slot_serving: dict[int, str] = {}
+        self.slot_desired: dict[int, str] = {}
         whitelist = student_whitelist(config.char_whitelist, config.bot_char)
         self._whitelist = set(whitelist)
         self.specs = specs or make_partition(
@@ -753,9 +848,13 @@ class DolphinRolloutWorker:
             k: GameTracker()
             for k in ("cpu", "teacher", "snapshot", "reference", "self")
         }
-        # snapshot-game callback for PFSP payoff attribution:
-        # (slot, student_won) per decided snapshot game; wired by train_rl.
-        self.on_snapshot_game: tp.Optional[tp.Callable[[int, bool], None]] = None
+        # slot-game callback for PFSP payoff attribution: (slot, student_won,
+        # actual_kind) per decided game on a snapshot-slot env — actual_kind
+        # is "snapshot"/"teacher"/"cpu", following what the env really served
+        # (league members share this pathway). Wired by train_rl.
+        self.on_snapshot_game: tp.Optional[
+            tp.Callable[[int, bool, str], None]
+        ] = None
         # Imitation harvest (Phillip's seat while his char is whitelisted):
         # a second assembler over the reference group's own FrameRecords.
         self.harvest_imitation = harvest_imitation and bool(self.ref_idx)
@@ -872,6 +971,21 @@ class DolphinRolloutWorker:
             name=torch.full_like(rec.name, self._student_name_code),
         )
 
+    def _actual_kind(self, i: int, serving: str | None) -> str:
+        """Kind ACTUALLY serving env i's opponent seat, given the env's
+        reported serving label ("policy"/"cpu"/None). Non-slot envs keep
+        their fixed spec kind; slot envs resolve "cpu" directly and map
+        "policy" through slot_serving (snapshot vs live-teacher weights —
+        indistinguishable env-side, known to the refresh). Keys the per-kind
+        GameTrackers so teacher/cpu games keep their ticker/wandb continuity
+        even when served via league slots."""
+        sp = self.specs[i]
+        if sp.kind != "snapshot":
+            return sp.kind
+        if serving == "cpu":
+            return "cpu"
+        return self.slot_serving.get(sp.group, "snapshot")
+
     def collect(self, num_trajectories: int) -> list[Trajectory]:
         """Run the sync-barrier loop until N PPO trajectory chunks are
         assembled; any imitation chunks harvested along the way (reference
@@ -894,6 +1008,13 @@ class DolphinRolloutWorker:
 
         while len(out) < num_trajectories:
             payloads = self._gather_all()
+            # envs whose opponent seat is engine-AI-driven THIS frame (league
+            # cpu adoption is lazy at recycle, so this follows each env's own
+            # report, never the desired assignment). Empty outside league_cpu.
+            cpu_now = {
+                i for i, p in enumerate(payloads)
+                if p.get("opp_serving") == "cpu"
+            }
             for i, p in enumerate(payloads):
                 if p.get("final_stocks") is not None:
                     a, b = p["final_stocks"]  # (port1, port2)
@@ -905,13 +1026,17 @@ class DolphinRolloutWorker:
                         continue
                     if sp.student_port == 2:
                         a, b = b, a
-                    self.trackers[sp.kind].add_game((a, b))
+                    # attribute to the kind that PLAYED the ended game
+                    # (result_serving: carried alongside the result so a
+                    # recycle-boundary kind flip can't misattribute it)
+                    kind = self._actual_kind(i, p.get("result_serving"))
+                    self.trackers[kind].add_game((a, b))
                     if (
                         sp.kind == "snapshot"
                         and self.on_snapshot_game is not None
                         and a != b
                     ):
-                        self.on_snapshot_game(sp.group, a > b)
+                        self.on_snapshot_game(sp.group, a > b, kind)
             resets_d = torch.tensor([p["resetting"] for p in payloads])
             resets = resets_d[row_dolphin]  # row-level
 
@@ -939,7 +1064,9 @@ class DolphinRolloutWorker:
                 for i in range(self.num_dolphins):
                     if resets[i]:
                         continue  # boundary artifacts belong to no game
-                    tracker = self.trackers[self.specs[i].kind]
+                    tracker = self.trackers[
+                        self._actual_kind(i, payloads[i].get("opp_serving"))
+                    ]
                     if stocks[i, 0] < self._prev_stocks[i, 0]:
                         tracker.add_death(float(self._prev_percent[i, 0]))
                     if stocks[i, 1] < self._prev_stocks[i, 1]:
@@ -981,6 +1108,15 @@ class DolphinRolloutWorker:
             opp_controllers: dict[int, tp.Any] = {}
             ref_records: list[FrameRecord] = []
             for name, idx in self.groups.items():
+                if cpu_now and all(i in cpu_now for i in idx):
+                    # whole slot serving CPU lvl-9: no brain to run — skip
+                    # the group's inference entirely. Safe for the agent's
+                    # recurrent state: an env only returns to policy serving
+                    # via a recycle, whose first frame is resetting=True.
+                    # (Mixed groups mid-adoption still run the FULL batch —
+                    # stable shapes for compile — and routing below drops
+                    # the cpu rows' controllers.)
+                    continue
                 agent = self.opponents[name]
                 sel = torch.tensor(idx, device=device)
                 group_view = tree.map_structure(
@@ -997,8 +1133,16 @@ class DolphinRolloutWorker:
                 cmd = {port: controllers1[i]}
                 if i in self._self_row_of:
                     cmd[3 - port] = controllers1[self._self_row_of[i]]
-                elif i in opp_controllers:
+                elif i in opp_controllers and i not in cpu_now:
+                    # cpu_now rows have no policy seat: the engine AI drives
+                    # the opponent port (like dedicated cpu envs today)
                     cmd[3 - port] = opp_controllers[i]
+                if self._league_cpu and self.specs[i].kind == "snapshot":
+                    # piggyback the desired serving kind; the env adopts a
+                    # policy<->cpu change at its next recycle boundary
+                    cmd["opp_kind"] = self.slot_desired.get(
+                        self.specs[i].group, "policy"
+                    )
                 conn.send(cmd)
 
             for j, record in enumerate(records):
