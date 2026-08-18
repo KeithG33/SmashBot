@@ -577,10 +577,10 @@ def test_pfsp_prior_and_payoff_updates(tmp_path):
     pool.record_result(p, True)
     est = pool.win_estimate(p)
     assert est != 0.5
-    # hand EMA (alpha 0.05, seeded at first outcome)
+    # hand EMA (alpha 0.01, seeded at first outcome)
     ema = 1.0
     for o in [1.0, 1.0, 0.0, 1.0]:
-        ema = 0.95 * ema + 0.05 * o
+        ema = 0.99 * ema + 0.01 * o
     assert est == pytest.approx(ema)
 
 

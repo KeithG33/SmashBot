@@ -173,7 +173,11 @@ class SnapshotPool:
         keep: int = 20,
         pfsp: bool = True,
         pfsp_p: float = 1.0,
-        payoff_ema_alpha: float = 0.05,
+        # ~100-game effective memory per ghost (matches AlphaStar's 0.99
+        # payoff decay). A serving ghost sees ~200 games/hour, so faster
+        # alphas track only the last minutes of a stint; slower ones lag
+        # across student versions. Char mixture averages out at this horizon.
+        payoff_ema_alpha: float = 0.01,
     ):
         self.dir = directory
         self.slots = slots
