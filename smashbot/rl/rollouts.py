@@ -271,14 +271,17 @@ class RolloutConfig:
     # only — zero effect on losses or memory.
     pfsp: bool = True
     pfsp_p: float = 1.0
-    # League membership for the teacher / CPU lvl-9 (dormant by default):
-    # instead of fixed teacher_envs/cpu_envs partitions, the member joins the
-    # PFSP candidate set and competes for non-latest snapshot slots via
-    # f_hard — it serves only while the payoff table says it's worth serving.
-    # Requires that kind's fixed env count be 0 (move the envs into snapshot
-    # slots) and pfsp=True. See league_members().
+    # League membership for the teacher / CPU lvl-9 / Phillip (dormant by
+    # default): instead of fixed teacher_envs/cpu_envs/ref_envs partitions,
+    # the member joins the PFSP class-weighted candidate set and competes
+    # for non-latest snapshot slots — it serves only while the payoff table
+    # says it's worth serving. Requires that kind's fixed env count be 0
+    # (move the envs into snapshot slots) and pfsp=True. Phillip serves by
+    # ROUTING to his own agent (different architecture — never loaded into
+    # a slot policy). See league_members().
     league_teacher: bool = False
     league_cpu: bool = False
+    league_phillip: bool = False
 
     def league_members(self) -> list[str]:
         """Special league member keys enabled by the flags; validates the
@@ -298,6 +301,13 @@ class RolloutConfig:
                 f"into the snapshot slots"
             )
             members.append("cpu")
+        if self.league_phillip:
+            assert self.ref_envs == 0, (
+                f"league_phillip folds Phillip into the PFSP league — set "
+                f"ref_envs=0 (got {self.ref_envs}) and move those envs into "
+                f"the snapshot slots"
+            )
+            members.append("phillip")
         if members:
             assert self.pfsp, (
                 "league_teacher/league_cpu require pfsp=True: league members "
@@ -855,19 +865,40 @@ class DolphinRolloutWorker:
         self.on_snapshot_game: tp.Optional[
             tp.Callable[[int, bool, str], None]
         ] = None
+        # Phillip as a league member: served by ROUTING slot rows to his own
+        # agent (his architecture never fits a slot policy). train_rl sets
+        # phillip_factory (n -> BatchedPolicyAgent over the shared Phillip
+        # module); the agent is (re)built whenever his slot occupancy
+        # changes — see _phillip_agent_for.
+        self.phillip_factory: tp.Optional[tp.Callable[[int], tp.Any]] = None
+        self._phillip_agent = None
+        self._phillip_rows_built: list[int] = []
         # Imitation harvest (Phillip's seat while his char is whitelisted):
-        # a second assembler over the reference group's own FrameRecords.
-        self.harvest_imitation = harvest_imitation and bool(self.ref_idx)
+        # a second assembler over Phillip's own FrameRecords — from the
+        # fixed reference group (ref_envs mode) or, under league_phillip,
+        # from whatever rows Phillip is CURRENTLY serving (kind routing).
+        self.harvest_imitation = harvest_imitation and (
+            bool(self.ref_idx) or config.league_phillip
+        )
         if self.harvest_imitation:
-            ref_agent = self.opponents["reference"]
-            self._imit_assembler = ChunkAssembler(
-                config.unroll_length, ref_agent.delay
-            )
             self._imit_elig: list[torch.Tensor] = []  # [R] per pushed record
             self._imit_pending: list = []  # (resets[R], elig[R]) per frame
-            self._ref_embed = ref_agent._embed_controller
             self._stu_embed = student._embed_controller
             self._student_name_code = int(student._name[0].item())
+            if self.ref_idx:
+                ref_agent = self.opponents["reference"]
+                self._imit_assembler = ChunkAssembler(
+                    config.unroll_length, ref_agent.delay
+                )
+                self._ref_embed = ref_agent._embed_controller
+            else:
+                # league_phillip: assembler/embedding come from the phillip
+                # agent at his first serving stint (_phillip_harvest)
+                self._imit_assembler = None
+                self._ref_embed = None
+            # row set of the in-flight imitation chunk (league_phillip only;
+            # the fixed-ref path always harvests ref_idx)
+            self._imit_rows: list[int] = []
         self._procs: list = []
         self._conns: list = []
 
@@ -971,20 +1002,48 @@ class DolphinRolloutWorker:
             name=torch.full_like(rec.name, self._student_name_code),
         )
 
+    # league serving kinds -> GameTracker keys (phillip games keep the
+    # "reference" tracker for ticker R:/rl/reference/* continuity)
+    _TRACKER_KIND = {"phillip": "reference"}
+
     def _actual_kind(self, i: int, serving: str | None) -> str:
         """Kind ACTUALLY serving env i's opponent seat, given the env's
         reported serving label ("policy"/"cpu"/None). Non-slot envs keep
         their fixed spec kind; slot envs resolve "cpu" directly and map
-        "policy" through slot_serving (snapshot vs live-teacher weights —
-        indistinguishable env-side, known to the refresh). Keys the per-kind
-        GameTrackers so teacher/cpu games keep their ticker/wandb continuity
-        even when served via league slots."""
+        "policy" through slot_serving (snapshot vs live-teacher weights vs
+        phillip routing — indistinguishable env-side, known to the refresh).
+        Mapped through _TRACKER_KIND this keys the per-kind GameTrackers so
+        teacher/cpu/phillip games keep their ticker/wandb continuity even
+        when served via league slots; raw values also feed the payoff
+        attribution callback."""
         sp = self.specs[i]
         if sp.kind != "snapshot":
             return sp.kind
         if serving == "cpu":
             return "cpu"
         return self.slot_serving.get(sp.group, "snapshot")
+
+    def _phillip_agent_for(self, rows: list[int]):
+        """Phillip's agent covering exactly his currently-served rows.
+
+        Batch-size variability choice (documented per design): ONE Phillip
+        module is loaded at startup; the cheap BatchedPolicyAgent wrapper is
+        rebuilt whenever his slot occupancy changes. Row counts are
+        multiples of the per-slot env count with at most (slots-1) distinct
+        values, so compiled-sample variants stay a small bounded set.
+        Rebuilding costs only fresh delay queues / hidden state: newly
+        routed rows feed ~delay frames of neutral inputs and re-zero at the
+        next game boundary anyway (same acceptance as a snapshot hot-swap
+        mid-game)."""
+        if self._phillip_agent is None or rows != self._phillip_rows_built:
+            assert self.phillip_factory is not None, (
+                "a slot is assigned to phillip but worker.phillip_factory "
+                "was never set (train_rl sets it at startup under "
+                "league_phillip)"
+            )
+            self._phillip_agent = self.phillip_factory(len(rows))
+            self._phillip_rows_built = list(rows)
+        return self._phillip_agent
 
     def collect(self, num_trajectories: int) -> list[Trajectory]:
         """Run the sync-barrier loop until N PPO trajectory chunks are
@@ -1015,6 +1074,14 @@ class DolphinRolloutWorker:
                 i for i, p in enumerate(payloads)
                 if p.get("opp_serving") == "cpu"
             }
+            # rows Phillip serves THIS frame: slots routed to him minus any
+            # env still serving cpu from a lazy adoption (no policy seat)
+            phillip_rows = [
+                i for i, sp in enumerate(self.specs)
+                if sp.kind == "snapshot"
+                and self.slot_serving.get(sp.group) == "phillip"
+                and i not in cpu_now
+            ]
             for i, p in enumerate(payloads):
                 if p.get("final_stocks") is not None:
                     a, b = p["final_stocks"]  # (port1, port2)
@@ -1030,7 +1097,9 @@ class DolphinRolloutWorker:
                     # (result_serving: carried alongside the result so a
                     # recycle-boundary kind flip can't misattribute it)
                     kind = self._actual_kind(i, p.get("result_serving"))
-                    self.trackers[kind].add_game((a, b))
+                    self.trackers[
+                        self._TRACKER_KIND.get(kind, kind)
+                    ].add_game((a, b))
                     if (
                         sp.kind == "snapshot"
                         and self.on_snapshot_game is not None
@@ -1058,15 +1127,23 @@ class DolphinRolloutWorker:
                 if self.harvest_imitation:
                     # the reference seat's reward is the zero-sum mirror of
                     # the student seat's (both terms are antisymmetric)
-                    ref_rows = torch.tensor(self.ref_idx, device=device)
-                    self._imit_assembler.push_reward(-reward[ref_rows])
+                    if self.ref_idx:
+                        ref_rows = torch.tensor(self.ref_idx, device=device)
+                        self._imit_assembler.push_reward(-reward[ref_rows])
+                    elif self._imit_assembler is not None and self._imit_rows:
+                        # league_phillip source: same mirror over the rows
+                        # of the in-flight chunk (row-set changes reset the
+                        # assembler before this can misalign)
+                        rows_t = torch.tensor(self._imit_rows, device=device)
+                        self._imit_assembler.push_reward(-reward[rows_t])
             if self._frame_count > 0:
                 for i in range(self.num_dolphins):
                     if resets[i]:
                         continue  # boundary artifacts belong to no game
-                    tracker = self.trackers[
-                        self._actual_kind(i, payloads[i].get("opp_serving"))
-                    ]
+                    kind = self._actual_kind(
+                        i, payloads[i].get("opp_serving")
+                    )
+                    tracker = self.trackers[self._TRACKER_KIND.get(kind, kind)]
                     if stocks[i, 0] < self._prev_stocks[i, 0]:
                         tracker.add_death(float(self._prev_percent[i, 0]))
                     if stocks[i, 1] < self._prev_stocks[i, 1]:
@@ -1108,6 +1185,15 @@ class DolphinRolloutWorker:
             opp_controllers: dict[int, tp.Any] = {}
             ref_records: list[FrameRecord] = []
             for name, idx in self.groups.items():
+                if (
+                    isinstance(name, tuple)
+                    and self.slot_serving.get(name[1]) == "phillip"
+                ):
+                    # slot routed to Phillip's own agent (stepped below):
+                    # the slot policy idles. Its hidden state goes stale —
+                    # safe: rows only return to it via a refresh, and the
+                    # recurrent state re-zeros at each game boundary.
+                    continue
                 if cpu_now and all(i in cpu_now for i in idx):
                     # whole slot serving CPU lvl-9: no brain to run — skip
                     # the group's inference entirely. Safe for the agent's
@@ -1126,6 +1212,17 @@ class DolphinRolloutWorker:
                 if name == "reference" and self.harvest_imitation:
                     ref_records = g_records
                 for j, env_i in enumerate(idx):
+                    opp_controllers[env_i] = ctrls[j]
+
+            ph_records: list[FrameRecord] = []
+            if phillip_rows:
+                agent = self._phillip_agent_for(phillip_rows)
+                sel = torch.tensor(phillip_rows, device=device)
+                ph_view = tree.map_structure(
+                    lambda x: x.index_select(0, sel), opponent_view
+                )
+                ctrls, ph_records, _ = agent.step(ph_view, resets_dev[sel])
+                for j, env_i in enumerate(phillip_rows):
                     opp_controllers[env_i] = ctrls[j]
 
             for i, conn in enumerate(self._conns):
@@ -1158,7 +1255,16 @@ class DolphinRolloutWorker:
                 del pending_resets[: len(records)]
 
             if self.harvest_imitation:
-                self._harvest_step(payloads, resets_d, ref_records, imit_out)
+                if self.ref_idx:
+                    self._harvest_step(
+                        payloads, resets_d, self.ref_idx, ref_records,
+                        imit_out,
+                    )
+                else:
+                    self._phillip_harvest(
+                        payloads, resets_d, phillip_rows, ph_records,
+                        imit_out,
+                    )
 
             self._frame_count += 1
             if self.assembler.ready():
@@ -1166,33 +1272,68 @@ class DolphinRolloutWorker:
         self._records_pushed = records_pushed
         return out + imit_out
 
+    def _phillip_harvest(
+        self,
+        payloads: list[dict],
+        resets_d: torch.Tensor,
+        rows: list[int],
+        records: list[FrameRecord],
+        imit_out: list[Trajectory],
+    ) -> None:
+        """league_phillip imitation source: harvested rows follow Phillip's
+        CURRENT slot occupancy (kind routing), so only rows he actually
+        played are harvested. Occupancy changes only at a refresh or a lazy
+        cpu adoption; a change drops the partial chunk — row sets must be
+        homogeneous within a chunk, and one lost ~4s chunk per refresh is
+        negligible."""
+        if rows != self._imit_rows:
+            self._imit_rows = list(rows)
+            self._imit_assembler = None
+            self._imit_pending = []
+            self._imit_elig = []
+        if not rows:
+            return
+        if self._imit_assembler is None:
+            # first frame of a new stint: the assembler starts here, so its
+            # reward stream (pushed from the NEXT frame on) aligns with its
+            # records exactly like the main assembler's does from frame 0
+            agent = self._phillip_agent
+            self._imit_assembler = ChunkAssembler(
+                self.config.unroll_length, agent.delay
+            )
+            self._ref_embed = agent._embed_controller
+        self._harvest_step(payloads, resets_d, rows, records, imit_out)
+
     def _harvest_step(
         self,
         payloads: list[dict],
         resets_d: torch.Tensor,
-        ref_records: list[FrameRecord],
+        rows: list[int],
+        records: list[FrameRecord],
         imit_out: list[Trajectory],
     ) -> None:
-        """Per-frame imitation bookkeeping: buffer the reference seats'
-        eligibility (char whitelisted this game?) and resets, feed the ref
-        agent's flushed records into the imitation assembler, and emit
-        whole-chunk-eligible rows as kind="imitation" trajectories."""
+        """Per-frame imitation bookkeeping: buffer the harvested seats'
+        eligibility (char whitelisted this game?) and resets, feed the
+        harvested agent's flushed records into the imitation assembler, and
+        emit whole-chunk-eligible rows as kind="imitation" trajectories.
+        `rows` = the fixed reference group (ref_envs mode) or Phillip's
+        current serving rows (league_phillip)."""
         device = self.student.device
         elig = torch.tensor(
             [payloads[i].get("opp_char") in self._whitelist
-             for i in self.ref_idx]
+             for i in rows]
         )
         self._imit_pending.append(
-            (resets_d[torch.tensor(self.ref_idx)], elig)
+            (resets_d[torch.tensor(rows)], elig)
         )
-        for j, rec in enumerate(ref_records):
+        for j, rec in enumerate(records):
             frame_resets, frame_elig = self._imit_pending[j]
             self._imit_assembler.push_frame(
                 self._reencode_record(rec), frame_resets.to(device), None
             )
             self._imit_elig.append(frame_elig)
-        if ref_records:
-            del self._imit_pending[: len(ref_records)]
+        if records:
+            del self._imit_pending[: len(records)]
         if self._imit_assembler.ready():
             traj = self._imit_assembler.emit()._replace(kind="imitation")
             T = self.config.unroll_length

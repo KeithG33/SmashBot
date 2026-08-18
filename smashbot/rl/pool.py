@@ -147,12 +147,12 @@ def make_partition(
 
 
 # Special (non-snapshot) league members that can compete for snapshot slots
-# when the league_teacher/league_cpu flags fold them into the PFSP league.
-# Their payoff rows live in pfsp.json under these string keys, exactly like
-# ghost rows live under snapshot paths — and they are NEVER pruned (neither
-# by thinning, which only touches archive paths, nor by the load-time prune,
-# so toggling the flags across restarts loses no data).
-LEAGUE_MEMBER_KEYS = ("teacher", "cpu")
+# when the league_teacher/league_cpu/league_phillip flags fold them into the
+# PFSP league. Their payoff rows live in pfsp.json under these string keys,
+# exactly like ghost rows live under snapshot paths — and they are NEVER
+# pruned (neither by thinning, which only touches archive paths, nor by the
+# load-time prune, so toggling the flags across restarts loses no data).
+LEAGUE_MEMBER_KEYS = ("teacher", "cpu", "phillip")
 
 
 def f_hard(x: float, p: float = 1.0) -> float:
@@ -323,25 +323,73 @@ class SnapshotPool:
                 del self.payoff[victim]
                 self._save_payoff()
 
+    def class_hardness(self) -> dict[str, float]:
+        """Per-class student win estimate for the two-stage PFSP sampler
+        (and wandb): "ghosts" = mean win_ema over the whole archive minus
+        the latest snapshot (0.5 prior for unmeasured members), each league
+        member ("phillip"/"teacher"/"cpu") a singleton class = its own row.
+        Only nonempty/enabled classes appear."""
+        out: dict[str, float] = {}
+        ghosts = self.archive[:-1]
+        if ghosts:
+            out["ghosts"] = (
+                sum(self.win_estimate(g) for g in ghosts) / len(ghosts)
+            )
+        for m in self.league_members:
+            out[m] = self.win_estimate(m)
+        return out
+
+    def _class_weighted_picks(self, rng: random.Random) -> list[str]:
+        """Two-stage class-weighted PFSP for the non-latest slots (active
+        only when league members exist — user-chosen to stop ghost-mass
+        swamping: ~30 ghosts' collective flat weight must not outvote one
+        hard external member).
+
+        Stage 1, per slot independently (WITH replacement across slots):
+        sample a class with probability ∝ f_hard(class hardness) where the
+        hardness is the class's MEAN win_ema (class_hardness()). Singleton
+        classes can therefore hold multiple slots at once.
+        Stage 2, within "ghosts": the existing per-ghost f_hard, WITHOUT
+        replacement across slots — a ghost serves at most one slot."""
+        ghosts = list(self.archive[:-1])
+        hard = self.class_hardness()
+        picks: list[str] = []
+        while len(picks) < self.slots - 1:
+            classes = [c for c in hard if c != "ghosts" or ghosts]
+            weights = [f_hard(hard[c], self.pfsp_p) for c in classes]
+            if sum(weights) <= 0.0:  # everyone beaten: uniform fallback
+                weights = [1.0] * len(classes)
+            cls = classes[rng.choices(range(len(classes)), weights=weights)[0]]
+            if cls == "ghosts":
+                gw = [
+                    f_hard(self.win_estimate(g), self.pfsp_p) for g in ghosts
+                ]
+                if sum(gw) <= 0.0:
+                    gw = [1.0] * len(ghosts)
+                j = rng.choices(range(len(ghosts)), weights=gw)[0]
+                picks.append(ghosts.pop(j))
+            else:
+                picks.append(cls)
+        return picks
+
     def assignments(self, rng: random.Random | None = None) -> list[str]:
         """One member key per slot: an archive path, or a special league
-        member ("teacher"/"cpu") when league_members is set. Slot 0 = ALWAYS
-        the latest snapshot; the rest sampled without replacement where
-        possible — PFSP f_hard weights by default, the original exponential
-        recency bias with pfsp=False. Without-replacement sampling is also
-        what caps each special member at ONE slot per epoch (they are single
-        members, not pools). Empty archive -> [] (league members only start
-        serving once a first snapshot anchors slot 0)."""
+        member ("phillip"/"teacher"/"cpu") when league_members is set.
+        Slot 0 = ALWAYS the latest snapshot. With league members the rest
+        use the two-stage class-weighted PFSP (_class_weighted_picks);
+        without them, the flat per-ghost sampling is byte-identical to the
+        pre-league code — PFSP f_hard weights by default, the original
+        exponential recency bias with pfsp=False. Empty archive -> []
+        (league members only start serving once a first snapshot anchors
+        slot 0)."""
         if not self.archive:
             return []
         rng = rng or random.Random()
         picks = [self.archive[-1]]
         candidates = list(self.archive[:-1])
-        if self.pfsp:
-            # special members compete for the non-latest slots exactly like
-            # ghosts: fresh rows sit at the 0.5 prior (f_hard weight 0.5)
-            # until their first serving stint measures them
-            candidates += self.league_members
+        if self.pfsp and self.league_members:
+            picks += self._class_weighted_picks(rng)
+        elif self.pfsp:
             # PFSP (AlphaStar f_hard): weight by how much the student still
             # struggles vs each snapshot; beaten snapshots fade out.
             while len(picks) < self.slots and candidates:
@@ -380,11 +428,18 @@ def apply_assignments(
       policy (in-memory state_dict copy, no disk). Staleness bound: if the
       teacher watcher hot-swaps the module mid-epoch, this slot keeps serving
       its copy until the next snapshot_interval refresh re-copies it.
+    - "phillip": ROUTING only — Phillip's architecture differs from the
+      student's, so he can never be loaded into a slot policy. The worker
+      sends this slot's rows to Phillip's own BatchedPolicyAgent instead
+      (rollouts: _phillip_agent_for). The slot policy module is untouched
+      and idle. Hot-swappable like a snapshot: both seats stay standard
+      controllers, so no Dolphin reboot is needed.
     - "cpu": only record the desired kind — Dolphin CPU ports cannot hot-swap
-      mid-game, so each env adopts policy<->cpu at its NEXT recycle boundary
-      (rollouts._env_process_main). slot_keys/slot_serving are deliberately
-      left on the PREVIOUS member: attribution must follow what each env is
-      ACTUALLY serving, and not-yet-adopted envs still serve the old policy.
+      mid-game, so each env adopts (policy|phillip)<->cpu at its NEXT recycle
+      boundary (rollouts._env_process_main). slot_keys/slot_serving are
+      deliberately left on the PREVIOUS member: attribution must follow what
+      each env is ACTUALLY serving, and not-yet-adopted envs still serve the
+      old policy.
     """
     for slot, slot_policy in slot_policies:
         if slot >= len(assigns):
@@ -393,7 +448,9 @@ def apply_assignments(
         if key == "cpu":
             worker.slot_desired[slot] = "cpu"
             continue
-        if key == "teacher":
+        if key == "phillip":
+            worker.slot_serving[slot] = "phillip"
+        elif key == "teacher":
             slot_policy.load_state_dict(teacher_module.state_dict())
             worker.slot_serving[slot] = "teacher"
         else:

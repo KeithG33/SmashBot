@@ -258,6 +258,26 @@ def main() -> None:
             snapshot_pool.record_result(key, won)
 
     worker.on_snapshot_game = _on_snapshot_game
+    if rcfg.league_phillip:
+        # Phillip's own module, loaded ONCE (exactly as ref-envs mode does);
+        # his architecture never fits a slot policy, so slots assigned
+        # "phillip" are served by ROUTING their rows to his agent. The agent
+        # wrapper is rebuilt per occupancy change (worker._phillip_agent_for
+        # documents the bounded compile-variant choice).
+        ph_policy, ph_names, _ = load_policy(rcfg.ref_ckpt, device)
+        ph_policy.train_value_head = False
+        ph_policy.requires_grad_(False)
+        ph_policy.eval()
+        if args.runtime.compile:
+            mode = "reduce-overhead" if device == "cuda" else "default"
+            ph_policy.sample = torch.compile(ph_policy.sample, mode=mode)
+        ph_code = resolve_name_code(ph_names, "Master Player")
+        worker.phillip_factory = lambda n: BatchedPolicyAgent(
+            ph_policy, n, name_code=ph_code, device=device,
+            batch_steps=rcfg.batch_steps,
+        )
+        print(f"phillip (league member): {rcfg.ref_ckpt} "
+              f"(delay {ph_policy.delay}, name code {ph_code})")
     if restored_trackers:
         for kind, st in restored_trackers.items():
             if kind in worker.trackers:
@@ -275,6 +295,7 @@ def main() -> None:
     )
 
     run_dir = f"{args.runtime.run_dir}/{args.runtime.tag}"
+    last_assigns: list = []  # latest refresh's slot keys (class-slot wandb)
     state = learner.initial_state(args.rollouts.num_envs, device)
     watcher = TeacherWatcher(args.runtime.teacher_watch or args.ckpt)
     teacher_swaps = 0
@@ -290,10 +311,12 @@ def main() -> None:
                 import random as _random
 
                 assigns = snapshot_pool.assignments(_random.Random(i))
+                last_assigns = assigns
                 # snapshot paths hot-swap instantly; "teacher" copies the
                 # LIVE teacher module's weights (stale at most until the
-                # next refresh if the watcher swaps mid-epoch); "cpu" only
-                # flips the desired kind — envs adopt at recycle
+                # next refresh if the watcher swaps mid-epoch); "phillip"
+                # reroutes the slot's rows to his agent; "cpu" only flips
+                # the desired kind — envs adopt at recycle
                 apply_assignments(
                     assigns, slot_policies, teacher, worker, slot_keys,
                     device,
@@ -350,10 +373,16 @@ def main() -> None:
                     log[f"rl/pfsp/slot{slot}_winrate"] = (
                         snapshot_pool.win_estimate(key)
                     )
-                for member in league:
-                    log[f"rl/pfsp/{member}_winrate"] = (
-                        snapshot_pool.win_estimate(member)
-                    )
+                if league:
+                    # class view of the two-stage PFSP: per-class hardness
+                    # and how many non-latest slots each class holds now
+                    held = {c: 0 for c in ("phillip", "teacher", "cpu",
+                                           "ghosts")}
+                    for k in last_assigns[1:]:
+                        held[k if k in held else "ghosts"] += 1
+                    for cname, h in snapshot_pool.class_hardness().items():
+                        log[f"rl/pfsp/class_{cname}_winrate"] = h
+                        log[f"rl/pfsp/class_{cname}_slots"] = held[cname]
                 for kind, tracker in worker.trackers.items():
                     for k, v in tracker.stats().items():
                         log[f"rl/{kind}/{k}"] = v
@@ -367,7 +396,7 @@ def main() -> None:
                 # stays in wandb as */win_rate_recent for fast-read comparison
                 ref_bit = (
                     f"R:{log.get('rl/reference/win_rate_ema', 0.5):.0%} "
-                    if worker.ref_idx else ""
+                    if worker.ref_idx or rcfg.league_phillip else ""
                 )
                 # self-play port-1-seat win rate: a ~50% health metric
                 sp_bit = (

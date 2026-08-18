@@ -182,21 +182,7 @@ def _make_worker(monkeypatch, num_envs, seed=0, opp_chars=None,
             _tiny_policy(seed=1), counts["teacher"], name_code=1
         )
     if counts.get("reference"):
-        ref_policy = build_policy(
-            embed_config=embed_lib.EmbedConfig(),
-            controller_config=(
-                ref_controller_config or embed_lib.ControllerConfig()
-            ),
-            network_config=configs.NetworkConfig(
-                name="sgu", num_layers=1, hidden_size=32, num_heads=1, window=4
-            ),
-            head_config=configs.ControllerHeadConfig(
-                residual_size=32, component_depth=0
-            ),
-            policy_config=configs.PolicyConfig(delay=2),
-            num_names=4,
-        )
-        ref_policy.train_value_head = False
+        ref_policy = _phillip_like_policy(ref_controller_config)
         opponents["reference"] = BatchedPolicyAgent(
             ref_policy, counts["reference"], name_code=2
         )
@@ -204,9 +190,36 @@ def _make_worker(monkeypatch, num_envs, seed=0, opp_chars=None,
         cfg, student, opponents=opponents, specs=specs,
         harvest_imitation=harvest,
     )
+    if cfg.league_phillip:
+        # a differently-discretized policy, like the real Phillip module
+        # (exercises the harvest re-encode path); ONE module, agent rebuilt
+        # per occupancy — mirrors train_rl's factory
+        ph_policy = _phillip_like_policy(
+            embed_lib.ControllerConfig(axis_spacing=8)
+        )
+        worker.phillip_factory = lambda n: BatchedPolicyAgent(
+            ph_policy, n, name_code=2
+        )
     envs = _FakeEnvs(worker, seed=seed, opp_chars=opp_chars)
     envs.install(monkeypatch)
     return worker, envs
+
+
+def _phillip_like_policy(controller_config=None):
+    policy = build_policy(
+        embed_config=embed_lib.EmbedConfig(),
+        controller_config=controller_config or embed_lib.ControllerConfig(),
+        network_config=configs.NetworkConfig(
+            name="sgu", num_layers=1, hidden_size=32, num_heads=1, window=4
+        ),
+        head_config=configs.ControllerHeadConfig(
+            residual_size=32, component_depth=0
+        ),
+        policy_config=configs.PolicyConfig(delay=2),
+        num_names=4,
+    )
+    policy.train_value_head = False
+    return policy
 
 
 def test_worker_default_config_noop(monkeypatch):
@@ -758,10 +771,14 @@ def test_league_flag_asserts():
         RolloutConfig(
             league_cpu=True, cpu_envs=4, teacher_envs=0
         ).league_members()
+    with pytest.raises(AssertionError, match="ref_envs=0"):
+        RolloutConfig(league_phillip=True, ref_envs=52).league_members()
     with pytest.raises(AssertionError, match="pfsp"):
         RolloutConfig(
             league_teacher=True, teacher_envs=0, pfsp=False
         ).league_members()
+    with pytest.raises(AssertionError, match="pfsp"):
+        RolloutConfig(league_phillip=True, pfsp=False).league_members()
     # SnapshotPool enforces the pfsp dependency independently
     from smashbot.rl.pool import SnapshotPool
 
@@ -772,6 +789,11 @@ def test_league_flag_asserts():
     assert RolloutConfig(
         league_teacher=True, league_cpu=True, teacher_envs=0, cpu_envs=0
     ).league_members() == ["teacher", "cpu"]
+    assert RolloutConfig(league_phillip=True).league_members() == ["phillip"]
+    assert RolloutConfig(
+        league_teacher=True, league_cpu=True, league_phillip=True,
+        teacher_envs=0, cpu_envs=0,
+    ).league_members() == ["teacher", "cpu", "phillip"]
 
 
 def test_league_teacher_candidates_and_fhard(tmp_path):
@@ -805,10 +827,10 @@ def test_league_teacher_candidates_and_fhard(tmp_path):
     assert pool.win_estimate("teacher") > 0.9
 
 
-def test_league_members_at_most_one_slot_each(tmp_path):
-    """Without-replacement sampling: a special member can hold at most ONE
-    slot per epoch even when slots outnumber candidates (padding duplicates
-    the latest snapshot, never the members)."""
+def test_league_singletons_repeat_ghosts_dont(tmp_path):
+    """Class-weighted sampling semantics: a singleton member class CAN hold
+    multiple slots per epoch; a ghost serves at most one (stage-2 without
+    replacement); slot 0 stays the (single) latest snapshot."""
     from smashbot.rl.pool import SnapshotPool
 
     pool = SnapshotPool(
@@ -817,13 +839,17 @@ def test_league_members_at_most_one_slot_each(tmp_path):
     latest = None
     for s in (100, 200):
         latest = pool.save(_Stub(), s)
+    ghost = pool.archive[0]
+    saw_multi_singleton = False
     for seed in range(100):
         picks = pool.assignments(random.Random(seed))
         assert len(picks) == 5 and picks[0] == latest
-        assert picks.count("teacher") <= 1
-        assert picks.count("cpu") <= 1
-        # padding uses the latest snapshot
-        assert picks.count(latest) >= 2
+        assert picks.count(latest) == 1  # classes fill every slot: no pads
+        assert picks.count(ghost) <= 1  # without replacement within ghosts
+        saw_multi_singleton |= (
+            picks.count("teacher") > 1 or picks.count("cpu") > 1
+        )
+    assert saw_multi_singleton  # singletons may hold several slots at once
 
 
 def test_apply_assignments_teacher_copy_and_cpu_lazy(tmp_path):
@@ -866,9 +892,20 @@ def test_apply_assignments_teacher_copy_and_cpu_lazy(tmp_path):
     assert w.slot_desired[1] == "cpu"
     assert w.slot_serving[1] == "teacher" and keys[1] == "teacher"
 
+    # "phillip": routing only — the slot policy module is NEVER touched
+    # (his architecture differs); serving/keys flip instantly like a
+    # snapshot swap, desired returns to "policy" (standard controllers)
+    frozen = {k: v.detach().clone() for k, v in slot1.state_dict().items()}
+    apply_assignments([snap, "phillip"], [(1, slot1)], teacher, w, keys)
+    assert w.slot_serving[1] == "phillip" and keys[1] == "phillip"
+    assert w.slot_desired[1] == "policy"
+    for k, v in slot1.state_dict().items():
+        assert torch.equal(v, frozen[k])
+
     # short assignment list (early training): out-of-range slots untouched
+    before = (w.slot_serving[1], w.slot_desired[1], keys[1])
     apply_assignments([snap], [(0, slot0), (1, slot1)], teacher, w, keys)
-    assert w.slot_desired[1] == "cpu"
+    assert (w.slot_serving[1], w.slot_desired[1], keys[1]) == before
 
 
 def test_league_payoff_persistence_and_thinning(tmp_path):
@@ -878,17 +915,20 @@ def test_league_payoff_persistence_and_thinning(tmp_path):
     from smashbot.rl.pool import SnapshotPool
 
     pool = SnapshotPool(str(tmp_path), slots=2, keep=4,
-                        league_members=("teacher", "cpu"))
+                        league_members=("teacher", "cpu", "phillip"))
     for s in range(0, 800, 100):
         pool.save(_Stub(), s)
     for _ in range(6):
         pool.record_result("teacher", True)
         pool.record_result("cpu", False)
+        pool.record_result("phillip", False)
     assert len(pool.archive) == 4  # thinning ran
     assert pool.payoff["teacher"]["games"] == 6
     assert pool.payoff["cpu"]["games"] == 6
+    assert pool.payoff["phillip"]["games"] == 6
     assert pool.win_estimate("teacher") == pytest.approx(1.0)
     assert pool.win_estimate("cpu") == pytest.approx(0.0)
+    assert pool.win_estimate("phillip") == pytest.approx(0.0)
 
     # round-trip through a league-flag-less pool: rows kept, not pruned
     fresh = SnapshotPool(str(tmp_path), slots=2, keep=4)
@@ -896,9 +936,11 @@ def test_league_payoff_persistence_and_thinning(tmp_path):
         pool.win_estimate("teacher")
     )
     assert fresh.payoff["cpu"]["games"] == 6
+    assert fresh.payoff["phillip"]["games"] == 6
     # and its assignments ignore the members (flags off = ghosts only)
     for seed in range(25):
-        assert "teacher" not in fresh.assignments(random.Random(seed))
+        picks = fresh.assignments(random.Random(seed))
+        assert "teacher" not in picks and "phillip" not in picks
 
 
 def test_league_cpu_lazy_adoption_worker(monkeypatch):
@@ -1029,3 +1071,177 @@ def test_league_composed_with_self_play(monkeypatch):
         torch.testing.assert_close(
             traj.rewards[d], -traj.rewards[worker._self_row_of[d]]
         )
+
+
+# ------------------------- phillip league member + class-weighted sampling
+
+
+def test_pfsp_class_weighting_math(tmp_path):
+    """Two-stage class weighting: class probability follows f_hard over the
+    class MEAN win_ema. Ghost-mass scenario (user's motivating case): 30
+    ghosts at x=0.75 vs phillip at the 0.5 prior — phillip's class share is
+    f_hard(0.5)/(f_hard(0.5)+f_hard(0.75)) = 2/3, NOT the flat-sampling
+    0.5/(0.5+30*0.25) ~= 0.06 that ghost mass would give."""
+    from smashbot.rl.pool import SnapshotPool
+
+    pool = SnapshotPool(str(tmp_path), slots=2, keep=64,
+                        league_members=("phillip",))
+    for s in range(0, 3100, 100):  # 30 ghosts + the latest
+        pool.save(_Stub(), s)
+    for g in pool.archive[:-1]:
+        pool.payoff[g] = {"wins": 8, "games": 10, "win_ema": 0.75}
+    assert pool.class_hardness() == {"ghosts": 0.75, "phillip": 0.5}
+
+    latest = pool.archive[-1]
+    n, ph = 4000, 0
+    for s in range(n):
+        picks = pool.assignments(random.Random(s))
+        assert picks[0] == latest and len(picks) == 2
+        ph += picks[1] == "phillip"
+    share = ph / n
+    assert share == pytest.approx(2 / 3, abs=0.03)
+    assert share > 0.5  # far above any ghost-mass-proportional share
+
+
+def test_pfsp_class_sampler_ghost_stage2(tmp_path):
+    """Stage 2 within the ghosts class keeps the existing per-ghost f_hard
+    (harder ghosts serve more) and without-replacement across slots (a
+    ghost holds at most one slot; singletons may repeat)."""
+    from smashbot.rl.pool import SnapshotPool
+
+    pool = SnapshotPool(str(tmp_path), slots=4, keep=10,
+                        league_members=("teacher",))
+    hard = pool.save(_Stub(), 100)
+    easy = pool.save(_Stub(), 200)
+    latest = pool.save(_Stub(), 300)
+    pool.payoff[hard] = {"wins": 1, "games": 10, "win_ema": 0.1}
+    pool.payoff[easy] = {"wins": 9, "games": 10, "win_ema": 0.9}
+
+    hard_epochs = easy_epochs = 0
+    teacher_multi = False
+    for s in range(500):
+        picks = pool.assignments(random.Random(s))
+        assert picks[0] == latest
+        tail = picks[1:]
+        assert tail.count(hard) <= 1 and tail.count(easy) <= 1
+        teacher_multi |= tail.count("teacher") > 1
+        hard_epochs += hard in tail
+        easy_epochs += easy in tail
+    assert teacher_multi  # singleton class held several slots at once
+    assert hard_epochs > easy_epochs  # per-ghost f_hard preserved
+
+
+def test_league_phillip_routing_and_multislot(monkeypatch):
+    """A slot assigned phillip routes its rows to Phillip's own agent (the
+    slot policy idles); occupancy can span multiple slots (agent rebuilt to
+    the summed row count); rows still yield full-budget student-seat PPO
+    trajectories; games log under tracker kind "reference" and pay off to
+    the "phillip" key."""
+    worker, envs = _make_worker(
+        monkeypatch, num_envs=6, teacher_envs=2, snapshot_slots=2,
+        league_phillip=True,
+    )
+    slot_of = {i: sp.group for i, sp in enumerate(worker.specs)
+               if sp.kind == "snapshot"}
+    assert slot_of == {2: 0, 3: 0, 4: 1, 5: 1}
+    calls = []
+    worker.on_snapshot_game = lambda s, w, k: calls.append((s, w, k))
+    steps = {0: 0, 1: 0}
+
+    def wrap(g):
+        agent = worker.opponents[("slot", g)]
+        orig = agent.step
+
+        def stepped(*a, **k):
+            steps[g] += 1
+            return orig(*a, **k)
+
+        agent.step = stepped
+
+    wrap(0)
+    wrap(1)
+
+    # no phillip serving: both slot agents run, no phillip agent exists
+    worker.collect(1)
+    assert steps[0] > 0 and steps[1] > 0
+    assert worker._phillip_agent is None
+
+    # slot 0 -> phillip: its agent stops stepping, phillip covers its rows,
+    # results log under "reference" and attribute to the "phillip" key
+    worker.slot_serving[0] = "phillip"
+    s0 = steps[0]
+    envs.final_stocks[2] = (4, 0)  # port-1 student wins on a phillip row
+    (traj,) = worker.collect(1)
+    assert steps[0] == s0  # slot-0 policy idle
+    assert worker._phillip_agent is not None
+    assert worker._phillip_agent.num_envs == 2
+    assert worker.trackers["reference"].wins == 1
+    assert worker.trackers["snapshot"].wins == 0
+    assert calls[-1] == (0, True, "phillip")
+    for i in (2, 3):
+        port = worker.specs[i].student_port
+        assert all(set(cmd) == {port, 3 - port}
+                   for cmd in worker._conns[i].sent)
+    assert traj.rewards.shape[0] == 6  # full learner-row budget
+    assert torch.isfinite(traj.rewards).all()
+
+    # multi-slot occupancy: agent rebuilt over both slots' rows
+    worker.slot_serving[1] = "phillip"
+    s1 = steps[1]
+    worker.collect(1)
+    assert steps[1] == s1
+    assert worker._phillip_agent.num_envs == 4
+    assert worker._phillip_rows_built == [2, 3, 4, 5]
+
+    # back to snapshots: routing reverts instantly (hot-swap, no reboot)
+    worker.slot_serving.pop(0)
+    worker.slot_serving.pop(1)
+    worker.collect(1)
+    assert steps[0] > s0 and steps[1] > s1
+
+
+def test_league_phillip_imitation_follows_serving(monkeypatch):
+    """The (dormant) imitation harvest keys off phillip-SERVING rows: no
+    output while he serves nothing; once routed, exactly his rows are
+    harvested, whitelist-gated, name-reconditioned, with the opponent-seat
+    reward mirror; occupancy changes reset the partial chunk cleanly."""
+    worker, envs = _make_worker(
+        monkeypatch, num_envs=4, teacher_envs=2, snapshot_slots=1,
+        league_phillip=True, harvest=True,
+        opp_chars={2: "FOX", 3: "MARTH"},  # slot rows: one whitelisted
+    )
+    assert worker.harvest_imitation
+    assert worker.ref_idx == []  # no fixed reference group
+
+    trajs = worker.collect(1)
+    assert [t.kind for t in trajs] == ["ppo"]  # phillip serving nothing
+
+    worker.slot_serving[0] = "phillip"
+    trajs = worker.collect(3)
+    imits = [t for t in trajs if t.kind == "imitation"]
+    assert imits  # harvested once his chunks fill
+    for imit in imits:
+        assert imit.rewards.shape[0] == 1  # only the FOX (whitelisted) row
+        assert imit.initial_state is None
+        # name re-conditioned on the student's code (1), not phillip's (2)
+        assert torch.equal(imit.name, torch.ones_like(imit.name))
+        # opponent-seat mirror of the fake envs' +0.01/frame student reward
+        torch.testing.assert_close(
+            imit.rewards, torch.full_like(imit.rewards, -0.01)
+        )
+        # actions round-trip the STUDENT embedding despite phillip's
+        # different discretization (axis_spacing 8 vs 16)
+        stu_embed = worker.student._embed_controller
+        stu_embed.decode(stu_embed.map(
+            lambda e, x: x.astype(getattr(e, "dtype", x.dtype)),
+            tree.map_structure(
+                lambda x: x.cpu().numpy(), imit.actions.controller_state
+            ),
+        ))
+
+    # occupancy change mid-stream: partial chunk dropped, no output, no
+    # crash; serving again restarts a fresh chunk
+    worker.slot_serving.pop(0)
+    trajs = worker.collect(1)
+    assert [t.kind for t in trajs] == ["ppo"]
+    assert worker._imit_rows == []
