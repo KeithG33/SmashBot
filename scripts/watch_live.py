@@ -21,6 +21,7 @@ Usage:
   .venv/bin/python scripts/watch_live.py --dry-run           # no Dolphin
 """
 
+import threading
 import argparse
 import dataclasses
 import os
@@ -154,10 +155,31 @@ def build_agents(
     ports = sorted(specs)
     agents: dict[int, AsyncDelayedAgent] = {}
     infos: dict[int, SideInfo] = {}
+    # torch.compile guard: dynamo compilation state is process-global, and
+    # both async workers hit their first REAL frame simultaneously — small
+    # guard-miss recompiles then race (one thread FX-tracing while the other
+    # calls its compiled fn => "symbolically trace a dynamo-optimized
+    # function" RuntimeError). Serialize each policy's first ~2s of calls
+    # through one shared lock; the delay queues absorb the brief stagger.
+    compile_lock = threading.Lock()
+
+    def _race_guarded(fn, warm_calls: int = 120):
+        state = {"n": 0}
+
+        def wrapped(*a, **k):
+            if state["n"] < warm_calls:
+                with compile_lock:
+                    state["n"] += 1
+                    return fn(*a, **k)
+            return fn(*a, **k)
+
+        return wrapped
+
     for port in ports:
         policy, name_map, step = load_side(specs[port], device)
         if compile_policies:
             game_lib.maybe_compile(policy, device)
+            policy.sample = _race_guarded(policy.sample)
         code = game_lib.resolve_name_code(name_map, name)
         (opponent,) = [p for p in ports if p != port]
         agents[port] = AsyncDelayedAgent(
