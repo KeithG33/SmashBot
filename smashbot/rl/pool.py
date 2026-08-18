@@ -2,8 +2,9 @@
 sampling, random seats, and the student-snapshot lifecycle.
 
 Design (user-decided):
-- Student always plays FOX (RL round one focuses one character; the BC prior
-  retains the rest via the KL leash).
+- Student plays characters from a whitelist (default FOX-only: RL round one
+  focuses one character; the BC prior retains the rest via the KL leash).
+  See student_whitelist() for the legacy bot_char interaction.
 - Opponent characters vary. Policy opponents (teacher/snapshots) draw from
   the MAIN-12 roster only — the BC prior never saw off-roster characters and
   would play them at garbage tier (noise, not diversity). CPU opponents draw
@@ -16,6 +17,7 @@ Design (user-decided):
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import random
 import typing as tp
@@ -46,11 +48,25 @@ OFF_ROSTER = [
 ]
 
 
+def student_whitelist(
+    char_whitelist: tp.Sequence[str], bot_char: str = "FOX"
+) -> list[str]:
+    """Effective student-character whitelist.
+
+    The default whitelist ["FOX"] defers to the legacy bot_char flag (so
+    `--rollouts.bot-char MARTH` keeps working); any non-default whitelist
+    wins. len==1 reproduces the fixed-character behavior exactly."""
+    wl = [c.upper() for c in char_whitelist]
+    if wl == ["FOX"]:
+        return [bot_char.upper()]
+    return wl
+
+
 @dataclasses.dataclass
 class EnvSpec:
     """Per-env assignment, fixed for the run."""
 
-    kind: str  # "cpu" | "teacher" | "snapshot"
+    kind: str  # "cpu" | "teacher" | "reference" | "self" | "snapshot"
     group: int  # snapshot slot index (0 = freshest); -1 otherwise
     student_port: int  # 1 or 2
     opponent_char: str
@@ -65,14 +81,22 @@ def make_partition(
     main12_prob: float = 0.6,
     seed: int = 0,
     ref_envs: int = 0,
+    self_envs: int = 0,
+    char_whitelist: tp.Sequence[str] = ("FOX",),
 ) -> list[EnvSpec]:
     """Fixed env partition. Snapshot envs are split evenly across slots
     (num_envs - cpu - teacher must divide evenly); seats alternate so each
-    kind is port-balanced."""
+    kind is port-balanced.
+
+    num_envs is the LEARNER trajectory budget, not the Dolphin count: a
+    self-play env contributes BOTH seats as PPO trajectories, so it costs 2
+    budget units while running one Dolphin. The returned list has
+    num_envs - self_envs specs (= Dolphins to boot). Order:
+    cpu / teacher / reference / self / snapshot."""
     if teacher_envs < 0:  # default: teacher takes every env not otherwise used
         assert snapshot_slots == 0, "specify teacher_envs explicitly with slots"
-        teacher_envs = num_envs - cpu_envs - ref_envs
-    snap_envs = num_envs - cpu_envs - teacher_envs - ref_envs
+        teacher_envs = num_envs - cpu_envs - ref_envs - 2 * self_envs
+    snap_envs = num_envs - cpu_envs - teacher_envs - ref_envs - 2 * self_envs
     assert snap_envs >= 0 and (
         snapshot_slots == 0 or snap_envs % snapshot_slots == 0
     ), "snapshot envs must divide evenly across slots"
@@ -86,12 +110,12 @@ def make_partition(
         pool = CPU_CHARS if rng.random() < main12_prob else OFF_ROSTER
         return rng.choice(pool)
 
-    def stratified(n: int) -> list[str]:
-        """All 12 guaranteed once (when n >= 12), remainder random, order
-        shuffled — pure random draws left holes (live-audited: Phillip's
-        32-env group drew zero PEACH for an entire run)."""
-        chars = list(OPPONENT_CHARS) if n >= len(OPPONENT_CHARS) else []
-        chars += [rng.choice(OPPONENT_CHARS) for _ in range(n - len(chars))]
+    def stratified(n: int, roster: tp.Sequence[str] = OPPONENT_CHARS) -> list[str]:
+        """All roster chars guaranteed once (when n >= len(roster)), remainder
+        random, order shuffled — pure random draws left holes (live-audited:
+        Phillip's 32-env group drew zero PEACH for an entire run)."""
+        chars = list(roster) if n >= len(roster) else []
+        chars += [rng.choice(roster) for _ in range(n - len(chars))]
         rng.shuffle(chars)
         return chars
 
@@ -103,6 +127,12 @@ def make_partition(
     for i, ch in enumerate(stratified(ref_envs)):
         # reference agent (e.g. medium-v2) plays the main 12 (user-verified)
         specs.append(EnvSpec("reference", -1, 1 + (i % 2), ch))
+    # self-play: both seats are the student, so the second seat's boot char
+    # draws from the student whitelist (stratified for coverage). NOTE: with
+    # self_envs == 0 this consumes ZERO rng draws, keeping the stream (and
+    # therefore every downstream char draw) identical to the pre-self code.
+    for i, ch in enumerate(stratified(self_envs, list(char_whitelist))):
+        specs.append(EnvSpec("self", -1, 1 + (i % 2), ch))
     per_slot = snap_envs // snapshot_slots if snapshot_slots else 0
     snap_chars = stratified(per_slot * snapshot_slots)
     for slot in range(snapshot_slots):
@@ -110,21 +140,47 @@ def make_partition(
             specs.append(
                 EnvSpec("snapshot", slot, 1 + (i % 2), snap_chars.pop())
             )
+    assert len(specs) == num_envs - self_envs, (
+        "dolphin count must be num_envs - self_envs (memory-neutral batching)"
+    )
     return specs
 
 
+def f_hard(x: float, p: float = 1.0) -> float:
+    """AlphaStar PFSP hardness weighting: f_hard(x) = (1 - x)^p where x is
+    the student's estimated win rate vs the candidate. x=1 (fully beaten)
+    => weight 0; low win rates dominate the sampling."""
+    return (1.0 - x) ** p
+
+
 class SnapshotPool:
-    """Student snapshots on disk + recency-biased slot assignments.
+    """Student snapshots on disk + PFSP (or recency-biased) slot assignments.
 
     save() freezes the current policy every snapshot_interval learner steps;
     refresh() reassigns serving slots: slot 0 always the latest snapshot,
-    remaining slots sampled with exponential recency bias over the archive
-    (old styles stay in rotation; difficulty tracks the student)."""
+    remaining slots sampled without replacement. With pfsp=True (default)
+    the sampling weight is AlphaStar's f_hard over the student's estimated
+    win rate vs each snapshot (payoff table persisted as pfsp.json in the
+    snapshot directory); pfsp=False keeps the original exponential recency
+    bias exactly."""
 
-    def __init__(self, directory: str, slots: int, keep: int = 20):
+    PRIOR_GAMES = 5  # below this, a snapshot's win rate is the 0.5 prior
+
+    def __init__(
+        self,
+        directory: str,
+        slots: int,
+        keep: int = 20,
+        pfsp: bool = True,
+        pfsp_p: float = 1.0,
+        payoff_ema_alpha: float = 0.05,
+    ):
         self.dir = directory
         self.slots = slots
         self.keep = keep
+        self.pfsp = pfsp
+        self.pfsp_p = pfsp_p
+        self.payoff_ema_alpha = payoff_ema_alpha
         os.makedirs(directory, exist_ok=True)
         # Adopt snapshots already on disk (restarts must not amnesia the
         # league: without this, every resume served only its own boot's
@@ -139,6 +195,58 @@ class SnapshotPool:
             print(f"snapshot archive: adopted {len(self.archive)} existing "
                   f"(steps {self._step_of(self.archive[0])}-"
                   f"{self._step_of(self.archive[-1])})", flush=True)
+        # Per-snapshot payoff table {path: {wins, games, win_ema}}, persisted
+        # across restarts and pruned to snapshots that still exist.
+        self._payoff_path = os.path.join(directory, "pfsp.json")
+        self.payoff: dict[str, dict] = {}
+        self._load_payoff()
+
+    def _load_payoff(self) -> None:
+        try:
+            with open(self._payoff_path) as f:
+                table = json.load(f)
+        except (OSError, ValueError):
+            return
+        existing = set(self.archive)
+        self.payoff = {
+            path: entry for path, entry in table.items() if path in existing
+        }
+        if self.payoff:
+            print(f"pfsp payoff table: loaded {len(self.payoff)} entries",
+                  flush=True)
+
+    def _save_payoff(self) -> None:
+        tmp = self._payoff_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.payoff, f, indent=1)
+        os.replace(tmp, self._payoff_path)
+
+    def record_result(self, path: str, won: bool) -> None:
+        """One decided game vs the snapshot at `path` (won = student won)."""
+        entry = self.payoff.setdefault(
+            path, {"wins": 0, "games": 0, "win_ema": None}
+        )
+        entry["games"] += 1
+        entry["wins"] += int(won)
+        outcome = 1.0 if won else 0.0
+        a = self.payoff_ema_alpha
+        entry["win_ema"] = (
+            outcome if entry["win_ema"] is None
+            else (1 - a) * entry["win_ema"] + a * outcome
+        )
+        self._save_payoff()
+
+    def win_estimate(self, path: str) -> float:
+        """Student's estimated win rate vs this snapshot; 0.5 prior below
+        PRIOR_GAMES decided games."""
+        entry = self.payoff.get(path)
+        if (
+            entry is None
+            or entry["games"] < self.PRIOR_GAMES
+            or entry["win_ema"] is None
+        ):
+            return 0.5
+        return float(entry["win_ema"])
 
     def save(self, policy, step: int) -> str:
         path = os.path.join(self.dir, f"snapshot-{step:07d}.pt")
@@ -182,20 +290,38 @@ class SnapshotPool:
                 os.remove(victim)
             except OSError:
                 pass
+            if victim in self.payoff:  # evicted ghost: drop its payoff row
+                del self.payoff[victim]
+                self._save_payoff()
 
     def assignments(self, rng: random.Random | None = None) -> list[str]:
-        """One archive path per slot (slot 0 = latest; others recency-biased
-        without replacement where possible). Empty archive -> []."""
+        """One archive path per slot (slot 0 = latest; others sampled without
+        replacement where possible — PFSP f_hard weights by default, the
+        original exponential recency bias with pfsp=False). Empty archive
+        -> []."""
         if not self.archive:
             return []
         rng = rng or random.Random()
         picks = [self.archive[-1]]
         candidates = list(self.archive[:-1])
-        # exponential recency bias: newer snapshots ~2x likelier per halving
-        while len(picks) < self.slots and candidates:
-            weights = [2.0 ** (i / max(1, len(candidates) / 3)) for i in range(len(candidates))]
-            chosen = rng.choices(range(len(candidates)), weights=weights)[0]
-            picks.append(candidates.pop(chosen))
+        if self.pfsp:
+            # PFSP (AlphaStar f_hard): weight by how much the student still
+            # struggles vs each snapshot; beaten snapshots fade out.
+            while len(picks) < self.slots and candidates:
+                weights = [
+                    f_hard(self.win_estimate(c), self.pfsp_p)
+                    for c in candidates
+                ]
+                if sum(weights) <= 0.0:  # everyone beaten: uniform fallback
+                    weights = [1.0] * len(candidates)
+                chosen = rng.choices(range(len(candidates)), weights=weights)[0]
+                picks.append(candidates.pop(chosen))
+        else:
+            # exponential recency bias: newer snapshots ~2x likelier per halving
+            while len(picks) < self.slots and candidates:
+                weights = [2.0 ** (i / max(1, len(candidates) / 3)) for i in range(len(candidates))]
+                chosen = rng.choices(range(len(candidates)), weights=weights)[0]
+                picks.append(candidates.pop(chosen))
         while len(picks) < self.slots:
             picks.append(self.archive[-1])  # early training: duplicate latest
         return picks
