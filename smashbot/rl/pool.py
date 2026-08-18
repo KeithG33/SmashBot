@@ -179,7 +179,7 @@ class SnapshotPool:
         self,
         directory: str,
         slots: int,
-        keep: int = 20,
+        keep: int = 30,
         pfsp: bool = True,
         pfsp_p: float = 1.0,
         # ~100-game effective memory per ghost (matches AlphaStar's 0.99
