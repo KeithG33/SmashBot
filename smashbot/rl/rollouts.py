@@ -375,6 +375,11 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
     # Dolphin recycle: matchups rotate over the run instead of being frozen
     # by the boot-time draw (the first Dolphin still uses the partition's
     # stratified char, preserving guaranteed full-roster coverage at boot).
+    # Per-env replay subdir: parallel Dolphins start games in the same
+    # second, and Slippi names files Game_<timestamp>.slp — a shared dir
+    # would collide/overwrite across envs.
+    _replay_dir = f"{cfg.replay_dir}/env-{idx}" if cfg.replay_dir else ""
+
     char_rng = random_lib.Random((cfg.partition_seed << 16) ^ idx)
     # Student-seat whitelist draws use their OWN rng stream so a multi-char
     # whitelist never perturbs the opponent redraw sequence (and vice versa).
@@ -467,7 +472,7 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
         try:
             spare["dolphin"] = game_lib.make_dolphin(
                 players, headless=cfg.headless, stage=cfg.stage,
-                save_replays=cfg.save_replays, replay_dir=cfg.replay_dir,
+                save_replays=cfg.save_replays, replay_dir=_replay_dir,
             )
         except Exception as e:  # fall back to a cold boot at swap time
             print(f"spare boot failed (cold boot at swap): {e}", flush=True)
@@ -526,7 +531,7 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
         try:
             return game_lib.make_dolphin(
                 players, headless=cfg.headless, stage=cfg.stage,
-                save_replays=cfg.save_replays, replay_dir=cfg.replay_dir,
+                save_replays=cfg.save_replays, replay_dir=_replay_dir,
             )
         finally:
             signal.alarm(0)
