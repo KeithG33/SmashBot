@@ -601,6 +601,7 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
             last_frame = None
             last_stocks = None
             frozen_polls = 0  # pause-armor counter (see below)
+            pause_taps = 0  # frame-starvation unpause attempts (see below)
             # New-game gate: a pre-booted spare idles at the title screen,
             # where Melee's ATTRACT-MODE DEMO auto-plays after a timeout —
             # demo frames are "in-game" frames with garbage ports/fields
@@ -625,6 +626,32 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
                     try:
                         gs = next(gs_iter)
                     except AlarmTimeout:
+                        # A paused game delivers NO frames (indistinguishable
+                        # from a wedge in-band). Before killing the Dolphin,
+                        # assume pause: tap START and rebuild the iterator
+                        # (the alarm exception killed the old generator; the
+                        # underlying console stream survives).
+                        if game_started and pause_taps < 2:
+                            pause_taps += 1
+                            print(f"PAUSE RECOVERY: frame stream starved; "
+                                  f"tapping START ({pause_taps}/2)",
+                                  flush=True)
+                            for _c in dolphin.controllers.values():
+                                try:
+                                    _c.press_button(
+                                        melee.Button.BUTTON_START)
+                                    _c.flush()
+                                    time.sleep(0.05)
+                                    _c.release_button(
+                                        melee.Button.BUTTON_START)
+                                    _c.flush()
+                                except Exception:
+                                    pass
+                            gs_iter = iter(
+                                dolphin.iter_gamestates(
+                                    skip_menu_frames=True)
+                            )
+                            continue
                         consecutive_wedges += 1
                         print(f"DOLPHIN WEDGED mid-stream "
                               f"({consecutive_wedges}/3); killing it",
@@ -664,9 +691,20 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
                         if gs.frame > 0:
                             continue  # attract-mode demo frame: discard
                         game_started = True
+                        # clear any START still held/buffered from the menu
+                        # helper's final "start game" press: under load (e.g.
+                        # torch.compile warmup) that press can be consumed
+                        # AFTER the game begins = instant pause at frame ~0
+                        for _c in dolphin.controllers.values():
+                            try:
+                                _c.release_button(melee.Button.BUTTON_START)
+                                _c.flush()
+                            except Exception:
+                                pass
                     # a delivered frame is an in-game frame (skip_menu_frames
-                    # above): re-arm the menu-helper guard
+                    # above): re-arm the menu-helper guard + pause recovery
                     _menu_calls["n"] = 0
+                    pause_taps = 0
                     # PAUSE ARMOR: the policy CANNOT press START (not in
                     # LEGAL_BUTTONS), but the vendor menu helper mashes it —
                     # one mid-game frame misparsed as a menu pauses the game
