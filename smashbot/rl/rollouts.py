@@ -364,6 +364,7 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
     embed_game = embed_lib.EmbedConfig().make_game_embedding()
 
     import random as random_lib
+    import time
 
     from smashbot.rl.pool import (
         CPU_CHARS, OFF_ROSTER, OPPONENT_CHARS, student_whitelist,
@@ -572,6 +573,7 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
             games = 0
             last_frame = None
             last_stocks = None
+            frozen_polls = 0  # pause-armor counter (see below)
             # New-game gate: a pre-booted spare idles at the title screen,
             # where Melee's ATTRACT-MODE DEMO auto-plays after a timeout —
             # demo frames are "in-game" frames with garbage ports/fields
@@ -635,6 +637,30 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
                         if gs.frame > 0:
                             continue  # attract-mode demo frame: discard
                         game_started = True
+                    # PAUSE ARMOR: the policy CANNOT press START (not in
+                    # LEGAL_BUTTONS), but the vendor menu helper mashes it —
+                    # one mid-game frame misparsed as a menu pauses the game
+                    # FOREVER (nothing can unpause; the env sits "healthy"
+                    # emitting frozen frames — live-caught via an exhibition
+                    # replay showing our port pausing at 8min-frozen timer).
+                    # Detect a frozen in-game frame counter and tap START.
+                    if last_frame is not None and gs.frame == last_frame:
+                        frozen_polls += 1
+                        if frozen_polls % 120 == 0:  # ~2s of identical frames
+                            print(f"PAUSE ARMOR: frame {gs.frame} frozen for "
+                                  f"{frozen_polls} polls; tapping START",
+                                  flush=True)
+                            # explicit tap: the policy's controller stream
+                            # never touches START (not in its schema), so
+                            # we must release it ourselves or it stays held
+                            c = dolphin.controllers[spec.student_port]
+                            c.press_button(melee.Button.BUTTON_START)
+                            c.flush()
+                            time.sleep(0.05)
+                            c.release_button(melee.Button.BUTTON_START)
+                            c.flush()
+                    else:
+                        frozen_polls = 0
                     serving = "cpu" if cur_kind == "cpu" else "policy"
                     boundary = last_frame is not None and gs.frame < last_frame
                     resetting = boundary or pending_reset
