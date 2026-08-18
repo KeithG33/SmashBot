@@ -10,7 +10,6 @@ and the config/name_map (RL checkpoints stay play.py-compatible).
 
 from __future__ import annotations
 
-import copy
 import dataclasses
 import time
 
@@ -165,7 +164,7 @@ def main() -> None:
         batch_steps=args.rollouts.batch_steps,
     )
 
-    from smashbot.rl.pool import SnapshotPool, make_partition
+    from smashbot.rl.pool import SnapshotPool, make_partition, student_whitelist
 
     rcfg = args.rollouts
     if not rcfg.log_tag:
@@ -173,7 +172,8 @@ def main() -> None:
     specs = make_partition(
         rcfg.num_envs, rcfg.cpu_envs, rcfg.teacher_envs,
         rcfg.snapshot_slots, rcfg.main12_prob, rcfg.partition_seed,
-        ref_envs=rcfg.ref_envs,
+        ref_envs=rcfg.ref_envs, self_envs=rcfg.self_envs,
+        char_whitelist=student_whitelist(rcfg.char_whitelist, rcfg.bot_char),
     )
     opponents = {}
     slot_policies = []
@@ -230,10 +230,22 @@ def main() -> None:
     snapshot_pool = SnapshotPool(
         f"{args.runtime.run_dir}/{args.runtime.tag}/snapshots",
         slots=rcfg.snapshot_slots,
+        pfsp=rcfg.pfsp, pfsp_p=rcfg.pfsp_p,
     )
     worker = DolphinRolloutWorker(
-        args.rollouts, student_agent, opponents=opponents, specs=specs
+        args.rollouts, student_agent, opponents=opponents, specs=specs,
+        harvest_imitation=args.learner.imitation_slots > 0,
     )
+    # PFSP payoff attribution: the worker knows env->slot; we know
+    # slot->snapshot-path from the last refresh.
+    slot_paths: dict[int, str] = {}
+
+    def _on_snapshot_game(slot: int, won: bool) -> None:
+        path = slot_paths.get(slot)
+        if path:
+            snapshot_pool.record_result(path, won)
+
+    worker.on_snapshot_game = _on_snapshot_game
     if restored_trackers:
         for kind, st in restored_trackers.items():
             if kind in worker.trackers:
@@ -271,6 +283,7 @@ def main() -> None:
                         slot_policy.load_state_dict(
                             torch.load(assigns[slot], map_location=device)
                         )
+                        slot_paths[slot] = assigns[slot]
                 print(f"[{i}] snapshot saved; slots refreshed")
 
             if i > 0 and i % args.runtime.teacher_check_interval == 0:
@@ -285,7 +298,11 @@ def main() -> None:
                     teacher_swaps += 1
                     print(f"[{i}] TEACHER SWAPPED (#{teacher_swaps})")
             trajectories = worker.collect(args.runtime.trajectories_per_step)
-            state, metrics = learner.step(trajectories, state)
+            state, metrics = learner.step(
+                trajectories, state,
+                progress=i / max(1, args.runtime.steps),
+                row_kinds=worker.row_kinds,
+            )
 
             if i % args.runtime.log_interval == 0:
                 # frames THIS BOOT only: after a restore, i includes the
@@ -304,6 +321,17 @@ def main() -> None:
                 })
                 log["rl/reverted"] = float(metrics["reverted"])
                 log["rl/teacher_swaps"] = teacher_swaps
+                im = metrics.get("imitation")
+                if im:
+                    log["rl/imitation/loss"] = im["loss"]
+                    log["rl/imitation/w_mean"] = im["w_mean"]
+                    log["rl/imitation/w_max"] = im["w_max"]
+                    log["rl/imitation/traj_count"] = im["traj_count"]
+                    log["rl/imitation/lambda"] = im["lambda"]
+                for slot, path in slot_paths.items():
+                    log[f"rl/pfsp/slot{slot}_winrate"] = (
+                        snapshot_pool.win_estimate(path)
+                    )
                 for kind, tracker in worker.trackers.items():
                     for k, v in tracker.stats().items():
                         log[f"rl/{kind}/{k}"] = v
@@ -311,13 +339,18 @@ def main() -> None:
                 wandb.log(log, step=i)
                 games = sum(
                     log.get(f"rl/{k}/games_played", 0)
-                    for k in ("cpu", "teacher", "snapshot", "reference")
+                    for k in ("cpu", "teacher", "snapshot", "reference", "self")
                 )
                 # ticker shows the EMAs (restart-proof); the 100-game window
                 # stays in wandb as */win_rate_recent for fast-read comparison
                 ref_bit = (
                     f"R:{log.get('rl/reference/win_rate_ema', 0.5):.0%} "
                     if worker.ref_idx else ""
+                )
+                # self-play port-1-seat win rate: a ~50% health metric
+                sp_bit = (
+                    f"SP:{log.get('rl/self/win_rate_ema', 0.5):.0%} "
+                    if worker.self_idx else ""
                 )
                 print(
                     f"[{i:4d}/{args.runtime.steps}] "
@@ -326,6 +359,7 @@ def main() -> None:
                     f"S:{log.get('rl/snapshot/win_rate_ema', 0.5):.0%} "
                     f"C:{log.get('rl/cpu/win_rate_ema', 0.5):.0%} "
                     f"{ref_bit}"
+                    f"{sp_bit}"
                     f"({games:.0f}g) | "
                     f"kill@{log.get('rl/teacher/avg_percent_at_kill', 0):.0f}% "
                     f"die@{log.get('rl/teacher/avg_percent_at_death', 0):.0f}% | "
