@@ -661,11 +661,11 @@ def test_tracker_ema_and_persistence():
     round-trips through state()/load_state (the part that survives
     restarts — the windows are boot-local by design). Only the EMA VALUES
     persist: alpha is a code-level knob, so a restored tracker uses the
-    CURRENT default horizon (200 games, alpha 0.01), not the one that
+    CURRENT default horizon (250 games, alpha 0.008), not the one that
     produced the checkpoint."""
     from smashbot.rl.rollouts import GameTracker
 
-    assert GameTracker().ema_alpha == 0.01  # ~200-game horizon (default)
+    assert GameTracker().ema_alpha == 0.008  # ~250-game horizon (default)
 
     t = GameTracker(ema_alpha=0.5)
     t.add_game((4, 0))   # win  -> ema seeds at 1.0

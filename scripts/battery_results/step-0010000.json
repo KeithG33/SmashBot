@@ -1,0 +1,247 @@
+{
+  "student_ckpt": "/home/kage/drive2/ShineBot/runs/rl-pool-v3/snapshots/snapshot-0010000.pt",
+  "student_rl_step": 10000,
+  "timestamp": "2026-08-17T20:46:08",
+  "char_slate": [
+    "FOX",
+    "FALCO",
+    "MARTH",
+    "SHEIK",
+    "PEACH",
+    "CPTFALCON",
+    "JIGGLYPUFF",
+    "SAMUS",
+    "YOSHI",
+    "POPO",
+    "LUIGI",
+    "PIKACHU"
+  ],
+  "config": {
+    "num_envs": 8,
+    "unroll_length": 240,
+    "batch_steps": 1,
+    "bot_char": "FOX",
+    "stage": "FINAL_DESTINATION",
+    "games_per_dolphin": 200,
+    "cpu_envs": 0,
+    "teacher_envs": 4,
+    "snapshot_slots": 0,
+    "main12_prob": 0.6,
+    "snapshot_interval": 500,
+    "partition_seed": 0,
+    "headless": true,
+    "log_tag": "battery",
+    "redraw_chars": false,
+    "double_buffer": false,
+    "ref_shard_size": 16,
+    "env_timeout": 300.0,
+    "ref_envs": 4,
+    "ref_ckpt": "/home/kage/drive2/ShineBot/models/medium-v2-torch.pt",
+    "char_whitelist": [
+      "FOX"
+    ],
+    "self_envs": 0,
+    "pfsp": true,
+    "pfsp_p": 1.0,
+    "envs": 8,
+    "games_per_side": 24,
+    "phase_game_targets": [
+      8,
+      8,
+      8
+    ],
+    "max_minutes": 90.0,
+    "device": "cpu",
+    "yardstick_teacher": "/home/kage/drive2/ShineBot/models/yardstick-teacher-887500.pt",
+    "yardstick_phillip": "/home/kage/drive2/ShineBot/models/medium-v2-torch.pt",
+    "student_mode": "snapshot",
+    "config_from": "/home/kage/drive2/ShineBot/runs/rl-pool-v3/latest.pt",
+    "elapsed_seconds": 5425.3
+  },
+  "results": {
+    "teacher": {
+      "games": 15,
+      "wins": 13,
+      "losses": 2,
+      "draws": 0,
+      "win_rate": 0.8666666666666667,
+      "avg_stock_diff": 1.9333333333333333,
+      "avg_percent_at_kill": 103.69436102647047,
+      "avg_percent_at_death": 127.87307944664589
+    },
+    "phillip": {
+      "games": 16,
+      "wins": 9,
+      "losses": 7,
+      "draws": 0,
+      "win_rate": 0.5625,
+      "avg_stock_diff": 0.1875,
+      "avg_percent_at_kill": 99.213855490965,
+      "avg_percent_at_death": 110.85248365856353
+    }
+  },
+  "per_char": {
+    "teacher": {
+      "FOX": 2,
+      "FALCO": 1,
+      "MARTH": 2,
+      "SHEIK": 1,
+      "PEACH": 1,
+      "CPTFALCON": 1,
+      "JIGGLYPUFF": 2,
+      "SAMUS": 1,
+      "YOSHI": 1,
+      "POPO": 1,
+      "LUIGI": 1,
+      "PIKACHU": 1
+    },
+    "phillip": {
+      "FOX": 2,
+      "FALCO": 2,
+      "MARTH": 2,
+      "SHEIK": 1,
+      "PEACH": 1,
+      "CPTFALCON": 1,
+      "JIGGLYPUFF": 1,
+      "SAMUS": 1,
+      "YOSHI": 1,
+      "POPO": 1,
+      "LUIGI": 2,
+      "PIKACHU": 1
+    }
+  },
+  "phases": [
+    {
+      "phase": "A",
+      "slate": [
+        "FOX",
+        "FALCO",
+        "MARTH",
+        "SHEIK"
+      ],
+      "elapsed_seconds": 1806.6,
+      "teacher": {
+        "games": 6,
+        "wins": 5,
+        "losses": 1,
+        "draws": 0,
+        "win_rate": 0.8333333333333334,
+        "avg_stock_diff": 2.0,
+        "avg_percent_at_kill": 100.19862207873115,
+        "avg_percent_at_death": 119.04400194608249
+      },
+      "phillip": {
+        "games": 7,
+        "wins": 5,
+        "losses": 2,
+        "draws": 0,
+        "win_rate": 0.7142857142857143,
+        "avg_stock_diff": 0.5714285714285714,
+        "avg_percent_at_kill": 98.34680046081543,
+        "avg_percent_at_death": 110.59367606753395
+      },
+      "per_char": {
+        "teacher": {
+          "FOX": 2,
+          "FALCO": 1,
+          "MARTH": 2,
+          "SHEIK": 1
+        },
+        "phillip": {
+          "FOX": 2,
+          "FALCO": 2,
+          "MARTH": 2,
+          "SHEIK": 1
+        }
+      }
+    },
+    {
+      "phase": "B",
+      "slate": [
+        "PEACH",
+        "CPTFALCON",
+        "JIGGLYPUFF",
+        "SAMUS"
+      ],
+      "elapsed_seconds": 1809.3,
+      "teacher": {
+        "games": 5,
+        "wins": 4,
+        "losses": 1,
+        "draws": 0,
+        "win_rate": 0.8,
+        "avg_stock_diff": 2.0,
+        "avg_percent_at_kill": 100.38720260620117,
+        "avg_percent_at_death": 135.29898775540866
+      },
+      "phillip": {
+        "games": 4,
+        "wins": 2,
+        "losses": 2,
+        "draws": 0,
+        "win_rate": 0.5,
+        "avg_stock_diff": 0.25,
+        "avg_percent_at_kill": 106.66144821860574,
+        "avg_percent_at_death": 105.1991037067614
+      },
+      "per_char": {
+        "teacher": {
+          "PEACH": 1,
+          "CPTFALCON": 1,
+          "JIGGLYPUFF": 2,
+          "SAMUS": 1
+        },
+        "phillip": {
+          "PEACH": 1,
+          "CPTFALCON": 1,
+          "JIGGLYPUFF": 1,
+          "SAMUS": 1
+        }
+      }
+    },
+    {
+      "phase": "C",
+      "slate": [
+        "YOSHI",
+        "POPO",
+        "LUIGI",
+        "PIKACHU"
+      ],
+      "elapsed_seconds": 1809.4,
+      "teacher": {
+        "games": 4,
+        "wins": 4,
+        "losses": 0,
+        "draws": 0,
+        "win_rate": 1.0,
+        "avg_stock_diff": 1.75,
+        "avg_percent_at_kill": 111.36333560943604,
+        "avg_percent_at_death": 129.2762486384465
+      },
+      "phillip": {
+        "games": 5,
+        "wins": 2,
+        "losses": 3,
+        "draws": 0,
+        "win_rate": 0.4,
+        "avg_stock_diff": -0.4,
+        "avg_percent_at_kill": 92.44382385980515,
+        "avg_percent_at_death": 115.7589696801227
+      },
+      "per_char": {
+        "teacher": {
+          "YOSHI": 1,
+          "POPO": 1,
+          "LUIGI": 1,
+          "PIKACHU": 1
+        },
+        "phillip": {
+          "YOSHI": 1,
+          "POPO": 1,
+          "LUIGI": 2,
+          "PIKACHU": 1
+        }
+      }
+    }
+  ]
+}

@@ -134,13 +134,13 @@ class GameTracker:
     average opponent percent at our kills (low = early kills, strong punish
     game), and average own percent at our deaths (high = hard to kill)."""
 
-    # ema_alpha 0.01 ~ a 200-game horizon: at 120 envs a 100-game horizon is
-    # less than one wave of concurrent games, so the ticker EMA wobbled with
-    # single-batch luck (~±5pp); 200 games reads ~±3.5pp. Persisted tracker
-    # state stores the EMA VALUES only, so restored checkpoints pick up the
-    # new alpha automatically.
+    # ema_alpha 0.008 ~ a 250-game horizon (user-dialed): 2-3 full waves of
+    # concurrent games across the fleet, so the ticker EMA reflects several
+    # rounds rather than single-batch luck (~±3pp wobble vs ±5pp at the old
+    # 100-game horizon). Persisted tracker state stores the EMA VALUES
+    # only, so restored checkpoints pick up the new alpha automatically.
     def __init__(self, window: int = 100, event_window: int = 200,
-                 ema_alpha: float = 0.01):
+                 ema_alpha: float = 0.008):
         import collections
 
         self.diffs = collections.deque(maxlen=window)  # per finished game
