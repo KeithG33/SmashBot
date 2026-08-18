@@ -296,6 +296,26 @@ def main() -> None:
 
     run_dir = f"{args.runtime.run_dir}/{args.runtime.tag}"
     last_assigns: list = []  # latest refresh's slot keys (class-slot wandb)
+    # Boot auction: slot policies initialize as teacher-weight copies, and
+    # without this the first REAL assignment waits for the next
+    # snapshot_interval boundary — up to ~2.5h during which every "snapshot"
+    # env silently serves an unlabeled teacher clone and league members
+    # (teacher/cpu/phillip) play zero games (live-caught after the league
+    # relaunch: T:/R:/C: frozen for 125 steps). Requires a non-empty archive
+    # (slot 0 needs a latest snapshot); fresh runs keep the old behavior.
+    if rcfg.snapshot_slots and snapshot_pool.archive:
+        import random as _random
+
+        assigns = snapshot_pool.assignments(_random.Random(start_step))
+        if assigns:
+            last_assigns = assigns
+            apply_assignments(
+                assigns, slot_policies, teacher, worker, slot_keys, device
+            )
+            served = [
+                os.path.basename(k) if os.sep in k else k for k in assigns
+            ]
+            print(f"boot auction: slots -> {served}", flush=True)
     state = learner.initial_state(args.rollouts.num_envs, device)
     watcher = TeacherWatcher(args.runtime.teacher_watch or args.ckpt)
     teacher_swaps = 0
