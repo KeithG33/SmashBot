@@ -137,10 +137,17 @@ def make_dolphin(
     gfx_backend: str = "OGL",
     online_delay: int = 0,
     mute: bool = False,
+    save_replays: bool = False,
+    replay_dir: str = "",
 ) -> dolphin_lib.Dolphin:
     """One Dolphin. Headless uses the ExiAI build (Null video, fast-forward);
-    visible play uses the standard netplay build."""
+    visible play uses the standard netplay build. save_replays writes .slp
+    files (headless included — run fast, watch later in Slippi at 60fps)."""
     console_kwargs: dict = {"stage": melee.Stage[stage.upper()]}
+    if save_replays:
+        console_kwargs["save_replays"] = True
+        if replay_dir:
+            console_kwargs["replay_dir"] = replay_dir
     # Slippi builds open slippi.gg/online/enable in a browser when their
     # (fresh temp) user dir has no linked account. All our games are local
     # direct-mode (headless fleets AND rendered watch sessions), so make

@@ -248,6 +248,10 @@ class RolloutConfig:
     # crashing loudly (a supervisor/--runtime.restore auto turns that crash
     # into a ~20min self-heal instead of a silent overnight hang).
     env_timeout: float = 300.0
+    # Slippi replay recording (.slp per game; headless included — run fast,
+    # watch later in Slippi at 60fps). Empty replay_dir = Slippi default.
+    save_replays: bool = False
+    replay_dir: str = ""
     # Reference opponent (slippi-ai medium-v2 via venv-ref subprocess).
     ref_envs: int = 0
     ref_ckpt: str = "/home/kage/drive2/ShineBot/models/medium-v2-torch.pt"
@@ -461,7 +465,8 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
     def _boot_spare() -> None:
         try:
             spare["dolphin"] = game_lib.make_dolphin(
-                players, headless=cfg.headless, stage=cfg.stage
+                players, headless=cfg.headless, stage=cfg.stage,
+                save_replays=cfg.save_replays, replay_dir=cfg.replay_dir,
             )
         except Exception as e:  # fall back to a cold boot at swap time
             print(f"spare boot failed (cold boot at swap): {e}", flush=True)
@@ -519,7 +524,8 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
         signal.alarm(180)
         try:
             return game_lib.make_dolphin(
-                players, headless=cfg.headless, stage=cfg.stage
+                players, headless=cfg.headless, stage=cfg.stage,
+                save_replays=cfg.save_replays, replay_dir=cfg.replay_dir,
             )
         finally:
             signal.alarm(0)
