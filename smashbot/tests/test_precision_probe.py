@@ -176,3 +176,14 @@ def test_fp32_must_lead(tiny):
     learner, traj = tiny
     with pytest.raises(AssertionError):
         probe.run_fidelity(learner, [traj], "cpu", arms=("bf16", "fp32"))
+
+
+def test_lambda_calib_scales(tiny):
+    probe = _load_probe()
+    learner, traj = tiny
+    out = probe.run_lambda_calib(learner, [traj])
+    assert out["grad_norm_ppo"] > 0 and out["grad_norm_imitation_at_lambda1"] > 0
+    share = out["grad_share_at_lambda1"]
+    for pct, lam in out["recommended_lambda"].items():
+        target = int(pct.rstrip("pct")) / 100
+        assert lam == pytest.approx(target / share, rel=1e-6)

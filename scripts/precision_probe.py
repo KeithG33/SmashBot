@@ -507,6 +507,59 @@ def run_memcurve(learner, rows_list, unroll: int, arm: str) -> list[dict]:
 # ----------------------------------------------------------------- CLI glue
 
 
+def run_lambda_calib(learner, trajectories, target_shares=(0.10, 0.15, 0.20)):
+    """Measure the PPO policy gradient vs the imitation gradient at lambda=1
+    on the SAME rows (rows reused as pseudo-demonstrations: L_opp math is
+    identical and NLL magnitude is what sets the scale, regardless of whose
+    actions they are). recommended_lambda(share) = share * ||g_ppo|| /
+    ||g_imit||. No optimizer steps; weights untouched."""
+    freeze_value_updates(learner)
+    ppo_trajs = [
+        t for t in trajectories if getattr(t, "kind", "ppo") != "imitation"
+    ]
+    assert ppo_trajs, "batch contains no PPO trajectories"
+    batch_size = ppo_trajs[0].rewards.shape[0]
+    device = next(learner.policy.parameters()).device
+    state = learner.initial_state(batch_size, device)
+
+    learner.policy_optimizer.zero_grad(set_to_none=True)
+    ppo_losses = []
+    for traj in ppo_trajs:
+        fixed, state, _ = learner._fixed_pass(traj, state)
+        loss, _ = learner._policy_loss(fixed)
+        loss.backward()
+        ppo_losses.append(float(loss.detach()))
+    g_ppo, nf = _grad_stats(learner.policy.parameters())
+    assert nf == 0, "nonfinite PPO grads in calibration"
+
+    learner.policy_optimizer.zero_grad(set_to_none=True)
+    imit_losses = []
+    for traj in ppo_trajs:
+        imf = learner._imitation_fixed(traj)
+        if imf is None:
+            continue
+        loss = learner._imitation_policy_loss(imf)
+        loss.backward()
+        imit_losses.append(float(loss.detach()))
+    assert imit_losses, "no imitation-eligible trajectories"
+    g_imit, nf = _grad_stats(learner.policy.parameters())
+    assert nf == 0, "nonfinite imitation grads in calibration"
+    learner.policy_optimizer.zero_grad(set_to_none=True)
+
+    out = {
+        "ppo_loss_mean": sum(ppo_losses) / len(ppo_losses),
+        "imitation_loss_mean_at_lambda1": sum(imit_losses) / len(imit_losses),
+        "grad_norm_ppo": g_ppo,
+        "grad_norm_imitation_at_lambda1": g_imit,
+        "grad_share_at_lambda1": g_imit / max(g_ppo, 1e-12),
+        "recommended_lambda": {
+            f"{int(s*100)}pct": s * g_ppo / max(g_imit, 1e-12)
+            for s in target_shares
+        },
+    }
+    return out
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -531,6 +584,19 @@ def parse_args(argv=None) -> argparse.Namespace:
                      help="tolerance for the ratio_mean==1 invariant flag")
     fid.add_argument("--out", default="",
                      help="JSON report path (default: <batch>.fidelity.json)")
+
+    cal = sub.add_parser(
+        "lambda-calib",
+        help="imitation-vs-PPO gradient share on a saved batch -> "
+             "recommended imitation_lambda (cpu-safe beside the live run)",
+    )
+    cal.add_argument("--batch", required=True)
+    csrc = cal.add_mutually_exclusive_group(required=True)
+    csrc.add_argument("--ckpt", default="")
+    csrc.add_argument("--snapshot", default="")
+    cal.add_argument("--config-from", default=DEFAULT_CONFIG_FROM)
+    cal.add_argument("--device", default="cpu", choices=("cpu", "cuda"))
+    cal.add_argument("--out", default="")
 
     mem = sub.add_parser(
         "memcurve",
@@ -657,10 +723,31 @@ def main_memcurve(args) -> None:
     print(f"wrote {out}", flush=True)
 
 
+def main_lambda_calib(args) -> None:
+    saved = torch.load(args.batch, map_location="cpu", weights_only=False)
+    trajectories = to_device(saved["trajectories"], args.device)
+    meta = saved.get("meta", {})
+    print(f"lambda-calib: batch {args.batch} "
+          f"(step {meta.get('rl_step', '?')}), device {args.device}",
+          flush=True)
+    learner, _ = build_learner(
+        ckpt=args.ckpt, snapshot=args.snapshot,
+        config_from=args.config_from, device=args.device,
+    )
+    out = run_lambda_calib(learner, trajectories)
+    print(json.dumps(out, indent=2))
+    dest = args.out or (args.batch + ".lambda_calib.json")
+    with open(dest, "w") as f:
+        json.dump(out, f, indent=2)
+    print(f"wrote {dest}", flush=True)
+
+
 def main() -> None:
     args = parse_args()
     if args.cmd == "fidelity":
         main_fidelity(args)
+    elif args.cmd == "lambda-calib":
+        main_lambda_calib(args)
     else:
         main_memcurve(args)
 
