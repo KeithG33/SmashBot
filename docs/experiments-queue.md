@@ -35,8 +35,19 @@ https://unsloth.ai/docs/get-started/reinforcement-learning-rl-guide/advanced-rl-
 tKL behavior, ratio_mean == 1 invariant on fresh learner, learner peak
 memory (rows headroom), fps; then a battery each vs the shared baseline.
 
-**Adopt if**: equal-or-better battery + no guard-cadence regression; then
-raise rows to the new ceiling at the v4 launch.
+**Rollout/learner precision matching** (the actual failure mode Unsloth's
+guide targets): their mismatch is between the rollout engine's logprobs and
+the learner's recomputation. Our ratio_mean == 1 fresh-learner invariant is
+a direct detector for it — run it per arm. Corollary: the rollout sample
+path must adopt the SAME precision as the learner unroll (or ratio math
+stays fp32), else we manufacture the mismatch ourselves. Unsloth's
+practical recs: try fp16+loss-scaling first and measure; stick with bf16
+when sequences are short / mismatch measures small / fp16 overflows —
+our 240-frame chunks are short by their standards, so measure, don't
+assume either way.
+
+**Adopt if**: equal-or-better battery + no guard-cadence regression + ratio
+invariant intact; then raise rows to the new ceiling at the v4 launch.
 
 ## Ticker redesign for the league era
 
