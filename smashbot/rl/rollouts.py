@@ -625,7 +625,13 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
                 # loudly (the worker watchdog is the outer backstop).
                 gs_iter = iter(dolphin.iter_gamestates(skip_menu_frames=True))
                 while True:
-                    signal.alarm(120)
+                    # Recovery ladder must fit UNDER the worker's 300s
+                    # watchdog: first detection waits the full 120s, but
+                    # after a pause-recovery tap an unpause shows frames
+                    # within seconds — re-arm short. (Live-caught: two 120s
+                    # re-arms pushed the ladder to 360s and the watchdog
+                    # killed the run at 300s before the SIGKILL step.)
+                    signal.alarm(120 if pause_taps == 0 else 30)
                     try:
                         gs = next(gs_iter)
                     except AlarmTimeout:
