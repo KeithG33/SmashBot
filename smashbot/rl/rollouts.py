@@ -441,30 +441,8 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
     # by test_worker_side_encode_matches_policy_encode).
     embed_game = embed_lib.EmbedConfig().make_game_embedding()
 
-    # MENU-HELPER GUARD (root cause of the pause bug): the vendor Dolphin
-    # loop runs melee's menu helper on any frame whose state parses as a
-    # menu — a single mid-game misparse lets it mash START into a LIVE game,
-    # pausing it (and the policy cannot unpause: START isn't in its action
-    # space). Pause also STALLS gamestate delivery (pause screen classifies
-    # as menu and is skipped), so no in-band armor can see it; a permanently
-    # paused game starves the frame alarm into a SIGKILL ("mystery wedge").
-    # Fix: suppress the helper until the menu state persists ~0.25s — real
-    # menu phases (boot CSS, postgame) run hundreds of consecutive helper
-    # calls, a misparse runs one or two. The env loop resets the counter on
-    # every delivered in-game frame.
-    _menu_calls = {"n": 0}
-    _orig_menu_helper = melee.MenuHelper.menu_helper_simple
-
-    def _guarded_menu_helper(self, gamestate, controller, *a, **kw):
-        _menu_calls["n"] += 1
-        if _menu_calls["n"] < 30:
-            return
-        return _orig_menu_helper(self, gamestate, controller, *a, **kw)
-
-    melee.MenuHelper.menu_helper_simple = _guarded_menu_helper
 
     import random as random_lib
-    import time
 
     from smashbot.rl.pool import (
         CPU_CHARS, OFF_ROSTER, OPPONENT_CHARS, student_whitelist,
@@ -687,8 +665,6 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
             games = 0
             last_frame = None
             last_stocks = None
-            frozen_polls = 0  # pause-armor counter (see below)
-            pause_taps = 0  # frame-starvation unpause attempts (see below)
             # New-game gate: a pre-booted spare idles at the title screen,
             # where Melee's ATTRACT-MODE DEMO auto-plays after a timeout —
             # demo frames are "in-game" frames with garbage ports/fields
@@ -709,42 +685,10 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
                 # loudly (the worker watchdog is the outer backstop).
                 gs_iter = iter(dolphin.iter_gamestates(skip_menu_frames=True))
                 while True:
-                    # Recovery ladder must fit UNDER the worker's 300s
-                    # watchdog: first detection waits the full 120s, but
-                    # after a pause-recovery tap an unpause shows frames
-                    # within seconds — re-arm short. (Live-caught: two 120s
-                    # re-arms pushed the ladder to 360s and the watchdog
-                    # killed the run at 300s before the SIGKILL step.)
-                    signal.alarm(120 if pause_taps == 0 else 30)
+                    signal.alarm(120)
                     try:
                         gs = next(gs_iter)
                     except AlarmTimeout:
-                        # A paused game delivers NO frames (indistinguishable
-                        # from a wedge in-band). Before killing the Dolphin,
-                        # assume pause: tap START and rebuild the iterator
-                        # (the alarm exception killed the old generator; the
-                        # underlying console stream survives).
-                        if game_started and pause_taps < 2:
-                            pause_taps += 1
-                            print(f"PAUSE RECOVERY: frame stream starved; "
-                                  f"tapping START ({pause_taps}/2)",
-                                  flush=True)
-                            for _c in dolphin.controllers.values():
-                                try:
-                                    _c.press_button(
-                                        melee.Button.BUTTON_START)
-                                    _c.flush()
-                                    time.sleep(0.05)
-                                    _c.release_button(
-                                        melee.Button.BUTTON_START)
-                                    _c.flush()
-                                except Exception:
-                                    pass
-                            gs_iter = iter(
-                                dolphin.iter_gamestates(
-                                    skip_menu_frames=True)
-                            )
-                            continue
                         consecutive_wedges += 1
                         print(f"DOLPHIN WEDGED mid-stream "
                               f"({consecutive_wedges}/3); killing it",
@@ -784,44 +728,6 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
                         if gs.frame > 0:
                             continue  # attract-mode demo frame: discard
                         game_started = True
-                        # clear any START still held/buffered from the menu
-                        # helper's final "start game" press: under load (e.g.
-                        # torch.compile warmup) that press can be consumed
-                        # AFTER the game begins = instant pause at frame ~0
-                        for _c in dolphin.controllers.values():
-                            try:
-                                _c.release_button(melee.Button.BUTTON_START)
-                                _c.flush()
-                            except Exception:
-                                pass
-                    # a delivered frame is an in-game frame (skip_menu_frames
-                    # above): re-arm the menu-helper guard + pause recovery
-                    _menu_calls["n"] = 0
-                    pause_taps = 0
-                    # PAUSE ARMOR: the policy CANNOT press START (not in
-                    # LEGAL_BUTTONS), but the vendor menu helper mashes it —
-                    # one mid-game frame misparsed as a menu pauses the game
-                    # FOREVER (nothing can unpause; the env sits "healthy"
-                    # emitting frozen frames — live-caught via an exhibition
-                    # replay showing our port pausing at 8min-frozen timer).
-                    # Detect a frozen in-game frame counter and tap START.
-                    if last_frame is not None and gs.frame == last_frame:
-                        frozen_polls += 1
-                        if frozen_polls % 120 == 0:  # ~2s of identical frames
-                            print(f"PAUSE ARMOR: frame {gs.frame} frozen for "
-                                  f"{frozen_polls} polls; tapping START",
-                                  flush=True)
-                            # explicit tap: the policy's controller stream
-                            # never touches START (not in its schema), so
-                            # we must release it ourselves or it stays held
-                            c = dolphin.controllers[spec.student_port]
-                            c.press_button(melee.Button.BUTTON_START)
-                            c.flush()
-                            time.sleep(0.05)
-                            c.release_button(melee.Button.BUTTON_START)
-                            c.flush()
-                    else:
-                        frozen_polls = 0
                     serving = "cpu" if cur_kind == "cpu" else "policy"
                     boundary = last_frame is not None and gs.frame < last_frame
                     resetting = boundary or pending_reset
@@ -1072,8 +978,7 @@ class DolphinRolloutWorker:
         self.assembler = ChunkAssembler(config.unroll_length, student.delay)
         self.trackers = {
             k: GameTracker()
-            for k in ("cpu", "teacher", "snapshot", "reference", "self",
-                      "self_port1")
+            for k in ("cpu", "teacher", "snapshot", "reference", "self")
         }
         # slot-game callback for PFSP payoff attribution: (slot, student_won,
         # actual_kind) per decided game on a snapshot-slot env — actual_kind
@@ -1304,17 +1209,9 @@ class DolphinRolloutWorker:
                     a, b = p["final_stocks"]  # (port1, port2)
                     sp = self.specs[i]
                     if sp.kind == "self":
-                        # both seats are the student. TWO health gauges:
-                        # - "self" = PRIMARY-seat (student_port) win rate:
-                        #   ports randomize across envs, so engine port bias
-                        #   cancels — a sustained lean isolates a defect in
-                        #   the second-seat plumbing (pipeline invariant).
-                        # - "self_port1" = literal port-1 win rate: pipeline
-                        #   effects cancel — measures engine port-priority
-                        #   bias (climbs as converged mirrors produce ties).
-                        self.trackers["self_port1"].add_game((a, b))
-                        pa, pb = (b, a) if sp.student_port == 2 else (a, b)
-                        self.trackers["self"].add_game((pa, pb))
+                        # both seats are the student: track the PORT-1 seat's
+                        # win rate (a ~50% health metric, not a skill signal)
+                        self.trackers["self"].add_game((a, b))
                         continue
                     if sp.student_port == 2:
                         a, b = b, a
