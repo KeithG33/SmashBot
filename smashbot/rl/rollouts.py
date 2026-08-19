@@ -965,7 +965,8 @@ class DolphinRolloutWorker:
         self.assembler = ChunkAssembler(config.unroll_length, student.delay)
         self.trackers = {
             k: GameTracker()
-            for k in ("cpu", "teacher", "snapshot", "reference", "self")
+            for k in ("cpu", "teacher", "snapshot", "reference", "self",
+                      "self_port1")
         }
         # slot-game callback for PFSP payoff attribution: (slot, student_won,
         # actual_kind) per decided game on a snapshot-slot env — actual_kind
@@ -1196,9 +1197,17 @@ class DolphinRolloutWorker:
                     a, b = p["final_stocks"]  # (port1, port2)
                     sp = self.specs[i]
                     if sp.kind == "self":
-                        # both seats are the student: track the PORT-1 seat's
-                        # win rate (a ~50% health metric, not a skill signal)
-                        self.trackers["self"].add_game((a, b))
+                        # both seats are the student. TWO health gauges:
+                        # - "self" = PRIMARY-seat (student_port) win rate:
+                        #   ports randomize across envs, so engine port bias
+                        #   cancels — a sustained lean isolates a defect in
+                        #   the second-seat plumbing (pipeline invariant).
+                        # - "self_port1" = literal port-1 win rate: pipeline
+                        #   effects cancel — measures engine port-priority
+                        #   bias (climbs as converged mirrors produce ties).
+                        self.trackers["self_port1"].add_game((a, b))
+                        pa, pb = (b, a) if sp.student_port == 2 else (a, b)
+                        self.trackers["self"].add_game((pa, pb))
                         continue
                     if sp.student_port == 2:
                         a, b = b, a

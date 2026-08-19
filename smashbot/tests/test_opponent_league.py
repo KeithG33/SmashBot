@@ -1252,3 +1252,61 @@ def test_league_phillip_imitation_follows_serving(monkeypatch):
     trajs = worker.collect(1)
     assert [t.kind for t in trajs] == ["ppo"]
     assert worker._imit_rows == []
+
+
+def test_self_seat_pipeline_equivalence(monkeypatch):
+    """THE seat-equivalence proof (house standard, cf. batch_steps): which
+    internal pipeline serves a port must not matter. Two workers with the
+    SAME weights and the SAME scripted frames, one with student_port=1
+    (primary pipeline drives port 1) and one with student_port=2 (primary
+    drives port 2), must emit BYTE-IDENTICAL controller streams per port —
+    including across a game boundary. Greedy-patched so streams are
+    deterministic."""
+    from smashbot.rl.pool import EnvSpec
+
+    monkeypatch.setattr(
+        embed_lib.OneHotEmbedding, "sample",
+        lambda self, logits, temperature=None: logits.argmax(-1).to(
+            {"uint8": torch.uint8, "int32": torch.int32}[
+                np.dtype(self.dtype).name
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        embed_lib.BoolEmbedding, "sample",
+        lambda self, logits, temperature=None: logits.squeeze(-1) > 0,
+    )
+
+    def build(student_port):
+        cfg = RolloutConfig(
+            num_envs=2, cpu_envs=0, teacher_envs=0, ref_envs=0,
+            snapshot_slots=0, self_envs=1, unroll_length=4,
+            games_per_dolphin=10**9,
+        )
+        specs = [EnvSpec("self", -1, student_port, "FOX")]
+        student = BatchedPolicyAgent(_tiny_policy(seed=0), 2, name_code=1)
+        return DolphinRolloutWorker(cfg, student, opponents={}, specs=specs)
+
+    streams = {}
+    for port in (1, 2):
+        torch.manual_seed(0)
+        worker = build(port)
+        fake = _FakeEnvs(worker, seed=123)
+        fake.install(monkeypatch)
+        for t in range(10):
+            if t == 5:  # game boundary mid-stream
+                fake.final_stocks[0] = (3, 1)
+            worker.collect(1)
+        streams[port] = worker._conns[0].sent
+
+    a, b = streams[1], streams[2]
+    assert len(a) == len(b) and len(a) > 0
+    for t, (ca, cb) in enumerate(zip(a, b)):
+        assert set(ca) == set(cb) == {1, 2}, f"frame {t}: ports differ"
+        for port in (1, 2):
+            tree.map_structure(
+                lambda x, y: np.testing.assert_array_equal(
+                    np.asarray(x), np.asarray(y)
+                ),
+                ca[port], cb[port],
+            )
