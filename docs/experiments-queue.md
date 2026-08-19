@@ -23,7 +23,21 @@ ratios depend on; fp16's 10-bit mantissa preserves ratio fidelity at the
 cost of range (needs loss scaling / overflow care).
 https://unsloth.ai/docs/get-started/reinforcement-learning-rl-guide/advanced-rl-documentation/fp16-vs-bf16-for-rl
 
-**Design (three arms from one shared RL checkpoint)**:
+**Budget-compressed protocol (no full A/B — user call: compute/time)**:
+- Tier 1 (minutes, offline, can run on the vast box): save one batch of
+  REAL trajectories; run learner forward/backward on the identical batch
+  under fp32/bf16/fp16; diff ratio-deviation-from-1, logprob deltas,
+  advantage deltas, aKL floor. Decides the Unsloth ratio-corruption
+  question outright.
+- Tier 2 (minutes): learner steps under autocast at increasing row counts
+  -> measured rows-unlocked curve.
+- Tier 3 (~2h, WINNING arm only): branch checkpoint, ~200 steps, watch
+  nonfinite cadence / tKL / entropy. Fits a natural restart gap.
+- Adoption: v4 boots with the winner + an fp32 fallback flag; v4's routine
+  battery cadence is the production judge (reversibility substitutes for
+  pre-validation).
+
+**Full design for reference (three arms from one shared RL checkpoint)**:
 1. fp32 (control, current behavior)
 2. bf16 autocast: network unroll under torch.autocast(cuda, bf16); fp32
    master weights; losses/log-probs/ratios/KL/advantages in fp32 (autocast
