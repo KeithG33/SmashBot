@@ -251,33 +251,44 @@ class SnapshotPool:
 
     def record_result(self, path: str, won: bool) -> None:
         """One decided game vs the member keyed by `path` — a snapshot path
-        or a special league member key (won = student won)."""
+        or a special league member key (won = student won).
+
+        Estimator: DECAYED COUNTS (AlphaStar-payoff style), not an EMA of
+        the rate. wins_d/games_d with per-game 0.99 decay equals the exact
+        empirical mean at small n and a ~100-game recency window at large n
+        — an EMA of the rate mostly reports its own seed below ~1/alpha
+        games (live-caught: a 9-of-13 member displayed 0.963)."""
         entry = self.payoff.setdefault(
-            path, {"wins": 0, "games": 0, "win_ema": None}
+            path, {"wins": 0, "games": 0, "wins_d": 0.0, "games_d": 0.0}
         )
         entry["games"] += 1
         entry["wins"] += int(won)
-        outcome = 1.0 if won else 0.0
-        a = self.payoff_ema_alpha
-        # seed from the 0.5 prior, not the first outcome: at alpha 0.01 a
-        # first-game coin flip carries ~26% of the EMA for 100+ games and
-        # skews auction weights (live-caught: phillip read 0.60 vs a true
-        # ~0.46 because his first league game happened to be a student win)
-        prev = 0.5 if entry["win_ema"] is None else entry["win_ema"]
-        entry["win_ema"] = (1 - a) * prev + a * outcome
+        if "wins_d" not in entry:  # legacy row (rate-EMA era): adopt its
+            # lifetime record at a capped effective count so old members
+            # rejoin with their raw rate, not their seed-polluted EMA
+            eff = min(float(entry["games"] - 1), 1.0 / (1 - self.PAYOFF_DECAY))
+            rate = entry["wins"] / max(1, entry["games"])
+            entry["games_d"] = eff
+            entry["wins_d"] = rate * eff
+            entry.pop("win_ema", None)
+        d = self.PAYOFF_DECAY
+        entry["wins_d"] = d * entry["wins_d"] + float(won)
+        entry["games_d"] = d * entry["games_d"] + 1.0
         self._save_payoff()
+
+    # ~100-game effective recency window at large n; exact mean at small n
+    PAYOFF_DECAY = 0.99
 
     def win_estimate(self, path: str) -> float:
         """Student's estimated win rate vs this snapshot; 0.5 prior below
-        PRIOR_GAMES decided games."""
+        PRIOR_GAMES decided games. Legacy rate-EMA rows (no decayed counts)
+        fall back to their raw lifetime rate."""
         entry = self.payoff.get(path)
-        if (
-            entry is None
-            or entry["games"] < self.PRIOR_GAMES
-            or entry["win_ema"] is None
-        ):
+        if entry is None or entry["games"] < self.PRIOR_GAMES:
             return 0.5
-        return float(entry["win_ema"])
+        if entry.get("games_d"):
+            return float(entry["wins_d"] / entry["games_d"])
+        return float(entry["wins"] / entry["games"])
 
     def save(self, policy, step: int) -> str:
         path = os.path.join(self.dir, f"snapshot-{step:07d}.pt")

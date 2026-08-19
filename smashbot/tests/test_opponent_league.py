@@ -603,11 +603,12 @@ def test_pfsp_prior_and_payoff_updates(tmp_path):
     pool.record_result(p, True)
     est = pool.win_estimate(p)
     assert est != 0.5
-    # hand EMA (alpha 0.01, seeded from the 0.5 prior)
-    ema = 0.5
+    # hand decayed counts (0.99 decay): ~= exact mean at small n
+    wd = gd = 0.0
     for o in [1.0, 1.0, 1.0, 0.0, 1.0]:
-        ema = 0.99 * ema + 0.01 * o
-    assert est == pytest.approx(ema)
+        wd = 0.99 * wd + o
+        gd = 0.99 * gd + 1.0
+    assert est == pytest.approx(wd / gd)
 
 
 def test_pfsp_persistence_roundtrip_and_prune(tmp_path):
@@ -929,11 +930,10 @@ def test_league_payoff_persistence_and_thinning(tmp_path):
     assert pool.payoff["teacher"]["games"] == 6
     assert pool.payoff["cpu"]["games"] == 6
     assert pool.payoff["phillip"]["games"] == 6
-    exp_up = 1 - 0.5 * 0.99 ** 6   # six wins from the 0.5 prior seed
-    exp_dn = 0.5 * 0.99 ** 6       # six losses from the 0.5 prior seed
-    assert pool.win_estimate("teacher") == pytest.approx(exp_up)
-    assert pool.win_estimate("cpu") == pytest.approx(exp_dn)
-    assert pool.win_estimate("phillip") == pytest.approx(exp_dn)
+    # decayed counts = exact rates at small n: 6/6 wins -> 1.0, 0/6 -> 0.0
+    assert pool.win_estimate("teacher") == pytest.approx(1.0)
+    assert pool.win_estimate("cpu") == pytest.approx(0.0)
+    assert pool.win_estimate("phillip") == pytest.approx(0.0)
 
     # round-trip through a league-flag-less pool: rows kept, not pruned
     fresh = SnapshotPool(str(tmp_path), slots=2, keep=4)
@@ -1095,7 +1095,8 @@ def test_pfsp_class_weighting_math(tmp_path):
         pool.save(_Stub(), s)
     for g in pool.archive[:-1]:
         pool.payoff[g] = {"wins": 8, "games": 10, "win_ema": 0.75}
-    assert pool.class_hardness() == {"ghosts": 0.75, "phillip": 0.5}
+    # legacy rate-EMA rows fall back to their RAW lifetime rate (8/10)
+    assert pool.class_hardness() == {"ghosts": 0.8, "phillip": 0.5}
 
     latest = pool.archive[-1]
     n, ph = 4000, 0
@@ -1104,7 +1105,8 @@ def test_pfsp_class_weighting_math(tmp_path):
         assert picks[0] == latest and len(picks) == 2
         ph += picks[1] == "phillip"
     share = ph / n
-    assert share == pytest.approx(2 / 3, abs=0.03)
+    # phillip f_hard 0.5 vs legacy-row ghosts at RAW 0.8 -> f_hard 0.2:
+    assert share == pytest.approx(0.5 / 0.7, abs=0.03)
     assert share > 0.5  # far above any ghost-mass-proportional share
 
 
