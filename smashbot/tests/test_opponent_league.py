@@ -1105,8 +1105,9 @@ def test_pfsp_class_weighting_math(tmp_path):
         assert picks[0] == latest and len(picks) == 2
         ph += picks[1] == "phillip"
     share = ph / n
-    # phillip f_hard 0.5 vs legacy-row ghosts at RAW 0.8 -> f_hard 0.2:
-    assert share == pytest.approx(0.5 / 0.7, abs=0.03)
+    # squared f_hard (p=2 default): phillip 0.5^2=0.25 vs ghosts-at-RAW-0.8
+    # 0.2^2=0.04 -> share 0.25/0.29
+    assert share == pytest.approx(0.25 / 0.29, abs=0.03)
     assert share > 0.5  # far above any ghost-mass-proportional share
 
 

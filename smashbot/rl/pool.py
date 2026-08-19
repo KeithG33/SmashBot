@@ -181,7 +181,11 @@ class SnapshotPool:
         slots: int,
         keep: int = 30,
         pfsp: bool = True,
-        pfsp_p: float = 1.0,
+        # squared = AlphaStar main agents' f_hard weighting (smooth max-min:
+        # concentrate serving on the hardest members). p is a no-op while
+        # everyone sits at the 0.5 prior, so there is no cold-start reason
+        # to soften it (user-caught).
+        pfsp_p: float = 2.0,
         # ~100-game effective memory per ghost (matches AlphaStar's 0.99
         # payoff decay). A serving ghost sees ~200 games/hour, so faster
         # alphas track only the last minutes of a stint; slower ones lag

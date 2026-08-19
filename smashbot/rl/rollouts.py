@@ -277,7 +277,7 @@ class RolloutConfig:
     # assignment; False = the original recency-biased sampling. Selection
     # only — zero effect on losses or memory.
     pfsp: bool = True
-    pfsp_p: float = 1.0
+    pfsp_p: float = 2.0  # squared f_hard (AlphaStar mains): see pool.py
     # League membership for the teacher / CPU lvl-9 / Phillip (dormant by
     # default): instead of fixed teacher_envs/cpu_envs/ref_envs partitions,
     # the member joins the PFSP class-weighted candidate set and competes
