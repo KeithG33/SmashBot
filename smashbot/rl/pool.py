@@ -259,10 +259,12 @@ class SnapshotPool:
         entry["wins"] += int(won)
         outcome = 1.0 if won else 0.0
         a = self.payoff_ema_alpha
-        entry["win_ema"] = (
-            outcome if entry["win_ema"] is None
-            else (1 - a) * entry["win_ema"] + a * outcome
-        )
+        # seed from the 0.5 prior, not the first outcome: at alpha 0.01 a
+        # first-game coin flip carries ~26% of the EMA for 100+ games and
+        # skews auction weights (live-caught: phillip read 0.60 vs a true
+        # ~0.46 because his first league game happened to be a student win)
+        prev = 0.5 if entry["win_ema"] is None else entry["win_ema"]
+        entry["win_ema"] = (1 - a) * prev + a * outcome
         self._save_payoff()
 
     def win_estimate(self, path: str) -> float:

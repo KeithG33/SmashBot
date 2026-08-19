@@ -603,9 +603,9 @@ def test_pfsp_prior_and_payoff_updates(tmp_path):
     pool.record_result(p, True)
     est = pool.win_estimate(p)
     assert est != 0.5
-    # hand EMA (alpha 0.01, seeded at first outcome)
-    ema = 1.0
-    for o in [1.0, 1.0, 0.0, 1.0]:
+    # hand EMA (alpha 0.01, seeded from the 0.5 prior)
+    ema = 0.5
+    for o in [1.0, 1.0, 1.0, 0.0, 1.0]:
         ema = 0.99 * ema + 0.01 * o
     assert est == pytest.approx(ema)
 
@@ -665,7 +665,10 @@ def test_pfsp_sampling_prefers_hard_opponents(tmp_path):
         assert picks[0] == latest  # slot 0 always the latest
         assert len(picks) == 2
         counts[picks[1]] += 1
-    assert counts[easy] == 0        # x ~= 1 => f_hard ~= 0 => never served
+    # prior-seeded EMA after 120 straight wins: x ~ 0.85, so easy is
+    # strongly suppressed but no longer EXACTLY zero-weight
+    assert counts[easy] < counts[mid] < counts[hard]
+    assert counts[easy] < 0.15 * 400
     assert counts[hard] > counts[mid]  # hardest opponent served most
 
     # everyone beaten: uniform fallback still fills the slots
@@ -926,9 +929,11 @@ def test_league_payoff_persistence_and_thinning(tmp_path):
     assert pool.payoff["teacher"]["games"] == 6
     assert pool.payoff["cpu"]["games"] == 6
     assert pool.payoff["phillip"]["games"] == 6
-    assert pool.win_estimate("teacher") == pytest.approx(1.0)
-    assert pool.win_estimate("cpu") == pytest.approx(0.0)
-    assert pool.win_estimate("phillip") == pytest.approx(0.0)
+    exp_up = 1 - 0.5 * 0.99 ** 6   # six wins from the 0.5 prior seed
+    exp_dn = 0.5 * 0.99 ** 6       # six losses from the 0.5 prior seed
+    assert pool.win_estimate("teacher") == pytest.approx(exp_up)
+    assert pool.win_estimate("cpu") == pytest.approx(exp_dn)
+    assert pool.win_estimate("phillip") == pytest.approx(exp_dn)
 
     # round-trip through a league-flag-less pool: rows kept, not pruned
     fresh = SnapshotPool(str(tmp_path), slots=2, keep=4)
