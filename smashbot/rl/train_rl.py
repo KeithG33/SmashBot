@@ -412,28 +412,38 @@ def main() -> None:
                     log.get(f"rl/{k}/games_played", 0)
                     for k in ("cpu", "teacher", "snapshot", "reference", "self")
                 )
-                # ticker shows the EMAs (restart-proof); the 100-game window
-                # stays in wandb as */win_rate_recent for fast-read comparison
+                # Ticker categories come from the SAME ledger the auction
+                # uses (pfsp decayed counts — user: "log what is in our
+                # json"), so a member's ticker % IS its auction basis.
+                # '--' = no league-era games yet. SP (self-play) has no
+                # payoff row; it stays the tracker's ~50% health gauge.
+                # kill@/die@ + per-kind EMAs remain in wandb only.
+                cat = snapshot_pool.category_estimates() if rcfg.snapshot_slots else {}
+
+                def _pct(x):  # "decayed/raw%" from the payoff ledger
+                    if x is None:
+                        return "--"
+                    return f"{100 * x[0]:.0f}/{100 * x[1]:.0f}%"
+
                 ref_bit = (
-                    f"R:{log.get('rl/reference/win_rate_ema', 0.5):.0%} "
-                    if worker.ref_idx or rcfg.league_phillip else ""
+                    f"R:{_pct(cat.get('phillip'))} "
+                    if rcfg.league_phillip else (
+                        f"R:{log.get('rl/reference/win_rate_ema', 0.5):.0%} "
+                        if worker.ref_idx else ""
+                    )
                 )
-                # self-play port-1-seat win rate: a ~50% health metric
                 sp_bit = (
                     f"SP:{log.get('rl/self/win_rate_ema', 0.5):.0%} "
                     if worker.self_idx else ""
                 )
                 print(
                     f"[{i:4d}/{args.runtime.steps}] "
-                    f"T:{log.get('rl/teacher/win_rate_ema', 0.5):.0%}"
-                    f"/{log.get('rl/teacher/stock_diff_ema', 0):+.1f} "
-                    f"S:{log.get('rl/snapshot/win_rate_ema', 0.5):.0%} "
-                    f"C:{log.get('rl/cpu/win_rate_ema', 0.5):.0%} "
+                    f"T:{_pct(cat.get('teacher'))} "
+                    f"S:{_pct(cat.get('ghosts'))} "
+                    f"C:{_pct(cat.get('cpu'))} "
                     f"{ref_bit}"
                     f"{sp_bit}"
                     f"({games:.0f}g) | "
-                    f"kill@{log.get('rl/reference/avg_percent_at_kill', 0):.0f}% "
-                    f"die@{log.get('rl/reference/avg_percent_at_death', 0):.0f}% | "
                     f"tKL {log['rl/teacher_kl']:.4f} "
                     f"aKL {log['rl/actor_kl_mean']:.5f} "
                     f"{'REVERTED ' if log['rl/reverted'] else ''}| "

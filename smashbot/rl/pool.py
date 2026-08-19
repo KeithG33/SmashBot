@@ -279,6 +279,36 @@ class SnapshotPool:
     # ~100-game effective recency window at large n; exact mean at small n
     PAYOFF_DECAY = 0.99
 
+    def category_estimates(self) -> dict[str, tuple[float, float] | None]:
+        """Ticker-facing (decayed_rate, raw_lifetime_rate) pairs from the
+        SAME ledger the auction uses. 'ghosts' pools across all archive
+        rows (a rate over the league's actual serving mix); members with
+        no games -> None."""
+        out: dict[str, tuple[float, float] | None] = {}
+
+        def pair(e):
+            raw = e["wins"] / e["games"]
+            if e.get("games_d"):
+                return (e["wins_d"] / e["games_d"], raw)
+            return (raw, raw)
+
+        for m in LEAGUE_MEMBER_KEYS:
+            e = self.payoff.get(m)
+            out[m] = pair(e) if e and e.get("games") else None
+        wd = gd = 0.0
+        rw = rg = 0
+        for g in self.archive:
+            e = self.payoff.get(g)
+            if not e or not e.get("games"):
+                continue
+            rw += e["wins"]; rg += e["games"]
+            if e.get("games_d"):
+                wd += e["wins_d"]; gd += e["games_d"]
+            else:
+                wd += e["wins"]; gd += e["games"]
+        out["ghosts"] = (wd / gd, rw / rg) if rg else None
+        return out
+
     def win_estimate(self, path: str) -> float:
         """Student's estimated win rate vs this snapshot; 0.5 prior below
         PRIOR_GAMES decided games. Legacy rate-EMA rows (no decayed counts)
