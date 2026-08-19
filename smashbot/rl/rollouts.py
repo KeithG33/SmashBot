@@ -289,6 +289,51 @@ class RolloutConfig:
     league_teacher: bool = False
     league_cpu: bool = False
     league_phillip: bool = False
+    # Imported league members (dormant by default): frozen checkpoints from
+    # a PREVIOUS run join the league as PERMANENT members — RL-strong
+    # opponents that pressure the new student and serve as a live
+    # cross-generation benchmark (the payoff row vs an import = "are we
+    # beating the old model yet"). Entries are "NAME=/path/to/state_dict.pt"
+    # (bare policy state_dict, snapshot-pool format, same architecture as
+    # the student — loaded exactly like a ghost slot load), optionally with
+    # a per-import character lock "NAME=PATH@CHAR" (default lock: FOX —
+    # these are trained-fox opponents). While a slot serves an import, its
+    # envs pin the locked character instead of redrawing per game.
+    # Requires pfsp=True and snapshot_slots > 0.
+    league_imports: list[str] = dataclasses.field(default_factory=list)
+
+    def import_members(self) -> dict[str, tuple[str, str]]:
+        """Parsed league_imports: {NAME: (path, char_lock)}. Bad entries
+        fail loudly (a silently dropped import would serve nothing and skew
+        the auction)."""
+        out: dict[str, tuple[str, str]] = {}
+        for entry in self.league_imports:
+            name, eq, rest = entry.partition("=")
+            assert eq and name and rest, (
+                f"bad league_imports entry {entry!r}: want "
+                f"NAME=/path/to/state_dict.pt or NAME=PATH@CHAR"
+            )
+            assert all(c.isalnum() or c in "-_." for c in name), (
+                f"bad league_imports name {name!r}: names key payoff rows "
+                f"and wandb metrics — alphanumeric/-/_/. only"
+            )
+            before, at, after = rest.rpartition("@")
+            if at:
+                path, char = before, after.upper()
+            else:
+                path, char = rest, "FOX"
+            assert path, f"bad league_imports entry {entry!r}: empty path"
+            from smashbot.rl.pool import MAIN_12
+
+            assert char in MAIN_12, (
+                f"league import {name!r}: char lock {char!r} not in the "
+                f"policy-opponent roster {MAIN_12}"
+            )
+            assert name not in out, (
+                f"duplicate league_imports name {name!r}"
+            )
+            out[name] = (path, char)
+        return out
 
     def league_members(self) -> list[str]:
         """Special league member keys enabled by the flags; validates the
@@ -315,6 +360,13 @@ class RolloutConfig:
                 f"the snapshot slots"
             )
             members.append("phillip")
+        imports = self.import_members()
+        if imports:
+            assert self.snapshot_slots > 0, (
+                f"league_imports serve through snapshot slots — set "
+                f"snapshot_slots > 0 (got {self.snapshot_slots})"
+            )
+            members += [f"import:{name}" for name in imports]
         if members:
             assert self.pfsp, (
                 "league_teacher/league_cpu require pfsp=True: league members "
@@ -322,6 +374,29 @@ class RolloutConfig:
                 "recency sampler never consults"
             )
         return members
+
+
+def next_opponent_char(
+    cur_kind: str,
+    char_lock: str | None,
+    redraw_chars: bool,
+    armed_char: str | None,
+    draw: tp.Callable[[], str],
+) -> str | None:
+    """Opponent-seat character for the NEXT game (game boundary or Dolphin
+    recycle). Returns the character to arm, or None to keep the sitting one.
+
+    Char-locked league members (imports) pin their lock: while locked, NO
+    rng draw is consumed (the redraw stream simply pauses) and the seat pins
+    the lock; when the lock clears, normal redraws resume. CPU serving
+    ignores the lock — locks belong to policy imports only, and an env that
+    lazily adopted cpu must draw from the cpu roster. Default path (lock
+    None) is byte-identical to the pre-import redraw behavior."""
+    if char_lock is not None and cur_kind != "cpu":
+        return char_lock if armed_char != char_lock else None
+    if redraw_chars:
+        return draw()
+    return None
 
 
 def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
@@ -420,6 +495,11 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
     # attribution follows reality, not the desired assignment.
     cur_kind = spec.kind
     desired_kind = None  # latest "policy"/"cpu" wish from the worker
+    # Character lock piggybacked by the worker while this env's slot serves
+    # a char-locked import ("opp_char_lock" command key; None = unlocked).
+    # While locked, the opponent seat pins this char instead of redrawing
+    # per game — see next_opponent_char. Never sent outside league_imports.
+    char_lock = None
 
     def _draw_char() -> str:
         if cur_kind == "cpu":
@@ -580,7 +660,11 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
                     print(f"recycle: opponent kind adopted -> {cur_kind}",
                           flush=True)
             if not first_boot and (cfg.redraw_chars or kind_changed):
-                new_char = _draw_char()
+                # armed_char=None forces the lock through even when already
+                # armed (players are rebuilt from scratch below)
+                new_char = next_opponent_char(
+                    cur_kind, char_lock, True, None, _draw_char
+                )
                 players.clear()
                 players.update(_build_players(new_char, _draw_student_char()))
                 # fresh Dolphin: its first CSS pass uses the new draw directly
@@ -756,26 +840,38 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
                             pending_reset, pending_result = True, result
                             pending_result_kind = serving
                             break
-                        if cfg.redraw_chars:
-                            # per-GAME character rotation: the vendor's menu
-                            # helper and misselect guard both read
-                            # player.character LIVE each menu pass, so
-                            # mutating it between games retargets the next
-                            # rematch CSS pick — no recycle needed.
-                            nc = _draw_char()
+                        # per-GAME character rotation: the vendor's menu
+                        # helper and misselect guard both read
+                        # player.character LIVE each menu pass, so
+                        # mutating it between games retargets the next
+                        # rematch CSS pick — no recycle needed. A char lock
+                        # (import serving) pins the seat instead — no rng
+                        # draw consumed; unlock resumes normal redraws.
+                        nc = next_opponent_char(
+                            cur_kind, char_lock, cfg.redraw_chars,
+                            armed_opp_char, _draw_char,
+                        )
+                        if nc is not None:
                             players[opp_port].character = (
                                 melee.Character[nc.upper()]
                             )
                             armed_opp_char = nc
-                            print(f"game end: opponent redrawn -> {nc}",
+                            verb = (
+                                "pinned (char lock)"
+                                if char_lock is not None and cur_kind != "cpu"
+                                else "redrawn"
+                            )
+                            print(f"game end: opponent {verb} -> {nc}",
                                   flush=True)
-                            if len(whitelist) > 1:
-                                sc = _draw_student_char()
-                                players[spec.student_port].character = (
-                                    melee.Character[sc.upper()]
-                                )
-                                print(f"game end: student redrawn -> {sc}",
-                                      flush=True)
+                        if cfg.redraw_chars and len(whitelist) > 1:
+                            # student-seat whitelist draws are unaffected by
+                            # any opponent char lock (own rng stream)
+                            sc = _draw_student_char()
+                            players[spec.student_port].character = (
+                                melee.Character[sc.upper()]
+                            )
+                            print(f"game end: student redrawn -> {sc}",
+                                  flush=True)
                         parser = Parser(ports=[1, 2])
                     if games >= cfg.games_per_dolphin - 1:
                         _start_spare()  # entering this Dolphin's final game
@@ -822,6 +918,10 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
                     desired = controllers.pop("opp_kind", None)
                     if desired is not None:
                         desired_kind = desired
+                    # league_imports: piggybacked char lock (None = unlock);
+                    # absent key (imports not configured) keeps the current
+                    # value — i.e. stays None forever, today's behavior
+                    char_lock = controllers.pop("opp_char_lock", char_lock)
                     for port, controller_state in controllers.items():
                         if cur_kind == "cpu" and port == opp_port:
                             continue  # engine AI drives this port; no inputs
@@ -899,6 +999,13 @@ class DolphinRolloutWorker:
         # serving is read from each env's payload, never from this dict.
         self.slot_serving: dict[int, str] = {}
         self.slot_desired: dict[int, str] = {}
+        # slot -> char lock ("FOX"/... or None) while the slot serves a
+        # char-locked import; written by pool.apply_assignments and
+        # piggybacked to the slot's envs ("opp_char_lock") so they pin the
+        # member's character instead of redrawing per game. Empty / all-None
+        # outside league_imports (the key is then never sent at all).
+        self.slot_char_lock: dict[int, str | None] = {}
+        self._has_imports = bool(config.league_imports)
         whitelist = student_whitelist(config.char_whitelist, config.bot_char)
         self._whitelist = set(whitelist)
         self.specs = specs or make_partition(
@@ -1357,6 +1464,13 @@ class DolphinRolloutWorker:
                     # policy<->cpu change at its next recycle boundary
                     cmd["opp_kind"] = self.slot_desired.get(
                         self.specs[i].group, "policy"
+                    )
+                if self._has_imports and self.specs[i].kind == "snapshot":
+                    # piggyback the slot's char lock (None = unlocked): the
+                    # env pins a locked import's character at its next game
+                    # boundary and resumes redraws once the lock clears
+                    cmd["opp_char_lock"] = self.slot_char_lock.get(
+                        self.specs[i].group
                     )
                 conn.send(cmd)
 

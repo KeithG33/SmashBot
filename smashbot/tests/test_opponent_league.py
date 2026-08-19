@@ -748,6 +748,10 @@ def test_league_flags_default_off_golden(tmp_path):
     from smashbot.rl.pool import SnapshotPool
 
     assert RolloutConfig().league_members() == []
+    # league_imports=[] (the default) is part of the same guarantee: no
+    # members, no import registry, nothing changes
+    assert RolloutConfig(league_imports=[]).league_members() == []
+    assert RolloutConfig().import_members() == {}
 
     pool_a = SnapshotPool(str(tmp_path / "a"), slots=3)
     pool_b = SnapshotPool(str(tmp_path / "b"), slots=3, league_members=())
@@ -867,6 +871,7 @@ def test_apply_assignments_teacher_copy_and_cpu_lazy(tmp_path):
         def __init__(self):
             self.slot_serving = {}
             self.slot_desired = {}
+            self.slot_char_lock = {}
 
     torch.manual_seed(0)
     teacher = torch.nn.Linear(3, 2)
@@ -883,6 +888,8 @@ def test_apply_assignments_teacher_copy_and_cpu_lazy(tmp_path):
     assert keys == {0: snap, 1: "teacher"}
     assert w.slot_serving == {0: "snapshot", 1: "teacher"}
     assert w.slot_desired == {0: "policy", 1: "policy"}
+    # non-import members never set a char lock
+    assert w.slot_char_lock == {0: None, 1: None}
 
     # the copy is a snapshot of the live module, not a reference: a teacher
     # hot-swap mid-epoch leaves the serving slot on its copy until refresh
@@ -1253,6 +1260,282 @@ def test_league_phillip_imitation_follows_serving(monkeypatch):
     trajs = worker.collect(1)
     assert [t.kind for t in trajs] == ["ppo"]
     assert worker._imit_rows == []
+
+
+# ------------------------------- imported league members (previous-run bots)
+
+
+def test_league_imports_parse():
+    """"NAME=PATH" (implicit @FOX) and "NAME=PATH@CHAR" forms; bad forms
+    fail loudly; imports require snapshot_slots and pfsp."""
+    cfg = RolloutConfig(
+        league_imports=["v3best=/m/rl-best-step0010000.pt",
+                        "old=/m/old.pt@marth"],
+        snapshot_slots=2,
+    )
+    assert cfg.import_members() == {
+        "v3best": ("/m/rl-best-step0010000.pt", "FOX"),  # default lock FOX
+        "old": ("/m/old.pt", "MARTH"),  # case-normalized
+    }
+    assert cfg.league_members() == ["import:v3best", "import:old"]
+    # composes with the other league flags (imports appended last)
+    combo = RolloutConfig(
+        league_teacher=True, teacher_envs=0,
+        league_imports=["v3=/m/x.pt"], snapshot_slots=2,
+    )
+    assert combo.league_members() == ["teacher", "import:v3"]
+
+    for bad in [
+        "nopathatall",       # no '='
+        "=/m/x.pt",          # empty name
+        "v3=",               # empty path
+        "v3=/m/x.pt@ZELDA",  # not a policy-opponent char (MAIN_12)
+        "v3=/m/x.pt@NOTACHAR",
+        "a b=/m/x.pt",       # name must be metric/key-safe
+    ]:
+        with pytest.raises(AssertionError):
+            RolloutConfig(
+                league_imports=[bad], snapshot_slots=1
+            ).import_members()
+    with pytest.raises(AssertionError):  # duplicate names
+        RolloutConfig(
+            league_imports=["a=/m/x.pt", "a=/m/y.pt"], snapshot_slots=1
+        ).import_members()
+    with pytest.raises(AssertionError, match="snapshot_slots"):
+        RolloutConfig(league_imports=["a=/m/x.pt"]).league_members()
+    with pytest.raises(AssertionError, match="pfsp"):
+        RolloutConfig(
+            league_imports=["a=/m/x.pt"], snapshot_slots=1, pfsp=False
+        ).league_members()
+    # SnapshotPool accepts import keys as members; rejects junk keys
+    from smashbot.rl.pool import SnapshotPool
+
+    with pytest.raises(AssertionError, match="unknown league members"):
+        SnapshotPool("/tmp/never-used", slots=2,
+                     league_members=("imported:v3",))
+
+
+def test_import_default_noop_worker(monkeypatch):
+    """league_imports=[] leaves the worker byte-identical: no char-lock
+    state, and the opp_char_lock command key is NEVER sent (env-side lock
+    stays None forever = today's redraw behavior)."""
+    worker, _ = _make_worker(
+        monkeypatch, num_envs=4, teacher_envs=2, snapshot_slots=2,
+    )
+    assert worker.slot_char_lock == {}
+    assert not worker._has_imports
+    worker.collect(1)
+    for i, conn in enumerate(worker._conns):
+        port = worker.specs[i].student_port
+        expect = {port, 3 - port}
+        assert all(set(cmd) == expect for cmd in conn.sent)
+
+
+def test_import_auction_singleton_class(tmp_path):
+    """An import joins the auction as its OWN singleton class: weight from
+    its payoff row via f_hard(p=2), may hold multiple non-latest slots at
+    once (with-replacement class draws), slot 0 stays the latest snapshot,
+    and it fades as the student starts beating it."""
+    from smashbot.rl.pool import SnapshotPool
+
+    # exact class-share math: 1 ghost at raw 0.8 vs import at the 0.5 prior
+    # -> f_hard(p=2): 0.04 vs 0.25 -> import share 0.25/0.29
+    pool = SnapshotPool(str(tmp_path / "m"), slots=2,
+                        league_members=("import:v3best",))
+    pool.save(_Stub(), 100)
+    latest = pool.save(_Stub(), 200)
+    pool.payoff[pool.archive[0]] = {"wins": 8, "games": 10, "win_ema": 0.75}
+    assert pool.class_hardness() == {"ghosts": 0.8, "import:v3best": 0.5}
+    n, imp = 4000, 0
+    for s in range(n):
+        picks = pool.assignments(random.Random(s))
+        assert picks[0] == latest and len(picks) == 2
+        imp += picks[1] == "import:v3best"
+    assert imp / n == pytest.approx(0.25 / 0.29, abs=0.03)
+
+    # multi-slot occupancy + fade-out once beaten (3 ghosts >= 2 tail
+    # slots, so the ghost class never exhausts into the uniform fallback)
+    pool = SnapshotPool(str(tmp_path / "s"), slots=3,
+                        league_members=("import:v3best",))
+    for s in (100, 200, 300, 400):
+        latest = pool.save(_Stub(), s)
+    ghosts = pool.archive[:-1]
+
+    def import_slots(n=300):
+        held, multi = 0, False
+        for s in range(n):
+            picks = pool.assignments(random.Random(s))
+            assert picks[0] == latest
+            tail = picks[1:]
+            for g in ghosts:
+                assert tail.count(g) <= 1  # ghosts: without replacement
+            held += tail.count("import:v3best")
+            multi |= tail.count("import:v3best") > 1
+        return held, multi
+
+    held_prior, saw_multi = import_slots()
+    assert saw_multi  # singleton class held several slots at once
+    assert held_prior > 0
+    for _ in range(300):
+        pool.record_result("import:v3best", True)  # student now dominates
+    assert pool.win_estimate("import:v3best") > 0.9
+    held_beaten, _ = import_slots()
+    assert held_beaten < held_prior * 0.6  # f_hard fade-out
+
+
+def test_import_serving_char_lock_and_attribution(monkeypatch, tmp_path):
+    """Fake-env collect() run: a slot assigned an import loads the given
+    state_dict into its slot policy, the char lock reaches the slot's env
+    conns (opp_char_lock command key), results attribute to the
+    "import:NAME" payoff row via slot_keys, and reassignment clears the
+    lock so redraws resume."""
+    from smashbot.rl.pool import SnapshotPool, apply_assignments
+
+    donor = _tiny_policy(seed=9)  # the "previous run's battery best"
+    w_path = str(tmp_path / "rl-best-step0010000.pt")
+    torch.save(donor.state_dict(), w_path)
+    ghost = _tiny_policy(seed=7)
+    snap = str(tmp_path / "snapshot-0000100.pt")
+    torch.save(ghost.state_dict(), snap)
+
+    worker, envs = _make_worker(
+        monkeypatch, num_envs=4, teacher_envs=2, snapshot_slots=2,
+        league_imports=[f"v3={w_path}@MARTH"],
+    )
+    assert worker._has_imports
+    # specs: 2 teacher + slot-0 env (2) + slot-1 env (3)
+    assert [sp.kind for sp in worker.specs] == (
+        ["teacher"] * 2 + ["snapshot"] * 2
+    )
+    m0 = worker.opponents[("slot", 0)].policy
+    m1 = worker.opponents[("slot", 1)].policy
+    teacher_module = worker.opponents["teacher"].policy
+    imports = {"import:v3": (w_path, "MARTH")}
+    keys = {}
+    apply_assignments(
+        [snap, "import:v3"], [(0, m0), (1, m1)], teacher_module, worker,
+        keys, imports=imports,
+    )
+    # import state_dict loaded into the slot policy (stub-weight check);
+    # slot 0 loaded the plain ghost
+    for k, v in donor.state_dict().items():
+        assert torch.equal(v, m1.state_dict()[k]), k
+    for k, v in ghost.state_dict().items():
+        assert torch.equal(v, m0.state_dict()[k]), k
+    assert keys == {0: snap, 1: "import:v3"}
+    assert worker.slot_serving == {0: "snapshot", 1: "snapshot"}
+    assert worker.slot_char_lock == {0: None, 1: "MARTH"}
+
+    # an import assignment without the registry fails loudly
+    with pytest.raises(AssertionError, match="import registry"):
+        apply_assignments(
+            [snap, "import:v3"], [(1, m1)], teacher_module, worker, {},
+        )
+
+    # payoff attribution exactly as train_rl wires it
+    pool = SnapshotPool(str(tmp_path / "pool"), slots=2,
+                        league_members=("import:v3",))
+    worker.on_snapshot_game = lambda s, won, kind: pool.record_result(
+        "cpu" if kind == "cpu" else keys[s], won
+    )
+    envs.final_stocks[3] = (4, 0)  # student (port 1) beats the import
+    worker.collect(1)
+    assert pool.payoff["import:v3"] == pytest.approx(
+        {"wins": 1, "games": 1, "wins_d": 1.0, "games_d": 1.0}
+    )
+    assert worker.trackers["snapshot"].wins == 1  # imports are policy ghosts
+
+    # char-lock command channel: slot envs get the lock (import slot MARTH,
+    # ghost slot None); teacher envs get no such key
+    for i, conn in enumerate(worker._conns):
+        port = worker.specs[i].student_port
+        if worker.specs[i].kind == "snapshot":
+            assert all(set(c) == {port, 3 - port, "opp_char_lock"}
+                       for c in conn.sent)
+            lock = "MARTH" if worker.specs[i].group == 1 else None
+            assert all(c["opp_char_lock"] == lock for c in conn.sent)
+        else:
+            assert all(set(c) == {port, 3 - port} for c in conn.sent)
+
+    # slot moves off the import: lock clears, envs are told to unlock
+    apply_assignments(
+        [snap, "teacher"], [(0, m0), (1, m1)], teacher_module, worker,
+        keys, imports=imports,
+    )
+    assert worker.slot_char_lock == {0: None, 1: None}
+    assert keys[1] == "teacher"
+    worker.collect(1)
+    assert worker._conns[3].sent[-1]["opp_char_lock"] is None
+
+
+def test_import_char_lock_redraw_helper():
+    """Env-side redraw gate: while locked the opponent seat pins the lock
+    and consumes NO rng draw; unlock resumes normal redraws; cpu serving
+    (lazy league_cpu adoption) ignores the lock; the default path (lock
+    None) is exactly the old redraw_chars behavior."""
+    from smashbot.rl.rollouts import next_opponent_char
+
+    draws = []
+
+    def draw():
+        draws.append(1)
+        return "FALCO"
+
+    # locked: pin, no draw consumed
+    assert next_opponent_char("snapshot", "MARTH", True, "FOX", draw) == "MARTH"
+    assert draws == []
+    # already pinned: keep the seat, still no draw
+    assert next_opponent_char("snapshot", "MARTH", True, "MARTH", draw) is None
+    assert draws == []
+    # lock works even with per-game redraws globally off
+    assert next_opponent_char("snapshot", "MARTH", False, "FOX", draw) == "MARTH"
+    assert draws == []
+    # unlocked: redraws resume (rng consumed again)
+    assert next_opponent_char("snapshot", None, True, "MARTH", draw) == "FALCO"
+    assert len(draws) == 1
+    # unlocked + redraw_chars off: keep the sitting char (old behavior)
+    assert next_opponent_char("snapshot", None, False, "FOX", draw) is None
+    assert len(draws) == 1
+    # cpu serving ignores the lock: draws from the cpu roster as usual
+    assert next_opponent_char("cpu", "MARTH", True, "FOX", draw) == "FALCO"
+    assert len(draws) == 2
+
+
+def test_import_payoff_persistence_never_pruned(tmp_path):
+    """Import rows round-trip pfsp.json, survive thinning AND a reload
+    without the import configured (permanent members: toggling flags across
+    restarts loses no cross-generation data); category_estimates carries
+    the import keys for the ticker."""
+    from smashbot.rl.pool import SnapshotPool
+
+    pool = SnapshotPool(str(tmp_path), slots=2, keep=4,
+                        league_members=("import:v3",))
+    for s in range(0, 800, 100):
+        pool.save(_Stub(), s)
+    for _ in range(6):
+        pool.record_result("import:v3", False)  # old model still winning
+    assert len(pool.archive) == 4  # thinning ran; import row untouched
+    assert pool.payoff["import:v3"]["games"] == 6
+    assert pool.win_estimate("import:v3") == pytest.approx(0.0)
+    d, raw = pool.category_estimates()["import:v3"]
+    assert d == pytest.approx(0.0) and raw == pytest.approx(0.0)
+
+    # reload WITHOUT the import configured: row kept, but neither served
+    # nor surfaced (flags off = ghosts only)
+    fresh = SnapshotPool(str(tmp_path), slots=2, keep=4)
+    assert fresh.payoff["import:v3"]["games"] == 6
+    assert "import:v3" not in fresh.category_estimates()
+    for seed in range(25):
+        assert "import:v3" not in fresh.assignments(random.Random(seed))
+
+    # reload WITH it again: estimates resume where they left off; a fresh
+    # unmeasured import sits at the 0.5 prior with a None ticker estimate
+    back = SnapshotPool(str(tmp_path), slots=2, keep=4,
+                        league_members=("import:v3", "import:new"))
+    assert back.win_estimate("import:v3") == pytest.approx(0.0)
+    assert back.win_estimate("import:new") == 0.5
+    assert back.category_estimates()["import:new"] is None
+    assert back.class_hardness()["import:new"] == 0.5
 
 
 def test_self_seat_pipeline_equivalence(monkeypatch):

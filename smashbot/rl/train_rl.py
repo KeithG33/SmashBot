@@ -177,6 +177,22 @@ def main() -> None:
     league = rcfg.league_members()
     if league:
         print(f"league members via PFSP slots: {league}")
+    # Imported league members (frozen checkpoints from a previous run):
+    # registry {"import:NAME": (path, char_lock)} consumed by
+    # apply_assignments — a slot assigned an import loads that state_dict
+    # into its slot policy (no extra resident module) and its envs pin the
+    # locked char. Validate paths up front: loud assert beats 120 Dolphins
+    # booting into a run whose benchmark opponent can never serve.
+    import_registry = {
+        f"import:{name}": (path, char)
+        for name, (path, char) in rcfg.import_members().items()
+    } or None
+    if import_registry:
+        for key, (path, char) in import_registry.items():
+            assert os.path.exists(path), (
+                f"league import {key}: state_dict not found at {path}"
+            )
+            print(f"league import: {key} <- {path} @ {char} (char lock)")
     specs = make_partition(
         rcfg.num_envs, rcfg.cpu_envs, rcfg.teacher_envs,
         rcfg.snapshot_slots, rcfg.main12_prob, rcfg.partition_seed,
@@ -310,7 +326,8 @@ def main() -> None:
         if assigns:
             last_assigns = assigns
             apply_assignments(
-                assigns, slot_policies, teacher, worker, slot_keys, device
+                assigns, slot_policies, teacher, worker, slot_keys, device,
+                imports=import_registry,
             )
             served = [
                 os.path.basename(k) if os.sep in k else k for k in assigns
@@ -339,7 +356,7 @@ def main() -> None:
                 # the desired kind — envs adopt at recycle
                 apply_assignments(
                     assigns, slot_policies, teacher, worker, slot_keys,
-                    device,
+                    device, imports=import_registry,
                 )
                 served = [
                     os.path.basename(k) if os.sep in k else k
@@ -395,14 +412,23 @@ def main() -> None:
                     )
                 if league:
                     # class view of the two-stage PFSP: per-class hardness
-                    # and how many non-latest slots each class holds now
+                    # and how many non-latest slots each class holds now.
+                    # Imports log as rl/pfsp/import_{NAME}_* — the
+                    # import_..._winrate row IS the cross-generation
+                    # progress bar (are we beating the old model yet?)
+                    hard = snapshot_pool.class_hardness()
                     held = {c: 0 for c in ("phillip", "teacher", "cpu",
-                                           "ghosts")}
+                                           "ghosts", *hard)}
                     for k in last_assigns[1:]:
                         held[k if k in held else "ghosts"] += 1
-                    for cname, h in snapshot_pool.class_hardness().items():
-                        log[f"rl/pfsp/class_{cname}_winrate"] = h
-                        log[f"rl/pfsp/class_{cname}_slots"] = held[cname]
+                    for cname, h in hard.items():
+                        tag = (
+                            f"import_{cname[len('import:'):]}"
+                            if cname.startswith("import:")
+                            else f"class_{cname}"
+                        )
+                        log[f"rl/pfsp/{tag}_winrate"] = h
+                        log[f"rl/pfsp/{tag}_slots"] = held[cname]
                 for kind, tracker in worker.trackers.items():
                     for k, v in tracker.stats().items():
                         log[f"rl/{kind}/{k}"] = v

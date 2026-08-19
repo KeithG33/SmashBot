@@ -152,7 +152,21 @@ def make_partition(
 # exactly like ghost rows live under snapshot paths — and they are NEVER
 # pruned (neither by thinning, which only touches archive paths, nor by the
 # load-time prune, so toggling the flags across restarts loses no data).
+# Imported members (frozen checkpoints from a PREVIOUS run, configured via
+# RolloutConfig.league_imports) use dynamic "import:NAME" keys with the same
+# permanence guarantees — see _is_import_key.
 LEAGUE_MEMBER_KEYS = ("teacher", "cpu", "phillip")
+
+IMPORT_KEY_PREFIX = "import:"
+
+
+def _is_import_key(key: str) -> bool:
+    """League-member key of an imported frozen checkpoint ("import:NAME").
+    Import rows are permanent: never pruned by thinning (which only touches
+    archive paths) nor by the load-time prune, flags on or off — the payoff
+    row vs an old run's best snapshot is the cross-generation benchmark and
+    must survive restarts."""
+    return key.startswith(IMPORT_KEY_PREFIX)
 
 
 def f_hard(x: float, p: float = 1.0) -> float:
@@ -191,8 +205,9 @@ class SnapshotPool:
         # alphas track only the last minutes of a stint; slower ones lag
         # across student versions. Char mixture averages out at this horizon.
         payoff_ema_alpha: float = 0.01,
-        # Special league members ("teacher"/"cpu") folded into the candidate
-        # set for non-latest slots; empty = snapshots only (today's league).
+        # Special league members ("teacher"/"cpu"/"phillip"/"import:NAME")
+        # folded into the candidate set for non-latest slots; empty =
+        # snapshots only (today's league).
         league_members: tp.Sequence[str] = (),
     ):
         self.dir = directory
@@ -201,9 +216,12 @@ class SnapshotPool:
         self.pfsp = pfsp
         self.pfsp_p = pfsp_p
         self.payoff_ema_alpha = payoff_ema_alpha
-        assert all(m in LEAGUE_MEMBER_KEYS for m in league_members), (
+        assert all(
+            m in LEAGUE_MEMBER_KEYS or _is_import_key(m)
+            for m in league_members
+        ), (
             f"unknown league members {list(league_members)}; "
-            f"valid: {LEAGUE_MEMBER_KEYS}"
+            f"valid: {LEAGUE_MEMBER_KEYS} or '{IMPORT_KEY_PREFIX}NAME'"
         )
         assert pfsp or not league_members, (
             "league members (teacher/cpu) need PFSP win-rate prioritization "
@@ -238,10 +256,13 @@ class SnapshotPool:
         except (OSError, ValueError):
             return
         # keep rows for surviving snapshots AND the special league members
-        # (special rows persist regardless of the current league flags)
+        # (special rows persist regardless of the current league flags);
+        # import rows ("import:NAME") are likewise permanent — the payoff
+        # row vs a previous run's checkpoint is a cross-generation record
         existing = set(self.archive) | set(LEAGUE_MEMBER_KEYS)
         self.payoff = {
-            path: entry for path, entry in table.items() if path in existing
+            path: entry for path, entry in table.items()
+            if path in existing or _is_import_key(path)
         }
         if self.payoff:
             print(f"pfsp payoff table: loaded {len(self.payoff)} entries",
@@ -299,6 +320,11 @@ class SnapshotPool:
         for m in LEAGUE_MEMBER_KEYS:
             e = self.payoff.get(m)
             out[m] = pair(e) if e and e.get("games") else None
+        # imported members (cross-generation benchmark rows), when enabled
+        for m in self.league_members:
+            if _is_import_key(m):
+                e = self.payoff.get(m)
+                out[m] = pair(e) if e and e.get("games") else None
         wd = gd = 0.0
         rw = rg = 0
         for g in self.archive:
@@ -374,8 +400,8 @@ class SnapshotPool:
         """Per-class student win estimate for the two-stage PFSP sampler
         (and wandb): "ghosts" = mean win_ema over the whole archive minus
         the latest snapshot (0.5 prior for unmeasured members), each league
-        member ("phillip"/"teacher"/"cpu") a singleton class = its own row.
-        Only nonempty/enabled classes appear."""
+        member ("phillip"/"teacher"/"cpu"/"import:NAME") a singleton class
+        = its own row. Only nonempty/enabled classes appear."""
         out: dict[str, float] = {}
         ghosts = self.archive[:-1]
         if ghosts:
@@ -466,11 +492,21 @@ def apply_assignments(
     worker,
     slot_keys: dict[int, str],
     device: str = "cpu",
+    imports: dict[str, tuple[str, str]] | None = None,
 ) -> None:
     """Route one epoch's slot assignments into the serving machinery.
 
     - snapshot path: load from disk into the slot policy (instant hot-swap,
       today's behavior); the slot serves kind "snapshot".
+    - "import:NAME": load the imported frozen checkpoint (a bare policy
+      state_dict from a PREVIOUS run — same architecture as the student by
+      definition) from `imports[key][0]` into the slot policy, exactly like
+      a ghost load; serves kind "snapshot" (it IS a policy ghost — just a
+      cross-generation one; its payoff attribution flows through slot_keys).
+      The member's char lock (`imports[key][1]`) lands in
+      worker.slot_char_lock so the slot's envs pin that character instead
+      of redrawing per game; every non-import member clears the lock, so
+      redraws resume when the slot moves on.
     - "teacher": copy the LIVE teacher module's CURRENT weights into the slot
       policy (in-memory state_dict copy, no disk). Staleness bound: if the
       teacher watcher hot-swaps the module mid-epoch, this slot keeps serving
@@ -500,8 +536,28 @@ def apply_assignments(
         elif key == "teacher":
             slot_policy.load_state_dict(teacher_module.state_dict())
             worker.slot_serving[slot] = "teacher"
+        elif _is_import_key(key):
+            assert imports is not None and key in imports, (
+                f"slot {slot} assigned {key} but the import registry has no "
+                f"entry for it — pass imports={{'import:NAME': (path, "
+                f"char)}} (train_rl builds it from "
+                f"--rollouts.league-imports)"
+            )
+            path, _char = imports[key]
+            # bare state_dict, snapshot-pool format; strict load_state_dict
+            # raises loudly on any architecture mismatch
+            slot_policy.load_state_dict(torch.load(path, map_location=device))
+            worker.slot_serving[slot] = "snapshot"
         else:
             slot_policy.load_state_dict(torch.load(key, map_location=device))
             worker.slot_serving[slot] = "snapshot"
         worker.slot_desired[slot] = "policy"
+        # char lock follows the member: imports pin their locked char (the
+        # slot's envs stop redrawing the opponent seat); anything else
+        # restores normal per-game redraws. "cpu" never reaches here
+        # (continue above), deliberately leaving the previous member's lock
+        # in place for envs that haven't adopted cpu yet.
+        worker.slot_char_lock[slot] = (
+            imports[key][1] if imports and _is_import_key(key) else None
+        )
         slot_keys[slot] = key
