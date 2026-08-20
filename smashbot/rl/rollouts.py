@@ -278,6 +278,8 @@ class RolloutConfig:
     # only — zero effect on losses or memory.
     pfsp: bool = True
     pfsp_p: float = 2.0  # squared f_hard (AlphaStar mains): see pool.py
+    pfsp_weighting: str = "hard"  # "hard" | "var" (catch-up): see pool.py
+    pfsp_explore: float = 0.0  # uniform probe fraction: see pool.py
     # League membership for the teacher / CPU lvl-9 / Phillip (dormant by
     # default): instead of fixed teacher_envs/cpu_envs/ref_envs partitions,
     # the member joins the PFSP class-weighted candidate set and competes

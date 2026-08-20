@@ -176,6 +176,15 @@ def f_hard(x: float, p: float = 1.0) -> float:
     return (1.0 - x) ** p
 
 
+def f_var(x: float, p: float = 1.0) -> float:
+    """AlphaStar's catch-up weighting: f_var(x) = (x(1 - x))^p — peaked at
+    even matchups, ZERO at both ends. Their prescription "for main
+    exploiters and in situations where the main agent has to catch up";
+    unbeatable members (x=0) and beaten ones (x=1) both rely on the
+    explore mix (pfsp_explore) for probe games."""
+    return (x * (1.0 - x)) ** p
+
+
 class SnapshotPool:
     """Student snapshots on disk + PFSP (or recency-biased) slot assignments.
 
@@ -200,6 +209,17 @@ class SnapshotPool:
         # everyone sits at the 0.5 prior, so there is no cold-start reason
         # to soften it (user-caught).
         pfsp_p: float = 2.0,
+        # "hard" = f_hard (AlphaStar main-agent default); "var" = f_var
+        # (their catch-up mode — used for rl-pool-v4's fresh start where
+        # phillip/imports begin unbeatable, user-chosen).
+        pfsp_weighting: str = "hard",
+        # Fraction of non-latest slot draws that ignore weights and sample
+        # uniformly (classes first, then members) — AlphaStar's 15%
+        # forgotten-players bucket adapted to a one-learner league: without
+        # it a member at 0% or 100% win rate is benched FOREVER (weight 0
+        # and a payoff row that can never refresh; user-caught via "will
+        # the teacher ever get sampled back?").
+        pfsp_explore: float = 0.0,
         # ~100-game effective memory per ghost (matches AlphaStar's 0.99
         # payoff decay). A serving ghost sees ~200 games/hour, so faster
         # alphas track only the last minutes of a stint; slower ones lag
@@ -215,6 +235,9 @@ class SnapshotPool:
         self.keep = keep
         self.pfsp = pfsp
         self.pfsp_p = pfsp_p
+        assert pfsp_weighting in ("hard", "var"), pfsp_weighting
+        self.pfsp_weighting = pfsp_weighting
+        self.pfsp_explore = pfsp_explore
         self.payoff_ema_alpha = payoff_ema_alpha
         assert all(
             m in LEAGUE_MEMBER_KEYS or _is_import_key(m)
@@ -429,6 +452,10 @@ class SnapshotPool:
             out[m] = self.win_estimate(m)
         return out
 
+    def _weight(self, x: float) -> float:
+        fn = f_var if self.pfsp_weighting == "var" else f_hard
+        return fn(x, self.pfsp_p)
+
     def _class_weighted_picks(self, rng: random.Random) -> list[str]:
         """Two-stage class-weighted PFSP for the non-latest slots (active
         only when league members exist — user-chosen to stop ghost-mass
@@ -446,16 +473,21 @@ class SnapshotPool:
         picks: list[str] = []
         while len(picks) < self.slots - 1:
             classes = [c for c in hard if c != "ghosts" or ghosts]
-            weights = [f_hard(hard[c], self.pfsp_p) for c in classes]
-            if sum(weights) <= 0.0:  # everyone beaten: uniform fallback
+            explore = rng.random() < self.pfsp_explore
+            if explore:  # probe draw: uniform at BOTH stages
                 weights = [1.0] * len(classes)
+            else:
+                weights = [self._weight(hard[c]) for c in classes]
+                if sum(weights) <= 0.0:  # everyone beaten: uniform fallback
+                    weights = [1.0] * len(classes)
             cls = classes[rng.choices(range(len(classes)), weights=weights)[0]]
             if cls == "ghosts":
-                gw = [
-                    f_hard(self.win_estimate(g), self.pfsp_p) for g in ghosts
-                ]
-                if sum(gw) <= 0.0:
+                if explore:
                     gw = [1.0] * len(ghosts)
+                else:
+                    gw = [self._weight(self.win_estimate(g)) for g in ghosts]
+                    if sum(gw) <= 0.0:
+                        gw = [1.0] * len(ghosts)
                 j = rng.choices(range(len(ghosts)), weights=gw)[0]
                 picks.append(ghosts.pop(j))
             else:
@@ -483,12 +515,15 @@ class SnapshotPool:
             # PFSP (AlphaStar f_hard): weight by how much the student still
             # struggles vs each snapshot; beaten snapshots fade out.
             while len(picks) < self.slots and candidates:
-                weights = [
-                    f_hard(self.win_estimate(c), self.pfsp_p)
-                    for c in candidates
-                ]
-                if sum(weights) <= 0.0:  # everyone beaten: uniform fallback
+                if rng.random() < self.pfsp_explore:
                     weights = [1.0] * len(candidates)
+                else:
+                    weights = [
+                        self._weight(self.win_estimate(c))
+                        for c in candidates
+                    ]
+                    if sum(weights) <= 0.0:  # everyone beaten: uniform
+                        weights = [1.0] * len(candidates)
                 chosen = rng.choices(range(len(candidates)), weights=weights)[0]
                 picks.append(candidates.pop(chosen))
         else:

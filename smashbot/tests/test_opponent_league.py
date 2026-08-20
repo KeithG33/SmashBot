@@ -1610,3 +1610,46 @@ def test_category_estimates_pools_imports(tmp_path):
     dec, raw = pool.category_estimates()["imports"]
     assert raw == pytest.approx(2 / 4)
     assert 0.0 < dec < 1.0
+
+
+def test_f_var_catchup_weighting():
+    """f_var peaks at even matchups and zeroes BOTH tails (unbeatable and
+    beaten), unlike f_hard which maxes at unbeatable."""
+    from smashbot.rl.pool import f_hard, f_var
+
+    assert f_var(0.0, 2) == 0.0 and f_var(1.0, 2) == 0.0
+    assert f_hard(0.0, 2) == 1.0  # the contrast that motivated the switch
+    assert f_var(0.5, 2) == pytest.approx(0.25 ** 2)
+    assert f_var(0.5, 2) > f_var(0.2, 2) > f_var(0.05, 2)
+
+
+def test_pfsp_explore_resurrects_benched_members(tmp_path):
+    """With f_var an unbeatable member (phillip 0%) and a beaten one
+    (teacher 100%) both have zero weight — only the explore mix can serve
+    them. explore=0 never picks them; explore=1 (all probes) does."""
+    from smashbot.rl.pool import SnapshotPool
+
+    def build(explore):
+        pool = SnapshotPool(
+            str(tmp_path), slots=6, pfsp_weighting="var",
+            pfsp_explore=explore,
+            league_members=["teacher", "phillip", "import:a"])
+        for step in (100, 200):
+            pool.save(_Stub(), step)
+        for _ in range(10):  # firm rows past the 0.5-games prior
+            pool.record_result("phillip", False)   # unbeatable
+            pool.record_result("teacher", True)    # fully beaten
+            pool.record_result("import:a", random.random() < 0.5)
+        return pool
+
+    pool = build(explore=0.0)
+    picks = set()
+    for seed in range(30):
+        picks.update(pool.assignments(random.Random(seed)))
+    assert "phillip" not in picks and "teacher" not in picks
+
+    pool = build(explore=1.0)
+    picks = set()
+    for seed in range(30):
+        picks.update(pool.assignments(random.Random(seed)))
+    assert "phillip" in picks and "teacher" in picks
