@@ -93,10 +93,15 @@ def main() -> None:
                 "--max-minutes", str(args.pair_timeout / 60),
                 "--out", out,
             ]
+            env = {**os.environ,
+                   # batch-2 cpu inference gains nothing from intra-op
+                   # threads; N procs x 48-thread default pools thrashed
+                   # the box to load 160+ (live-caught)
+                   "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}
             running[i] = (
                 subprocess.Popen(
                     cmd, stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, env=env,
                 ),
                 time.monotonic(), a, b, out,
             )
