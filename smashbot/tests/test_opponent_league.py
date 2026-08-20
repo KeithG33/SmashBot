@@ -1631,7 +1631,7 @@ def test_pfsp_explore_resurrects_benched_members(tmp_path):
 
     def build(explore):
         pool = SnapshotPool(
-            str(tmp_path), slots=6, pfsp_weighting="var",
+            str(tmp_path), slots=6, pfsp_hard_frac=0.0,
             pfsp_explore=explore,
             league_members=["teacher", "phillip", "import:a"])
         for step in (100, 200):
@@ -1653,3 +1653,34 @@ def test_pfsp_explore_resurrects_benched_members(tmp_path):
     for seed in range(30):
         picks.update(pool.assignments(random.Random(seed)))
     assert "phillip" in picks and "teacher" in picks
+
+
+def test_pfsp_hard_frac_blend_serves_unbeatable(tmp_path):
+    """hard_frac > 0 restores real (non-probe) serving for an unbeatable
+    member under the blend: with explore OFF, pure f_var never picks the
+    0% member but hard_frac=0.25 does (via its f_hard draws)."""
+    from smashbot.rl.pool import SnapshotPool
+
+    def build(hard_frac):
+        pool = SnapshotPool(
+            str(tmp_path), slots=6, pfsp_hard_frac=hard_frac,
+            pfsp_explore=0.0,
+            league_members=["phillip", "import:a"])
+        for step in (100, 200):
+            pool.save(_Stub(), step)
+        for _ in range(10):
+            pool.record_result("phillip", False)  # unbeatable
+            pool.record_result("import:a", random.random() < 0.5)
+        return pool
+
+    picks = set()
+    pool = build(hard_frac=0.0)
+    for seed in range(30):
+        picks.update(pool.assignments(random.Random(seed)))
+    assert "phillip" not in picks  # pure f_var: zero weight at 0%
+
+    picks = set()
+    pool = build(hard_frac=0.25)
+    for seed in range(30):
+        picks.update(pool.assignments(random.Random(seed)))
+    assert "phillip" in picks  # hard draws bring him back

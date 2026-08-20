@@ -266,7 +266,7 @@ def main() -> None:
         f"{args.runtime.run_dir}/{args.runtime.tag}/snapshots",
         slots=rcfg.snapshot_slots,
         pfsp=rcfg.pfsp, pfsp_p=rcfg.pfsp_p,
-        pfsp_weighting=rcfg.pfsp_weighting, pfsp_explore=rcfg.pfsp_explore,
+        pfsp_hard_frac=rcfg.pfsp_hard_frac, pfsp_explore=rcfg.pfsp_explore,
         league_members=league,
     )
     worker = DolphinRolloutWorker(

@@ -209,10 +209,13 @@ class SnapshotPool:
         # everyone sits at the 0.5 prior, so there is no cold-start reason
         # to soften it (user-caught).
         pfsp_p: float = 2.0,
-        # "hard" = f_hard (AlphaStar main-agent default); "var" = f_var
-        # (their catch-up mode — used for rl-pool-v4's fresh start where
-        # phillip/imports begin unbeatable, user-chosen).
-        pfsp_weighting: str = "hard",
+        # Fraction of WEIGHTED draws using f_hard; the rest use f_var.
+        # 1.0 = pure f_hard (AlphaStar main-agent default, legacy
+        # behavior); 0.0 = pure f_var (their catch-up mode). rl-pool-v4
+        # runs 0.25 (user-designed blend: an unbeatable member keeps ~8%
+        # overall sampling for the both-sides imitation harvest instead of
+        # f_var's probe-only 1.4%).
+        pfsp_hard_frac: float = 1.0,
         # Fraction of non-latest slot draws that ignore weights and sample
         # uniformly (classes first, then members) — AlphaStar's 15%
         # forgotten-players bucket adapted to a one-learner league: without
@@ -235,8 +238,8 @@ class SnapshotPool:
         self.keep = keep
         self.pfsp = pfsp
         self.pfsp_p = pfsp_p
-        assert pfsp_weighting in ("hard", "var"), pfsp_weighting
-        self.pfsp_weighting = pfsp_weighting
+        assert 0.0 <= pfsp_hard_frac <= 1.0, pfsp_hard_frac
+        self.pfsp_hard_frac = pfsp_hard_frac
         self.pfsp_explore = pfsp_explore
         self.payoff_ema_alpha = payoff_ema_alpha
         assert all(
@@ -452,9 +455,14 @@ class SnapshotPool:
             out[m] = self.win_estimate(m)
         return out
 
-    def _weight(self, x: float) -> float:
-        fn = f_var if self.pfsp_weighting == "var" else f_hard
-        return fn(x, self.pfsp_p)
+    def _draw_weight_fn(self, rng: random.Random):
+        """Weight function for ONE weighted (non-explore) draw: f_hard
+        with prob pfsp_hard_frac, else f_var. The mixture-of-draws IS the
+        blended sampling curve (25/60/15 tables in the v4 design
+        discussion): hard draws keep unbeatable members served, var draws
+        center the curriculum on even matchups."""
+        fn = f_hard if rng.random() < self.pfsp_hard_frac else f_var
+        return lambda x: fn(x, self.pfsp_p)
 
     def _class_weighted_picks(self, rng: random.Random) -> list[str]:
         """Two-stage class-weighted PFSP for the non-latest slots (active
@@ -474,10 +482,11 @@ class SnapshotPool:
         while len(picks) < self.slots - 1:
             classes = [c for c in hard if c != "ghosts" or ghosts]
             explore = rng.random() < self.pfsp_explore
+            wfn = self._draw_weight_fn(rng)  # this draw's f_hard-or-f_var
             if explore:  # probe draw: uniform at BOTH stages
                 weights = [1.0] * len(classes)
             else:
-                weights = [self._weight(hard[c]) for c in classes]
+                weights = [wfn(hard[c]) for c in classes]
                 if sum(weights) <= 0.0:  # everyone beaten: uniform fallback
                     weights = [1.0] * len(classes)
             cls = classes[rng.choices(range(len(classes)), weights=weights)[0]]
@@ -485,7 +494,7 @@ class SnapshotPool:
                 if explore:
                     gw = [1.0] * len(ghosts)
                 else:
-                    gw = [self._weight(self.win_estimate(g)) for g in ghosts]
+                    gw = [wfn(self.win_estimate(g)) for g in ghosts]
                     if sum(gw) <= 0.0:
                         gw = [1.0] * len(ghosts)
                 j = rng.choices(range(len(ghosts)), weights=gw)[0]
@@ -518,9 +527,9 @@ class SnapshotPool:
                 if rng.random() < self.pfsp_explore:
                     weights = [1.0] * len(candidates)
                 else:
+                    wfn = self._draw_weight_fn(rng)
                     weights = [
-                        self._weight(self.win_estimate(c))
-                        for c in candidates
+                        wfn(self.win_estimate(c)) for c in candidates
                     ]
                     if sum(weights) <= 0.0:  # everyone beaten: uniform
                         weights = [1.0] * len(candidates)
