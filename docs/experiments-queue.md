@@ -79,6 +79,18 @@ touching env allocation. Per-ghost slot selection already integrates the
 char mixture (~100-game memory), so this is about reshaping what we play,
 not measuring better.
 
+## AdamW for the next BC generation
+
+Current BC uses plain Adam (slippi-ai fidelity; AlphaStar's SL phase used
+Adam + coupled L2 — the combination AdamW was invented to fix). BC is the
+textbook AdamW setting: supervised, multi-epoch, generalization-gap
+sensitive — and the mega train's eval best has plateaued (0.7736 @ 1.475M)
+while training continued 250k+ steps, a possible early-overfit symptom.
+Next time we optimize the BC network/training: switch to AdamW (tune decay
+~0.01-0.1), never mid-run on an existing train. RL keeps plain Adam (the
+KL leash is the right regularizer there; anchor-to-behavior beats
+anchor-to-zero).
+
 ## Also queued (older)
 
 - Advantage imitation A/B (machinery landed, dormant: imitation-slots /
