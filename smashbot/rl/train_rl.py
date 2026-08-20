@@ -125,6 +125,17 @@ def main() -> None:
     print(f"teacher/init: {args.ckpt} (BC step {step}); conditioning code {name_code}")
 
     learner = Learner(args.learner, policy, teacher, value_fn)
+    # learner.precision is post-fallback (fp16 on cpu loudly reverts to fp32
+    # inside Learner.__init__)
+    print(
+        f"learner precision: {learner.precision}"
+        + (
+            " (fp16 autocast on policy paths, value net fp32, GradScaler "
+            "on the policy optimizer)"
+            if learner.precision == "fp16"
+            else ""
+        )
+    )
 
     start_step = 0
     restored_trackers = None
@@ -399,6 +410,12 @@ def main() -> None:
                 })
                 log["rl/reverted"] = float(metrics["reverted"])
                 log["rl/teacher_swaps"] = teacher_swaps
+                if learner.grad_scaler is not None:
+                    # fp16 health gauge: collapsing scale = repeated overflow
+                    # skips; a steady 2^15..2^17 is the healthy regime
+                    log["rl/grad_scaler_scale"] = (
+                        learner.grad_scaler.get_scale()
+                    )
                 im = metrics.get("imitation")
                 if im:
                     log["rl/imitation/loss"] = im["loss"]

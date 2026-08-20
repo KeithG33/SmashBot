@@ -239,13 +239,9 @@ def copy_params(module) -> list[torch.Tensor]:
     return [p.detach().clone() for p in module.parameters()]
 
 
-def test_nonfinite_gradients_never_reach_weights():
-    """A batch that produces NaN gradients (even with finite loss) must be
-    skipped entirely — step 705 of rl-pool-v3 NaN'd every policy weight
-    because only the LOSS was checked. Poison a gradient mid-update via a
-    backward hook and assert weights stay finite and unchanged."""
-    import copy as copy_lib
-
+def _poisoned_learner(N=2, T=5) -> tuple[Learner, Trajectory]:
+    """Learner whose first policy parameter's gradient is NaN-poisoned via a
+    backward hook, plus a real rollout-shaped trajectory to step on."""
     torch.manual_seed(0)
     policy = _tiny_policy(seed=0)
     teacher = _tiny_policy(seed=0)
@@ -261,7 +257,6 @@ def test_nonfinite_gradients_never_reach_weights():
     from smashbot.rl.rollouts import ChunkAssembler
     from smashbot.rl.agent import BatchedPolicyAgent
 
-    N, T = 2, 5
     agent = BatchedPolicyAgent(policy, num_envs=N)
     asm = ChunkAssembler(unroll_length=T, delay=policy.delay)
     rng = np.random.default_rng(3)
@@ -277,10 +272,155 @@ def test_nonfinite_gradients_never_reach_weights():
         if asm.ready():
             traj = asm.emit()
         t += 1
+    return learner, traj
 
-    before = copy_lib.deepcopy(policy.state_dict())
-    state = learner.initial_state(N)
+
+@pytest.mark.parametrize("scaled", [False, True], ids=["fp32", "fp16-scaler"])
+def test_nonfinite_gradients_never_reach_weights(scaled):
+    """A batch that produces NaN gradients (even with finite loss) must be
+    skipped entirely — step 705 of rl-pool-v3 NaN'd every policy weight
+    because only the LOSS was checked. Poison a gradient mid-update via a
+    backward hook and assert weights stay finite and unchanged.
+
+    The scaled arm exercises the fp16 GradScaler code path (cpu autocast
+    fp16 is not the production path, but the scale->backward->unscale_->
+    guard->update composition is device-agnostic): the guard must still
+    catch the poison AFTER unscale_, and update() must halve the scale."""
+    learner, traj = _poisoned_learner()
+    if scaled:
+        # attach the scaler exactly as fp16-on-cuda mode would create it
+        learner.grad_scaler = torch.amp.GradScaler("cpu", init_scale=2.0 ** 16)
+
+    import copy as copy_lib
+
+    before = copy_lib.deepcopy(learner.policy.state_dict())
+    state = learner.initial_state(2)
     learner.step([traj], state)
-    for k, v in policy.state_dict().items():
+    for k, v in learner.policy.state_dict().items():
         assert torch.isfinite(v.float()).all(), f"nonfinite weight {k}"
         assert torch.equal(v, before[k]), f"weights changed despite NaN grads: {k}"
+    if scaled:
+        # unscale_ recorded found_inf; the guard skipped, update() reacted
+        assert learner.grad_scaler.get_scale() == 2.0 ** 15
+
+
+# ------------------------------------------------- learner precision (fp16)
+
+
+def test_fp32_mode_is_golden():
+    """precision="fp32" (and the default) must be the pre-fp16 code path
+    byte-for-byte: no autocast object is ever constructed, no GradScaler
+    exists, and a full step from identical seeds lands on bit-identical
+    weights whether precision was defaulted or passed explicitly."""
+    import contextlib
+
+    results = []
+    for kwargs in ({}, {"precision": "fp32"}):
+        learner, traj = _make_learner(
+            ppo=PPOConfig(max_mean_actor_kl=1.0), **kwargs
+        )
+        assert learner.precision == "fp32"
+        assert learner.grad_scaler is None
+        assert isinstance(learner._autocast(), contextlib.nullcontext)
+        torch.manual_seed(123)
+        _, metrics = learner.step([traj], learner.initial_state(3))
+        results.append((learner.policy.state_dict(), metrics))
+    (sd_a, m_a), (sd_b, m_b) = results
+    assert m_a["post_update"]["loss"] == m_b["post_update"]["loss"]
+    for k in sd_a:
+        assert torch.equal(sd_a[k], sd_b[k]), f"fp32 golden mismatch: {k}"
+
+
+def test_fp16_on_cpu_falls_back_loudly(capsys):
+    """fp16 is the cuda production path only; on cpu the learner must fall
+    back to fp32 with a printed warning (no autocast, no scaler)."""
+    learner, traj = _make_learner(
+        precision="fp16", ppo=PPOConfig(max_mean_actor_kl=1.0)
+    )
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "fp16" in out and "falling back to fp32" in out
+    assert learner.precision == "fp32"
+    assert learner.grad_scaler is None
+    # and it still trains normally
+    _, metrics = learner.step([traj], learner.initial_state(3))
+    assert np.isfinite(metrics["post_update"]["loss"])
+
+
+def test_unknown_precision_rejected():
+    with pytest.raises(AssertionError):
+        _make_learner(precision="bf16")
+
+
+def test_precision_flag_plumbs_through_tyro():
+    """train_rl's CLI must accept --learner.precision fp16."""
+    import tyro
+
+    from smashbot.rl.train_rl import Config
+
+    cfg = tyro.cli(Config, args=["--learner.precision", "fp16"])
+    assert cfg.learner.precision == "fp16"
+    cfg = tyro.cli(Config, args=[])
+    assert cfg.learner.precision == "fp32"
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and __import__("os").environ.get("SMASHBOT_GPU_TESTS")),
+    reason="cuda-only; set SMASHBOT_GPU_TESTS=1 on an IDLE gpu "
+           "(never beside a live training run)",
+)
+def test_fp16_dtype_receipts_cuda():
+    """Under precision="fp16" on cuda: policy/teacher unroll logits are
+    float16 (autocast is real), while every sensitive quantity — log-probs,
+    advantages, actor log-probs, the loss — and the ENTIRE value net
+    (head in/out) stay float32."""
+    policy = _tiny_policy(seed=0)
+    traj = _rollout(policy)  # rollout on cpu fp32, as in production
+    to_cuda = lambda s: tree.map_structure(
+        lambda t: t.to("cuda") if isinstance(t, torch.Tensor) else t, s
+    )
+    traj = to_cuda(traj)
+    policy = policy.to("cuda")
+    teacher = _tiny_policy(seed=0).to("cuda")
+    value = _tiny_value().to("cuda")
+    learner = Learner(
+        RLConfig(precision="fp16", ppo=PPOConfig(max_mean_actor_kl=1.0)),
+        policy, teacher, value,
+    )
+    assert learner.precision == "fp16" and learner.grad_scaler is not None
+
+    captured = {}
+    orig_unroll = policy.unroll
+
+    def _capturing_unroll(*a, **k):
+        out = orig_unroll(*a, **k)
+        captured["out"] = out
+        return out
+
+    policy.unroll = _capturing_unroll
+    head_dtypes = []
+    hook = value.head.register_forward_hook(
+        lambda mod, inp, out: head_dtypes.append((inp[0].dtype, out.dtype))
+    )
+    try:
+        fixed, _, _ = learner._fixed_pass(traj, learner.initial_state(3, "cuda"))
+        loss, _ = learner._policy_loss(fixed)
+    finally:
+        policy.__dict__.pop("unroll", None)
+        hook.remove()
+
+    out = captured["out"]
+    assert tree.flatten(out.logits)[0].dtype == torch.float16
+    assert tree.flatten(fixed.teacher_logits)[0].dtype == torch.float16
+    assert out.log_probs.dtype == torch.float32
+    assert fixed.advantages.dtype == torch.float32
+    assert fixed.actor_log_probs.dtype == torch.float32
+    assert loss.dtype == torch.float32
+    assert head_dtypes and all(
+        din == torch.float32 and dout == torch.float32
+        for din, dout in head_dtypes
+    ), f"value net touched by autocast: {head_dtypes}"
+
+    # and a full scaled step runs to completion with finite metrics
+    _, metrics = learner.step([traj], learner.initial_state(3, "cuda"))
+    assert np.isfinite(metrics["post_update"]["loss"])
+    assert learner.grad_scaler.get_scale() > 0

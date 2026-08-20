@@ -25,6 +25,7 @@ exceeds ppo.max_mean_actor_kl the whole update is reverted (vendor behavior).
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import dataclasses
 import random
@@ -61,6 +62,16 @@ class RLConfig:
     entropy_weight: float = 0.0
     reward_halflife: float = 4.0  # seconds
     max_grad_norm: float = 1.0  # 0 = no clipping
+    # Learner numeric precision: "fp32" (exact current behavior — no autocast
+    # objects, no scaler) or "fp16" (cuda-only production path; cpu falls back
+    # to fp32 with a loud warning). fp16 = torch.autocast(float16) around the
+    # POLICY forward regions only (policy unroll, frozen-teacher unroll,
+    # imitation unroll) + one GradScaler on the policy optimizer. The VALUE
+    # net stays entirely fp32 — its fixed-pass forward/backward/step never
+    # enter autocast (weakest fp16 arm in the probe, small compute share;
+    # measured recipe: scripts/precision_probe.py fp16s arm, receipts in
+    # /home/kage/drive2/ShineBot/probes/batch-0013549.pt.fidelity.json).
+    precision: str = "fp32"
     ppo: PPOConfig = dataclasses.field(default_factory=PPOConfig)
     # --- opponent advantage imitation (docs/idea-opponent-learning.md) ---
     # Memory-neutral substitution: up to imitation_slots harvested opponent
@@ -241,6 +252,27 @@ class Learner:
         self.teacher.requires_grad_(False)
         self.teacher.eval()
 
+        assert config.precision in ("fp32", "fp16"), config.precision
+        self._device_type = next(policy.parameters()).device.type
+        precision = config.precision
+        if precision == "fp16" and self._device_type != "cuda":
+            print(
+                f"WARNING: precision=fp16 requested but the learner lives on "
+                f"{self._device_type} — falling back to fp32 (fp16 autocast "
+                f"is only the production path on cuda)",
+                flush=True,
+            )
+            precision = "fp32"
+        self.precision = precision
+        self._amp_enabled = precision == "fp16"
+        # One scaler, policy optimizer only (the value path never scales).
+        # init_scale matches the measured probe recipe (make_scaler).
+        self.grad_scaler = (
+            torch.amp.GradScaler(self._device_type, init_scale=2.0 ** 16)
+            if self._amp_enabled
+            else None
+        )
+
         self.policy_optimizer = torch.optim.Adam(
             policy.parameters(), lr=config.learning_rate
         )
@@ -251,6 +283,24 @@ class Learner:
         # Substitution/slot RNG (imitation row picks + PPO row drops);
         # seeded for reproducibility, reseedable in tests.
         self._subst_rng = random.Random(0)
+
+    def _autocast(self):
+        """fp16-mode autocast for POLICY forward regions; a plain null
+        context in fp32 mode (byte-identical legacy behavior: no autocast
+        object is ever constructed)."""
+        if not self._amp_enabled:
+            return contextlib.nullcontext()
+        return torch.autocast(self._device_type, dtype=torch.float16)
+
+    def _backward(self, loss: torch.Tensor) -> None:
+        """Policy-loss backward: scaled through the GradScaler in fp16 mode
+        (gradients underflow fp16 without it — the probe's unscaled fp16 arm
+        lost 2/3 of the policy grad norm, 0.0206 vs fp32's 0.0597; the
+        scaled arm recovered it, 0.0601), plain backward in fp32."""
+        if self.grad_scaler is not None:
+            self.grad_scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
     def initial_state(self, batch_size: int, device=None) -> LearnerState:
         return LearnerState(
@@ -286,11 +336,18 @@ class Learner:
             traj.initial_state,
         )
 
-        with torch.no_grad():
+        # Frozen-teacher forward follows the policy autocast (fp16 mode):
+        # its logits only feed KL terms whose log_softmax autocast pins to
+        # fp32 — the probe measured this exact path.
+        with self._autocast(), torch.no_grad():
             teacher_out = self.teacher.unroll(
                 frames, state.teacher, discount=self.config.discount
             )
 
+        # VALUE island: everything from here through the value optimizer
+        # step stays entirely fp32 — deliberately OUTSIDE any autocast scope
+        # (fp16's weakest probe arm; small compute share). No scaler either:
+        # fp32 gradients don't underflow.
         value_out = self.value_function.outputs(
             frames, state.value, discount=self.config.discount
         )
@@ -313,7 +370,12 @@ class Learner:
         actor_actions = tree.map_structure(
             lambda t: t[:, 1:], traj.actions.controller_state
         )
-        with torch.no_grad():
+        # Rollout/inference precision is untouched by fp16 mode: these are
+        # sample-time fp32 logits, and the log_prob math bottoms out in ops
+        # autocast pins to fp32 — the fidelity probe measured exactly this
+        # rollout-fp32/learner-fp16 combination and the ratio_mean==1
+        # invariant held (dev 8.2e-4, inside tol — fp32's own dev was 9.7e-4).
+        with self._autocast(), torch.no_grad():
             actor_log_probs = self._ops.log_prob(actor_logits, actor_actions)
 
         fixed = _Fixed(
@@ -335,6 +397,16 @@ class Learner:
         return fixed, new_state, value_out.metrics
 
     def _policy_loss(self, fixed: _Fixed) -> tuple[torch.Tensor, dict]:
+        # The whole loss runs under the policy autocast (fp16 mode), exactly
+        # like the measured probe arm: the unroll's matmuls go fp16 while
+        # every sensitive quantity (log-probs, KLs, entropies) is fp32
+        # because autocast pins their log_softmax/bce ops to fp32. NOTE the
+        # KL math must stay INSIDE the autocast for that pinning — outside
+        # it, fp16 logits would flow through log_softmax at fp16.
+        with self._autocast():
+            return self._policy_loss_inner(fixed)
+
+    def _policy_loss_inner(self, fixed: _Fixed) -> tuple[torch.Tensor, dict]:
         cfg = self.config
         out = self.policy.unroll(
             fixed.frames, fixed.initial_policy_state, discount=cfg.discount
@@ -483,15 +555,17 @@ class Learner:
 
     def _imitation_policy_loss(self, imf: _ImitFixed) -> torch.Tensor:
         """L_opp = -(w * log pi(a_opp|s)).mean() over valid positions —
-        log pi via the same teacher-forced unroll path PPO uses."""
+        log pi via the same teacher-forced unroll path PPO uses (and, in
+        fp16 mode, under the same policy autocast + scaled backward)."""
         batch_size = imf.valid.shape[0]
-        out = self.policy.unroll(
-            imf.frames,
-            self.policy.initial_state(batch_size, imf.valid.device),
-            discount=self.config.discount,
-        )
-        n_valid = imf.valid.sum().clamp(min=1.0)
-        return -(imf.weights * out.log_probs * imf.valid).sum() / n_valid
+        with self._autocast():
+            out = self.policy.unroll(
+                imf.frames,
+                self.policy.initial_state(batch_size, imf.valid.device),
+                discount=self.config.discount,
+            )
+            n_valid = imf.valid.sum().clamp(min=1.0)
+            return -(imf.weights * out.log_probs * imf.valid).sum() / n_valid
 
     @staticmethod
     def _slice_fixed(fixed: _Fixed, rows: tp.Sequence[int]) -> _Fixed:
@@ -622,6 +696,7 @@ class Learner:
         imit_loss_val = 0.0
         for _ in range(cfg.ppo.num_epochs):
             self.policy_optimizer.zero_grad(set_to_none=True)
+            any_backward = False
             batch_metrics = []
             for fixed in train_fixed:
                 loss, metrics = self._policy_loss(fixed)
@@ -629,7 +704,8 @@ class Learner:
                     print("NONFINITE LOSS: skipping minibatch")
                     batch_metrics.append(metrics)
                     continue
-                (loss / len(train_fixed)).backward()
+                self._backward(loss / len(train_fixed))
+                any_backward = True
                 batch_metrics.append(metrics)
             if imit_fixed and lambda_t > 0.0:
                 imit_losses = []
@@ -639,10 +715,17 @@ class Learner:
                         print("NONFINITE IMITATION LOSS: skipping minibatch",
                               flush=True)
                         continue
-                    (lambda_t * iloss / len(imit_fixed)).backward()
+                    self._backward(lambda_t * iloss / len(imit_fixed))
+                    any_backward = True
                     imit_losses.append(iloss.item())
                 if imit_losses:
                     imit_loss_val = sum(imit_losses) / len(imit_losses)
+            use_scaler = self.grad_scaler is not None and any_backward
+            if use_scaler:
+                # Divide the loss scale back out BEFORE clipping/guarding so
+                # (a) clip_grad_norm_ operates on true magnitudes and (b)
+                # the nonfinite guard below reads honest numbers.
+                self.grad_scaler.unscale_(self.policy_optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 self.policy.parameters(),
                 cfg.max_grad_norm if cfg.max_grad_norm > 0 else float("inf"),
@@ -655,6 +738,19 @@ class Learner:
                 print(f"NONFINITE GRAD NORM ({grad_norm}): skipping update",
                       flush=True)
                 self.policy_optimizer.zero_grad(set_to_none=True)
+                if use_scaler:
+                    # unscale_ already recorded found_inf, so update() halves
+                    # the scale — the right response whether the cause was
+                    # fp16 overflow at this scale or genuinely bad math.
+                    self.grad_scaler.update()
+            elif use_scaler:
+                # Two layers of skip, same semantics: our guard above catches
+                # every nonfinite gradient FIRST (any inf/NaN element makes
+                # the global norm nonfinite), and scaler.step's own internal
+                # found_inf skip backstops it. Either way weights only move
+                # on finite, unscaled, clipped gradients.
+                self.grad_scaler.step(self.policy_optimizer)
+                self.grad_scaler.update()
             else:
                 self.policy_optimizer.step()
             epoch_metrics.append(_mean_dicts(batch_metrics))
