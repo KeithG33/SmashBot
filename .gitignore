@@ -8,3 +8,4 @@ runs/
 *.pt
 *.pkl
 .ruff_cache/
+scripts/tournament_results/
