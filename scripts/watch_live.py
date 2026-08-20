@@ -232,8 +232,9 @@ def parse_args(argv=None):
     ap.add_argument("--p1", default="",
                     help="full checkpoint for player 1 (default: snapshot "
                          f"mode with {DEFAULT_P1_SNAPSHOT})")
-    ap.add_argument("--p2", default=DEFAULT_P2,
-                    help="full checkpoint for player 2 (Phillip medium-v2)")
+    ap.add_argument("--p2", default="",
+                    help="full checkpoint for player 2 (default: Phillip "
+                         "medium-v2, unless --p2-snapshot is given)")
     ap.add_argument("--p1-snapshot", default="",
                     help="bare policy state_dict for player 1; config comes "
                          "from --config-from")
