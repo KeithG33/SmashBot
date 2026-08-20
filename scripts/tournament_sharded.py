@@ -50,7 +50,13 @@ def main() -> None:
                     help="max simultaneous pair processes (each runs "
                          "games-per-pair dolphins + 1 python)")
     ap.add_argument("--char-mode", default="fox", choices=("fox", "main12"))
-    ap.add_argument("--pair-timeout", type=float, default=900,
+    ap.add_argument("--device", default="cuda",
+                    help="inference device for pair processes; cuda shares "
+                         "the idle GPU across shards (batch-2 forwards are "
+                         "tiny) and frees the cores for the dolphins — cpu "
+                         "inference at concurrency 32 starved the games "
+                         "below the pair timeout (live-caught)")
+    ap.add_argument("--pair-timeout", type=float, default=1800,
                     help="seconds per pair process before it is killed "
                          "(partials from finished games are still merged)")
     ap.add_argument("--out", default="")
@@ -89,7 +95,7 @@ def main() -> None:
                 "--games-per-pair", str(args.games_per_pair),
                 "--envs", str(args.games_per_pair),
                 "--char-mode", args.char_mode,
-                "--device", "cpu",
+                "--device", args.device,
                 "--max-minutes", str(args.pair_timeout / 60),
                 "--out", out,
             ]
