@@ -52,8 +52,8 @@ import time
 import torch
 import tree
 
-ARMS = ("fp32", "bf16", "fp16")
-_ARM_DTYPE = {"bf16": torch.bfloat16, "fp16": torch.float16}
+ARMS = ("fp32", "bf16", "fp16", "fp16s")
+_ARM_DTYPE = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp16s": torch.float16}
 
 DEFAULT_CONFIG_FROM = "/home/kage/drive2/ShineBot/runs/rl-pool-v3/latest.pt"
 
@@ -68,6 +68,15 @@ def autocast_ctx(device_type: str, arm: str):
     if arm == "fp32":
         return contextlib.nullcontext()
     return torch.autocast(device_type, dtype=_ARM_DTYPE[arm])
+
+
+def make_scaler(arm: str, device_type: str):
+    """fp16s = fp16 + GradScaler (the proper fp16 training recipe). bf16
+    never needs one (fp32 exponent range; underflow is not its failure
+    mode)."""
+    if arm != "fp16s":
+        return None
+    return torch.amp.GradScaler(device_type, init_scale=2.0 ** 16)
 
 
 def to_device(struct, device):
@@ -175,6 +184,7 @@ def run_arm(learner, trajectories, arm: str, device_type: str) -> dict:
     _policy_loss per trajectory (network unrolls under autocast for half
     arms), then loss.backward(). No optimizer steps; grads are measured and
     zeroed. Returns per-position tensors (cpu fp32) + scalar metrics."""
+    scaler = make_scaler(arm, device_type)
     learner.policy_optimizer.zero_grad(set_to_none=True)
     learner.value_optimizer.zero_grad(set_to_none=True)
 
@@ -216,7 +226,10 @@ def run_arm(learner, trajectories, arm: str, device_type: str) -> dict:
             # backward outside the autocast region (recommended amp pattern;
             # the value net's backward runs inside _fixed_pass by design —
             # gradient math replays recorded ops, unaffected by the context)
-            loss.backward()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
             out = captured["out"]
             if not dtypes:  # dtype receipt: sensitive path must read fp32
                 dtypes = {
@@ -244,6 +257,10 @@ def run_arm(learner, trajectories, arm: str, device_type: str) -> dict:
     finally:
         learner.policy.__dict__.pop("unroll", None)
 
+    if scaler is not None:
+        # divide the scale back out so measured grads are comparable
+        scaler.unscale_(learner.policy_optimizer)
+        scaler.unscale_(learner.value_optimizer)
     policy_grad_norm, policy_grad_bad = _grad_stats(
         learner.policy.parameters()
     )
