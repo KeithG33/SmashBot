@@ -490,12 +490,17 @@ def main() -> None:
                     f"SP:{log.get('rl/self/win_rate_ema', 0.5):.0%} "
                     if worker.self_idx else ""
                 )
+                imp_bit = (
+                    f"I:{_pct(cat.get('imports'))} "
+                    if rcfg.league_imports else ""
+                )
                 print(
                     f"[{i:4d}/{args.runtime.steps}] "
                     f"T:{_pct(cat.get('teacher'))} "
                     f"S:{_pct(cat.get('ghosts'))} "
                     f"C:{_pct(cat.get('cpu'))} "
                     f"{ref_bit}"
+                    f"{imp_bit}"
                     f"{sp_bit}"
                     f"({games:.0f}g) | "
                     f"tKL {log['rl/teacher_kl']:.4f} "

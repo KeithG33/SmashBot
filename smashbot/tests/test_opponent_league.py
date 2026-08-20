@@ -1594,3 +1594,19 @@ def test_self_seat_pipeline_equivalence(monkeypatch):
                 ),
                 ca[port], cb[port],
             )
+
+
+def test_category_estimates_pools_imports(tmp_path):
+    """The pooled 'imports' row aggregates decayed and raw counts across
+    all import members (ticker I: bit), None with no import games."""
+    from smashbot.rl.pool import SnapshotPool
+
+    pool = SnapshotPool(str(tmp_path), slots=3, league_members=[
+        "teacher", "import:a", "import:b"])
+    assert pool.category_estimates()["imports"] is None
+    for won in (True, True, False):
+        pool.record_result("import:a", won)
+    pool.record_result("import:b", False)
+    dec, raw = pool.category_estimates()["imports"]
+    assert raw == pytest.approx(2 / 4)
+    assert 0.0 < dec < 1.0

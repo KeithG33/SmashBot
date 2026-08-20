@@ -337,6 +337,23 @@ class SnapshotPool:
             else:
                 wd += e["wins"]; gd += e["games"]
         out["ghosts"] = (wd / gd, rw / rg) if rg else None
+        # pooled imports row (ticker "I:"): cross-generation benchmark
+        # aggregated over the imports' actual serving mix, same math as
+        # "ghosts"; per-import rows above stay for wandb detail.
+        wd = gd = 0.0
+        rw = rg = 0
+        for m in self.league_members:
+            if not _is_import_key(m):
+                continue
+            e = self.payoff.get(m)
+            if not e or not e.get("games"):
+                continue
+            rw += e["wins"]; rg += e["games"]
+            if e.get("games_d"):
+                wd += e["wins_d"]; gd += e["games_d"]
+            else:
+                wd += e["wins"]; gd += e["games"]
+        out["imports"] = (wd / gd, rw / rg) if rg else None
         return out
 
     def win_estimate(self, path: str) -> float:
