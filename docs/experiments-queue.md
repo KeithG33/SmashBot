@@ -102,3 +102,9 @@ anchor-to-zero).
 - Playback-of-ExiAI-replays question for vladfi (evidence bundle in memory;
   live watching via scripts/watch_live.py meanwhile)
 - GC-adapter LD_PRELOAD shim (headless dolphins blind to the WUP-028)
+
+## League exploiters (AlphaStar-style, v5 candidate)
+The one league ingredient we lack vs AlphaStar's: agents trained ONLY to
+beat the current main (no KL leash, reset to BC init periodically), frozen
+into the league as past players. Needs a second concurrent learner —
+real GPU/CPU cost. Revisit after v4 shows where the 50% equilibrium moves.
