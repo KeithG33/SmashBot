@@ -328,8 +328,19 @@ def main() -> None:
     # snapshot_interval boundary — up to ~2.5h during which every "snapshot"
     # env silently serves an unlabeled teacher clone and league members
     # (teacher/cpu/phillip) play zero games (live-caught after the league
-    # relaunch: T:/R:/C: frozen for 125 steps). Requires a non-empty archive
-    # (slot 0 needs a latest snapshot); fresh runs keep the old behavior.
+    # relaunch: T:/R:/C: frozen for 125 steps). The auction needs a
+    # non-empty archive (slot 0 serves the latest snapshot), so fresh runs
+    # seed one below.
+    if rcfg.snapshot_slots and not snapshot_pool.archive:
+        # Fresh run: seed the archive with the init weights (labeled
+        # honestly as the step-<start> snapshot) so the boot auction below
+        # can run. Without this, every slot serves an unlabeled teacher
+        # clone until the first snapshot_interval boundary and the league
+        # (incl. imports) records nothing (live-caught at v4 launch:
+        # 12 slots dark, no pfsp ledger, T:/C:/R: all "--").
+        snapshot_pool.save(policy, start_step)
+        print(f"boot snapshot: seeded empty archive at step {start_step}",
+              flush=True)
     if rcfg.snapshot_slots and snapshot_pool.archive:
         import random as _random
 
