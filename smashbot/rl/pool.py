@@ -177,11 +177,8 @@ def f_hard(x: float, p: float = 1.0) -> float:
 
 
 def f_var(x: float, p: float = 1.0) -> float:
-    """AlphaStar's catch-up weighting: f_var(x) = (x(1 - x))^p — peaked at
-    even matchups, ZERO at both ends. Their prescription "for main
-    exploiters and in situations where the main agent has to catch up";
-    unbeatable members (x=0) and beaten ones (x=1) both rely on the
-    explore mix (pfsp_explore) for probe games."""
+    """AlphaStar's catch-up weighting f_var(x) = (x(1 - x))^p: peaked at
+    even matchups, zero at both ends (probes come from pfsp_explore)."""
     return (x * (1.0 - x)) ** p
 
 
@@ -204,24 +201,12 @@ class SnapshotPool:
         slots: int,
         keep: int = 30,
         pfsp: bool = True,
-        # squared = AlphaStar main agents' f_hard weighting (smooth max-min:
-        # concentrate serving on the hardest members). p is a no-op while
-        # everyone sits at the 0.5 prior, so there is no cold-start reason
-        # to soften it (user-caught).
-        pfsp_p: float = 2.0,
-        # Fraction of WEIGHTED draws using f_hard; the rest use f_var.
-        # 1.0 = pure f_hard (AlphaStar main-agent default, legacy
-        # behavior); 0.0 = pure f_var (their catch-up mode). rl-pool-v4
-        # runs 0.25 (user-designed blend: an unbeatable member keeps ~8%
-        # overall sampling for the both-sides imitation harvest instead of
-        # f_var's probe-only 1.4%).
+        pfsp_p: float = 2.0,  # exponent on f_hard / f_var (AlphaStar: 2)
+        # fraction of weighted draws using f_hard (rest f_var): 1.0 = pure
+        # f_hard (AlphaStar mains), 0.0 = pure f_var (their catch-up mode)
         pfsp_hard_frac: float = 1.0,
-        # Fraction of non-latest slot draws that ignore weights and sample
-        # uniformly (classes first, then members) — AlphaStar's 15%
-        # forgotten-players bucket adapted to a one-learner league: without
-        # it a member at 0% or 100% win rate is benched FOREVER (weight 0
-        # and a payoff row that can never refresh; user-caught via "will
-        # the teacher ever get sampled back?").
+        # fraction of draws sampled uniformly (AlphaStar's 15% forgotten-
+        # players bucket); keeps 0%/100% members from being benched forever
         pfsp_explore: float = 0.0,
         # ~100-game effective memory per ghost (matches AlphaStar's 0.99
         # payoff decay). A serving ghost sees ~200 games/hour, so faster
@@ -363,9 +348,7 @@ class SnapshotPool:
             else:
                 wd += e["wins"]; gd += e["games"]
         out["ghosts"] = (wd / gd, rw / rg) if rg else None
-        # pooled imports row (ticker "I:"): cross-generation benchmark
-        # aggregated over the imports' actual serving mix, same math as
-        # "ghosts"; per-import rows above stay for wandb detail.
+        # pooled imports row (ticker "I:"), same math as "ghosts"
         wd = gd = 0.0
         rw = rg = 0
         for m in self.league_members:
@@ -456,11 +439,7 @@ class SnapshotPool:
         return out
 
     def _draw_weight_fn(self, rng: random.Random):
-        """Weight function for ONE weighted (non-explore) draw: f_hard
-        with prob pfsp_hard_frac, else f_var. The mixture-of-draws IS the
-        blended sampling curve (25/60/15 tables in the v4 design
-        discussion): hard draws keep unbeatable members served, var draws
-        center the curriculum on even matchups."""
+        """f_hard with prob pfsp_hard_frac, else f_var (one draw)."""
         fn = f_hard if rng.random() < self.pfsp_hard_frac else f_var
         return lambda x: fn(x, self.pfsp_p)
 
@@ -519,13 +498,8 @@ class SnapshotPool:
         (league members only start serving once a first snapshot anchors
         slot 0).
 
-        cover=True (the BOOT auction only): every league member gets one
-        slot first (shuffled), the remaining slots are drawn as usual. On
-        an empty ledger all tickets sit at the 0.5 prior, so the draw is
-        pure chance anyway — guaranteeing coverage just starts measuring
-        every member on minute one (user-caught: the first v4 boot draw
-        skipped imp10000, cpu AND teacher). Later auctions must follow
-        the payoff curve; re-probing there is the explore mix's job."""
+        cover=True (boot auction): every league member gets one slot
+        first (shuffled), the rest are drawn as usual."""
         if not self.archive:
             return []
         rng = rng or random.Random()
@@ -572,36 +546,11 @@ def apply_assignments(
     device: str = "cpu",
     imports: dict[str, tuple[str, str]] | None = None,
 ) -> None:
-    """Route one epoch's slot assignments into the serving machinery.
-
-    - snapshot path: load from disk into the slot policy; envs adopt it at
-      their next game boundary (deferred adoption — see
-      rollouts.begin_transition); the slot serves kind "snapshot".
-    - "import:NAME": load the imported frozen checkpoint (a bare policy
-      state_dict from a PREVIOUS run — same architecture as the student by
-      definition) from `imports[key][0]` into the slot policy, exactly like
-      a ghost load; serves kind "snapshot" (it IS a policy ghost — just a
-      cross-generation one; its payoff attribution flows through slot_keys).
-      The member's char lock (`imports[key][1]`) lands in
-      worker.slot_char_lock so the slot's envs pin that character instead
-      of redrawing per game; every non-import member clears the lock, so
-      redraws resume when the slot moves on.
-    - "teacher": copy the LIVE teacher module's CURRENT weights into the slot
-      policy (in-memory state_dict copy, no disk). Staleness bound: if the
-      teacher watcher hot-swaps the module mid-epoch, this slot keeps serving
-      its copy until the next snapshot_interval refresh re-copies it.
-    - "phillip": ROUTING only — Phillip's architecture differs from the
-      student's, so he can never be loaded into a slot policy. The worker
-      sends this slot's rows to Phillip's own BatchedPolicyAgent instead
-      (rollouts: _phillip_agent_for). The slot policy module is untouched
-      and idle. Hot-swappable like a snapshot: both seats stay standard
-      controllers, so no Dolphin reboot is needed.
-    - "cpu": only record the desired kind — Dolphin CPU ports cannot hot-swap
-      mid-game, so each env adopts (policy|phillip)<->cpu at its NEXT recycle
-      boundary (rollouts._env_process_main). Attribution follows what each
-      env is ACTUALLY serving (worker.env_member), and not-yet-adopted envs
-      still serve the old policy from the slot's spare module.
-    """
+    """Route one auction's slot assignments: announce each slot's member to
+    the worker (begin_transition), then load the member's weights into the
+    slot policy — a snapshot path or import from disk, "teacher" as a copy
+    of the live module; "phillip" and "cpu" load nothing (own module /
+    engine AI). Imports carry a char lock into worker.slot_char_lock."""
     for slot, slot_policy in slot_policies:
         if slot >= len(assigns):
             continue
@@ -609,18 +558,13 @@ def apply_assignments(
         lock = (
             imports[key][1] if imports and _is_import_key(key) else None
         )
-        # DEFERRED ADOPTION: announce first, so the worker can park the
-        # CURRENT weights in the slot's spare module for envs mid-game on
-        # them; only then overwrite the slot policy with the new member.
-        # Each env flips brain+char+label together at its own next game
-        # boundary (rollouts.begin_transition / _adopt_pending).
-        worker.begin_transition(slot, key, lock, slot_policy)
+        worker.begin_transition(slot, key, lock, slot_policy)  # before loading
         if key == "cpu":
             worker.slot_desired[slot] = "cpu"
             slot_keys[slot] = key
             continue
         if key == "phillip":
-            pass  # routing only: rows move to his agent as they adopt
+            pass
         elif key == "teacher":
             slot_policy.load_state_dict(teacher_module.state_dict())
         elif _is_import_key(key):
@@ -631,17 +575,9 @@ def apply_assignments(
                 f"--rollouts.league-imports)"
             )
             path, _char = imports[key]
-            # bare state_dict, snapshot-pool format; strict load_state_dict
-            # raises loudly on any architecture mismatch
             slot_policy.load_state_dict(torch.load(path, map_location=device))
         else:
             slot_policy.load_state_dict(torch.load(key, map_location=device))
         worker.slot_desired[slot] = "policy"
-        # char lock follows the INCOMING member: imports pin their locked
-        # char (the slot's envs stop redrawing the opponent seat once they
-        # adopt); anything else restores normal per-game redraws. "cpu"
-        # never reaches here (continue above), deliberately leaving the
-        # previous member's lock in place for envs that haven't adopted
-        # cpu yet.
-        worker.slot_char_lock[slot] = lock
+        worker.slot_char_lock[slot] = lock  # (cpu keeps the previous lock)
         slot_keys[slot] = key

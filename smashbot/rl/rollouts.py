@@ -869,12 +869,10 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
 
 
 class _HarvestGroup:
-    """Imitation harvest state for opponent seats sharing one model config
-    (delay + controller encoding): a ChunkAssembler over a FIXED row set
-    plus the per-frame eligibility stream. Records arrive merged over the
-    whole row set (zero placeholders for rows not on this config); the
-    whole-chunk eligibility gate at emit slices out only rows that were
-    real and whitelisted for the ENTIRE chunk."""
+    """Imitation harvest for opponent seats of one model config (delay +
+    controller encoding): a ChunkAssembler over a fixed row set (all slot
+    envs) plus a per-frame eligibility mask; emit keeps only rows eligible
+    for the entire chunk."""
 
     def __init__(self, key, rows, unroll, delay, reencode, device):
         self.key = key
@@ -912,12 +910,8 @@ class _HarvestGroup:
 
 
 class _Seat:
-    """A role in a slot's transition — `current` (the announced member) or
-    `outgoing` (the previous member, still fought by envs mid-game):
-    member key + the agent serving it + the agent's model config label
-    (groups the imitation harvest by delay/controller encoding).
-    Model-agnostic: the agent is whatever the member needs, borrowed from
-    the slot's _SlotPool, which is what labels it."""
+    """A slot role (`current` or `outgoing`): member key, the agent serving
+    it, and the agent's model-config label (for harvest grouping)."""
 
     __slots__ = ("member", "agent", "config")
 
@@ -928,11 +922,9 @@ class _Seat:
 
 
 class _SlotPool:
-    """The physical modules a slot's seats borrow from (the ONLY place
-    "ours vs phillip" exists): two our-config batch-8 agents — `ours_main`
-    (the slot policy, compiled) and `ours_spare` (eager; parks weights) —
-    and a batch-8 wrapper over the ONE shared Phillip module. All are
-    created lazily."""
+    """Agents a slot's seats borrow from — the only place model configs are
+    named: `ours_main` (the slot policy), `ours_spare` (parks outgoing
+    weights), `phillip` (wrapper over the shared Phillip module)."""
 
     __slots__ = ("ours_main", "ours_spare", "phillip")
 
@@ -972,44 +964,22 @@ class DolphinRolloutWorker:
         # validates the league flags (env counts must be 0, pfsp required)
         self._league = config.league_members()
         self._league_cpu = config.league_cpu
-        # League serving state, written by the slot refresh
-        # (pool.apply_assignments -> begin_transition); empty = no auction
-        # yet (slots serve their init weights unlabeled).
-        #
-        # DEFERRED ADOPTION (user-designed, v4): an env only ever changes
-        # opponent BETWEEN games, never during — brain, body (char) and
-        # payoff label move together at the env's own next game boundary.
-        # The auction only announces a slot's INCOMING member; each env
-        # flips to it when its current game ends (for a char-locked
-        # import: when the lock has actually reached the CSS, i.e. the new
-        # game's opp_char == lock). Until then it keeps playing its old
-        # brain. Never any waiting: the first env to finish is the first to
-        # adopt.
-        #
-        # SEATS (user-designed, v4): every slot has two model-agnostic
-        # role seats — `current` (the announced member) and `outgoing` (the
-        # previous member while envs still play it). Each seat's agent is a
-        # batch-8 wrapper stepping the slot's FULL env batch every frame
-        # (one fixed shape -> one compiled graph, per-row recurrent state
-        # never disturbed; rows not on that seat just drop their
-        # controller). Seats borrow agents from the slot's _SlotPool — the
-        # only place "ours vs phillip" is ever mentioned. Ghost, import,
-        # teacher and Phillip transitions are one code path. CPU remains
-        # the one true exception: not a brain (Dolphin's engine AI),
-        # adopted at a Dolphin recycle (slot_desired + the env's own
-        # opp_serving report) — it occupies no seat.
-        #   env_member[i]    member key env i is ACTUALLY fighting now
-        #   slot_incoming[k] the slot's announced member
-        #   _seats[k]        {"current": _Seat|None, "outgoing": _Seat|None}
-        #   slot_pending[k]  envs of slot k yet to adopt the incoming
+        # Deferred adoption: an env changes opponent (brain, char, payoff
+        # label) only at its own game boundary. The auction announces a
+        # slot's incoming member; each env adopts it when its game ends.
+        # Seats: `current` / `outgoing` per slot, each a full-batch agent
+        # (fixed shape; controllers routed per row). CPU is the exception:
+        # no seat, adopted at a Dolphin recycle via slot_desired.
+        #   env_member[i]    member env i is fighting now
+        #   slot_incoming[k] announced member
+        #   _seats[k]        {"current", "outgoing"} -> _Seat | None
+        #   slot_pending[k]  envs yet to adopt the incoming
         self.env_member: dict[int, str] = {}
         self.slot_incoming: dict[int, str] = {}
         self.slot_pending: dict[int, set] = {}
         self._seats: dict[int, dict[str, "_Seat | None"]] = {}
         self._pool: dict[int, _SlotPool] = {}
-        # n -> BatchedPolicyAgent over a FRESH (eager) our-config module:
-        # the per-slot spare. train_rl sets it; None = transitions fall
-        # back to instant swaps (tests without a factory).
+        # n -> agent over a fresh our-config module (the per-slot spare)
         self.outgoing_factory: tp.Optional[tp.Callable[[int], tp.Any]] = None
         self.slot_desired: dict[int, str] = {}
         # slot -> char lock ("FOX"/... or None) while the slot serves a
@@ -1094,23 +1064,11 @@ class DolphinRolloutWorker:
         self.on_snapshot_game: tp.Optional[
             tp.Callable[[int, bool, str], None]
         ] = None
-        # Phillip as a league member: n -> BatchedPolicyAgent wrapper over
-        # the ONE shared Phillip module (his own config). Each slot that
-        # draws him gets its own batch-8 wrapper (see _SlotPool); train_rl
-        # sets the factory under league_phillip.
+        # n -> wrapper over the shared Phillip module (set by train_rl)
         self.phillip_factory: tp.Optional[tp.Callable[[int], tp.Any]] = None
-        # Imitation harvest of OPPONENT seats (user-designed, v4: agnostic
-        # to who the opponent is). Two sources:
-        #  - ref_envs mode: the fixed reference group (one assembler).
-        #  - league slots: EVERY policy seat (ghost, import, teacher copy,
-        #    Phillip — cpu has no seat). Harvested rows are grouped by the
-        #    seat agent's model config (delay + controller encoding) into
-        #    _HarvestGroups, each with a FIXED row set (all slot envs) and
-        #    a per-row per-frame eligibility mask (row on a seat of this
-        #    config AND opponent char whitelisted). Membership changes
-        #    move through the mask, never by resetting an assembler, so
-        #    transitions drop nothing; the whole-chunk eligibility gate at
-        #    emit keeps every harvested row homogeneous.
+        # Imitation harvest of opponent seats: the fixed reference group
+        # (ref_envs mode) and/or every league policy seat, grouped by model
+        # config into _HarvestGroups.
         self.harvest_imitation = harvest_imitation and (
             bool(self.ref_idx) or bool(self._league)
         )
@@ -1204,12 +1162,9 @@ class DolphinRolloutWorker:
         return game._replace(p0=game.p1, p1=game.p0)
 
     def _reencode_record(self, rec: FrameRecord, embed=None) -> FrameRecord:
-        """Opponent-seat record -> student-schema record: actions re-encoded
-        through the STUDENT's controller embedding (the opponent checkpoint
-        may discretize differently) and the name conditioned on the
-        student's code (its name codes index a different vocabulary).
-        `embed` = the opponent's controller embedding (default: the fixed
-        reference group's)."""
+        """Opponent-seat record -> student schema: actions re-encoded through
+        the student's controller embedding, name set to the student's
+        code. `embed` = the opponent's embedding (default: reference)."""
         import numpy as np
 
         embed = embed if embed is not None else self._ref_embed
@@ -1241,19 +1196,12 @@ class DolphinRolloutWorker:
 
     @staticmethod
     def member_kind(key: str | None) -> str:
-        """Serving kind of a league member key: teacher/cpu/phillip are
-        themselves; snapshot paths and imports are "snapshot"."""
+        """teacher/cpu/phillip as themselves; snapshot paths and imports
+        are "snapshot"."""
         return key if key in ("teacher", "cpu", "phillip") else "snapshot"
 
     def _actual_kind(self, i: int, serving: str | None) -> str:
-        """Kind ACTUALLY serving env i's opponent seat, given the env's
-        reported serving label ("policy"/"cpu"/None). Non-slot envs keep
-        their fixed spec kind; slot envs resolve "cpu" directly and
-        otherwise follow env_member (deferred adoption: what the env is
-        really fighting, not what the slot was last assigned). Mapped
-        through _TRACKER_KIND this keys the per-kind GameTrackers so
-        teacher/cpu/phillip games keep their ticker/wandb continuity even
-        when served via league slots."""
+        """Kind actually serving env i's opponent seat (tracker key)."""
         sp = self.specs[i]
         if sp.kind != "snapshot":
             return sp.kind
@@ -1262,9 +1210,7 @@ class DolphinRolloutWorker:
         return self.member_kind(self.env_member.get(i))
 
     def _result_key(self, i: int, result_serving: str | None) -> str | None:
-        """Payoff-row key for a game that just ended on slot env i: "cpu"
-        if the engine AI played it, else the member the env was fighting
-        (None = unlabeled init serving before any auction)."""
+        """Payoff-row key for a game that ended on slot env i."""
         if result_serving == "cpu":
             return "cpu"
         return self.env_member.get(i)
@@ -1272,10 +1218,7 @@ class DolphinRolloutWorker:
     _POLICY_KINDS = ("snapshot", "teacher")
 
     def _pool_agent(self, slot: int, member: str):
-        """Borrow the agent a member needs from the slot's pool (lazily
-        created) as (agent, config label): Phillip -> the shared-module
-        wrapper, "phillip"; anything else -> the slot policy (ours_main),
-        "ours". Parking onto ours_spare is done by _park."""
+        """(agent, config label) serving `member`, created lazily."""
         pool = self._pool.setdefault(slot, _SlotPool())
         n = len(self.groups[("slot", slot)])
         if member == "phillip":
@@ -1300,16 +1243,14 @@ class DolphinRolloutWorker:
         ]
 
     def _release_outgoing(self, slot: int) -> None:
-        """The outgoing seat empties once no env fights its member."""
         seats = self._seats.get(slot)
         if seats and seats["outgoing"] is not None:
             if not self._rows_on(slot, seats["outgoing"].member):
                 seats["outgoing"] = None
 
     def _needs_slot_policy(self, member: str) -> bool:
-        """Does this member live in the slot policy module? (ghosts,
-        imports, teacher copies do; phillip has his own module; cpu has
-        none). The ONE model-specific predicate in the transition logic."""
+        """Does `member` live in the slot policy module? (cpu has none,
+        phillip has his own.)"""
         return member != "cpu" and member != "phillip"
 
     def _seat_for(self, slot: int, member: str) -> "_Seat | None":
@@ -1318,9 +1259,8 @@ class DolphinRolloutWorker:
         return _Seat(member, *self._pool_agent(slot, member))
 
     def _park(self, slot: int, seat: _Seat, slot_policy) -> _Seat:
-        """The slot policy is about to be overwritten while envs still
-        fight its occupant: copy its weights into the pool's spare module
-        and re-seat the occupant there."""
+        """Copy the slot policy's weights into the spare and re-seat the
+        occupant there (the slot policy is about to be overwritten)."""
         assert self.outgoing_factory is not None and slot_policy is not None, (
             "deferred adoption needs a spare-brain factory (train_rl sets "
             "worker.outgoing_factory) and the slot policy to park"
@@ -1332,9 +1272,8 @@ class DolphinRolloutWorker:
         return _Seat(seat.member, pool.ours_spare, seat.config)
 
     def _evict_outgoing(self, slot: int, onto: str) -> None:
-        """Rare: a transition still open when the next auction lands (a
-        game longer than a whole snapshot_interval). The outgoing seat must
-        be freed, so its remaining rows take ONE mid-game swap. Loud."""
+        """Free the outgoing seat; any rows still on it take one mid-game
+        swap (only when a game outlasts a whole snapshot_interval)."""
         out = self._seats[slot]["outgoing"]
         if out is None:
             return
@@ -1351,18 +1290,11 @@ class DolphinRolloutWorker:
         self, slot: int, new_key: str, char_lock: str | None,
         slot_policy=None,
     ) -> None:
-        """Announce slot `slot`'s next member (called by
-        pool.apply_assignments BEFORE it loads any weights into the slot
-        policy).
-
-        Boot (no member yet): every env adopts immediately — nothing is in
-        flight — and a char lock is written into the env specs so the very
-        FIRST game already pins it.
-        Later: the occupant of `current` moves to `outgoing` if any env is
-        still fighting it (parked onto the spare module when the newcomer
-        needs the slot policy), `current` becomes the newcomer, and every
-        env of the slot is pending until its own game boundary
-        (_adopt_pending)."""
+        """Announce the slot's next member (before apply_assignments loads
+        any weights). Boot: envs adopt immediately and a char lock goes
+        into the env specs. Later: the current occupant becomes outgoing
+        if envs still fight it (parked when the newcomer needs the slot
+        policy), and every env is pending until its own game boundary."""
         idx = self.groups.get(("slot", slot), [])
         seats = self._seats.setdefault(slot, {"current": None, "outgoing": None})
         old = self.slot_incoming.get(slot)
@@ -1393,14 +1325,10 @@ class DolphinRolloutWorker:
         self._release_outgoing(slot)
 
     def _adopt_pending(self, payloads: list[dict], resets_d) -> None:
-        """Flip pending envs onto their slot's incoming member at their game
-        boundary (the payload's resetting frame = first frame of the new
-        game). A char-locked incoming additionally waits until the new
-        game's opp_char IS the lock (the CSS pick lags one game behind the
-        arming); "cpu" incoming waits for the env's own recycle adoption
-        (opp_serving == "cpu"); a row currently on cpu waits for its
-        recycle back to a policy seat. Must run AFTER the frame's results
-        were attributed (the ended game belongs to the previous member)."""
+        """Flip pending envs at their game boundary (resetting frame). A
+        char-locked incoming waits until the new game's opp_char is the
+        lock; cpu waits for the env's recycle report. Runs after the
+        frame's results are attributed."""
         for slot, pend in list(self.slot_pending.items()):
             inc = self.slot_incoming[slot]
             lock = self.slot_char_lock.get(slot)
@@ -1477,9 +1405,7 @@ class DolphinRolloutWorker:
                         if key is not None:
                             self.on_snapshot_game(key, a > b)
             resets_d = torch.tensor([p["resetting"] for p in payloads])
-            # deferred adoption flips happen AFTER the ended games above were
-            # credited to the member that actually played them
-            if self.slot_pending:
+            if self.slot_pending:  # after results: ended games credit the old member
                 self._adopt_pending(payloads, resets_d)
 
             resets = resets_d[row_dolphin]  # row-level
@@ -1555,19 +1481,13 @@ class DolphinRolloutWorker:
 
             opp_controllers: dict[int, tp.Any] = {}
             ref_records: list[FrameRecord] = []
-            # per config: [(env rows live on a seat, their local idx in
-            # the slot batch, the seat's flushed records, the seat agent)]
+            # config -> [(live rows, local idx, records, agent)] per seat
             harvest_parts: dict[str, list] = {}
             for name, idx in self.groups.items():
                 if isinstance(name, tuple):
-                    # slot group: each occupied seat (current, outgoing)
-                    # with live rows steps the slot's FULL batch (stable
-                    # compile shape, per-row recurrent state undisturbed;
-                    # unused rows' state is junk that re-zeros at their
-                    # next boundary) and the controllers are routed per
-                    # row. A Phillip seat also feeds the imitation harvest.
-                    # Before any auction (no seats yet) the slot policy
-                    # serves every row, unlabeled.
+                    # slot group: each occupied seat steps the full batch;
+                    # controllers routed per row. No seats yet (pre-auction)
+                    # = the slot policy serves every row, unlabeled.
                     k = name[1]
                     seats = self._seats.get(k)
                     sel = torch.tensor(idx, device=device)
@@ -1689,14 +1609,9 @@ class DolphinRolloutWorker:
         parts: dict[str, list],
         imit_out: list[Trajectory],
     ) -> None:
-        """Feed every config group one merged record per flushed frame
-        over its FIXED row set (all slot envs): rows live on a seat of that
-        config get their real record (re-encoded to the student's schema
-        when the config differs), other rows a zero placeholder, and the
-        eligibility mask marks which rows were real AND whitelisted. A
-        group is created at its config's first appearance (delay from its
-        agent); a frame with no seat of that config pushes only an
-        all-ineligible mask so rewards/resets/records stay aligned."""
+        """Per config group: merge this frame's seat records over the fixed
+        row set (zeros for rows not on this config), mark rows that are
+        real and whitelisted eligible, and step the group."""
         slot_rows = self._slot_rows
         pos = {r: k for k, r in enumerate(slot_rows)}
         T = self.config.unroll_length

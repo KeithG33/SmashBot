@@ -17,17 +17,8 @@ RecurrentState = tp.Any
 
 
 class RMSNorm(nn.RMSNorm):
-    """nn.RMSNorm that normalizes in fp32 under mixed precision.
-
-    Under fp16 autocast the activations arrive half while the weight stays
-    fp32; torch has no fused kernel for that pair and silently falls back
-    to an unfused path (UserWarning "Mismatch dtype between input and
-    weight"). Casting the input up engages the fused fp32 kernel and
-    computes the statistics in full precision — the standard mixed-
-    precision practice (autocast already does this for LayerNorm, just not
-    for rms_norm). Measured at learner batch (144x240x512, 3090): fwd
-    0.93 -> 0.50 ms, fwd+bwd 3.64 -> 1.62 ms. Same parameters/state_dict
-    keys as nn.RMSNorm; a no-op under fp32."""
+    """nn.RMSNorm computed in fp32 under autocast (fused kernel, full-
+    precision statistics; same state_dict keys; no-op under fp32)."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dtype == torch.float32:

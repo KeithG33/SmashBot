@@ -273,18 +273,15 @@ def main() -> None:
         args.rollouts, student_agent, opponents=opponents, specs=specs,
         harvest_imitation=args.learner.imitation_slots > 0,
     )
-    # PFSP payoff attribution: the worker reports the member key each env
-    # was ACTUALLY fighting when the game ended (deferred adoption keeps
-    # brain/char/label in lockstep); slot_keys is the auction's log view.
+    # payoff attribution: the worker reports the member each env was
+    # fighting when its game ended; slot_keys is the auction's log view
     slot_keys: dict[int, str] = {}
 
     def _on_snapshot_game(key: str, won: bool) -> None:
         snapshot_pool.record_result(key, won)
 
     worker.on_snapshot_game = _on_snapshot_game
-    # Spare brain per slot for deferred adoption: a fresh EAGER policy
-    # module (transitions last ~one game; not worth a compile warmup stall
-    # mid-run) wrapped for the slot's env count.
+    # spare brain per slot (eager: transitions last ~one game)
     def _outgoing_factory(n: int):
         spare, _, _ = load_policy(args.ckpt, device)
         spare.train_value_head = False
@@ -335,21 +332,10 @@ def main() -> None:
 
     run_dir = f"{args.runtime.run_dir}/{args.runtime.tag}"
     last_assigns: list = []  # latest refresh's slot keys (class-slot wandb)
-    # Boot auction: slot policies initialize as teacher-weight copies, and
-    # without this the first REAL assignment waits for the next
-    # snapshot_interval boundary — up to ~2.5h during which every "snapshot"
-    # env silently serves an unlabeled teacher clone and league members
-    # (teacher/cpu/phillip) play zero games (live-caught after the league
-    # relaunch: T:/R:/C: frozen for 125 steps). The auction needs a
-    # non-empty archive (slot 0 serves the latest snapshot), so fresh runs
-    # seed one below.
+    # Boot auction: assign slots now rather than at the first
+    # snapshot_interval. Needs a latest snapshot for slot 0, so a fresh run
+    # seeds its archive with the init weights.
     if rcfg.snapshot_slots and not snapshot_pool.archive:
-        # Fresh run: seed the archive with the init weights (labeled
-        # honestly as the step-<start> snapshot) so the boot auction below
-        # can run. Without this, every slot serves an unlabeled teacher
-        # clone until the first snapshot_interval boundary and the league
-        # (incl. imports) records nothing (live-caught at v4 launch:
-        # 12 slots dark, no pfsp ledger, T:/C:/R: all "--").
         snapshot_pool.save(policy, start_step)
         print(f"boot snapshot: seeded empty archive at step {start_step}",
               flush=True)
