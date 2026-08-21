@@ -868,17 +868,32 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
         _drain_old_stops()
 
 
-class _Brain:
-    """One batch-8 opponent brain resident in a slot (see
-    DolphinRolloutWorker._brains): a BatchedPolicyAgent wrapper plus the
-    league member key it currently embodies (None = idle)."""
+class _Seat:
+    """A role in a slot's transition — `current` (the announced member) or
+    `outgoing` (the previous member, still fought by envs mid-game):
+    member key + the agent serving it. Model-agnostic: the agent is
+    whatever the member needs, borrowed from the slot's _SlotPool."""
 
-    __slots__ = ("agent", "config", "member")
+    __slots__ = ("member", "agent")
 
-    def __init__(self, agent, config: str):
+    def __init__(self, member: str, agent):
+        self.member = member
         self.agent = agent
-        self.config = config  # "ours" | "phillip"
-        self.member: str | None = None
+
+
+class _SlotPool:
+    """The physical modules a slot's seats borrow from (the ONLY place
+    "ours vs phillip" exists): two our-config batch-8 agents — `ours_main`
+    (the slot policy, compiled) and `ours_spare` (eager; parks weights) —
+    and a batch-8 wrapper over the ONE shared Phillip module. All are
+    created lazily."""
+
+    __slots__ = ("ours_main", "ours_spare", "phillip")
+
+    def __init__(self):
+        self.ours_main = None
+        self.ours_spare = None
+        self.phillip = None
 
 
 class DolphinRolloutWorker:
@@ -925,30 +940,27 @@ class DolphinRolloutWorker:
         # brain. Never any waiting: the first env to finish is the first to
         # adopt.
         #
-        # UNIFORM BRAINS (user-designed, v4): every slot holds up to three
-        # batch-8 brains, each a BatchedPolicyAgent wrapper stepping the
-        # slot's FULL env batch every frame (one fixed shape -> one compiled
-        # graph, per-row recurrent state never disturbed; rows not on that
-        # brain just have their controller dropped):
-        #   "main"    the slot policy (our config; members' weights swap in)
-        #   "spare"   a fresh our-config module that PARKS the outgoing
-        #             member's weights while envs still play it
-        #   "phillip" a wrapper over the ONE shared Phillip module (his own
-        #             config; frozen, so wrappers share weights — only the
-        #             per-row state is per slot)
-        # Ghost, import, teacher and Phillip transitions are the same code;
-        # Phillip is no longer a routed exception. CPU remains the one true
-        # exception: not a brain (Dolphin's engine AI), adopted at a
-        # Dolphin recycle (slot_desired + the env's own opp_serving report).
+        # SEATS (user-designed, v4): every slot has two model-agnostic
+        # role seats — `current` (the announced member) and `outgoing` (the
+        # previous member while envs still play it). Each seat's agent is a
+        # batch-8 wrapper stepping the slot's FULL env batch every frame
+        # (one fixed shape -> one compiled graph, per-row recurrent state
+        # never disturbed; rows not on that seat just drop their
+        # controller). Seats borrow agents from the slot's _SlotPool — the
+        # only place "ours vs phillip" is ever mentioned. Ghost, import,
+        # teacher and Phillip transitions are one code path. CPU remains
+        # the one true exception: not a brain (Dolphin's engine AI),
+        # adopted at a Dolphin recycle (slot_desired + the env's own
+        # opp_serving report) — it occupies no seat.
         #   env_member[i]    member key env i is ACTUALLY fighting now
         #   slot_incoming[k] the slot's announced member
-        #   _brains[k]       {"main"|"spare"|"phillip": _Brain}; a brain's
-        #                    .member is the key it currently embodies
+        #   _seats[k]        {"current": _Seat|None, "outgoing": _Seat|None}
         #   slot_pending[k]  envs of slot k yet to adopt the incoming
         self.env_member: dict[int, str] = {}
         self.slot_incoming: dict[int, str] = {}
         self.slot_pending: dict[int, set] = {}
-        self._brains: dict[int, dict[str, _Brain]] = {}
+        self._seats: dict[int, dict[str, "_Seat | None"]] = {}
+        self._pool: dict[int, _SlotPool] = {}
         # n -> BatchedPolicyAgent over a FRESH (eager) our-config module:
         # the per-slot spare. train_rl sets it; None = transitions fall
         # back to instant swaps (tests without a factory).
@@ -1038,7 +1050,7 @@ class DolphinRolloutWorker:
         ] = None
         # Phillip as a league member: n -> BatchedPolicyAgent wrapper over
         # the ONE shared Phillip module (his own config). Each slot that
-        # draws him gets its own batch-8 wrapper (see _brains); train_rl
+        # draws him gets its own batch-8 wrapper (see _SlotPool); train_rl
         # sets the factory under league_phillip.
         self.phillip_factory: tp.Optional[tp.Callable[[int], tp.Any]] = None
         # Imitation harvest (Phillip's seat while his char is whitelisted):
@@ -1206,30 +1218,25 @@ class DolphinRolloutWorker:
 
     _POLICY_KINDS = ("snapshot", "teacher")
 
-    def _brain(self, slot: int, which: str) -> "_Brain | None":
-        """The slot's brain of the given kind, created lazily (None when the
-        needed factory is absent — tests without spare/phillip)."""
-        d = self._brains.setdefault(slot, {})
-        if which in d:
-            return d[which]
+    def _pool_agent(self, slot: int, member: str):
+        """Borrow the agent a member needs from the slot's pool (lazily
+        created): Phillip -> the shared-module wrapper; anything else ->
+        the slot policy (ours_main). Parking onto ours_spare is done by
+        begin_transition, which is the only caller that needs it."""
+        pool = self._pool.setdefault(slot, _SlotPool())
         n = len(self.groups[("slot", slot)])
-        if which == "main":
-            agent = self.opponents[("slot", slot)]
-        elif which == "spare":
-            if self.outgoing_factory is None:
-                return None
-            agent = self.outgoing_factory(n)
-        elif which == "phillip":
-            assert self.phillip_factory is not None, (
-                "a slot is assigned to phillip but worker.phillip_factory "
-                "was never set (train_rl sets it at startup under "
-                "league_phillip)"
-            )
-            agent = self.phillip_factory(n)
-        else:
-            raise KeyError(which)
-        d[which] = _Brain(agent, "phillip" if which == "phillip" else "ours")
-        return d[which]
+        if member == "phillip":
+            if pool.phillip is None:
+                assert self.phillip_factory is not None, (
+                    "a slot is assigned to phillip but worker.phillip_factory "
+                    "was never set (train_rl sets it at startup under "
+                    "league_phillip)"
+                )
+                pool.phillip = self.phillip_factory(n)
+            return pool.phillip
+        if pool.ours_main is None:
+            pool.ours_main = self.opponents[("slot", slot)]
+        return pool.ours_main
 
     def _rows_on(self, slot: int, key: str | None) -> list[int]:
         if key is None:
@@ -1239,86 +1246,98 @@ class DolphinRolloutWorker:
             if self.env_member.get(i) == key
         ]
 
-    def _release_idle_brains(self, slot: int) -> None:
-        """A brain whose member is neither the slot's incoming nor fought by
-        any env anymore goes idle (its member label clears)."""
-        inc = self.slot_incoming.get(slot)
-        for b in self._brains.get(slot, {}).values():
-            if b.member is not None and b.member != inc and not self._rows_on(slot, b.member):
-                b.member = None
+    def _release_outgoing(self, slot: int) -> None:
+        """The outgoing seat empties once no env fights its member."""
+        seats = self._seats.get(slot)
+        if seats and seats["outgoing"] is not None:
+            if not self._rows_on(slot, seats["outgoing"].member):
+                seats["outgoing"] = None
+
+    def _needs_slot_policy(self, member: str) -> bool:
+        """Does this member live in the slot policy module? (ghosts,
+        imports, teacher copies do; phillip has his own module; cpu has
+        none). The ONE model-specific predicate in the transition logic."""
+        return member != "cpu" and member != "phillip"
+
+    def _seat_for(self, slot: int, member: str) -> "_Seat | None":
+        if member == "cpu":
+            return None  # engine AI: no brain, no seat
+        return _Seat(member, self._pool_agent(slot, member))
+
+    def _park(self, slot: int, seat: _Seat, slot_policy) -> _Seat:
+        """The slot policy is about to be overwritten while envs still
+        fight its occupant: copy its weights into the pool's spare module
+        and re-seat the occupant there."""
+        assert self.outgoing_factory is not None and slot_policy is not None, (
+            "deferred adoption needs a spare-brain factory (train_rl sets "
+            "worker.outgoing_factory) and the slot policy to park"
+        )
+        pool = self._pool[slot]
+        if pool.ours_spare is None:
+            pool.ours_spare = self.outgoing_factory(len(self.groups[("slot", slot)]))
+        pool.ours_spare.policy.load_state_dict(slot_policy.state_dict())
+        return _Seat(seat.member, pool.ours_spare)
+
+    def _evict_outgoing(self, slot: int, onto: str) -> None:
+        """Rare: a transition still open when the next auction lands (a
+        game longer than a whole snapshot_interval). The outgoing seat must
+        be freed, so its remaining rows take ONE mid-game swap. Loud."""
+        out = self._seats[slot]["outgoing"]
+        if out is None:
+            return
+        rows = self._rows_on(slot, out.member)
+        if rows:
+            print(f"slot {slot}: {len(rows)} env(s) still on {out.member} "
+                  f"when the next member arrived — forcing onto {onto} "
+                  f"(one mid-game swap)", flush=True)
+            for i in rows:
+                self.env_member[i] = onto
+        self._seats[slot]["outgoing"] = None
 
     def begin_transition(
         self, slot: int, new_key: str, char_lock: str | None,
         slot_policy=None,
     ) -> None:
-        """Announce slot `slot`'s next member. Called by
-        pool.apply_assignments BEFORE it loads a policy member's weights
-        into the slot policy, so the main brain's current weights can be
-        parked in the spare for the envs still mid-game on them.
+        """Announce slot `slot`'s next member (called by
+        pool.apply_assignments BEFORE it loads any weights into the slot
+        policy).
 
         Boot (no member yet): every env adopts immediately — nothing is in
         flight — and a char lock is written into the env specs so the very
-        FIRST game already pins it (the spawn reads spec.opponent_char).
-        Later: the brain that will embody new_key is claimed (main for
-        policy members, the phillip wrapper for phillip, none for cpu);
-        whatever main held stays served — parked in the spare if main is
-        about to be overwritten, in place otherwise; every env of the slot
-        becomes pending and flips in _adopt_pending."""
+        FIRST game already pins it.
+        Later: the occupant of `current` moves to `outgoing` if any env is
+        still fighting it (parked onto the spare module when the newcomer
+        needs the slot policy), `current` becomes the newcomer, and every
+        env of the slot is pending until its own game boundary
+        (_adopt_pending)."""
         idx = self.groups.get(("slot", slot), [])
+        seats = self._seats.setdefault(slot, {"current": None, "outgoing": None})
         old = self.slot_incoming.get(slot)
-        main = self._brain(slot, "main")
-        if old is None:
+        if old == new_key:
+            return
+        if old is None:  # boot
             for i in idx:
                 self.env_member[i] = new_key
                 if char_lock is not None and new_key != "cpu":
                     self.specs[i].opponent_char = char_lock
-            if new_key == "phillip":
-                self._brain(slot, "phillip").member = "phillip"
-            elif self.member_kind(new_key) in self._POLICY_KINDS:
-                main.member = new_key
-            self.slot_incoming[slot] = new_key
-            self.slot_pending.pop(slot, None)
-            return
-        if old == new_key:
-            return
-        if self.member_kind(new_key) in self._POLICY_KINDS:
-            # main is about to be overwritten with new_key's weights
-            held = main.member
-            rows_held = self._rows_on(slot, held)
-            if rows_held:
-                spare = self._brain(slot, "spare")
-                if spare is not None and slot_policy is not None:
-                    rows_spare = self._rows_on(slot, spare.member)
-                    if rows_spare:
-                        # the spare is needed for `held`: rows still on the
-                        # previous spare member take ONE mid-game swap onto
-                        # `held` (a game longer than a whole
-                        # snapshot_interval). Loud; should be rare.
-                        print(f"slot {slot}: {len(rows_spare)} env(s) still "
-                              f"on {spare.member} when {new_key} arrived — "
-                              f"forcing onto {held} (one mid-game swap)",
-                              flush=True)
-                        for i in rows_spare:
-                            self.env_member[i] = held
-                    spare.agent.policy.load_state_dict(slot_policy.state_dict())
-                    spare.member = held
-                else:
-                    # no spare brain available: legacy instant swap
-                    for i in rows_held:
-                        self.env_member[i] = new_key
-            main.member = new_key
-        elif new_key == "phillip":
-            # shared frozen weights: nothing to load; main keeps its member
-            # in place for the rows still on it
-            self._brain(slot, "phillip").member = "phillip"
-        # cpu: no brain; main/phillip keep serving their rows until recycle
+        else:
+            cur = seats["current"]
+            if cur is not None and self._rows_on(slot, cur.member):
+                self._evict_outgoing(slot, onto=cur.member)
+                seats["outgoing"] = (
+                    self._park(slot, cur, slot_policy)
+                    if self._needs_slot_policy(cur.member)
+                    and self._needs_slot_policy(new_key)
+                    else cur  # agent undisturbed: serves in place
+                )
+        seats["current"] = self._seat_for(slot, new_key)
         self.slot_incoming[slot] = new_key
         pend = {i for i in idx if self.env_member.get(i) != new_key}
         if pend:
             self.slot_pending[slot] = pend
         else:
             self.slot_pending.pop(slot, None)
-        self._release_idle_brains(slot)
+        self._release_outgoing(slot)
 
     def _adopt_pending(self, payloads: list[dict], resets_d) -> None:
         """Flip pending envs onto their slot's incoming member at their game
@@ -1347,7 +1366,7 @@ class DolphinRolloutWorker:
                     pend.discard(i)
             if not pend:
                 del self.slot_pending[slot]
-            self._release_idle_brains(slot)
+            self._release_outgoing(slot)
 
     @staticmethod
     def _merge_records(parts: list[tuple[list[int], list]]) -> list:
@@ -1514,18 +1533,18 @@ class DolphinRolloutWorker:
             ph_agent = None
             for name, idx in self.groups.items():
                 if isinstance(name, tuple):
-                    # slot group: every resident brain with live rows steps
-                    # the slot's FULL batch (stable compile shape, per-row
-                    # recurrent state undisturbed; unused rows' state is
-                    # junk that re-zeros at their next boundary) and the
-                    # controllers are routed per row. Phillip brains also
-                    # feed the imitation harvest. Before any auction (no
-                    # brains yet) the slot policy serves every row,
-                    # unlabeled.
+                    # slot group: each occupied seat (current, outgoing)
+                    # with live rows steps the slot's FULL batch (stable
+                    # compile shape, per-row recurrent state undisturbed;
+                    # unused rows' state is junk that re-zeros at their
+                    # next boundary) and the controllers are routed per
+                    # row. A Phillip seat also feeds the imitation harvest.
+                    # Before any auction (no seats yet) the slot policy
+                    # serves every row, unlabeled.
                     k = name[1]
-                    brains = self._brains.get(k)
+                    seats = self._seats.get(k)
                     sel = torch.tensor(idx, device=device)
-                    if not brains:
+                    if not seats:
                         live = [i for i in idx if i not in cpu_now]
                         if live:
                             group_view = tree.map_structure(
@@ -1539,12 +1558,12 @@ class DolphinRolloutWorker:
                                     opp_controllers[env_i] = ctrls[j]
                         continue
                     group_view = None
-                    for b in brains.values():
-                        if b.member is None:
+                    for seat in (seats["current"], seats["outgoing"]):
+                        if seat is None:
                             continue
                         live = [
                             i for i in idx
-                            if self.env_member.get(i) == b.member
+                            if self.env_member.get(i) == seat.member
                             and i not in cpu_now
                         ]
                         if not live:
@@ -1553,15 +1572,15 @@ class DolphinRolloutWorker:
                             group_view = tree.map_structure(
                                 lambda x: x.index_select(0, sel), opponent_view
                             )
-                        ctrls, recs, _ = b.agent.step(group_view, resets_dev[sel])
+                        ctrls, recs, _ = seat.agent.step(group_view, resets_dev[sel])
                         for j, env_i in enumerate(idx):
                             if env_i in live:
                                 opp_controllers[env_i] = ctrls[j]
-                        if b.config == "phillip":
+                        if seat.member == "phillip":
                             local = [j for j, env_i in enumerate(idx) if env_i in live]
                             ph_parts.append((local, recs))
                             ph_rows.extend(live)
-                            ph_agent = b.agent
+                            ph_agent = seat.agent
                     continue
                 if cpu_now and all(i in cpu_now for i in idx):
                     # whole slot serving CPU lvl-9: no brain to run — skip
