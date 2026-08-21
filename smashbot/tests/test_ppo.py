@@ -424,3 +424,29 @@ def test_fp16_dtype_receipts_cuda():
     _, metrics = learner.step([traj], learner.initial_state(3, "cuda"))
     assert np.isfinite(metrics["post_update"]["loss"])
     assert learner.grad_scaler.get_scale() > 0
+
+
+@pytest.mark.parametrize("k", [2, 3])
+def test_micro_batches_give_identical_update(k):
+    """Chunked policy pass with exact valid-weighted accumulation produces the
+    same parameters after one step as the full-batch pass (fp32, no scaler);
+    the loss/metric means agree too."""
+    torch.manual_seed(0)
+    full, traj = _make_learner(learning_rate=1e-3, micro_batches=1)
+    torch.manual_seed(0)
+    chunked, _ = _make_learner(learning_rate=1e-3, micro_batches=k)
+    # make the update non-trivial: perturb both policies identically away
+    # from the actor so ratios != 1
+    with torch.no_grad():
+        for (a, b) in zip(full.policy.parameters(), chunked.policy.parameters()):
+            noise = torch.randn_like(a) * 1e-2
+            a.add_(noise); b.add_(noise)
+    st_f = full.initial_state(traj.rewards.shape[0])
+    st_c = chunked.initial_state(traj.rewards.shape[0])
+    _, mf = full.step([traj], st_f)
+    _, mc = chunked.step([traj], st_c)
+    for pa, pb in zip(full.policy.parameters(), chunked.policy.parameters()):
+        torch.testing.assert_close(pa, pb, rtol=1e-6, atol=1e-7)
+    assert mf["reverted"] == mc["reverted"]
+    assert mf["post_update"]["actor_kl_mean"] == pytest.approx(
+        mc["post_update"]["actor_kl_mean"], rel=1e-5, abs=1e-9)

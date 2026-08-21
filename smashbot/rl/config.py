@@ -251,6 +251,10 @@ class RLConfig:
     # measured recipe: scripts/precision_probe.py fp16s arm, receipts in
     # /home/kage/drive2/ShineBot/probes/batch-0013549.pt.fidelity.json).
     precision: str = "fp32"
+    # PPO policy pass in this many row chunks with gradient accumulation:
+    # identical gradient and update, ~1/k the live activation memory
+    # (rows x 240 unrolls), ~20 ms/step overhead at k=2 (measured)
+    micro_batches: int = 1
     ppo: PPOConfig = dataclasses.field(default_factory=PPOConfig)
     # --- opponent advantage imitation (docs/idea-opponent-learning.md) ---
     # Memory-neutral substitution: up to imitation_slots harvested opponent

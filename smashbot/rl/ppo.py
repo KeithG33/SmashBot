@@ -514,6 +514,15 @@ class Learner:
             n_valid = imf.valid.sum().clamp(min=1.0)
             return -(imf.weights * out.log_probs * imf.valid).sum() / n_valid
 
+    @classmethod
+    def _row_chunks(cls, fixed: _Fixed, k: int) -> list:
+        n = fixed.valid.shape[0]
+        bounds = [round(j * n / k) for j in range(k + 1)]
+        return [
+            cls._slice_fixed(fixed, range(bounds[j], bounds[j + 1]))
+            for j in range(k) if bounds[j + 1] > bounds[j]
+        ]
+
     @staticmethod
     def _slice_fixed(fixed: _Fixed, rows: tp.Sequence[int]) -> _Fixed:
         """Row (env-dim) subset of a fixed pass, for PPO-row substitution."""
@@ -641,6 +650,14 @@ class Learner:
             [self._slice_fixed(f, keep_rows) for f in fixed_list]
             if keep_rows is not None else fixed_list
         )
+        check_fixed = train_fixed  # post-update KL check: full rows, no grad
+        if cfg.micro_batches > 1:
+            train_fixed = [
+                c for f in train_fixed for c in self._row_chunks(f, cfg.micro_batches)
+            ]
+        # exact accumulation: each chunk's mean-over-valid loss weighted by its
+        # share of all valid positions reproduces the full-batch mean
+        total_valid = sum(float(f.valid.sum()) for f in train_fixed) or 1.0
 
         snapshot = copy.deepcopy(self.policy.state_dict())
 
@@ -656,7 +673,7 @@ class Learner:
                     print("NONFINITE LOSS: skipping minibatch")
                     batch_metrics.append(metrics)
                     continue
-                self._backward(loss / len(train_fixed))
+                self._backward(loss * (float(fixed.valid.sum()) / total_valid))
                 any_backward = True
                 batch_metrics.append(metrics)
             if imit_fixed and lambda_t > 0.0:
@@ -709,7 +726,7 @@ class Learner:
 
         # Post-update measurement (and trust-region backstop).
         with torch.no_grad():
-            post = _mean_dicts([self._policy_loss(f)[1] for f in train_fixed])
+            post = _mean_dicts([self._policy_loss(f)[1] for f in check_fixed])
         reverted = post["actor_kl_mean"] > cfg.ppo.max_mean_actor_kl
         if reverted:
             self.policy.load_state_dict(snapshot)

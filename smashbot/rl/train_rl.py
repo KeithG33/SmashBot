@@ -410,11 +410,22 @@ def main() -> None:
                     teacher_swaps += 1
                     print(f"[{i}] TEACHER SWAPPED (#{teacher_swaps})")
             trajectories = worker.collect(args.runtime.trajectories_per_step)
+            if os.environ.get("SMASHBOT_PROFILE") and device == "cuda":
+                torch.cuda.synchronize()
+                _base = torch.cuda.memory_allocated()
+                torch.cuda.reset_peak_memory_stats()
             state, metrics = learner.step(
                 trajectories, state,
                 progress=i / max(1, args.runtime.steps),
                 row_kinds=worker.row_kinds,
             )
+            if os.environ.get("SMASHBOT_PROFILE") and device == "cuda":
+                torch.cuda.synchronize()
+                peak = torch.cuda.max_memory_allocated()
+                print(f"[vram] step {i}: baseline {_base / 2**30:.2f} GiB "
+                      f"(inference residency: weights + graph pools) | learner peak "
+                      f"{peak / 2**30:.2f} GiB | activations {(peak - _base) / 2**30:.2f} GiB | "
+                      f"reserved {torch.cuda.memory_reserved() / 2**30:.2f} GiB", flush=True)
 
             if i % args.runtime.log_interval == 0:
                 # frames THIS BOOT only: after a restore, i includes the
