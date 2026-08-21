@@ -868,14 +868,25 @@ def test_apply_assignments_teacher_copy_and_cpu_lazy(tmp_path):
     from smashbot.rl.pool import apply_assignments
 
     class _Worker:
+        """Records begin_transition announcements (the worker's deferred
+        adoption bookkeeping is exercised by the collect-loop tests)."""
         def __init__(self):
-            self.slot_serving = {}
             self.slot_desired = {}
             self.slot_char_lock = {}
+            self.announced = []
+
+        def begin_transition(self, slot, key, lock, slot_policy=None):
+            # the announcement must see the PREVIOUS weights: snapshot them
+            self.announced.append((
+                slot, key, lock,
+                None if slot_policy is None
+                else slot_policy.weight.detach().clone(),
+            ))
 
     torch.manual_seed(0)
     teacher = torch.nn.Linear(3, 2)
     slot0, slot1 = torch.nn.Linear(3, 2), torch.nn.Linear(3, 2)
+    init1 = slot1.weight.detach().clone()
     ghost = torch.nn.Linear(3, 2)
     snap = str(tmp_path / "snapshot-0000100.pt")
     torch.save(ghost.state_dict(), snap)
@@ -886,10 +897,13 @@ def test_apply_assignments_teacher_copy_and_cpu_lazy(tmp_path):
     torch.testing.assert_close(slot0.weight, ghost.weight)
     torch.testing.assert_close(slot1.weight, teacher.weight)
     assert keys == {0: snap, 1: "teacher"}
-    assert w.slot_serving == {0: "snapshot", 1: "teacher"}
     assert w.slot_desired == {0: "policy", 1: "policy"}
     # non-import members never set a char lock
     assert w.slot_char_lock == {0: None, 1: None}
+    # announced BEFORE the load: slot1 still held its init weights
+    assert [(a[0], a[1], a[2]) for a in w.announced] == [
+        (0, snap, None), (1, "teacher", None)]
+    torch.testing.assert_close(w.announced[1][3], init1)
 
     # the copy is a snapshot of the live module, not a reference: a teacher
     # hot-swap mid-epoch leaves the serving slot on its copy until refresh
@@ -897,26 +911,26 @@ def test_apply_assignments_teacher_copy_and_cpu_lazy(tmp_path):
         teacher.weight.add_(1.0)
     assert not torch.equal(slot1.weight, teacher.weight)
 
-    # "cpu": desired flips; serving/keys stay on the previous member so
-    # results from not-yet-adopted envs keep attributing correctly
+    # "cpu": desired flips; the slot policy is left alone (envs adopt cpu
+    # at their recycle; until then they play the parked weights)
+    frozen = {k: v.detach().clone() for k, v in slot1.state_dict().items()}
     apply_assignments([snap, "cpu"], [(1, slot1)], teacher, w, keys)
-    assert w.slot_desired[1] == "cpu"
-    assert w.slot_serving[1] == "teacher" and keys[1] == "teacher"
+    assert w.slot_desired[1] == "cpu" and keys[1] == "cpu"
+    for k, v in slot1.state_dict().items():
+        assert torch.equal(v, frozen[k])
 
     # "phillip": routing only — the slot policy module is NEVER touched
-    # (his architecture differs); serving/keys flip instantly like a
-    # snapshot swap, desired returns to "policy" (standard controllers)
-    frozen = {k: v.detach().clone() for k, v in slot1.state_dict().items()}
+    # (his architecture differs); desired returns to "policy"
     apply_assignments([snap, "phillip"], [(1, slot1)], teacher, w, keys)
-    assert w.slot_serving[1] == "phillip" and keys[1] == "phillip"
+    assert keys[1] == "phillip"
     assert w.slot_desired[1] == "policy"
     for k, v in slot1.state_dict().items():
         assert torch.equal(v, frozen[k])
 
     # short assignment list (early training): out-of-range slots untouched
-    before = (w.slot_serving[1], w.slot_desired[1], keys[1])
+    before = (w.slot_desired[1], keys[1], len(w.announced))
     apply_assignments([snap], [(0, slot0), (1, slot1)], teacher, w, keys)
-    assert (w.slot_serving[1], w.slot_desired[1], keys[1]) == before
+    assert (w.slot_desired[1], keys[1], len(w.announced) - 1) == before
 
 
 def test_league_payoff_persistence_and_thinning(tmp_path):
@@ -969,14 +983,18 @@ def test_league_cpu_lazy_adoption_worker(monkeypatch):
                  if sp.kind == "snapshot"]
     assert slot_envs == [2, 3]
     calls = []
-    worker.on_snapshot_game = lambda s, w, k: calls.append((s, w, k))
+    worker.on_snapshot_game = lambda key, w: calls.append((key, w))
+    slot_policy = worker.opponents[("slot", 0)].policy
 
     def cmds(i):
         got = worker._conns[i].sent[-1]
         return got
 
-    # phase 1: desired=policy (default): slot envs get both seats' inputs
-    # plus the opp_kind marker; teacher envs are untouched
+    # phase 1: boot assignment (adopted immediately — nothing in flight);
+    # desired=policy: slot envs get both seats' inputs plus the opp_kind
+    # marker; teacher envs are untouched
+    worker.begin_transition(0, "ghostA", None, slot_policy)
+    assert {worker.env_member[i] for i in slot_envs} == {"ghostA"}
     envs.final_stocks[2] = (4, 0)  # port1 (student) wins on a slot env
     worker.collect(1)
     for i in slot_envs:
@@ -987,23 +1005,29 @@ def test_league_cpu_lazy_adoption_worker(monkeypatch):
         port = worker.specs[i].student_port
         assert set(cmds(i)) == {port, 3 - port}
     assert worker.trackers["snapshot"].wins == 1
-    assert calls == [(0, True, "snapshot")]
+    assert calls == [("ghostA", True)]
 
-    # phase 1b: the slot's policy holds live-teacher weights: games log
-    # under the teacher kind for ticker/wandb continuity
-    worker.slot_serving[0] = "teacher"
+    # phase 1b: the slot moves to live-teacher weights. No spare-brain
+    # factory in this harness -> legacy instant swap; games log under the
+    # teacher kind for ticker/wandb continuity and credit "teacher"
+    worker.begin_transition(0, "teacher", None, slot_policy)
+    assert {worker.env_member[i] for i in slot_envs} == {"teacher"}
     envs.final_stocks[3] = (0, 4)
     worker.collect(1)
     tracked = (worker.trackers["teacher"].wins,
                worker.trackers["teacher"].losses)
     assert tracked == ((1, 0) if worker.specs[3].student_port == 2
                        else (0, 1))
-    assert calls[-1][2] == "teacher"
-    worker.slot_serving[0] = "snapshot"
+    assert calls[-1][0] == "teacher"
+    worker.begin_transition(0, "ghostA", None, slot_policy)
 
     # phase 2: refresh desires cpu — envs have NOT adopted yet: inputs still
-    # flow to the opponent seat, results still attribute to the snapshot
+    # flow to the opponent seat FROM THE SLOT POLICY IN PLACE (cpu never
+    # overwrites it), results still attribute to the snapshot
+    worker.begin_transition(0, "cpu", None, slot_policy)
     worker.slot_desired[0] = "cpu"
+    assert worker.slot_inplace_key[0] == "ghostA"
+    assert worker.slot_pending[0] == set(slot_envs)
     envs.final_stocks[2] = (4, 0)
     worker.collect(1)
     for i in slot_envs:
@@ -1012,7 +1036,7 @@ def test_league_cpu_lazy_adoption_worker(monkeypatch):
         assert cmds(i)["opp_kind"] == "cpu"
     assert worker.trackers["snapshot"].wins == 2
     assert worker.trackers["cpu"].wins == 0
-    assert calls[-1] == (0, True, "snapshot")
+    assert calls[-1] == ("ghostA", True)
 
     # phase 3: env 2 adopts at its recycle; env 3 hasn't — mixed slot still
     # runs the (full-batch) policy, but the cpu env gets no opponent input
@@ -1026,7 +1050,10 @@ def test_league_cpu_lazy_adoption_worker(monkeypatch):
     assert set(cmds(3)) == {p3, 3 - p3, "opp_kind"}
     assert worker.trackers["cpu"].wins == 1  # env 2's game: actual cpu
     assert worker.trackers["snapshot"].wins == 3  # env 3: still policy
-    assert {calls[-1], calls[-2]} == {(0, True, "cpu"), (0, True, "snapshot")}
+    assert {calls[-1], calls[-2]} == {("cpu", True), ("ghostA", True)}
+    # env 2 adopted cpu at its boundary; env 3 is still pending on ghostA
+    assert worker.env_member[2] == "cpu" and worker.env_member[3] == "ghostA"
+    assert worker.slot_pending[0] == {3}
 
     # phase 4: whole slot serving cpu: opponent inference skipped for the
     # slot, and collect() still yields well-formed full-budget trajectories
@@ -1160,7 +1187,8 @@ def test_league_phillip_routing_and_multislot(monkeypatch):
                if sp.kind == "snapshot"}
     assert slot_of == {2: 0, 3: 0, 4: 1, 5: 1}
     calls = []
-    worker.on_snapshot_game = lambda s, w, k: calls.append((s, w, k))
+    worker.on_snapshot_game = lambda key, w: calls.append((key, w))
+    pol = {g: worker.opponents[("slot", g)].policy for g in (0, 1)}
     steps = {0: 0, 1: 0}
 
     def wrap(g):
@@ -1176,23 +1204,33 @@ def test_league_phillip_routing_and_multislot(monkeypatch):
     wrap(0)
     wrap(1)
 
-    # no phillip serving: both slot agents run, no phillip agent exists
+    # boot assignments; no phillip serving: both slot agents run, no
+    # phillip agent exists
+    worker.begin_transition(0, "ghostA", None, pol[0])
+    worker.begin_transition(1, "ghostB", None, pol[1])
     worker.collect(1)
     assert steps[0] > 0 and steps[1] > 0
     assert worker._phillip_agent is None
 
-    # slot 0 -> phillip: its agent stops stepping, phillip covers its rows,
-    # results log under "reference" and attribute to the "phillip" key
-    worker.slot_serving[0] = "phillip"
+    # slot 0 -> phillip (deferred): rows keep ghostA until THEIR game ends.
+    # Deliver both boundaries on the first frame: the ended games still
+    # credit ghostA; from that frame on phillip covers the rows and the
+    # slot-0 policy idles
+    worker.begin_transition(0, "phillip", None, pol[0])
+    assert worker.slot_pending[0] == {2, 3}
+    assert worker.slot_inplace_key[0] == "ghostA"
     s0 = steps[0]
-    envs.final_stocks[2] = (4, 0)  # port-1 student wins on a phillip row
+    envs.final_stocks[2] = (4, 0)  # port-1 student wins on a ghostA game
+    envs.final_stocks[3] = (4, 0)
     (traj,) = worker.collect(1)
-    assert steps[0] == s0  # slot-0 policy idle
+    assert steps[0] == s0  # adopted on the boundary frame: policy idle
     assert worker._phillip_agent is not None
     assert worker._phillip_agent.num_envs == 2
-    assert worker.trackers["reference"].wins == 1
-    assert worker.trackers["snapshot"].wins == 0
-    assert calls[-1] == (0, True, "phillip")
+    assert worker.trackers["snapshot"].wins >= 1
+    assert worker.trackers["reference"].wins == 0
+    assert {c[0] for c in calls[-2:]} == {"ghostA"}  # both ended games
+    assert 0 not in worker.slot_pending and 0 not in worker.slot_inplace_key
+    assert worker.env_member[2] == worker.env_member[3] == "phillip"
     for i in (2, 3):
         port = worker.specs[i].student_port
         assert all(set(cmd) == {port, 3 - port}
@@ -1200,19 +1238,33 @@ def test_league_phillip_routing_and_multislot(monkeypatch):
     assert traj.rewards.shape[0] == 6  # full learner-row budget
     assert torch.isfinite(traj.rewards).all()
 
-    # multi-slot occupancy: agent rebuilt over both slots' rows
-    worker.slot_serving[1] = "phillip"
+    # a game played by phillip logs under "reference" and pays "phillip"
+    envs.final_stocks[2] = (4, 0)
+    worker.collect(1)
+    assert worker.trackers["reference"].wins == 1
+    assert calls[-1] == ("phillip", True)
+
+    # multi-slot occupancy: agent rebuilt over both slots' rows once slot
+    # 1's envs cross their boundaries
+    worker.begin_transition(1, "phillip", None, pol[1])
     s1 = steps[1]
+    envs.final_stocks[4] = (4, 0)
+    envs.final_stocks[5] = (4, 0)
     worker.collect(1)
     assert steps[1] == s1
     assert worker._phillip_agent.num_envs == 4
     assert worker._phillip_rows_built == [2, 3, 4, 5]
 
-    # back to snapshots: routing reverts instantly (hot-swap, no reboot)
-    worker.slot_serving.pop(0)
-    worker.slot_serving.pop(1)
+    # back to snapshots: rows leave phillip at their boundaries and the
+    # slot policies (now holding the new ghosts) resume stepping
+    worker.begin_transition(0, "ghostC", None, pol[0])
+    worker.begin_transition(1, "ghostD", None, pol[1])
+    for i in (2, 3, 4, 5):
+        envs.final_stocks[i] = (4, 0)
     worker.collect(1)
     assert steps[0] > s0 and steps[1] > s1
+    assert {worker.env_member[i] for i in (2, 3)} == {"ghostC"}
+    assert {worker.env_member[i] for i in (4, 5)} == {"ghostD"}
 
 
 def test_league_phillip_imitation_follows_serving(monkeypatch):
@@ -1231,7 +1283,13 @@ def test_league_phillip_imitation_follows_serving(monkeypatch):
     trajs = worker.collect(1)
     assert [t.kind for t in trajs] == ["ppo"]  # phillip serving nothing
 
-    worker.slot_serving[0] = "phillip"
+    # slot 0 -> phillip; rows adopt at their boundaries (delivered now)
+    slot_envs = [i for i, sp in enumerate(worker.specs)
+                 if sp.kind == "snapshot"]
+    worker.begin_transition(0, "ghostA", None)
+    worker.begin_transition(0, "phillip", None)
+    for i in slot_envs:
+        envs.final_stocks[i] = (4, 0)
     trajs = worker.collect(3)
     imits = [t for t in trajs if t.kind == "imitation"]
     assert imits  # harvested once his chunks fill
@@ -1256,7 +1314,9 @@ def test_league_phillip_imitation_follows_serving(monkeypatch):
 
     # occupancy change mid-stream: partial chunk dropped, no output, no
     # crash; serving again restarts a fresh chunk
-    worker.slot_serving.pop(0)
+    worker.begin_transition(0, "ghostB", None)
+    for i in slot_envs:
+        envs.final_stocks[i] = (4, 0)
     trajs = worker.collect(1)
     assert [t.kind for t in trajs] == ["ppo"]
     assert worker._imit_rows == []
@@ -1423,8 +1483,12 @@ def test_import_serving_char_lock_and_attribution(monkeypatch, tmp_path):
     for k, v in ghost.state_dict().items():
         assert torch.equal(v, m0.state_dict()[k]), k
     assert keys == {0: snap, 1: "import:v3"}
-    assert worker.slot_serving == {0: "snapshot", 1: "snapshot"}
     assert worker.slot_char_lock == {0: None, 1: "MARTH"}
+    # boot assignment: envs adopt immediately and the locked import's env
+    # spec already pins the character for its very first game
+    assert worker.env_member == {2: snap, 3: "import:v3"}
+    assert worker.specs[3].opponent_char == "MARTH"
+    assert not worker.slot_pending
 
     # an import assignment without the registry fails loudly
     with pytest.raises(AssertionError, match="import registry"):
@@ -1435,9 +1499,7 @@ def test_import_serving_char_lock_and_attribution(monkeypatch, tmp_path):
     # payoff attribution exactly as train_rl wires it
     pool = SnapshotPool(str(tmp_path / "pool"), slots=2,
                         league_members=("import:v3",))
-    worker.on_snapshot_game = lambda s, won, kind: pool.record_result(
-        "cpu" if kind == "cpu" else keys[s], won
-    )
+    worker.on_snapshot_game = lambda key, won: pool.record_result(key, won)
     envs.final_stocks[3] = (4, 0)  # student (port 1) beats the import
     worker.collect(1)
     assert pool.payoff["import:v3"] == pytest.approx(
@@ -1457,13 +1519,18 @@ def test_import_serving_char_lock_and_attribution(monkeypatch, tmp_path):
         else:
             assert all(set(c) == {port, 3 - port} for c in conn.sent)
 
-    # slot moves off the import: lock clears, envs are told to unlock
+    # slot moves off the import: lock clears, envs are told to unlock —
+    # but env 3 keeps FIGHTING the import until its game ends (deferred
+    # adoption): no spare-brain factory here, so the harness falls back to
+    # an instant brain swap, while the label still follows the brain
     apply_assignments(
         [snap, "teacher"], [(0, m0), (1, m1)], teacher_module, worker,
         keys, imports=imports,
     )
     assert worker.slot_char_lock == {0: None, 1: None}
     assert keys[1] == "teacher"
+    assert worker.env_member[3] == "teacher"  # legacy instant swap
+    assert not worker.slot_pending
     worker.collect(1)
     assert worker._conns[3].sent[-1]["opp_char_lock"] is None
 
@@ -1684,3 +1751,122 @@ def test_pfsp_hard_frac_blend_serves_unbeatable(tmp_path):
     for seed in range(30):
         picks.update(pool.assignments(random.Random(seed)))
     assert "phillip" in picks  # hard draws bring him back
+
+
+def _wrap_steps(agent, counter, key):
+    orig = agent.step
+
+    def stepped(*a, **k):
+        counter[key] += 1
+        return orig(*a, **k)
+
+    agent.step = stepped
+
+
+def test_deferred_adoption_parks_old_brain_until_boundary(monkeypatch):
+    """Policy->policy reassignment with a spare-brain factory: the OLD
+    weights are parked in the spare module and keep driving the slot's envs
+    (brain + payoff label) until each env's own game boundary; rows flip
+    one by one; the slot policy (new weights) only steps once a row has
+    adopted; the spare is released when the last row crosses."""
+    worker, envs = _make_worker(
+        monkeypatch, num_envs=4, teacher_envs=2, snapshot_slots=1,
+    )
+    slot_envs = [i for i, sp in enumerate(worker.specs)
+                 if sp.kind == "snapshot"]
+    assert slot_envs == [2, 3]
+    worker.outgoing_factory = lambda n: BatchedPolicyAgent(
+        _tiny_policy(seed=50), n, name_code=1
+    )
+    calls = []
+    worker.on_snapshot_game = lambda key, w: calls.append((key, w))
+    slot_agent = worker.opponents[("slot", 0)]
+    pol = slot_agent.policy
+    steps = {"slot": 0, "spare": 0}
+    _wrap_steps(slot_agent, steps, "slot")
+
+    worker.begin_transition(0, "ghostA", None, pol)
+    worker.collect(1)
+    assert steps["slot"] > 0 and not worker._outgoing_agents
+
+    # auction: ghostA -> ghostB. Announce, THEN overwrite the slot policy
+    # (exactly apply_assignments' order)
+    old_w = {k: v.detach().clone() for k, v in pol.state_dict().items()}
+    worker.begin_transition(0, "ghostB", None, pol)
+    pol.load_state_dict(_tiny_policy(seed=8).state_dict())
+    spare = worker._outgoing_agents[0]
+    _wrap_steps(spare, steps, "spare")
+    for k, v in spare.policy.state_dict().items():
+        assert torch.equal(v, old_w[k]), k  # parked = the OLD brain
+    assert worker.slot_spare_key[0] == "ghostA"
+    assert worker.slot_pending[0] == {2, 3}
+    assert {worker.env_member[i] for i in slot_envs} == {"ghostA"}
+
+    # no boundary yet: only the spare drives the rows; every env still
+    # receives an opponent-seat controller
+    s_slot, s_spare = steps["slot"], steps["spare"]
+    worker.collect(1)
+    assert steps["spare"] > s_spare and steps["slot"] == s_slot
+    for i in slot_envs:
+        port = worker.specs[i].student_port
+        assert all({port, 3 - port} <= set(c) for c in worker._conns[i].sent)
+
+    # env 2's game ends: that game is ghostA's; env 2 adopts ghostB, env 3
+    # is still on ghostA -> both brains step, routed per row
+    envs.final_stocks[2] = (4, 0)
+    s_slot, s_spare = steps["slot"], steps["spare"]
+    worker.collect(1)
+    assert calls[-1][0] == "ghostA"
+    assert worker.env_member[2] == "ghostB" and worker.env_member[3] == "ghostA"
+    assert worker.slot_pending[0] == {3}
+    assert steps["slot"] > s_slot and steps["spare"] > s_spare
+
+    # env 3 crosses: transition complete, spare released
+    envs.final_stocks[3] = (4, 0)
+    worker.collect(1)
+    assert {worker.env_member[i] for i in slot_envs} == {"ghostB"}
+    assert 0 not in worker.slot_pending and 0 not in worker.slot_spare_key
+    s_spare = steps["spare"]
+    envs.final_stocks[2] = (4, 0)
+    worker.collect(1)
+    assert steps["spare"] == s_spare  # idle
+    assert calls[-1][0] == "ghostB"  # ghostB's game, ghostB's row
+
+
+def test_deferred_adoption_waits_for_char_lock(monkeypatch):
+    """A char-locked incoming import is adopted only at a boundary whose
+    new game actually plays the locked character (the CSS pick lags the
+    arming by one game): a boundary with the wrong char keeps the env on
+    the old brain + label; the matching one flips it."""
+    worker, envs = _make_worker(
+        monkeypatch, num_envs=4, teacher_envs=2, snapshot_slots=1,
+        league_imports=["x=/dev/null@MARTH"],
+    )
+    worker.outgoing_factory = lambda n: BatchedPolicyAgent(
+        _tiny_policy(seed=50), n, name_code=1
+    )
+    calls = []
+    worker.on_snapshot_game = lambda key, w: calls.append((key, w))
+    pol = worker.opponents[("slot", 0)].policy
+    worker.begin_transition(0, "ghostA", None, pol)
+    worker.collect(1)
+
+    worker.begin_transition(0, "import:x", "MARTH", pol)
+    worker.slot_char_lock[0] = "MARTH"  # as apply_assignments does
+    # boundary on env 2 but the new game is still FOX (lock not yet at
+    # the CSS): stays on ghostA
+    envs.opp_chars[2] = "FOX"
+    envs.final_stocks[2] = (4, 0)
+    worker.collect(1)
+    assert calls[-1][0] == "ghostA"
+    assert worker.env_member[2] == "ghostA"
+    assert 2 in worker.slot_pending[0]
+    # next boundary: the game starting now IS Marth -> adopt
+    envs.opp_chars[2] = "MARTH"
+    envs.final_stocks[2] = (4, 0)
+    worker.collect(1)
+    assert calls[-1][0] == "ghostA"  # the ended (FOX) game was ghostA's
+    assert worker.env_member[2] == "import:x"
+    envs.final_stocks[2] = (4, 0)
+    worker.collect(1)
+    assert calls[-1][0] == "import:x"  # first Marth game credits the import

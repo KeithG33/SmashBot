@@ -273,19 +273,30 @@ def main() -> None:
         args.rollouts, student_agent, opponents=opponents, specs=specs,
         harvest_imitation=args.learner.imitation_slots > 0,
     )
-    # PFSP payoff attribution: the worker knows env->slot and what each env
-    # ACTUALLY served (lazy cpu adoption included); we know slot->member-key
-    # (snapshot path / "teacher") from the last refresh.
+    # PFSP payoff attribution: the worker reports the member key each env
+    # was ACTUALLY fighting when the game ended (deferred adoption keeps
+    # brain/char/label in lockstep); slot_keys is the auction's log view.
     slot_keys: dict[int, str] = {}
 
-    def _on_snapshot_game(slot: int, won: bool, kind: str = "snapshot") -> None:
-        # kind follows actual serving: "cpu" games credit the cpu member's
-        # row even while the slot's desired member has already moved on
-        key = "cpu" if kind == "cpu" else slot_keys.get(slot)
-        if key:
-            snapshot_pool.record_result(key, won)
+    def _on_snapshot_game(key: str, won: bool) -> None:
+        snapshot_pool.record_result(key, won)
 
     worker.on_snapshot_game = _on_snapshot_game
+    # Spare brain per slot for deferred adoption: a fresh EAGER policy
+    # module (transitions last ~one game; not worth a compile warmup stall
+    # mid-run) wrapped for the slot's env count.
+    def _outgoing_factory(n: int):
+        spare, _, _ = load_policy(args.ckpt, device)
+        spare.train_value_head = False
+        spare.requires_grad_(False)
+        spare.eval()
+        return BatchedPolicyAgent(
+            spare, n, name_code=name_code, device=device,
+            batch_steps=rcfg.batch_steps,
+        )
+
+    if slot_policies:
+        worker.outgoing_factory = _outgoing_factory
     if rcfg.league_phillip:
         # Phillip's own module, loaded ONCE (exactly as ref-envs mode does);
         # his architecture never fits a slot policy, so slots assigned

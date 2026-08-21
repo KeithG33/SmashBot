@@ -557,8 +557,9 @@ def apply_assignments(
 ) -> None:
     """Route one epoch's slot assignments into the serving machinery.
 
-    - snapshot path: load from disk into the slot policy (instant hot-swap,
-      today's behavior); the slot serves kind "snapshot".
+    - snapshot path: load from disk into the slot policy; envs adopt it at
+      their next game boundary (deferred adoption — see
+      rollouts.begin_transition); the slot serves kind "snapshot".
     - "import:NAME": load the imported frozen checkpoint (a bare policy
       state_dict from a PREVIOUS run — same architecture as the student by
       definition) from `imports[key][0]` into the slot policy, exactly like
@@ -580,23 +581,31 @@ def apply_assignments(
       controllers, so no Dolphin reboot is needed.
     - "cpu": only record the desired kind — Dolphin CPU ports cannot hot-swap
       mid-game, so each env adopts (policy|phillip)<->cpu at its NEXT recycle
-      boundary (rollouts._env_process_main). slot_keys/slot_serving are
-      deliberately left on the PREVIOUS member: attribution must follow what
-      each env is ACTUALLY serving, and not-yet-adopted envs still serve the
-      old policy.
+      boundary (rollouts._env_process_main). Attribution follows what each
+      env is ACTUALLY serving (worker.env_member), and not-yet-adopted envs
+      still serve the old policy from the slot's spare module.
     """
     for slot, slot_policy in slot_policies:
         if slot >= len(assigns):
             continue
         key = assigns[slot]
+        lock = (
+            imports[key][1] if imports and _is_import_key(key) else None
+        )
+        # DEFERRED ADOPTION: announce first, so the worker can park the
+        # CURRENT weights in the slot's spare module for envs mid-game on
+        # them; only then overwrite the slot policy with the new member.
+        # Each env flips brain+char+label together at its own next game
+        # boundary (rollouts.begin_transition / _adopt_pending).
+        worker.begin_transition(slot, key, lock, slot_policy)
         if key == "cpu":
             worker.slot_desired[slot] = "cpu"
+            slot_keys[slot] = key
             continue
         if key == "phillip":
-            worker.slot_serving[slot] = "phillip"
+            pass  # routing only: rows move to his agent as they adopt
         elif key == "teacher":
             slot_policy.load_state_dict(teacher_module.state_dict())
-            worker.slot_serving[slot] = "teacher"
         elif _is_import_key(key):
             assert imports is not None and key in imports, (
                 f"slot {slot} assigned {key} but the import registry has no "
@@ -608,17 +617,14 @@ def apply_assignments(
             # bare state_dict, snapshot-pool format; strict load_state_dict
             # raises loudly on any architecture mismatch
             slot_policy.load_state_dict(torch.load(path, map_location=device))
-            worker.slot_serving[slot] = "snapshot"
         else:
             slot_policy.load_state_dict(torch.load(key, map_location=device))
-            worker.slot_serving[slot] = "snapshot"
         worker.slot_desired[slot] = "policy"
-        # char lock follows the member: imports pin their locked char (the
-        # slot's envs stop redrawing the opponent seat); anything else
-        # restores normal per-game redraws. "cpu" never reaches here
-        # (continue above), deliberately leaving the previous member's lock
-        # in place for envs that haven't adopted cpu yet.
-        worker.slot_char_lock[slot] = (
-            imports[key][1] if imports and _is_import_key(key) else None
-        )
+        # char lock follows the INCOMING member: imports pin their locked
+        # char (the slot's envs stop redrawing the opponent seat once they
+        # adopt); anything else restores normal per-game redraws. "cpu"
+        # never reaches here (continue above), deliberately leaving the
+        # previous member's lock in place for envs that haven't adopted
+        # cpu yet.
+        worker.slot_char_lock[slot] = lock
         slot_keys[slot] = key
