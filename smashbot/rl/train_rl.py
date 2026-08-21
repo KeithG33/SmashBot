@@ -356,7 +356,9 @@ def main() -> None:
     if rcfg.snapshot_slots and snapshot_pool.archive:
         import random as _random
 
-        assigns = snapshot_pool.assignments(_random.Random(start_step))
+        assigns = snapshot_pool.assignments(
+            _random.Random(start_step), cover=True,
+        )
         if assigns:
             last_assigns = assigns
             apply_assignments(

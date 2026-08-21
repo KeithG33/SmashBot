@@ -1870,3 +1870,28 @@ def test_deferred_adoption_waits_for_char_lock(monkeypatch):
     envs.final_stocks[2] = (4, 0)
     worker.collect(1)
     assert calls[-1][0] == "import:x"  # first Marth game credits the import
+
+
+def test_boot_auction_cover_serves_every_member(tmp_path):
+    """cover=True (boot auction): with slots >= members + 1, every league
+    member holds a slot; the remainder is drawn normally. cover=False
+    keeps the weighted draw (no coverage guarantee)."""
+    from smashbot.rl.pool import SnapshotPool
+
+    members = ["teacher", "cpu", "phillip", "import:a", "import:b"]
+    pool = SnapshotPool(str(tmp_path), slots=8, league_members=members)
+    pool.save(_Stub(), 0)
+    for seed in range(20):
+        picks = pool.assignments(random.Random(seed), cover=True)
+        assert len(picks) == 8 and picks[0].endswith("snapshot-0000000.pt")
+        assert set(members) <= set(picks)
+    # tighter than the roster: still valid, first slots-1 members served
+    small = SnapshotPool(str(tmp_path / "s"), slots=3, league_members=members)
+    small.save(_Stub(), 0)
+    picks = small.assignments(random.Random(0), cover=True)
+    assert len(picks) == 3 and len(set(picks[1:]) & set(members)) == 2
+    missed = any(
+        not set(members) <= set(pool.assignments(random.Random(s)))
+        for s in range(40)
+    )
+    assert missed  # plain draw makes no such promise

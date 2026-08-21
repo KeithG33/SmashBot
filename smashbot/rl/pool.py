@@ -464,7 +464,9 @@ class SnapshotPool:
         fn = f_hard if rng.random() < self.pfsp_hard_frac else f_var
         return lambda x: fn(x, self.pfsp_p)
 
-    def _class_weighted_picks(self, rng: random.Random) -> list[str]:
+    def _class_weighted_picks(
+        self, rng: random.Random, need: int | None = None,
+    ) -> list[str]:
         """Two-stage class-weighted PFSP for the non-latest slots (active
         only when league members exist — user-chosen to stop ghost-mass
         swamping: ~30 ghosts' collective flat weight must not outvote one
@@ -479,7 +481,8 @@ class SnapshotPool:
         ghosts = list(self.archive[:-1])
         hard = self.class_hardness()
         picks: list[str] = []
-        while len(picks) < self.slots - 1:
+        need = self.slots - 1 if need is None else need
+        while len(picks) < need:
             classes = [c for c in hard if c != "ghosts" or ghosts]
             explore = rng.random() < self.pfsp_explore
             wfn = self._draw_weight_fn(rng)  # this draw's f_hard-or-f_var
@@ -503,7 +506,9 @@ class SnapshotPool:
                 picks.append(cls)
         return picks
 
-    def assignments(self, rng: random.Random | None = None) -> list[str]:
+    def assignments(
+        self, rng: random.Random | None = None, cover: bool = False,
+    ) -> list[str]:
         """One member key per slot: an archive path, or a special league
         member ("phillip"/"teacher"/"cpu") when league_members is set.
         Slot 0 = ALWAYS the latest snapshot. With league members the rest
@@ -512,14 +517,26 @@ class SnapshotPool:
         pre-league code — PFSP f_hard weights by default, the original
         exponential recency bias with pfsp=False. Empty archive -> []
         (league members only start serving once a first snapshot anchors
-        slot 0)."""
+        slot 0).
+
+        cover=True (the BOOT auction only): every league member gets one
+        slot first (shuffled), the remaining slots are drawn as usual. On
+        an empty ledger all tickets sit at the 0.5 prior, so the draw is
+        pure chance anyway — guaranteeing coverage just starts measuring
+        every member on minute one (user-caught: the first v4 boot draw
+        skipped imp10000, cpu AND teacher). Later auctions must follow
+        the payoff curve; re-probing there is the explore mix's job."""
         if not self.archive:
             return []
         rng = rng or random.Random()
         picks = [self.archive[-1]]
         candidates = list(self.archive[:-1])
         if self.pfsp and self.league_members:
-            picks += self._class_weighted_picks(rng)
+            if cover:
+                members = list(self.league_members)
+                rng.shuffle(members)
+                picks += members[: self.slots - 1]
+            picks += self._class_weighted_picks(rng, need=self.slots - len(picks))
         elif self.pfsp:
             # PFSP (AlphaStar f_hard): weight by how much the student still
             # struggles vs each snapshot; beaten snapshots fade out.
