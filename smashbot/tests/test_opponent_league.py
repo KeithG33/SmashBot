@@ -1341,7 +1341,8 @@ def test_league_phillip_imitation_follows_serving(monkeypatch):
     for i in slot_envs:
         envs.final_stocks[i] = (4, 0)
     trajs = worker.collect(4)
-    assert set(worker._harvest_groups) == {"phillip", "ours"}
+    # phillip's group is dropped while he has no seat; only "ours" remains
+    assert set(worker._harvest_groups) == {"ours"}
     ours = [t for t in trajs if t.kind == "imitation"]
     assert ours
     for imit in ours:
@@ -1968,3 +1969,42 @@ def test_phillip_multi_slot_fixed_shape_and_merged_harvest(monkeypatch):
     assert imits
     for imit in imits:
         assert imit.rewards.shape[0] == 3  # FOX rows 2, 3, 5 — merged across slots
+
+
+def test_harvest_group_dormancy_keeps_rewards_aligned(monkeypatch):
+    """A config group whose seats all leave is dropped while dormant and
+    recreated fresh on return, so its reward stream never runs ahead of
+    its records: chunks emitted after the gap still carry the exact
+    opponent-seat reward mirror (-0.01/frame in this harness)."""
+    worker, envs = _make_worker(
+        monkeypatch, num_envs=4, teacher_envs=2, snapshot_slots=1,
+        league_phillip=True, harvest=True, opp_chars={2: "FOX", 3: "MARTH"},
+    )  # only env 2 (student on port 1) is harvested: mirror reward -0.01
+    slot_envs = [2, 3]
+    worker.begin_transition(0, "ghostA", None)
+    worker.collect(1)
+    # phillip serves -> his group exists and emits
+    worker.begin_transition(0, "phillip", None)
+    for i in slot_envs:
+        envs.final_stocks[i] = (4, 0)
+    trajs = worker.collect(3)
+    assert "phillip" in worker._harvest_groups
+    assert any(t.kind == "imitation" for t in trajs)
+    # phillip leaves entirely (cpu occupies no seat): the group is dropped
+    worker.begin_transition(0, "cpu", None)
+    worker.slot_desired[0] = "cpu"
+    envs.serving[2] = envs.serving[3] = "cpu"
+    worker.collect(3)  # dormant frames: rewards must NOT accumulate
+    assert "phillip" not in worker._harvest_groups
+    # phillip returns: fresh group, rewards aligned from its first frame
+    envs.serving.clear()
+    worker.begin_transition(0, "phillip", None)
+    for i in slot_envs:
+        envs.final_stocks[i] = (4, 0)
+    trajs = worker.collect(4)
+    imits = [t for t in trajs if t.kind == "imitation"]
+    assert imits
+    for imit in imits:
+        torch.testing.assert_close(
+            imit.rewards, torch.full_like(imit.rewards, -0.01)
+        )

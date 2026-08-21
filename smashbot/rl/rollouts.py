@@ -1628,14 +1628,18 @@ class DolphinRolloutWorker:
                     self.student.device,
                 )
                 self._harvest_groups[cfg_key] = group
+        # a group with no live seat this frame is dropped: its assembler
+        # would otherwise take rewards without records and desync forever
+        for cfg_key in [k for k in self._harvest_groups if k not in parts]:
+            del self._harvest_groups[cfg_key]
         for cfg_key, group in self._harvest_groups.items():
-            plist = parts.get(cfg_key, [])
+            plist = parts[cfg_key]
             elig = torch.zeros(len(slot_rows), dtype=torch.bool)
             for live, _, _, _ in plist:
                 for r in live:
                     if payloads[r].get("opp_char") in self._whitelist:
                         elig[pos[r]] = True
-            nrec = {len(recs) for _, _, recs, _ in plist} or {0}
+            nrec = {len(recs) for _, _, recs, _ in plist}
             assert len(nrec) == 1, (
                 f"seats of config {cfg_key} flushed unevenly {nrec}: "
                 "wrappers must share flush cadence (batch_steps)"
