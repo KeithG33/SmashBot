@@ -597,16 +597,21 @@ class Learner:
         avail = sum(t.rewards.shape[0] for t in imit_trajs)
         budget = min(cfg.imitation_slots, avail, len(tier1) + len(tier2))
 
+        # sample the budget UNIFORMLY over every harvested row across all
+        # imitation chunks (several opponent config groups may each emit
+        # one), so no group crowds out another by arriving first
+        pool = [
+            (ti, r) for ti, t in enumerate(imit_trajs)
+            for r in range(t.rewards.shape[0])
+        ]
+        chosen = self._subst_rng.sample(pool, budget) if budget < len(pool) else pool
         imit_fixed: list[_ImitFixed] = []
         used = 0
-        for traj in imit_trajs:
-            take = min(traj.rewards.shape[0], budget - used)
-            if take <= 0:
-                break
-            if take < traj.rewards.shape[0]:
-                rows = sorted(self._subst_rng.sample(
-                    range(traj.rewards.shape[0]), take
-                ))
+        for ti, traj in enumerate(imit_trajs):
+            rows = sorted(r for t, r in chosen if t == ti)
+            if not rows:
+                continue
+            if len(rows) < traj.rewards.shape[0]:
                 traj = slice_trajectory_rows(traj, rows)
             imf = self._imitation_fixed(traj)
             if imf is not None:

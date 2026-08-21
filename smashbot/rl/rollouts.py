@@ -868,17 +868,63 @@ def _env_process_main(idx: int, cfg: "RolloutConfig", spec, conn) -> None:
         _drain_old_stops()
 
 
+class _HarvestGroup:
+    """Imitation harvest state for opponent seats sharing one model config
+    (delay + controller encoding): a ChunkAssembler over a FIXED row set
+    plus the per-frame eligibility stream. Records arrive merged over the
+    whole row set (zero placeholders for rows not on this config); the
+    whole-chunk eligibility gate at emit slices out only rows that were
+    real and whitelisted for the ENTIRE chunk."""
+
+    def __init__(self, key, rows, unroll, delay, reencode, device):
+        self.key = key
+        self.rows = list(rows)
+        self.rows_cpu = torch.tensor(self.rows)
+        self.rows_t = torch.tensor(self.rows, device=device)
+        self.unroll = unroll
+        self.assembler = ChunkAssembler(unroll, delay)
+        self.reencode = reencode  # record -> student-schema record, or None
+        self.pending: list = []  # (resets[R], elig[R]) per frame
+        self.elig: list[torch.Tensor] = []  # [R] per pushed record
+        self.device = device
+
+    def push_reward(self, reward_rows: torch.Tensor) -> None:
+        self.assembler.push_reward(reward_rows)
+
+    def step(self, resets_rows, elig_rows, records, imit_out) -> None:
+        self.pending.append((resets_rows, elig_rows))
+        for j, rec in enumerate(records):
+            frame_resets, frame_elig = self.pending[j]
+            if self.reencode is not None:
+                rec = self.reencode(rec)
+            self.assembler.push_frame(rec, frame_resets.to(self.device), None)
+            self.elig.append(frame_elig)
+        if records:
+            del self.pending[: len(records)]
+        if self.assembler.ready():
+            traj = self.assembler.emit()._replace(kind="imitation")
+            T = self.unroll
+            window = torch.stack(self.elig[: T + 1], dim=1)  # [R, T+1]
+            self.elig = self.elig[T:]
+            rows = window.all(dim=1).nonzero().flatten().tolist()
+            if rows:
+                imit_out.append(slice_trajectory_rows(traj, rows))
+
+
 class _Seat:
     """A role in a slot's transition — `current` (the announced member) or
     `outgoing` (the previous member, still fought by envs mid-game):
-    member key + the agent serving it. Model-agnostic: the agent is
-    whatever the member needs, borrowed from the slot's _SlotPool."""
+    member key + the agent serving it + the agent's model config label
+    (groups the imitation harvest by delay/controller encoding).
+    Model-agnostic: the agent is whatever the member needs, borrowed from
+    the slot's _SlotPool, which is what labels it."""
 
-    __slots__ = ("member", "agent")
+    __slots__ = ("member", "agent", "config")
 
-    def __init__(self, member: str, agent):
+    def __init__(self, member: str, agent, config: str):
         self.member = member
         self.agent = agent
+        self.config = config
 
 
 class _SlotPool:
@@ -1053,32 +1099,36 @@ class DolphinRolloutWorker:
         # draws him gets its own batch-8 wrapper (see _SlotPool); train_rl
         # sets the factory under league_phillip.
         self.phillip_factory: tp.Optional[tp.Callable[[int], tp.Any]] = None
-        # Imitation harvest (Phillip's seat while his char is whitelisted):
-        # a second assembler over Phillip's own FrameRecords — from the
-        # fixed reference group (ref_envs mode) or, under league_phillip,
-        # from whatever rows Phillip is CURRENTLY serving (kind routing).
+        # Imitation harvest of OPPONENT seats (user-designed, v4: agnostic
+        # to who the opponent is). Two sources:
+        #  - ref_envs mode: the fixed reference group (one assembler).
+        #  - league slots: EVERY policy seat (ghost, import, teacher copy,
+        #    Phillip — cpu has no seat). Harvested rows are grouped by the
+        #    seat agent's model config (delay + controller encoding) into
+        #    _HarvestGroups, each with a FIXED row set (all slot envs) and
+        #    a per-row per-frame eligibility mask (row on a seat of this
+        #    config AND opponent char whitelisted). Membership changes
+        #    move through the mask, never by resetting an assembler, so
+        #    transitions drop nothing; the whole-chunk eligibility gate at
+        #    emit keeps every harvested row homogeneous.
         self.harvest_imitation = harvest_imitation and (
-            bool(self.ref_idx) or config.league_phillip
+            bool(self.ref_idx) or bool(self._league)
         )
+        self._harvest_groups: dict[str, _HarvestGroup] = {}
         if self.harvest_imitation:
-            self._imit_elig: list[torch.Tensor] = []  # [R] per pushed record
-            self._imit_pending: list = []  # (resets[R], elig[R]) per frame
             self._stu_embed = student._embed_controller
             self._student_name_code = int(student._name[0].item())
+            self._slot_rows = [
+                i for i, sp in enumerate(self.specs) if sp.kind == "snapshot"
+            ]
             if self.ref_idx:
                 ref_agent = self.opponents["reference"]
+                self._imit_elig: list[torch.Tensor] = []
+                self._imit_pending: list = []
                 self._imit_assembler = ChunkAssembler(
                     config.unroll_length, ref_agent.delay
                 )
                 self._ref_embed = ref_agent._embed_controller
-            else:
-                # league_phillip: assembler/embedding come from the phillip
-                # agent at his first serving stint (_phillip_harvest)
-                self._imit_assembler = None
-                self._ref_embed = None
-            # row set of the in-flight imitation chunk (league_phillip only;
-            # the fixed-ref path always harvests ref_idx)
-            self._imit_rows: list[int] = []
         self._procs: list = []
         self._conns: list = []
 
@@ -1153,20 +1203,23 @@ class DolphinRolloutWorker:
     def _swap_perspective(game):
         return game._replace(p0=game.p1, p1=game.p0)
 
-    def _reencode_record(self, rec: FrameRecord) -> FrameRecord:
-        """Reference-seat record -> student-schema record: actions re-encoded
-        through the STUDENT's controller embedding (the ref checkpoint may
-        discretize differently) and the name conditioned on the student's
-        code (the ref's name codes index a different vocabulary)."""
+    def _reencode_record(self, rec: FrameRecord, embed=None) -> FrameRecord:
+        """Opponent-seat record -> student-schema record: actions re-encoded
+        through the STUDENT's controller embedding (the opponent checkpoint
+        may discretize differently) and the name conditioned on the
+        student's code (its name codes index a different vocabulary).
+        `embed` = the opponent's controller embedding (default: the fixed
+        reference group's)."""
         import numpy as np
 
+        embed = embed if embed is not None else self._ref_embed
         # records store actions widened to int64/bool; decode expects each
         # leaf embedding's native dtype (uint8/int32) back
-        encoded_np = self._ref_embed.map(
+        encoded_np = embed.map(
             lambda e, x: x.astype(getattr(e, "dtype", x.dtype)),
             tree.map_structure(lambda x: x.cpu().numpy(), rec.prev_action),
         )
-        raw = self._ref_embed.decode(encoded_np)
+        raw = embed.decode(encoded_np)
         prev = tree.map_structure(
             lambda x: torch.from_numpy(
                 np.ascontiguousarray(
@@ -1220,9 +1273,9 @@ class DolphinRolloutWorker:
 
     def _pool_agent(self, slot: int, member: str):
         """Borrow the agent a member needs from the slot's pool (lazily
-        created): Phillip -> the shared-module wrapper; anything else ->
-        the slot policy (ours_main). Parking onto ours_spare is done by
-        begin_transition, which is the only caller that needs it."""
+        created) as (agent, config label): Phillip -> the shared-module
+        wrapper, "phillip"; anything else -> the slot policy (ours_main),
+        "ours". Parking onto ours_spare is done by _park."""
         pool = self._pool.setdefault(slot, _SlotPool())
         n = len(self.groups[("slot", slot)])
         if member == "phillip":
@@ -1233,10 +1286,10 @@ class DolphinRolloutWorker:
                     "league_phillip)"
                 )
                 pool.phillip = self.phillip_factory(n)
-            return pool.phillip
+            return pool.phillip, "phillip"
         if pool.ours_main is None:
             pool.ours_main = self.opponents[("slot", slot)]
-        return pool.ours_main
+        return pool.ours_main, "ours"
 
     def _rows_on(self, slot: int, key: str | None) -> list[int]:
         if key is None:
@@ -1262,7 +1315,7 @@ class DolphinRolloutWorker:
     def _seat_for(self, slot: int, member: str) -> "_Seat | None":
         if member == "cpu":
             return None  # engine AI: no brain, no seat
-        return _Seat(member, self._pool_agent(slot, member))
+        return _Seat(member, *self._pool_agent(slot, member))
 
     def _park(self, slot: int, seat: _Seat, slot_policy) -> _Seat:
         """The slot policy is about to be overwritten while envs still
@@ -1276,7 +1329,7 @@ class DolphinRolloutWorker:
         if pool.ours_spare is None:
             pool.ours_spare = self.outgoing_factory(len(self.groups[("slot", slot)]))
         pool.ours_spare.policy.load_state_dict(slot_policy.state_dict())
-        return _Seat(seat.member, pool.ours_spare)
+        return _Seat(seat.member, pool.ours_spare, seat.config)
 
     def _evict_outgoing(self, slot: int, onto: str) -> None:
         """Rare: a transition still open when the next auction lands (a
@@ -1368,28 +1421,6 @@ class DolphinRolloutWorker:
                 del self.slot_pending[slot]
             self._release_outgoing(slot)
 
-    @staticmethod
-    def _merge_records(parts: list[tuple[list[int], list]]) -> list:
-        """Concatenate per-slot Phillip records (batch-wide per flushed
-        frame) down to their live rows, in the harvest row order: one
-        record per frame over all Phillip rows across slots."""
-        counts = {len(recs) for _, recs in parts}
-        assert len(counts) == 1, (
-            f"phillip wrappers flushed unevenly {counts}: per-slot wrappers "
-            "must share flush cadence (batch_steps) for the harvest merge"
-        )
-        out = []
-        for j in range(counts.pop()):
-            pieces = []
-            for local, recs in parts:
-                rec = recs[j]
-                sel = torch.tensor(local, device=rec.name.device)
-                pieces.append(tree.map_structure(
-                    lambda x: x.index_select(0, sel), rec
-                ))
-            out.append(tree.map_structure(lambda *xs: torch.cat(xs, 0), *pieces))
-        return out
-
     def collect(self, num_trajectories: int) -> list[Trajectory]:
         """Run the sync-barrier loop until N PPO trajectory chunks are
         assembled; any imitation chunks harvested along the way (reference
@@ -1474,12 +1505,8 @@ class DolphinRolloutWorker:
                     if self.ref_idx:
                         ref_rows = torch.tensor(self.ref_idx, device=device)
                         self._imit_assembler.push_reward(-reward[ref_rows])
-                    elif self._imit_assembler is not None and self._imit_rows:
-                        # league_phillip source: same mirror over the rows
-                        # of the in-flight chunk (row-set changes reset the
-                        # assembler before this can misalign)
-                        rows_t = torch.tensor(self._imit_rows, device=device)
-                        self._imit_assembler.push_reward(-reward[rows_t])
+                    for g in self._harvest_groups.values():
+                        g.push_reward(-reward[g.rows_t])
             if self._frame_count > 0:
                 for i in range(self.num_dolphins):
                     if resets[i]:
@@ -1528,9 +1555,9 @@ class DolphinRolloutWorker:
 
             opp_controllers: dict[int, tp.Any] = {}
             ref_records: list[FrameRecord] = []
-            ph_parts: list[tuple[list[int], list]] = []
-            ph_rows: list[int] = []
-            ph_agent = None
+            # per config: [(env rows live on a seat, their local idx in
+            # the slot batch, the seat's flushed records, the seat agent)]
+            harvest_parts: dict[str, list] = {}
             for name, idx in self.groups.items():
                 if isinstance(name, tuple):
                     # slot group: each occupied seat (current, outgoing)
@@ -1576,11 +1603,11 @@ class DolphinRolloutWorker:
                         for j, env_i in enumerate(idx):
                             if env_i in live:
                                 opp_controllers[env_i] = ctrls[j]
-                        if seat.member == "phillip":
+                        if self.harvest_imitation:
                             local = [j for j, env_i in enumerate(idx) if env_i in live]
-                            ph_parts.append((local, recs))
-                            ph_rows.extend(live)
-                            ph_agent = seat.agent
+                            harvest_parts.setdefault(seat.config, []).append(
+                                (live, local, recs, seat.agent)
+                            )
                     continue
                 if cpu_now and all(i in cpu_now for i in idx):
                     # whole slot serving CPU lvl-9: no brain to run — skip
@@ -1645,10 +1672,8 @@ class DolphinRolloutWorker:
                         imit_out,
                     )
                 else:
-                    ph_records = self._merge_records(ph_parts) if ph_parts else []
-                    self._phillip_harvest(
-                        payloads, resets_d, ph_rows, ph_records, imit_out,
-                        agent=ph_agent,
+                    self._league_harvest(
+                        payloads, resets_d, harvest_parts, imit_out
                     )
 
             self._frame_count += 1
@@ -1657,39 +1682,70 @@ class DolphinRolloutWorker:
         self._records_pushed = records_pushed
         return out + imit_out
 
-    def _phillip_harvest(
+    def _league_harvest(
         self,
         payloads: list[dict],
         resets_d: torch.Tensor,
-        rows: list[int],
-        records: list[FrameRecord],
+        parts: dict[str, list],
         imit_out: list[Trajectory],
-        agent=None,
     ) -> None:
-        """league_phillip imitation source: harvested rows are exactly the
-        envs currently fighting Phillip (across slots), so only rows he
-        actually played are harvested. A row-set change drops the partial
-        chunk — row sets must be homogeneous within a chunk; with deferred
-        adoption rows join/leave one boundary at a time, so a transition
-        costs a handful of lost ~4s chunks. `agent` = any Phillip wrapper
-        (they share the module: same delay and controller embedding)."""
-        if rows != self._imit_rows:
-            self._imit_rows = list(rows)
-            self._imit_assembler = None
-            self._imit_pending = []
-            self._imit_elig = []
-        if not rows:
-            return
-        if self._imit_assembler is None:
-            # first frame of a new stint: the assembler starts here, so its
-            # reward stream (pushed from the NEXT frame on) aligns with its
-            # records exactly like the main assembler's does from frame 0
-            assert agent is not None
-            self._imit_assembler = ChunkAssembler(
-                self.config.unroll_length, agent.delay
+        """Feed every config group one merged record per flushed frame
+        over its FIXED row set (all slot envs): rows live on a seat of that
+        config get their real record (re-encoded to the student's schema
+        when the config differs), other rows a zero placeholder, and the
+        eligibility mask marks which rows were real AND whitelisted. A
+        group is created at its config's first appearance (delay from its
+        agent); a frame with no seat of that config pushes only an
+        all-ineligible mask so rewards/resets/records stay aligned."""
+        slot_rows = self._slot_rows
+        pos = {r: k for k, r in enumerate(slot_rows)}
+        T = self.config.unroll_length
+        for cfg_key, plist in parts.items():
+            group = self._harvest_groups.get(cfg_key)
+            if group is None:
+                agent = plist[0][3]
+                reencode = None
+                if cfg_key != "ours":
+                    embed = agent._embed_controller
+                    reencode = lambda rec, e=embed: self._reencode_record(rec, e)
+                group = _HarvestGroup(
+                    cfg_key, slot_rows, T, agent.delay, reencode,
+                    self.student.device,
+                )
+                self._harvest_groups[cfg_key] = group
+        for cfg_key, group in self._harvest_groups.items():
+            plist = parts.get(cfg_key, [])
+            elig = torch.zeros(len(slot_rows), dtype=torch.bool)
+            for live, _, _, _ in plist:
+                for r in live:
+                    if payloads[r].get("opp_char") in self._whitelist:
+                        elig[pos[r]] = True
+            nrec = {len(recs) for _, _, recs, _ in plist} or {0}
+            assert len(nrec) == 1, (
+                f"seats of config {cfg_key} flushed unevenly {nrec}: "
+                "wrappers must share flush cadence (batch_steps)"
             )
-            self._ref_embed = agent._embed_controller
-        self._harvest_step(payloads, resets_d, rows, records, imit_out)
+            merged = []
+            for j in range(nrec.pop()):
+                full = None
+                for live, local, recs, _ in plist:
+                    rec = recs[j]
+                    dev = rec.name.device
+                    if full is None:
+                        full = tree.map_structure(
+                            lambda x: x.new_zeros(
+                                (len(slot_rows),) + tuple(x.shape[1:])
+                            ),
+                            rec,
+                        )
+                    dst = torch.tensor([pos[r] for r in live], device=dev)
+                    src = torch.tensor(local, device=dev)
+                    full = tree.map_structure(
+                        lambda f, x: f.index_copy(0, dst, x.index_select(0, src)),
+                        full, rec,
+                    )
+                merged.append(full)
+            group.step(resets_d[group.rows_cpu], elig, merged, imit_out)
 
     def _harvest_step(
         self,

@@ -1288,10 +1288,11 @@ def test_league_phillip_routing_and_multislot(monkeypatch):
 
 
 def test_league_phillip_imitation_follows_serving(monkeypatch):
-    """The (dormant) imitation harvest keys off phillip-SERVING rows: no
-    output while he serves nothing; once routed, exactly his rows are
-    harvested, whitelist-gated, name-reconditioned, with the opponent-seat
-    reward mirror; occupancy changes reset the partial chunk cleanly."""
+    """The imitation harvest keys off the rows each opponent ACTUALLY
+    serves: no output before any seat exists; once Phillip holds the slot
+    exactly his rows are harvested (config group "phillip": re-encoded,
+    name-reconditioned, opponent-seat reward mirror); when a ghost takes
+    over, its seat is harvested the same way (group "ours")."""
     worker, envs = _make_worker(
         monkeypatch, num_envs=4, teacher_envs=2, snapshot_slots=1,
         league_phillip=True, harvest=True,
@@ -1332,14 +1333,23 @@ def test_league_phillip_imitation_follows_serving(monkeypatch):
             ),
         ))
 
-    # occupancy change mid-stream: partial chunk dropped, no output, no
-    # crash; serving again restarts a fresh chunk
+    # the slot moves to a ghost: harvest is agnostic to who the opponent
+    # is, so the ghost's seat is harvested too — through the "ours" config
+    # group (no re-encoding; same delay), still whitelist-gated (row 2 FOX
+    # only) with the same reward mirror
     worker.begin_transition(0, "ghostB", None)
     for i in slot_envs:
         envs.final_stocks[i] = (4, 0)
-    trajs = worker.collect(1)
-    assert [t.kind for t in trajs] == ["ppo"]
-    assert worker._imit_rows == []
+    trajs = worker.collect(4)
+    assert set(worker._harvest_groups) == {"phillip", "ours"}
+    ours = [t for t in trajs if t.kind == "imitation"]
+    assert ours
+    for imit in ours:
+        assert imit.rewards.shape[0] == 1
+        assert torch.equal(imit.name, torch.ones_like(imit.name))
+        torch.testing.assert_close(
+            imit.rewards, torch.full_like(imit.rewards, -0.01)
+        )
 
 
 # ------------------------------- imported league members (previous-run bots)
