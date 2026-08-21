@@ -16,6 +16,25 @@ from torch import nn
 RecurrentState = tp.Any
 
 
+class RMSNorm(nn.RMSNorm):
+    """nn.RMSNorm that normalizes in fp32 under mixed precision.
+
+    Under fp16 autocast the activations arrive half while the weight stays
+    fp32; torch has no fused kernel for that pair and silently falls back
+    to an unfused path (UserWarning "Mismatch dtype between input and
+    weight"). Casting the input up engages the fused fp32 kernel and
+    computes the statistics in full precision — the standard mixed-
+    precision practice (autocast already does this for LayerNorm, just not
+    for rms_norm). Measured at learner batch (144x240x512, 3090): fwd
+    0.93 -> 0.50 ms, fwd+bwd 3.64 -> 1.62 ms. Same parameters/state_dict
+    keys as nn.RMSNorm; a no-op under fp32."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dtype == torch.float32:
+            return super().forward(x)
+        return super().forward(x.float()).to(x.dtype)
+
+
 def _mask_state(reset: torch.Tensor, initial, prev):
     """Replace state with initial where reset is True. reset: [B].
 
@@ -264,14 +283,14 @@ class TransformerBlock(nn.Module):
         self.num_heads = num_heads
         self.head_dim = d // num_heads
 
-        self.attn_norm = nn.RMSNorm(d)
+        self.attn_norm = RMSNorm(d)
         self.qkv = nn.Linear(d, 3 * d, bias=False)
-        self.q_norm = nn.RMSNorm(self.head_dim)  # QK-norm: attention stability
-        self.k_norm = nn.RMSNorm(self.head_dim)
+        self.q_norm = RMSNorm(self.head_dim)  # QK-norm: attention stability
+        self.k_norm = RMSNorm(self.head_dim)
         self.attn_out = nn.Linear(d, d, bias=False)
         nn.init.zeros_(self.attn_out.weight)
 
-        self.ffw_norm = nn.RMSNorm(d)
+        self.ffw_norm = RMSNorm(d)
         hidden = int(8 * d / 3 / 64) * 64  # SwiGLU sizing, 64-aligned
         self.gate_up = nn.Linear(d, 2 * hidden, bias=False)
         self.down = nn.Linear(hidden, d, bias=False)
@@ -358,7 +377,7 @@ class TransformerCore(Network):
         self.blocks = nn.ModuleList(
             [TransformerBlock(hidden_size, num_heads) for _ in range(num_layers)]
         )
-        self.final_norm = nn.RMSNorm(hidden_size)
+        self.final_norm = RMSNorm(hidden_size)
         self.output_size = hidden_size
 
     def initial_state(self, batch_size, device=None):
@@ -427,7 +446,7 @@ class SGUBlock(nn.Module):
     def __init__(self, d: int, window: int):
         super().__init__()
         self.window = window
-        self.mix_norm = nn.RMSNorm(d)
+        self.mix_norm = RMSNorm(d)
         self.uv = nn.Linear(d, 2 * d, bias=False)
         self.spatial = nn.Conv1d(d, d, kernel_size=window, groups=d)
         nn.init.zeros_(self.spatial.weight)
@@ -441,7 +460,7 @@ class SGUBlock(nn.Module):
         self.mix_out = nn.Linear(d, d, bias=False)
         nn.init.zeros_(self.mix_out.weight)
 
-        self.ffw_norm = nn.RMSNorm(d)
+        self.ffw_norm = RMSNorm(d)
         hidden = int(8 * d / 3 / 64) * 64
         self.gate_up = nn.Linear(d, 2 * hidden, bias=False)
         self.down = nn.Linear(hidden, d, bias=False)
@@ -517,7 +536,7 @@ class SGUCore(Network):
         self.blocks = nn.ModuleList(
             [SGUBlock(hidden_size, window) for _ in range(num_layers)]
         )
-        self.final_norm = nn.RMSNorm(hidden_size)
+        self.final_norm = RMSNorm(hidden_size)
         self.output_size = hidden_size
 
     def initial_state(self, batch_size, device=None):
