@@ -230,7 +230,9 @@ class _HarvestGroup:
         self.rows_t = torch.tensor(self.rows, device=device)
         self.unroll = unroll
         self.assembler = ChunkAssembler(unroll, delay)
-        self.reencode = reencode  # record -> student-schema record, or None
+        # trajectory -> student-schema trajectory (applied once per emitted
+        # chunk, on the sliced rows only), or None
+        self.reencode = reencode
         self.pending: list = []  # (resets[R], elig[R]) per frame
         self.elig: list[torch.Tensor] = []  # [R] per pushed record
         self.device = device
@@ -242,8 +244,6 @@ class _HarvestGroup:
         self.pending.append((resets_rows, elig_rows))
         for j, rec in enumerate(records):
             frame_resets, frame_elig = self.pending[j]
-            if self.reencode is not None:
-                rec = self.reencode(rec)
             self.assembler.push_frame(rec, frame_resets.to(self.device), None)
             self.elig.append(frame_elig)
         if records:
@@ -255,7 +255,10 @@ class _HarvestGroup:
             self.elig = self.elig[T:]
             rows = window.all(dim=1).nonzero().flatten().tolist()
             if rows:
-                imit_out.append(slice_trajectory_rows(traj, rows))
+                traj = slice_trajectory_rows(traj, rows)
+                if self.reencode is not None:
+                    traj = self.reencode(traj)
+                imit_out.append(traj)
 
 
 class _Seat:
@@ -425,9 +428,13 @@ class DolphinRolloutWorker:
         if self.harvest_imitation:
             self._stu_embed = student._embed_controller
             self._student_name_code = int(student._name[0].item())
+            self._slot_order = sorted(
+                {sp.group for sp in self.specs if sp.kind == "snapshot"}
+            )
             self._slot_rows = [
-                i for i, sp in enumerate(self.specs) if sp.kind == "snapshot"
+                i for k in self._slot_order for i in self.groups[("slot", k)]
             ]
+            assert len({len(self.groups[("slot", k)]) for k in self._slot_order}) <= 1
             if self.ref_idx:
                 ref_agent = self.opponents["reference"]
                 self._imit_elig: list[torch.Tensor] = []
@@ -840,8 +847,9 @@ class DolphinRolloutWorker:
 
             opp_controllers: dict[int, tp.Any] = {}
             ref_records: list[FrameRecord] = []
-            # config -> [(live rows, local idx, records, agent)] per seat
-            harvest_parts: dict[str, list] = {}
+            # config -> slot -> [(row mask over the slot batch, records,
+            # agent)] per occupied seat of that config
+            harvest_parts: dict[str, dict[int, list]] = {}
             for name, idx in self.groups.items():
                 if isinstance(name, tuple):
                     # slot group: each occupied seat steps the full batch;
@@ -883,10 +891,12 @@ class DolphinRolloutWorker:
                             if env_i in live:
                                 opp_controllers[env_i] = ctrls[j]
                         if self.harvest_imitation:
-                            local = [j for j, env_i in enumerate(idx) if env_i in live]
-                            harvest_parts.setdefault(seat.config, []).append(
-                                (live, local, recs, seat.agent)
+                            mask = torch.tensor(
+                                [env_i in live for env_i in idx], device=device
                             )
+                            harvest_parts.setdefault(seat.config, {}).setdefault(
+                                k, []
+                            ).append((mask, recs, seat.agent))
                     continue
                 if cpu_now and all(i in cpu_now for i in idx):
                     # whole slot serving CPU lvl-9: no brain to run — skip
@@ -965,65 +975,119 @@ class DolphinRolloutWorker:
         self,
         payloads: list[dict],
         resets_d: torch.Tensor,
-        parts: dict[str, list],
+        parts: dict[str, dict[int, list]],
         imit_out: list[Trajectory],
     ) -> None:
-        """Per config group: merge this frame's seat records over the fixed
-        row set (zeros for rows not on this config), mark rows that are
-        real and whitelisted eligible, and step the group."""
-        slot_rows = self._slot_rows
-        pos = {r: k for k, r in enumerate(slot_rows)}
+        """Per config group: one record per flushed frame over the fixed row
+        set (all slot envs, slot order) = the slots' full-batch seat records
+        concatenated (zeros for a slot with no seat of this config; a
+        per-row select when a slot's two seats share the config), plus the
+        eligibility mask (row on such a seat AND opponent char whitelisted).
+        Groups with no live seat are dropped (their assembler would take
+        rewards without records)."""
         T = self.config.unroll_length
-        for cfg_key, plist in parts.items():
+        for cfg_key in [k for k in self._harvest_groups if k not in parts]:
+            del self._harvest_groups[cfg_key]
+        for cfg_key, by_slot in parts.items():
             group = self._harvest_groups.get(cfg_key)
             if group is None:
-                agent = plist[0][3]
-                reencode = None
-                if cfg_key != "ours":
-                    embed = agent._embed_controller
-                    reencode = lambda rec, e=embed: self._reencode_record(rec, e)
+                agent = next(iter(by_slot.values()))[0][2]
                 group = _HarvestGroup(
-                    cfg_key, slot_rows, T, agent.delay, reencode,
+                    cfg_key, self._slot_rows, T, agent.delay,
+                    self._traj_reencoder(agent) if cfg_key != "ours" else None,
                     self.student.device,
                 )
                 self._harvest_groups[cfg_key] = group
-        # a group with no live seat this frame is dropped: its assembler
-        # would otherwise take rewards without records and desync forever
-        for cfg_key in [k for k in self._harvest_groups if k not in parts]:
-            del self._harvest_groups[cfg_key]
-        for cfg_key, group in self._harvest_groups.items():
-            plist = parts[cfg_key]
-            elig = torch.zeros(len(slot_rows), dtype=torch.bool)
-            for live, _, _, _ in plist:
-                for r in live:
-                    if payloads[r].get("opp_char") in self._whitelist:
-                        elig[pos[r]] = True
-            nrec = {len(recs) for _, _, recs, _ in plist}
+            # eligibility over the fixed row set
+            elig = []
+            for k in self._slot_order:
+                idx = self.groups[("slot", k)]
+                seats = by_slot.get(k)
+                if not seats:
+                    elig.extend([False] * len(idx))
+                    continue
+                on = torch.stack([m for m, _, _ in seats]).any(0).tolist()
+                elig.extend(
+                    o and payloads[i].get("opp_char") in self._whitelist
+                    for o, i in zip(on, idx)
+                )
+            nrec = {len(recs) for seats in by_slot.values() for _, recs, _ in seats}
             assert len(nrec) == 1, (
                 f"seats of config {cfg_key} flushed unevenly {nrec}: "
                 "wrappers must share flush cadence (batch_steps)"
             )
             merged = []
             for j in range(nrec.pop()):
-                full = None
-                for live, local, recs, _ in plist:
-                    rec = recs[j]
-                    dev = rec.name.device
-                    if full is None:
-                        full = tree.map_structure(
-                            lambda x: x.new_zeros(
-                                (len(slot_rows),) + tuple(x.shape[1:])
-                            ),
-                            rec,
-                        )
-                    dst = torch.tensor([pos[r] for r in live], device=dev)
-                    src = torch.tensor(local, device=dev)
-                    full = tree.map_structure(
-                        lambda f, x: f.index_copy(0, dst, x.index_select(0, src)),
-                        full, rec,
+                pieces = []
+                template = None
+                for k in self._slot_order:
+                    seats = by_slot.get(k)
+                    if seats:
+                        rec = seats[0][1][j]
+                        for mask, recs, _ in seats[1:]:
+                            mk = mask
+                            rec = tree.map_structure(
+                                lambda a, b: torch.where(
+                                    mk.view(-1, *([1] * (a.dim() - 1))), b, a
+                                ),
+                                rec, recs[j],
+                            )
+                        template = rec
+                        pieces.append(rec)
+                    else:
+                        pieces.append(None)
+                assert template is not None
+                n = len(self.groups[("slot", self._slot_order[0])])
+                zeros = self._zero_record(cfg_key, template, n)
+                pieces = [zeros if p is None else p for p in pieces]
+                merged.append(
+                    tree.map_structure(lambda *xs: torch.cat(xs, 0), *pieces)
+                )
+            group.step(
+                resets_d[group.rows_cpu],
+                torch.tensor(elig, dtype=torch.bool), merged, imit_out,
+            )
+
+    def _zero_record(self, cfg_key: str, template, n: int):
+        """Cached zero record of one slot batch for a config (placeholder
+        for slots with no seat of that config)."""
+        cache = self.__dict__.setdefault("_zero_records", {})
+        if cfg_key not in cache:
+            cache[cfg_key] = tree.map_structure(
+                lambda x: x.new_zeros((n,) + tuple(x.shape[1:])), template
+            )
+        return cache[cfg_key]
+
+    def _traj_reencoder(self, agent):
+        """Trajectory-level version of _reencode_record for an opponent
+        config: re-encode the [R, T+1] action stream through the student's
+        controller embedding and recondition the name — once per chunk."""
+        embed = agent._embed_controller
+
+        def reencode(traj: Trajectory) -> Trajectory:
+            import numpy as np
+
+            encoded_np = embed.map(
+                lambda e, x: x.astype(getattr(e, "dtype", x.dtype)),
+                tree.map_structure(
+                    lambda x: x.cpu().numpy(), traj.actions.controller_state
+                ),
+            )
+            raw = embed.decode(encoded_np)
+            prev = tree.map_structure(
+                lambda x: torch.from_numpy(
+                    np.ascontiguousarray(
+                        x.astype(np.int64) if x.dtype.kind in "iu" else x
                     )
-                merged.append(full)
-            group.step(resets_d[group.rows_cpu], elig, merged, imit_out)
+                ).to(self.student.device),
+                self._stu_embed.from_state(raw),
+            )
+            return traj._replace(
+                actions=traj.actions._replace(controller_state=prev),
+                name=torch.full_like(traj.name, self._student_name_code),
+            )
+
+        return reencode
 
     def _harvest_step(
         self,

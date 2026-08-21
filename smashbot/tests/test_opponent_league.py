@@ -2008,3 +2008,83 @@ def test_harvest_group_dormancy_keeps_rewards_aligned(monkeypatch):
         torch.testing.assert_close(
             imit.rewards, torch.full_like(imit.rewards, -0.01)
         )
+
+
+def test_harvest_rows_carry_their_own_seat_records(monkeypatch):
+    """Content check of the per-slot merge: every harvested row's state
+    stream equals, frame for frame, the record its SEAT produced for that
+    env — across two slots and through a two-seat (ours->ours) transition
+    where the slot's rows are split between current and outgoing."""
+    worker, envs = _make_worker(
+        monkeypatch, num_envs=6, teacher_envs=2, snapshot_slots=2,
+        league_phillip=True, harvest=True,
+        opp_chars={2: "FOX", 3: "FOX", 4: "FOX", 5: "FOX"},
+    )
+    pol = {g: worker.opponents[("slot", g)].policy for g in (0, 1)}
+    worker.begin_transition(0, "ghostA", None, pol[0])
+    worker.begin_transition(1, "ghostB", None, pol[1])
+    worker.collect(1)
+    # slot 0 -> ghostC; only env 2 crosses, so slot 0 runs two seats
+    worker.begin_transition(0, "ghostC", None, pol[0])
+    envs.final_stocks[2] = (4, 0)
+    worker.collect(1)
+    assert worker.env_member[2] == "ghostC" and worker.env_member[3] == "ghostA"
+
+    # record every seat agent's step outputs: (slot idx, records per frame)
+    captured = {}  # agent id -> list of FrameRecord per frame
+    def wrap(agent):
+        orig = agent.step
+        def stepped(view, resets):
+            out = orig(view, resets)
+            captured.setdefault(id(agent), []).extend(out[1])
+            return out
+        agent.step = stepped
+    seats0 = worker._seats[0]; seats1 = worker._seats[1]
+    for seat in (seats0["current"], seats0["outgoing"], seats1["current"]):
+        wrap(seat.agent)
+    start = {id(s.agent): 0 for s in (seats0["current"], seats0["outgoing"], seats1["current"])}
+    trajs = worker.collect(6)
+    imits = [t for t in trajs if t.kind == "imitation"]
+    assert len(imits) >= 2
+    # harvested rows are in slot order: env 2,3 (slot 0), env 4,5 (slot 1)
+    assert all(t.states.p0.percent.shape[0] == 4 for t in imits)
+    T = imits[0].rewards.shape[1]
+    # stitch the chunks (they overlap by one frame) into one stream per row
+    stream = torch.cat(
+        [t.states.p0.percent[:, :T] for t in imits[:-1]]
+        + [imits[-1].states.p0.percent], dim=1
+    )
+
+    def seat_states(seat, local):
+        recs = captured[id(seat.agent)]
+        return torch.stack([r.state.p0.percent[local] for r in recs], 0)
+
+    def seat_logits(seat, local):
+        recs = captured[id(seat.agent)]
+        return torch.stack([tree.flatten(r.logits)[0][local] for r in recs], 0)
+
+    def contains(long, short):
+        n = short.shape[0]
+        return any(torch.equal(long[i:i + n], short)
+                   for i in range(long.shape[0] - n + 1))
+
+    # env 2 on ghostC (current), env 3 on ghostA (outgoing), env 4/5 on ghostB
+    expect = {
+        0: seat_states(seats0["current"], 0),
+        1: seat_states(seats0["outgoing"], 1),
+        2: seat_states(seats1["current"], 0),
+        3: seat_states(seats1["current"], 1),
+    }
+    for row, exp in expect.items():
+        probe = exp[:T]  # a full chunk's worth of this env's frames
+        assert contains(stream[row], probe), f"row {row} carries the wrong env's state"
+    # seat identity (states are the shared observation; logits are the
+    # brain's): row 0 = slot 0's CURRENT seat, row 1 = its OUTGOING seat
+    lstream = torch.cat(
+        [tree.flatten(t.actions.logits)[0][:, :T] for t in imits[:-1]]
+        + [tree.flatten(imits[-1].actions.logits)[0]], dim=1
+    )
+    assert contains(lstream[0], seat_logits(seats0["current"], 0)[:T])
+    assert contains(lstream[1], seat_logits(seats0["outgoing"], 1)[:T])
+    assert not contains(lstream[0], seat_logits(seats0["outgoing"], 0)[:T])
+    assert not contains(lstream[1], seat_logits(seats0["current"], 1)[:T])
