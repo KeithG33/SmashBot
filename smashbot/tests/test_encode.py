@@ -117,3 +117,19 @@ def test_typed_flat_round_trip_matches_worker_encode():
     for x, y in zip(tree.flatten(got), tree.flatten(ref)):
         assert x.dtype == y.dtype and x.shape == y.shape
         assert torch.equal(x, y)
+
+
+def test_split_rows_builder_matches_unflatten_as():
+    """agent._split_rows (compiled constructor) == tree.unflatten_as per row
+    on the controller struct, values and types."""
+    from smashbot.rl.agent import _split_rows
+
+    ctrl = embed_lib.ControllerConfig().make_embedding()
+    rng = np.random.default_rng(5)
+    raw = _random_raw(ctrl, rng, (6,))
+    rows = _split_rows(raw, 6)
+    for i in range(6):
+        ref = tree.unflatten_as(raw, [leaf[i] for leaf in tree.flatten(raw)])
+        assert type(rows[i]) is type(ref)
+        for x, y in zip(tree.flatten(rows[i]), tree.flatten(ref)):
+            assert np.array_equal(x, y) and np.asarray(x).dtype == np.asarray(y).dtype

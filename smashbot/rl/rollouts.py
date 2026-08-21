@@ -561,7 +561,11 @@ class DolphinRolloutWorker:
         if not hasattr(self, "_game_template"):
             from smashbot import embed as embed_lib
 
-            self._game_template = embed_lib.EmbedConfig().make_game_embedding().dummy()
+            # building the embedding constructs nn.Modules (weight init
+            # draws from the global RNG): fork it so encoding leaves the
+            # sampling stream untouched
+            with torch.random.fork_rng(devices=[]):
+                self._game_template = embed_lib.EmbedConfig().make_game_embedding().dummy()
             self._game_layout = encode.layout_of(self._game_template)
         b, i, f = (
             torch.from_numpy(np.stack([g[k] for g in games])).to(device, non_blocking=True)
