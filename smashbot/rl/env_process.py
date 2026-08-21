@@ -419,7 +419,7 @@ def _env_process_main(
                     raw = tree_lib.map_structure(
                         np.asarray, parser.get_game(gs)
                     )
-                    game = embed_game.from_state(raw)
+                    game = encode.flatten_typed(embed_game.from_state(raw))
                     # armor at the source: never ship a nonfinite frame
                     finite = all(
                         np.all(np.isfinite(leaf))

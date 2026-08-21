@@ -86,3 +86,62 @@ def build(spec: tuple):
             ctor = getattr(ctor, part)
         return _Struct([(k, build(sub)) for k, sub in fields], ctor, fixed)
     raise ValueError(f"unknown encoder spec {kind!r}")
+
+
+# ---------------------------------------------------------------------------
+# Typed flat layout: env processes ship an encoded frame as three 1-D arrays
+# (bool / int32 / float32, leaves in tree order) instead of a ~150-leaf
+# nested struct — one pickle each side, three host->GPU copies per frame
+# for the whole fleet instead of ~150. The worker rebuilds the struct from a
+# layout computed once (layout_of) on a dummy of the same embedding.
+# ---------------------------------------------------------------------------
+
+_KIND = {"b": "bool", "i": "int", "u": "int", "f": "float"}
+
+
+def flatten_typed(struct) -> tuple:
+    """(bools, ints, floats) for one encoded frame (leaves ravelled in tree
+    order). Int leaves are widened to int32 (every one-hot fits)."""
+    import tree
+
+    parts: dict = {"bool": [], "int": [], "float": []}
+    for leaf in tree.flatten(struct):
+        a = np.asarray(leaf)
+        parts[_KIND[a.dtype.kind]].append(a.ravel())
+    return (
+        np.concatenate(parts["bool"]).astype(np.bool_) if parts["bool"] else np.zeros(0, np.bool_),
+        np.concatenate(parts["int"]).astype(np.int32) if parts["int"] else np.zeros(0, np.int32),
+        np.concatenate(parts["float"]).astype(np.float32) if parts["float"] else np.zeros(0, np.float32),
+    )
+
+
+def layout_of(struct) -> list:
+    """Per leaf in tree order: (kind, offset, size, shape) — computed from a
+    dummy struct of the embedding (shapes are fixed for a run)."""
+    import tree
+
+    off = {"bool": 0, "int": 0, "float": 0}
+    out = []
+    for leaf in tree.flatten(struct):
+        a = np.asarray(leaf)
+        k = _KIND[a.dtype.kind]
+        out.append((k, off[k], a.size, tuple(a.shape)))
+        off[k] += a.size
+    return out
+
+
+def unflatten_typed_torch(struct_template, layout, bools, ints, floats):
+    """Rebuild a batched struct [N, ...] from the three batched flat tensors
+    ([N, L_kind], already on the target device). Int leaves come back as
+    int64, bools as bool, floats as float32 — the learner's conventions."""
+    import tree
+
+    src = {"bool": bools, "int": ints, "float": floats}
+    n = bools.shape[0] if bools.numel() else (ints.shape[0] if ints.numel() else floats.shape[0])
+    leaves = []
+    for kind, off, size, shape in layout:
+        t = src[kind][:, off:off + size].reshape((n,) + shape)
+        if kind == "int":
+            t = t.long()
+        leaves.append(t)
+    return tree.unflatten_as(struct_template, leaves)

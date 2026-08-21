@@ -26,6 +26,40 @@ from smashbot.networks import _mask_state
 from smashbot.policy import Policy
 
 
+def _make_builder(struct):
+    """Compile a structure (nested NamedTuples/dicts/lists of leaves) into
+    a function leaves_iter -> struct, walking the structure ONCE so per-row
+    rebuilds are plain constructor calls (dm-tree's unflatten_as re-walks
+    with isinstance checks every time)."""
+    if isinstance(struct, tuple) and hasattr(struct, "_fields"):
+        kids = [_make_builder(v) for v in struct]
+        ctor = type(struct)
+        return lambda it: ctor(*[k(it) for k in kids])
+    if isinstance(struct, dict):
+        keys = list(struct.keys())
+        kids = [_make_builder(struct[k]) for k in keys]
+        return lambda it: {k: b(it) for k, b in zip(keys, kids)}
+    if isinstance(struct, (list, tuple)):
+        kids = [_make_builder(v) for v in struct]
+        ctor = type(struct)
+        return lambda it: ctor(k(it) for k in kids)
+    return next
+
+
+_BUILDERS: dict = {}
+
+
+def _split_rows(struct, n: int) -> list:
+    """Per-row structs of a batched struct: one flatten plus n cheap
+    rebuilds through a cached compiled constructor."""
+    leaves = tree.flatten(struct)
+    key = id(type(struct)), len(leaves)
+    builder = _BUILDERS.get(key)
+    if builder is None:
+        builder = _BUILDERS[key] = _make_builder(struct)
+    return [builder(iter([leaf[i] for leaf in leaves])) for i in range(n)]
+
+
 class FrameRecord(tp.NamedTuple):
     """Per-frame streams for trajectory assembly (all batched [N, ...])."""
 
@@ -93,7 +127,9 @@ class BatchedPolicyAgent:
 
     @torch.no_grad()
     def step(
-        self, states: tp.Any, resets: torch.Tensor | None = None
+        self, states: tp.Any, resets: torch.Tensor | None = None,
+        reset_indices: tp.Sequence[int] | None = None,
+        want_snapshot: bool = True,
     ) -> tuple[list[Controller], list[FrameRecord], tp.Any]:
         """states: encoded Game struct batched [N, ...]; resets: [N] bool.
 
@@ -106,7 +142,9 @@ class BatchedPolicyAgent:
         """
         if resets is None:
             resets = torch.zeros(self.num_envs, dtype=torch.bool, device=self._name.device)
-        for i in torch.nonzero(resets).flatten().tolist():
+        if reset_indices is None:  # caller without a CPU copy: one sync
+            reset_indices = torch.nonzero(resets).flatten().tolist()
+        for i in reset_indices:
             self._queues[i] = collections.deque(
                 [_neutral_controller()] * self.delay
             )
@@ -119,7 +157,7 @@ class BatchedPolicyAgent:
         if self.batch_steps == 1:
             # fast path: skip the sample_n wrapper (measured ~20% faster
             # under reduce-overhead compile at S=1)
-            hidden_before = self.hidden_snapshot()
+            hidden_before = self.hidden_snapshot() if want_snapshot else None
             reset_t = resets
             prev = tree.map_structure(
                 lambda pv, n: torch.where(
@@ -151,14 +189,14 @@ class BatchedPolicyAgent:
                 lambda x: x.cpu().numpy(), out.controller_state
             )
             decoded = self._embed_controller.decode(encoded_np)
-            for i in range(self.num_envs):
-                self._queues[i].append(tree.map_structure(lambda x: x[i], decoded))
+            for i, c in enumerate(_split_rows(decoded, self.num_envs)):
+                self._queues[i].append(c)
             self._buf_states, self._buf_resets = [], []
             to_execute = [self._queues[i].popleft() for i in range(self.num_envs)]
             return to_execute, records, hidden_before
 
         if len(self._buf_states) == self.batch_steps:
-            hidden_before = self.hidden_snapshot()
+            hidden_before = self.hidden_snapshot() if want_snapshot else None
             stack = lambda seq: tree.map_structure(
                 lambda *xs: torch.stack(xs, dim=1), *seq
             )
@@ -197,10 +235,8 @@ class BatchedPolicyAgent:
                     lambda x: x.cpu().numpy(), out.controller_state
                 )
                 decoded = self._embed_controller.decode(encoded_np)
-                for i in range(self.num_envs):
-                    self._queues[i].append(
-                        tree.map_structure(lambda x: x[i], decoded)
-                    )
+                for i, c in enumerate(_split_rows(decoded, self.num_envs)):
+                    self._queues[i].append(c)
             self._buf_states, self._buf_resets = [], []
 
         to_execute = [self._queues[i].popleft() for i in range(self.num_envs)]

@@ -17,7 +17,7 @@ import pytest
 import torch
 import tree
 
-from smashbot import configs, embed as embed_lib
+from smashbot import configs, embed as embed_lib, encode
 from smashbot.policy import build_policy
 from smashbot.rl.agent import BatchedPolicyAgent
 from smashbot.rl.ppo import (
@@ -137,7 +137,7 @@ class _FakeEnvs:
             fs = self.final_stocks.pop(i, None)
             serving = self.serving.get(i, "policy")
             payloads.append(dict(
-                game=self.embed_game.from_state(raw),
+                game=encode.flatten_typed(self.embed_game.from_state(raw)),
                 resetting=fs is not None,
                 final_stocks=fs,
                 stocks=(4, 4),
@@ -2034,8 +2034,8 @@ def test_harvest_rows_carry_their_own_seat_records(monkeypatch):
     captured = {}  # agent id -> list of FrameRecord per frame
     def wrap(agent):
         orig = agent.step
-        def stepped(view, resets):
-            out = orig(view, resets)
+        def stepped(view, resets, **kw):
+            out = orig(view, resets, **kw)
             captured.setdefault(id(agent), []).extend(out[1])
             return out
         agent.step = stepped

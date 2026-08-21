@@ -217,6 +217,38 @@ class GameTracker:
         }
 
 
+class _PhaseProfiler:
+    """Opt-in per-frame phase timing for the worker loop (SMASHBOT_PROFILE=1):
+    prints averaged ms per phase every `every` frames after a warm-up."""
+
+    def __init__(self, every: int = 200, warmup_frames: int = 600):
+        import time as _time
+
+        self._time = _time
+        self.every = every
+        self.warmup = warmup_frames
+        self.acc: dict[str, float] = {}
+        self.n = 0
+
+    def t(self) -> float:
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        return self._time.perf_counter()
+
+    def lap(self, key: str, t0: float) -> None:
+        self.acc[key] = self.acc.get(key, 0.0) + (self.t() - t0) * 1e3
+
+    def frame(self, frame_count: int) -> None:
+        if frame_count <= self.warmup:
+            self.acc = {}
+            return
+        self.n += 1
+        if self.n % self.every == 0:
+            total = sum(self.acc.values())
+            parts = "  ".join(f"{k} {v / self.n:6.1f}" for k, v in self.acc.items())
+            print(f"[profile] ms/frame total {total / self.n:6.1f} | {parts}",
+                  flush=True)
+
+
 class _HarvestGroup:
     """Imitation harvest for opponent seats of one model config (delay +
     controller encoding): a ChunkAssembler over a fixed row set (all slot
@@ -384,6 +416,11 @@ class DolphinRolloutWorker:
         for name, idx in self.groups.items():
             assert name in self.opponents, f"no agent supplied for group {name}"
             assert self.opponents[name].num_envs == len(idx)
+            # contiguous env ranges per group: group views are plain slices
+            # (no index_select launches — ~150 leaves x groups per frame)
+            assert idx == list(range(idx[0], idx[0] + len(idx))), (
+                f"group {name} envs not contiguous: {idx}"
+            )
 
         # dolphin-level seat mask (for the opponent-view mix)
         self.seat2 = torch.tensor(
@@ -445,6 +482,9 @@ class DolphinRolloutWorker:
                 self._ref_embed = ref_agent._embed_controller
         self._procs: list = []
         self._conns: list = []
+        import os as _os
+
+        self._prof = _PhaseProfiler() if _os.environ.get("SMASHBOT_PROFILE") else None
 
     def _ensure_started(self) -> None:
         if self._procs:
@@ -510,18 +550,30 @@ class DolphinRolloutWorker:
         return payloads
 
     def _encode(self, games: list) -> tp.Any:
-        """games: per-env structs ALREADY encoded by the env processes
-        (from_state runs worker-side); here we only stack and torch-ify."""
+        """games: per-env (bools, ints, floats) flat vectors of the ALREADY
+        encoded frame (encode.flatten_typed, env-side). Three stacks, three
+        host->GPU copies, then split back into the struct on the GPU."""
         import numpy as np
 
+        from smashbot import encode
+
         device = self.student.device
-        batched = tree.map_structure(lambda *xs: np.stack(xs), *games)
-        return tree.map_structure(
-            lambda x: torch.from_numpy(
-                np.ascontiguousarray(x.astype(np.int64) if x.dtype.kind in "iu" else x)
-            ).to(device),
-            batched,
+        if not hasattr(self, "_game_template"):
+            from smashbot import embed as embed_lib
+
+            self._game_template = embed_lib.EmbedConfig().make_game_embedding().dummy()
+            self._game_layout = encode.layout_of(self._game_template)
+        b, i, f = (
+            torch.from_numpy(np.stack([g[k] for g in games])).to(device, non_blocking=True)
+            for k in range(3)
         )
+        return encode.unflatten_typed_torch(self._game_template, self._game_layout, b, i, f)
+
+    def _group_view(self, name, opponent_view):
+        """The group's rows of the opponent view, as zero-copy slices."""
+        idx = self.groups[name]
+        lo, hi = idx[0], idx[-1] + 1
+        return tree.map_structure(lambda x: x[lo:hi], opponent_view)
 
     @staticmethod
     def _swap_perspective(game):
@@ -735,8 +787,11 @@ class DolphinRolloutWorker:
         records_pushed = getattr(self, "_records_pushed", 0)
         row_dolphin = self._row_dolphin
 
+        prof = self._prof  # opt-in per-phase timing (SMASHBOT_PROFILE=1)
         while len(out) < num_trajectories:
+            t0 = prof.t() if prof else None
             payloads = self._gather_all()
+            prof and prof.lap("gather", t0)
             # envs whose opponent seat is engine-AI-driven THIS frame (league
             # cpu adoption is lazy at recycle, so this follows each env's own
             # report, never the desired assignment). Empty outside league_cpu.
@@ -775,6 +830,7 @@ class DolphinRolloutWorker:
                 self._adopt_pending(payloads, resets_d)
 
             resets = resets_d[row_dolphin]  # row-level
+            resets_cpu = resets_d.tolist()
 
             stocks_d = torch.tensor([p["stocks"] for p in payloads], dtype=torch.float32)
             percent_d = torch.tensor([p["percent"] for p in payloads], dtype=torch.float32)
@@ -814,7 +870,9 @@ class DolphinRolloutWorker:
             self._prev_stocks, self._prev_percent = stocks, percent
 
             games = [p["game"] for p in payloads]
+            t0 = prof.t() if prof else None
             encoded = self._encode(games)
+            prof and prof.lap("encode", t0)
             # perspective swap commutes with encoding: both seat views are
             # pointer swaps of one encoded struct. The parser fixes p0=port1;
             # each agent must see ITSELF as p0, so seat-2 envs get the
@@ -841,9 +899,15 @@ class DolphinRolloutWorker:
             student_view = mix(rowsel(swapped), rowsel(encoded), row_seat2)
             resets_dev = resets.to(device)
             pending_resets.append(resets_dev)
+            t0 = prof.t() if prof else None
             controllers1, records, hidden_before = self.student.step(
-                student_view, resets_dev
+                student_view, resets_dev,
+                reset_indices=resets.nonzero().flatten().tolist(),
+                # the snapshot is only consumed at a chunk boundary
+                want_snapshot=(records_pushed % cfg.unroll_length == 0),
             )
+            prof and prof.lap("student_step", t0)
+            t0 = prof.t() if prof else None
 
             opp_controllers: dict[int, tp.Any] = {}
             ref_records: list[FrameRecord] = []
@@ -857,21 +921,20 @@ class DolphinRolloutWorker:
                     # = the slot policy serves every row, unlabeled.
                     k = name[1]
                     seats = self._seats.get(k)
-                    sel = torch.tensor(idx, device=device)
+                    view = self._group_view(name, opponent_view)
+                    g_resets = resets_dev[idx[0]:idx[-1] + 1]
+                    g_reset_idx = [j for j, i in enumerate(idx) if resets_cpu[i]]
                     if not seats:
                         live = [i for i in idx if i not in cpu_now]
                         if live:
-                            group_view = tree.map_structure(
-                                lambda x: x.index_select(0, sel), opponent_view
-                            )
                             ctrls, _, _ = self.opponents[name].step(
-                                group_view, resets_dev[sel]
+                                view, g_resets, reset_indices=g_reset_idx,
+                                want_snapshot=False,
                             )
                             for j, env_i in enumerate(idx):
                                 if env_i in live:
                                     opp_controllers[env_i] = ctrls[j]
                         continue
-                    group_view = None
                     for seat in (seats["current"], seats["outgoing"]):
                         if seat is None:
                             continue
@@ -882,11 +945,10 @@ class DolphinRolloutWorker:
                         ]
                         if not live:
                             continue
-                        if group_view is None:
-                            group_view = tree.map_structure(
-                                lambda x: x.index_select(0, sel), opponent_view
-                            )
-                        ctrls, recs, _ = seat.agent.step(group_view, resets_dev[sel])
+                        ctrls, recs, _ = seat.agent.step(
+                            view, g_resets, reset_indices=g_reset_idx,
+                            want_snapshot=False,
+                        )
                         for j, env_i in enumerate(idx):
                             if env_i in live:
                                 opp_controllers[env_i] = ctrls[j]
@@ -908,16 +970,19 @@ class DolphinRolloutWorker:
                     # the cpu rows' controllers.)
                     continue
                 agent = self.opponents[name]
-                sel = torch.tensor(idx, device=device)
-                group_view = tree.map_structure(
-                    lambda x: x.index_select(0, sel), opponent_view
+                group_view = self._group_view(name, opponent_view)
+                ctrls, g_records, _ = agent.step(
+                    group_view, resets_dev[idx[0]:idx[-1] + 1],
+                    reset_indices=[j for j, i in enumerate(idx) if resets_cpu[i]],
+                    want_snapshot=False,
                 )
-                ctrls, g_records, _ = agent.step(group_view, resets_dev[sel])
                 if name == "reference" and self.harvest_imitation:
                     ref_records = g_records
                 for j, env_i in enumerate(idx):
                     opp_controllers[env_i] = ctrls[j]
 
+            prof and prof.lap("seat_steps", t0)
+            t0 = prof.t() if prof else None
             for i, conn in enumerate(self._conns):
                 port = self.specs[i].student_port
                 cmd = {port: controllers1[i]}
@@ -942,6 +1007,8 @@ class DolphinRolloutWorker:
                     )
                 conn.send(cmd)
 
+            prof and prof.lap("send", t0)
+            t0 = prof.t() if prof else None
             for j, record in enumerate(records):
                 snap = None
                 if records_pushed % cfg.unroll_length == 0:
@@ -965,7 +1032,9 @@ class DolphinRolloutWorker:
                         payloads, resets_d, harvest_parts, imit_out
                     )
 
+            prof and prof.lap("assemble+harvest", t0)
             self._frame_count += 1
+            prof and prof.frame(self._frame_count)
             if self.assembler.ready():
                 out.append(self.assembler.emit())
         self._records_pushed = records_pushed

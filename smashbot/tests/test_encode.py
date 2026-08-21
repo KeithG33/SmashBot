@@ -93,3 +93,27 @@ def test_encode_module_never_imports_torch():
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "False"
+
+
+def test_typed_flat_round_trip_matches_worker_encode():
+    """env-side flatten_typed -> worker-side unflatten_typed_torch equals
+    today's per-leaf stack+from_numpy path exactly (values, dtypes, shapes)
+    for a batch of random frames."""
+    import torch
+
+    game = embed_lib.EmbedConfig().make_game_embedding()
+    rng = np.random.default_rng(3)
+    frames = [game.from_state(_random_raw(game, rng)) for _ in range(6)]
+    # today's worker path
+    batched = tree.map_structure(lambda *xs: np.stack(xs), *frames)
+    ref = tree.map_structure(
+        lambda x: torch.from_numpy(np.ascontiguousarray(
+            x.astype(np.int64) if x.dtype.kind in "iu" else x)), batched)
+    # flat path
+    layout = encode.layout_of(game.dummy())
+    flats = [encode.flatten_typed(f) for f in frames]
+    b, i, f = (torch.from_numpy(np.stack([fl[k] for fl in flats])) for k in range(3))
+    got = encode.unflatten_typed_torch(game.dummy(), layout, b, i, f)
+    for x, y in zip(tree.flatten(got), tree.flatten(ref)):
+        assert x.dtype == y.dtype and x.shape == y.shape
+        assert torch.equal(x, y)
