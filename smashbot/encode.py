@@ -145,3 +145,30 @@ def unflatten_typed_torch(struct_template, layout, bools, ints, floats):
             t = t.long()
         leaves.append(t)
     return tree.unflatten_as(struct_template, leaves)
+
+
+# ---------------------------------------------------------------------------
+# Flat controller: the worker ships each env's controller as a 13-float row
+# (tree order of slippi_ai.types.Controller: main_stick.x/y, c_stick.x/y,
+# shoulder, then the Buttons fields) instead of a nested NamedTuple of
+# numpy scalars; the env rebuilds the struct with one constructor call.
+# ---------------------------------------------------------------------------
+
+def controller_from_flat(v):
+    """Controller struct from a flat float row (tree order)."""
+    from slippi_ai.types import Buttons, Controller, Stick
+
+    nb = len(Buttons._fields)
+    return Controller(
+        main_stick=Stick(x=np.float32(v[0]), y=np.float32(v[1])),
+        c_stick=Stick(x=np.float32(v[2]), y=np.float32(v[3])),
+        shoulder=np.float32(v[4]),
+        buttons=Buttons(*(bool(v[5 + k] > 0.5) for k in range(nb))),
+    )
+
+
+def controller_rows(decoded) -> np.ndarray:
+    """[N, 13] float32 rows from a batched decoded controller struct."""
+    import tree
+
+    return np.stack([np.asarray(x, dtype=np.float32) for x in tree.flatten(decoded)], axis=-1)

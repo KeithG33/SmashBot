@@ -97,10 +97,16 @@ def test_partition_self_envs_arithmetic_and_order():
 
 
 class _FakeConn:
+    """Records commands and validates controller payloads the way the env
+    consumes them (encode.controller_from_flat on every port entry)."""
+
     def __init__(self):
         self.sent = []
 
     def send(self, cmd):
+        for k, v in cmd.items():
+            if isinstance(k, int):
+                encode.controller_from_flat(v)  # raises on a struct/short row
         self.sent.append(cmd)
 
 

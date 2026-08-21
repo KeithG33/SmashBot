@@ -465,6 +465,7 @@ def _env_process_main(
                     for port, controller_state in controllers.items():
                         if cur_kind == "cpu" and port == opp_port:
                             continue  # engine AI drives this port; no inputs
+                        controller_state = encode.controller_from_flat(controller_state)
                         controller_lib.send_controller(
                             dolphin.controllers[port], controller_state
                         )

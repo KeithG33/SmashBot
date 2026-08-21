@@ -399,6 +399,10 @@ class DolphinRolloutWorker:
             "student agent must cover every learner row"
         )
         self.opponents = opponents or {}
+        # controllers travel to the envs as 13-float rows (encode.controller_*)
+        student.set_flat_controllers(True)
+        for ag in self.opponents.values():
+            ag.set_flat_controllers(True)
         # group name -> env index list (fixed membership = stable batch shapes)
         self.groups: dict = {}
         self.ref_idx: list[int] = []
@@ -651,6 +655,7 @@ class DolphinRolloutWorker:
                     "league_phillip)"
                 )
                 pool.phillip = self.phillip_factory(n)
+                pool.phillip.set_flat_controllers(True)
             return pool.phillip, "phillip"
         if pool.ours_main is None:
             pool.ours_main = self.opponents[("slot", slot)]
@@ -690,6 +695,7 @@ class DolphinRolloutWorker:
         pool = self._pool[slot]
         if pool.ours_spare is None:
             pool.ours_spare = self.outgoing_factory(len(self.groups[("slot", slot)]))
+            pool.ours_spare.set_flat_controllers(True)
         pool.ours_spare.policy.load_state_dict(slot_policy.state_dict())
         return _Seat(seat.member, pool.ours_spare, seat.config)
 

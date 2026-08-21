@@ -100,6 +100,10 @@ class BatchedPolicyAgent:
 
         self.hidden = policy.initial_state(num_envs, device)
         self._prev_action = tree.map_structure(lambda t: t.clone(), self._neutral_encoded)
+        # flat_controllers=True (the rollout worker): queues hold 13-float
+        # rows and step() returns rows (env rebuilds the struct) — no
+        # per-env struct construction on the worker
+        self.flat_controllers = False
         self._queues: list[collections.deque[Controller]] = [
             collections.deque([_neutral_controller()] * self.delay)
             for _ in range(num_envs)
@@ -119,13 +123,42 @@ class BatchedPolicyAgent:
         self.hidden = _mask_state(
             mask, self.policy.initial_state(self.num_envs, self.device), self.hidden
         )
-        self._queues[i] = collections.deque([_neutral_controller()] * self.delay)
+        self._queues[i] = collections.deque([self._neutral()] * self.delay)
         tree.map_structure(
             lambda dst, src: dst[i].copy_(src[i]),
             self._prev_action, self._neutral_encoded,
         )
 
     @torch.no_grad()
+    def set_flat_controllers(self, flat: bool = True) -> None:
+        """Switch the controller output format (rows vs structs); the
+        pre-filled delay queues are rebuilt in the new format."""
+        self.flat_controllers = flat
+        self._queues = [
+            collections.deque([self._neutral()] * self.delay)
+            for _ in range(self.num_envs)
+        ]
+
+    def _neutral(self):
+        if self.flat_controllers:
+            from smashbot import encode
+
+            return encode.controller_rows(
+                tree.map_structure(lambda x: np.asarray(x)[None], _neutral_controller())
+            )[0]
+        return _neutral_controller()
+
+    def _enqueue(self, decoded) -> None:
+        if self.flat_controllers:
+            from smashbot import encode
+
+            rows = encode.controller_rows(decoded)
+            for i in range(self.num_envs):
+                self._queues[i].append(rows[i])
+        else:
+            for i, c in enumerate(_split_rows(decoded, self.num_envs)):
+                self._queues[i].append(c)
+
     def step(
         self, states: tp.Any, resets: torch.Tensor | None = None,
         reset_indices: tp.Sequence[int] | None = None,
@@ -145,9 +178,7 @@ class BatchedPolicyAgent:
         if reset_indices is None:  # caller without a CPU copy: one sync
             reset_indices = torch.nonzero(resets).flatten().tolist()
         for i in reset_indices:
-            self._queues[i] = collections.deque(
-                [_neutral_controller()] * self.delay
-            )
+            self._queues[i] = collections.deque([self._neutral()] * self.delay)
 
         self._buf_states.append(states)
         self._buf_resets.append(resets)
@@ -189,8 +220,7 @@ class BatchedPolicyAgent:
                 lambda x: x.cpu().numpy(), out.controller_state
             )
             decoded = self._embed_controller.decode(encoded_np)
-            for i, c in enumerate(_split_rows(decoded, self.num_envs)):
-                self._queues[i].append(c)
+            self._enqueue(decoded)
             self._buf_states, self._buf_resets = [], []
             to_execute = [self._queues[i].popleft() for i in range(self.num_envs)]
             return to_execute, records, hidden_before
@@ -235,8 +265,7 @@ class BatchedPolicyAgent:
                     lambda x: x.cpu().numpy(), out.controller_state
                 )
                 decoded = self._embed_controller.decode(encoded_np)
-                for i, c in enumerate(_split_rows(decoded, self.num_envs)):
-                    self._queues[i].append(c)
+                self._enqueue(decoded)
             self._buf_states, self._buf_resets = [], []
 
         to_execute = [self._queues[i].popleft() for i in range(self.num_envs)]

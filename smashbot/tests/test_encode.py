@@ -133,3 +133,28 @@ def test_split_rows_builder_matches_unflatten_as():
         assert type(rows[i]) is type(ref)
         for x, y in zip(tree.flatten(rows[i]), tree.flatten(ref)):
             assert np.array_equal(x, y) and np.asarray(x).dtype == np.asarray(y).dtype
+
+
+def test_flat_controller_round_trip():
+    """controller_rows -> controller_from_flat reproduces each row's struct
+    exactly (stick floats bit-equal, buttons as bools), incl. the neutral
+    controller; leaf order is the Controller tree order."""
+    from smashbot.eval.agent import _neutral_controller
+    from smashbot.rl.agent import _split_rows
+
+    ctrl = embed_lib.ControllerConfig().make_embedding()
+    rng = np.random.default_rng(9)
+    decoded = ctrl.decode(ctrl.from_state(_random_raw(ctrl, rng, (6,))))
+    rows = encode.controller_rows(decoded)
+    assert rows.shape == (6, len(tree.flatten(decoded))) and rows.dtype == np.float32
+    for i, ref in enumerate(_split_rows(decoded, 6)):
+        got = encode.controller_from_flat(rows[i])
+        assert type(got) is type(ref)
+        for x, y in zip(tree.flatten(got), tree.flatten(ref)):
+            assert np.asarray(x).dtype == np.asarray(y).dtype, (x, y)
+            assert np.array_equal(x, y)
+    neutral = _neutral_controller()
+    row = encode.controller_rows(tree.map_structure(lambda x: np.asarray(x)[None], neutral))[0]
+    got = encode.controller_from_flat(row)
+    for x, y in zip(tree.flatten(got), tree.flatten(neutral)):
+        assert np.array_equal(x, y)
