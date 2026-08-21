@@ -14,17 +14,12 @@ import dataclasses
 import os
 import time
 
-import torch
 import tyro
 
-from smashbot import configs, embed as embed_lib, saving
-from smashbot.eval.game import load_policy, resolve_name_code
-from smashbot.networks import build_embed_network
-from smashbot.rl.agent import BatchedPolicyAgent
-from smashbot.rl.ppo import Learner, RLConfig
-from smashbot.rl.rollouts import DolphinRolloutWorker, RolloutConfig
-from smashbot.rl.teacher_watch import TeacherWatcher
-from smashbot.value import ValueFunction
+# Module level stays torch-free on purpose: every env process re-imports
+# this __main__ module (multiprocessing prepare()), and torch would cost
+# each of them ~0.26 GB. Heavy imports live inside the functions below.
+from smashbot.rl.config import RLConfig, RolloutConfig
 
 
 @dataclasses.dataclass
@@ -55,7 +50,11 @@ class Config:
     runtime: RuntimeConfig = dataclasses.field(default_factory=RuntimeConfig)
 
 
-def build_value_function(cfg: dict, device: str) -> ValueFunction:
+def build_value_function(cfg: dict, device: str):
+    from smashbot import configs, embed as embed_lib
+    from smashbot.networks import build_embed_network
+    from smashbot.value import ValueFunction
+
     value_name = cfg["value"].get("name", "match")
     if value_name == "match":
         value_name = cfg["network"]["name"]
@@ -86,6 +85,10 @@ def _save_rl_checkpoint(
     the eval harness load RL checkpoints unchanged."""
     import os
 
+    import torch
+
+    from smashbot import saving
+
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
     torch.save(
@@ -110,6 +113,15 @@ def _save_rl_checkpoint(
 
 
 def main() -> None:
+    import torch
+
+    from smashbot import saving
+    from smashbot.eval.game import load_policy, resolve_name_code
+    from smashbot.rl.agent import BatchedPolicyAgent
+    from smashbot.rl.ppo import Learner
+    from smashbot.rl.rollouts import DolphinRolloutWorker
+    from smashbot.rl.teacher_watch import TeacherWatcher
+
     args = tyro.cli(Config)
     device = args.runtime.device
 

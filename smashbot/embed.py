@@ -47,6 +47,11 @@ class Embedding(Generic[In, Out], nn.Module, abc.ABC):
     def from_state(self, state: In) -> Out:
         return state.astype(self.dtype)
 
+    def spec(self) -> tuple:
+        """Pure-data description of this embedding's from_state rule, for
+        smashbot.encode (torch-free numpy encoder used by env processes)."""
+        return ("astype", np.dtype(self.dtype).str)
+
     @abc.abstractmethod
     def forward(self, x: Out) -> torch.Tensor:
         """Embed the input as a flat float tensor."""
@@ -187,6 +192,10 @@ class OneHotEmbedding(Embedding[int, np.ndarray]):
         self.input_size = size
         self.dtype = dtype
 
+    def spec(self) -> tuple:
+        return ("onehot", self.one_hot_policy.name, self.input_size,
+                np.dtype(self.dtype).str, self.name)
+
     def from_state(self, state: np.ndarray) -> np.ndarray:
         if self.one_hot_policy is OneHotPolicy.CLAMP:
             state = np.clip(state, 0, self.input_size - 1)
@@ -289,6 +298,14 @@ class StructEmbedding(Embedding[NT, NT]):
         struct = {k: e.from_state(self.getter(state, k)) for k, e in self.embedding}
         return self.builder(struct)
 
+    def spec(self) -> tuple:
+        assert isinstance(self.builder, SplatKwargs) and self.getter is getattr, (
+            "encode.spec supports SplatKwargs/getattr structs only"
+        )
+        f = self.builder._func
+        return ("struct", [(k, e.spec()) for k, e in self.embedding],
+                (f.__module__, f.__qualname__), dict(self.builder._fixed_kwargs))
+
     def forward(self, struct: NT) -> torch.Tensor:
         embed = []
         for field, op in self.embedding:
@@ -350,6 +367,9 @@ class MLPWrapper(Embedding[In, Out]):
 
     def from_state(self, state: In) -> Out:
         return self._embed.from_state(state)
+
+    def spec(self) -> tuple:
+        return self._embed.spec()
 
     def forward(self, inputs: Out) -> torch.Tensor:
         return self._mlp(self._embed(inputs))
@@ -557,6 +577,9 @@ class DiscreteEmbedding(OneHotEmbedding):
     def from_state(self, state: np.ndarray) -> np.ndarray:
         assert state.dtype == np.float32
         return (state * self.n + 0.5).astype(self.dtype)
+
+    def spec(self) -> tuple:
+        return ("discrete", self.n, np.dtype(self.dtype).str)
 
     def decode(self, out: np.ndarray) -> np.ndarray:
         assert out.dtype == self.dtype

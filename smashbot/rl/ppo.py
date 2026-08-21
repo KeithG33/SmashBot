@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import contextlib
 import copy
-import dataclasses
 import random
 import typing as tp
 
@@ -37,61 +36,9 @@ import tree
 from slippi_ai.types import Frames, StateAction
 
 from smashbot.networks import RecurrentState, _mask_state
+from smashbot.rl.config import PPOConfig, RLConfig  # noqa: F401  (re-export)
 from smashbot.policy import Policy
 from smashbot.value import ValueFunction
-
-
-@dataclasses.dataclass
-class PPOConfig:
-    num_epochs: int = 1
-    epsilon: float = 1e-2  # log-space clip: ratio confined to [e^-eps, e^eps]
-    beta: float = 0.0  # weight of KL(actor || policy)
-    max_mean_actor_kl: float = 1e-4  # revert the update above this
-    # Anomaly armor: |log ratio| beyond this is data corruption, not policy
-    # drift (one update moves aKL ~1e-5; e^10 is impossible drift). Clamped
-    # for the surrogate; occurrences logged + first few dumped for forensics.
-    log_rho_clamp: float = 10.0
-
-
-@dataclasses.dataclass
-class RLConfig:
-    learning_rate: float = 1e-4
-    policy_gradient_weight: float = 1.0
-    kl_teacher_weight: float = 1e-1
-    reverse_kl_teacher_weight: float = 0.0
-    entropy_weight: float = 0.0
-    reward_halflife: float = 4.0  # seconds
-    max_grad_norm: float = 1.0  # 0 = no clipping
-    # Learner numeric precision: "fp32" (exact current behavior — no autocast
-    # objects, no scaler) or "fp16" (cuda-only production path; cpu falls back
-    # to fp32 with a loud warning). fp16 = torch.autocast(float16) around the
-    # POLICY forward regions only (policy unroll, frozen-teacher unroll,
-    # imitation unroll) + one GradScaler on the policy optimizer. The VALUE
-    # net stays entirely fp32 — its fixed-pass forward/backward/step never
-    # enter autocast (weakest fp16 arm in the probe, small compute share;
-    # measured recipe: scripts/precision_probe.py fp16s arm, receipts in
-    # /home/kage/drive2/ShineBot/probes/batch-0013549.pt.fidelity.json).
-    precision: str = "fp32"
-    ppo: PPOConfig = dataclasses.field(default_factory=PPOConfig)
-    # --- opponent advantage imitation (docs/idea-opponent-learning.md) ---
-    # Memory-neutral substitution: up to imitation_slots harvested opponent
-    # trajectories per step REPLACE randomly-chosen PPO trajectories (never
-    # self-play seats; teacher/cpu first, then snapshot) so the learner batch
-    # never exceeds num_envs trajectories. 0 = fully dormant.
-    imitation_slots: int = 0
-    # MARWIL/AWR weighting: w = clip(exp(A_norm / beta), max=w_cap).
-    imitation_beta: float = 1.0
-    imitation_w_cap: float = 20.0
-    # Loss coefficient: lambda_t * L_opp added to the policy loss; 0 = the
-    # actor-side term is entirely absent (critic still trains on harvested
-    # states when slots > 0). Decays linearly from imitation_lambda to
-    # imitation_lambda * imitation_lambda_final_frac across runtime.steps.
-    imitation_lambda: float = 0.0
-    imitation_lambda_final_frac: float = 0.2
-
-    @property
-    def discount(self) -> float:
-        return 0.5 ** (1 / (self.reward_halflife * 60))
 
 
 class ActionData(tp.NamedTuple):

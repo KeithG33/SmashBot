@@ -16,7 +16,6 @@ Design (user-decided):
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import os
 import random
@@ -24,54 +23,9 @@ import typing as tp
 
 import torch
 
-MAIN_12 = [
-    "FOX", "FALCO", "MARTH", "SHEIK", "JIGGLYPUFF", "CPTFALCON",
-    "PEACH", "YOSHI", "POPO", "LUIGI", "PIKACHU", "SAMUS",
-]
-# Policy opponents can be any of the 12: Sheik works via the netplay CSS
-# Zelda slot (its Sheik/Zelda toggle defaults to Sheik); occasional menu
-# races are survived by the env-process retry guard. CPU opponents cannot
-# be Sheik (libmelee cannot force a CPU to transform), and Zelda is
-# unpickable on the netplay CSS entirely.
-OPPONENT_CHARS = list(MAIN_12)
-# CPU Sheik is IMPOSSIBLE (tested live: 362/362 attempts spawned Zelda —
-# the engine ignores held A on CPU-status ports, so the Zelda->Sheik
-# transform never triggers; libmelee's guard was right). Sheik matchup
-# coverage flows through the policy-opponent envs instead.
-CPU_CHARS = [c for c in MAIN_12 if c != "SHEIK"]
-# Rest of the CSS cast reachable by simple menuing (SHEIK reached via ZELDA
-# is already in MAIN_12 through the parser's lens; ZELDA herself included).
-OFF_ROSTER = [
-    "MARIO", "DOC", "LINK", "YLINK", "NESS", "BOWSER", "DK",
-    "GANONDORF", "GAMEANDWATCH", "KIRBY", "MEWTWO", "PICHU",
-    "ROY",
-]
-
-
-def student_whitelist(
-    char_whitelist: tp.Sequence[str], bot_char: str = "FOX"
-) -> list[str]:
-    """Effective student-character whitelist.
-
-    The default whitelist ["FOX"] defers to the legacy bot_char flag (so
-    `--rollouts.bot-char MARTH` keeps working); any non-default whitelist
-    wins. len==1 reproduces the fixed-character behavior exactly."""
-    wl = [c.upper() for c in char_whitelist]
-    if wl == ["FOX"]:
-        return [bot_char.upper()]
-    return wl
-
-
-@dataclasses.dataclass
-class EnvSpec:
-    """Per-env assignment, fixed for the run."""
-
-    kind: str  # "cpu" | "teacher" | "reference" | "self" | "snapshot"
-    group: int  # snapshot slot index (0 = freshest); -1 otherwise
-    student_port: int  # 1 or 2
-    opponent_char: str
-    cpu_level: int = 9
-
+from smashbot.rl.config import (  # noqa: F401  (re-exports)
+    CPU_CHARS, EnvSpec, MAIN_12, OFF_ROSTER, OPPONENT_CHARS, student_whitelist,
+)
 
 def make_partition(
     num_envs: int,
