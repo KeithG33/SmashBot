@@ -1026,7 +1026,7 @@ def test_league_cpu_lazy_adoption_worker(monkeypatch):
     # overwrites it), results still attribute to the snapshot
     worker.begin_transition(0, "cpu", None, slot_policy)
     worker.slot_desired[0] = "cpu"
-    assert worker.slot_inplace_key[0] == "ghostA"
+    assert worker._brains[0]["main"].member == "ghostA"  # served in place
     assert worker.slot_pending[0] == set(slot_envs)
     envs.final_stocks[2] = (4, 0)
     worker.collect(1)
@@ -1210,7 +1210,7 @@ def test_league_phillip_routing_and_multislot(monkeypatch):
     worker.begin_transition(1, "ghostB", None, pol[1])
     worker.collect(1)
     assert steps[0] > 0 and steps[1] > 0
-    assert worker._phillip_agent is None
+    assert "phillip" not in worker._brains.get(0, {})
 
     # slot 0 -> phillip (deferred): rows keep ghostA until THEIR game ends.
     # Deliver both boundaries on the first frame: the ended games still
@@ -1218,18 +1218,20 @@ def test_league_phillip_routing_and_multislot(monkeypatch):
     # slot-0 policy idles
     worker.begin_transition(0, "phillip", None, pol[0])
     assert worker.slot_pending[0] == {2, 3}
-    assert worker.slot_inplace_key[0] == "ghostA"
+    assert worker._brains[0]["main"].member == "ghostA"  # in place
+    assert worker._brains[0]["phillip"].member == "phillip"
     s0 = steps[0]
     envs.final_stocks[2] = (4, 0)  # port-1 student wins on a ghostA game
     envs.final_stocks[3] = (4, 0)
     (traj,) = worker.collect(1)
     assert steps[0] == s0  # adopted on the boundary frame: policy idle
-    assert worker._phillip_agent is not None
-    assert worker._phillip_agent.num_envs == 2
+    # phillip brain = a batch-(slot size) wrapper, fixed shape
+    assert worker._brains[0]["phillip"].agent.num_envs == 2
     assert worker.trackers["snapshot"].wins >= 1
     assert worker.trackers["reference"].wins == 0
     assert {c[0] for c in calls[-2:]} == {"ghostA"}  # both ended games
-    assert 0 not in worker.slot_pending and 0 not in worker.slot_inplace_key
+    assert 0 not in worker.slot_pending
+    assert worker._brains[0]["main"].member is None  # released: nobody on ghostA
     assert worker.env_member[2] == worker.env_member[3] == "phillip"
     for i in (2, 3):
         port = worker.specs[i].student_port
@@ -1252,8 +1254,10 @@ def test_league_phillip_routing_and_multislot(monkeypatch):
     envs.final_stocks[5] = (4, 0)
     worker.collect(1)
     assert steps[1] == s1
-    assert worker._phillip_agent.num_envs == 4
-    assert worker._phillip_rows_built == [2, 3, 4, 5]
+    # a second slot draws phillip: its OWN batch-2 wrapper (shared weights)
+    assert worker._brains[1]["phillip"].agent.num_envs == 2
+    assert worker._brains[1]["phillip"].member == "phillip"
+    assert {worker.env_member[i] for i in (2, 3, 4, 5)} == {"phillip"}
 
     # back to snapshots: rows leave phillip at their boundaries and the
     # slot policies (now holding the new ghosts) resume stepping
@@ -1787,18 +1791,19 @@ def test_deferred_adoption_parks_old_brain_until_boundary(monkeypatch):
 
     worker.begin_transition(0, "ghostA", None, pol)
     worker.collect(1)
-    assert steps["slot"] > 0 and not worker._outgoing_agents
+    assert steps["slot"] > 0 and "spare" not in worker._brains[0]
 
     # auction: ghostA -> ghostB. Announce, THEN overwrite the slot policy
     # (exactly apply_assignments' order)
     old_w = {k: v.detach().clone() for k, v in pol.state_dict().items()}
     worker.begin_transition(0, "ghostB", None, pol)
     pol.load_state_dict(_tiny_policy(seed=8).state_dict())
-    spare = worker._outgoing_agents[0]
+    spare = worker._brains[0]["spare"].agent
     _wrap_steps(spare, steps, "spare")
     for k, v in spare.policy.state_dict().items():
         assert torch.equal(v, old_w[k]), k  # parked = the OLD brain
-    assert worker.slot_spare_key[0] == "ghostA"
+    assert worker._brains[0]["spare"].member == "ghostA"
+    assert worker._brains[0]["main"].member == "ghostB"
     assert worker.slot_pending[0] == {2, 3}
     assert {worker.env_member[i] for i in slot_envs} == {"ghostA"}
 
@@ -1825,7 +1830,8 @@ def test_deferred_adoption_parks_old_brain_until_boundary(monkeypatch):
     envs.final_stocks[3] = (4, 0)
     worker.collect(1)
     assert {worker.env_member[i] for i in slot_envs} == {"ghostB"}
-    assert 0 not in worker.slot_pending and 0 not in worker.slot_spare_key
+    assert 0 not in worker.slot_pending
+    assert worker._brains[0]["spare"].member is None  # released
     s_spare = steps["spare"]
     envs.final_stocks[2] = (4, 0)
     worker.collect(1)
@@ -1895,3 +1901,37 @@ def test_boot_auction_cover_serves_every_member(tmp_path):
         for s in range(40)
     )
     assert missed  # plain draw makes no such promise
+
+
+def test_phillip_multi_slot_fixed_shape_and_merged_harvest(monkeypatch):
+    """Uniform brains: two slots on Phillip each run their OWN wrapper at
+    the slot's fixed batch size (shared frozen module), every frame, and
+    the imitation harvest merges their live rows into one chunk whose row
+    count is exactly the whitelisted Phillip rows across both slots."""
+    worker, envs = _make_worker(
+        monkeypatch, num_envs=6, teacher_envs=2, snapshot_slots=2,
+        league_phillip=True, harvest=True,
+        opp_chars={2: "FOX", 3: "FOX", 4: "MARTH", 5: "FOX"},
+    )
+    pol = {g: worker.opponents[("slot", g)].policy for g in (0, 1)}
+    worker.begin_transition(0, "ghostA", None, pol[0])
+    worker.begin_transition(1, "ghostB", None, pol[1])
+    worker.collect(1)
+    worker.begin_transition(0, "phillip", None, pol[0])
+    worker.begin_transition(1, "phillip", None, pol[1])
+    for i in (2, 3, 4, 5):
+        envs.final_stocks[i] = (4, 0)
+    steps = {0: 0, 1: 0}
+    for g in (0, 1):
+        _wrap_steps(worker._brains[g]["phillip"].agent, steps, g)
+    trajs = worker.collect(4)
+    assert steps[0] > 0 and steps[1] > 0  # both wrappers step every frame
+    for g in (0, 1):
+        assert worker._brains[g]["phillip"].agent.num_envs == 2  # fixed
+    # the two wrappers share ONE module (frozen weights, per-slot state)
+    assert (worker._brains[0]["phillip"].agent.policy
+            is worker._brains[1]["phillip"].agent.policy)
+    imits = [t for t in trajs if t.kind == "imitation"]
+    assert imits
+    for imit in imits:
+        assert imit.rewards.shape[0] == 3  # FOX rows 2, 3, 5 — merged across slots
