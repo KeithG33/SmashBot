@@ -2221,3 +2221,15 @@ def test_league_capture_path_matches_loop_on_gpu():
             for pl, ag in ((pols_a, cap), (pols_b, loop)):
                 pl[1].load_state_dict(donor)
                 ag.slot_weights_changed(1)
+        if frame == 4:  # park-style read of EVERY slot module, slot 0
+            # included: functional_call's template must not be a live
+            # module (tied params leak an escaped BatchedTensor into it —
+            # live-caught at the first auction)
+            for k, pl in enumerate(pols_a):
+                sd = pl.state_dict()
+                assert all(
+                    type(v) is torch.Tensor for v in sd.values()
+                ), f"slot {k} holds a non-plain tensor"
+            # and a refresh from a slot-0 state_dict round-trips
+            pols_a[0].load_state_dict(pols_a[0].state_dict())
+            cap.slot_weights_changed(0)

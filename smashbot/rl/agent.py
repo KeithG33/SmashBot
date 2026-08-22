@@ -347,6 +347,17 @@ class LeagueAgent:
             # sit on the card twice (12 x 107MB modules + the stack).
             for p in self.policies:
                 p.to("cpu")
+            # functional_call's template: a THROWAWAY copy. The policy has
+            # tied parameters (one item MLP shared across item slots and
+            # between the game/state-action embeddings) and functional_call
+            # under vmap leaves a tied template holding an escaped
+            # BatchedTensor — live-caught at the first auction as
+            # state_dict() failing on slot 0. No live slot module is ever
+            # reparametrized.
+            import copy as _copy
+
+            self._template = _copy.deepcopy(self.policies[0])
+            self._template.__dict__.pop("sample", None)  # drop any compiled wrapper
             stk_p, stk_b = stack_module_state([p for p in self.policies])
             dev = torch.device(device)
             self._stacked_params = {k: v.to(dev) for k, v in stk_p.items()}
@@ -438,7 +449,7 @@ class LeagueAgent:
     def _capture(self, stk_views, prev, resets):
         from torch.func import functional_call, vmap
 
-        base = self.policies[0]
+        base = self._template
         name = self._name
 
         def fmodel(p, b, st, ac, hid, rst):
