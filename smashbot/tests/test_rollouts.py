@@ -536,13 +536,10 @@ def test_async_delayed_agent_matches_sync(monkeypatch):
             self.i += 1
             return g
 
-    import sys
-    sys.path.insert(0, "/tmp/claude-1000/-home-kage-smashbot-workspace/622f61f0-32b7-4321-b892-7040871af8a8/scratchpad")
-    from test_ref_bridge import rand_raw_game
 
     embed_game = embed_lib.EmbedConfig().make_game_embedding()
     rng = np.random.default_rng(5)
-    frames = [rand_raw_game(embed_game, rng) for _ in range(12)]
+    frames = [_rand_raw_game(embed_game, (), rng) for _ in range(12)]
     sync.parser = StubParser(frames)
     awa.parser = StubParser(frames)
 
@@ -595,9 +592,6 @@ def test_async_agent_absorbs_slow_samples(monkeypatch):
             policy.sample = slow_sample
         return cls(policy, own_port=1, opponent_port=2, device="cpu")
 
-    import sys
-    sys.path.insert(0, "/tmp/claude-1000/-home-kage-smashbot-workspace/622f61f0-32b7-4321-b892-7040871af8a8/scratchpad")
-    from test_ref_bridge import rand_raw_game
 
     class StubParser:
         def __init__(self, seq):
@@ -610,7 +604,7 @@ def test_async_agent_absorbs_slow_samples(monkeypatch):
 
     embed_game = embed_lib.EmbedConfig().make_game_embedding()
     rng = np.random.default_rng(9)
-    frames = [rand_raw_game(embed_game, rng) for _ in range(10)]
+    frames = [_rand_raw_game(embed_game, (), rng) for _ in range(10)]
 
     sync = make(DelayedAgent, spike=False)
     awa = make(AsyncDelayedAgent, spike=True)  # spikes ONLY on async side
