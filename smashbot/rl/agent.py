@@ -159,6 +159,10 @@ class BatchedPolicyAgent:
             for i, c in enumerate(_split_rows(decoded, self.num_envs)):
                 self._queues[i].append(c)
 
+    @torch.no_grad()  # rollout stepping is inference: without this the
+    # compiled sample runs its TRAINING graph and every frame's activations
+    # are saved for a backward that never comes (live-caught: 21GB OOM at
+    # 200 rows, and cudagraph trees' "pending, uninvoked backwards" stall)
     def step(
         self, states: tp.Any, resets: torch.Tensor | None = None,
         reset_indices: tp.Sequence[int] | None = None,
