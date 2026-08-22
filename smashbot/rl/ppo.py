@@ -516,10 +516,17 @@ class Learner:
 
     @classmethod
     def _row_chunks(cls, fixed: _Fixed, k: int) -> list:
+        """Contiguous row-range VIEWS, not copies (index_select here would
+        hold the whole fixed pass on the card twice)."""
         n = fixed.valid.shape[0]
         bounds = [round(j * n / k) for j in range(k + 1)]
+
+        def rng(lo, hi):
+            take = lambda t: t[lo:hi] if isinstance(t, torch.Tensor) else t
+            return _Fixed(*(tree.map_structure(take, field) for field in fixed))
+
         return [
-            cls._slice_fixed(fixed, range(bounds[j], bounds[j + 1]))
+            rng(bounds[j], bounds[j + 1])
             for j in range(k) if bounds[j + 1] > bounds[j]
         ]
 
@@ -651,6 +658,10 @@ class Learner:
             if keep_rows is not None else fixed_list
         )
         check_fixed = train_fixed  # post-update KL check: full rows, no grad
+        # free the pre-substitution originals (with substitution active the
+        # sliced copies above fully replace them; without it this name is
+        # just an alias of train_fixed and nothing is freed)
+        del fixed_list
         if cfg.micro_batches > 1:
             train_fixed = [
                 c for f in train_fixed for c in self._row_chunks(f, cfg.micro_batches)

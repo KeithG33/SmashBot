@@ -693,7 +693,17 @@ class DolphinRolloutWorker:
         seats = self._seats.get(slot)
         if seats and seats["outgoing"] is not None:
             if not self._rows_on(slot, seats["outgoing"].member):
+                self._drop_spare(slot, seats["outgoing"])
                 seats["outgoing"] = None
+
+    def _drop_spare(self, slot: int, seat: "_Seat") -> None:
+        """Free the slot's parked spare brain when its seat retires (107MB
+        of GPU weights each; kept forever they'd accrete to 12 spares over
+        a long run). _park recreates one on demand."""
+        pool = self._pool.get(slot)
+        if pool is not None and pool.ours_spare is not None \
+                and seat.agent is pool.ours_spare:
+            pool.ours_spare = None
 
     def _needs_slot_policy(self, member: str) -> bool:
         """Does `member` live in the slot policy module? (cpu has none,
@@ -732,6 +742,7 @@ class DolphinRolloutWorker:
                   f"(one mid-game swap)", flush=True)
             for i in rows:
                 self.env_member[i] = onto
+        self._drop_spare(slot, out)
         self._seats[slot]["outgoing"] = None
 
     def begin_transition(
@@ -946,7 +957,10 @@ class DolphinRolloutWorker:
             harvest_parts: dict[str, dict[int, list]] = {}
             league_rows: dict = {}
             league_recs: dict = {}
-            if self._league_agent is not None and self._seats:
+            # league pass runs whenever the league exists (pre-auction too:
+            # the no-seats branch below serves its rows — the slot MODULES
+            # live on CPU under capture and must never be stepped directly)
+            if self._league_agent is not None:
                 views, rsts, ridx = [], [], []
                 for pos, k in enumerate(self._league_slots):
                     idx_k = self.groups[("slot", k)]
@@ -971,10 +985,13 @@ class DolphinRolloutWorker:
                     if not seats:
                         live = [i for i in idx if i not in cpu_now]
                         if live:
-                            ctrls, _, _ = self.opponents[name].step(
-                                view, g_resets, reset_indices=g_reset_idx,
-                                want_snapshot=False,
-                            )
+                            if k in league_rows:
+                                ctrls = list(league_rows[k])
+                            else:
+                                ctrls, _, _ = self.opponents[name].step(
+                                    view, g_resets, reset_indices=g_reset_idx,
+                                    want_snapshot=False,
+                                )
                             for j, env_i in enumerate(idx):
                                 if env_i in live:
                                     opp_controllers[env_i] = ctrls[j]

@@ -529,9 +529,14 @@ def apply_assignments(
                 f"--rollouts.league-imports)"
             )
             path, _char = imports[key]
-            slot_policy.load_state_dict(torch.load(path, map_location=device))
+            # map to the MODULE's device: under league capture the slot
+            # modules live on CPU (the GPU copy is the stacked params,
+            # refreshed by slot_weights_changed below)
+            mod_dev = next(slot_policy.parameters()).device
+            slot_policy.load_state_dict(torch.load(path, map_location=mod_dev))
         else:
-            slot_policy.load_state_dict(torch.load(key, map_location=device))
+            mod_dev = next(slot_policy.parameters()).device
+            slot_policy.load_state_dict(torch.load(key, map_location=mod_dev))
         worker.slot_desired[slot] = "policy"
         worker.slot_char_lock[slot] = lock  # (cpu keeps the previous lock)
         worker.slot_weights_changed(slot)

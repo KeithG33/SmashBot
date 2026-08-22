@@ -2127,9 +2127,16 @@ def test_league_capture_path_matches_loop_on_gpu():
         for p in pl:
             p.requires_grad_(False)
     cap = LeagueAgent(pols_a, N, name_code=1, device="cuda", temperature=1e-6)
-    loop = LeagueAgent(pols_b, N, name_code=1, device="cuda", temperature=1e-6)
+    loop = LeagueAgent(
+        pols_b, N, name_code=1, device="cuda", temperature=1e-6, capture=False
+    )
     assert cap._use_capture
-    loop._use_capture = False
+    assert not loop._use_capture
+    # capture moves the slot MODULES to CPU (the stack is the GPU copy)
+    for p in pols_a:
+        assert next(p.parameters()).device.type == "cpu"
+    for p in pols_b:
+        assert next(p.parameters()).device.type == "cuda"
     game = embed_lib.EmbedConfig().make_game_embedding()
     rng = np.random.default_rng(0)
     for frame in range(6):

@@ -291,7 +291,8 @@ class LeagueAgent:
     controller transfer/decode/queue update for all S*N rows. Seats point at
     slot refs (slot_ref) for weight loads and harvest metadata."""
 
-    def __init__(self, policies, num_envs: int, name_code: int, device, temperature=None):
+    def __init__(self, policies, num_envs: int, name_code: int, device,
+                 temperature=None, capture: bool | None = None):
         assert policies, "LeagueAgent needs at least one slot policy"
         self.policies = list(policies)
         self.S, self.N = len(self.policies), num_envs
@@ -329,16 +330,27 @@ class LeagueAgent:
         # MODULES stay the source of truth for weights; slot_weights_changed
         # refreshes the stack slice in place, which captured replays see
         # (graphs hold pointers). CPU / tests use the per-slot loop below.
-        self._use_capture = (
-            torch.device(device).type == "cuda" and len(self.policies) > 1
-        )
+        if capture is None:
+            capture = torch.device(device).type == "cuda"
+        if capture:
+            assert torch.device(device).type == "cuda", (
+                "LeagueAgent capture=True needs a CUDA device"
+            )
+        self._use_capture = capture
         self._graph = None
         if self._use_capture:
             from torch.func import stack_module_state
 
-            self._stacked_params, self._stacked_buffers = stack_module_state(
-                [p for p in self.policies]
-            )
+            # The GPU reads weights ONLY from the stacked copy: the modules
+            # are pure bookkeeping (auction loads, teacher copies, park
+            # sources), so keep them on CPU — otherwise the league weights
+            # sit on the card twice (12 x 107MB modules + the stack).
+            for p in self.policies:
+                p.to("cpu")
+            stk_p, stk_b = stack_module_state([p for p in self.policies])
+            dev = torch.device(device)
+            self._stacked_params = {k: v.to(dev) for k, v in stk_p.items()}
+            self._stacked_buffers = {k: v.to(dev) for k, v in stk_b.items()}
 
     def slot_weights_changed(self, k: int) -> None:
         """Refresh stack slice k from the slot's module (weights are loaded
