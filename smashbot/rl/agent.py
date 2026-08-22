@@ -319,6 +319,36 @@ class LeagueAgent:
             collections.deque([self._neutral_row] * self.delay)
             for _ in range(self.S * num_envs)
         ]
+        # CUDA production path: ONE eager-vmap forward over stacked per-slot
+        # parameters, captured into a manual CUDA graph (inductor's cudagraph
+        # trees choke on 12 compiled callables in a tight loop). The slot
+        # MODULES stay the source of truth for weights; slot_weights_changed
+        # refreshes the stack slice in place, which captured replays see
+        # (graphs hold pointers). CPU / tests use the per-slot loop below.
+        self._use_capture = (
+            torch.device(device).type == "cuda" and len(self.policies) > 1
+        )
+        self._graph = None
+        if self._use_capture:
+            from torch.func import stack_module_state
+
+            self._stacked_params, self._stacked_buffers = stack_module_state(
+                [p for p in self.policies]
+            )
+
+    def slot_weights_changed(self, k: int) -> None:
+        """Refresh stack slice k from the slot's module (weights are loaded
+        into modules by apply_assignments/parking; the captured graph reads
+        the stack in place)."""
+        if not self._use_capture:
+            return
+        sd = self.policies[k].state_dict()
+        with torch.no_grad():
+            for name, t in self._stacked_params.items():
+                t[k].copy_(sd[name])
+            for name, t in self._stacked_buffers.items():
+                if name in sd:
+                    t[k].copy_(sd[name])
 
     def slot_ref(self, k: int) -> "_SlotRef":
         return _SlotRef(self, k)
@@ -338,22 +368,10 @@ class LeagueAgent:
             ),
             self._prev, self._neutral,
         )
-        outs, hiddens = [], []
-        for k, policy in enumerate(self.policies):
-            out, hid = policy.sample(
-                StateAction(state=views[k], action=tree.map_structure(lambda t: t[k], prev), name=self._name[k]),
-                self.hidden[k], is_resetting=resets[k], temperature=self.temperature,
-            )
-            outs.append(out)
-            hiddens.append(hid)
-        self.hidden = [
-            tree.map_structure(lambda t: t.clone() if isinstance(t, torch.Tensor) else t, h)
-            for h in hiddens
-        ]
-        # one stack per leaf across slots (fresh tensors: outputs of
-        # cudagraph replays get overwritten on the next replay)
-        ctrl = tree.map_structure(lambda *xs: torch.stack(xs), *[o.controller_state for o in outs])
-        logits = tree.map_structure(lambda *xs: torch.stack(xs), *[o.logits for o in outs])
+        if self._use_capture:
+            ctrl, logits = self._captured_forward(views, prev, resets)
+        else:
+            ctrl, logits = self._loop_forward(views, prev, resets)
         self._prev = tree.map_structure(
             lambda t: t.clone() if t.dtype == torch.bool else t.long().clone(), ctrl
         )
@@ -378,6 +396,91 @@ class LeagueAgent:
             q.append(row)
         execute = np.stack([q.popleft() for q in self._queues]).reshape(self.S, self.N, -1)
         return [execute[k] for k in range(self.S)], records
+
+    def _captured_forward(self, views, prev, resets):
+        """One vmap'd forward over the stacked slot parameters, executed as a
+        manual CUDA-graph replay: copy this frame's inputs into the static
+        buffers, replay, return clones of the static outputs. Captured once
+        at first use (shapes never change); in-place stack-slice weight
+        updates are visible to replays."""
+        stk_views = tree.map_structure(lambda *xs: torch.stack(xs), *views)
+        if self._graph is None:
+            self._capture(stk_views, prev, resets)
+        tree.map_structure(lambda d, s: d.copy_(s), self._in_views, stk_views)
+        tree.map_structure(lambda d, s: d.copy_(s), self._in_prev, prev)
+        self._in_resets.copy_(resets)
+        # recurrent state: static in <- last replay's static out
+        tree.map_structure(
+            lambda d, s: d.copy_(s) if isinstance(d, torch.Tensor) else None,
+            self._in_hidden, self._out_hidden,
+        )
+        self._graph.replay()
+        ctrl = tree.map_structure(lambda t: t.clone(), self._out_ctrl)
+        logits = tree.map_structure(lambda t: t.clone(), self._out_logits)
+        return ctrl, logits
+
+    def _capture(self, stk_views, prev, resets):
+        from torch.func import functional_call, vmap
+
+        base = self.policies[0]
+        name = self._name
+
+        def fmodel(p, b, st, ac, hid, rst):
+            out, hid2 = functional_call(base, (p, b), (
+                StateAction(state=st, action=ac, name=name[0]), hid, rst, self.temperature,
+            ))
+            return out.controller_state, out.logits, hid2
+
+        self._vm = vmap(fmodel, in_dims=(0, 0, 0, 0, 0, 0), randomness="different")
+        self._in_views = tree.map_structure(lambda t: t.clone(), stk_views)
+        self._in_prev = tree.map_structure(lambda t: t.clone(), prev)
+        self._in_resets = resets.clone()
+        h0 = [p.initial_state(self.N, self.device) for p in self.policies]
+        self._in_hidden = tree.map_structure(
+            lambda *xs: torch.stack(xs) if isinstance(xs[0], torch.Tensor) else xs[0], *h0
+        )
+        args = (self._stacked_params, self._stacked_buffers, self._in_views,
+                self._in_prev, self._in_hidden, self._in_resets)
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                self._vm(*args)
+        torch.cuda.current_stream().wait_stream(s)
+        self._graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self._graph):
+            self._out_ctrl, self._out_logits, self._out_hidden = self._vm(*args)
+        # the just-captured pass ran with the warm-up inputs; hidden restarts
+        # from the stacked initial state on the first real replay
+        tree.map_structure(
+            lambda d, s_: d.copy_(s_) if isinstance(d, torch.Tensor) else None,
+            self._out_hidden, self._in_hidden,
+        )
+
+    def _loop_forward(self, views, prev, resets):
+        outs, hiddens = [], []
+        for k, policy in enumerate(self.policies):
+            # contiguous per-slot inputs: a strided slice of the [S, N, ...]
+            # stack would miss the compiled sample's guards and re-record a
+            # CUDA graph per slot (live-caught as an OOM)
+            out, hid = policy.sample(
+                StateAction(
+                    state=views[k],
+                    action=tree.map_structure(lambda t: t[k].contiguous(), prev),
+                    name=self._name[k].contiguous(),
+                ),
+                self.hidden[k], is_resetting=resets[k].contiguous(),
+                temperature=self.temperature,
+            )
+            outs.append(out)
+            hiddens.append(hid)
+        self.hidden = [
+            tree.map_structure(lambda t: t.clone() if isinstance(t, torch.Tensor) else t, h)
+            for h in hiddens
+        ]
+        ctrl = tree.map_structure(lambda *xs: torch.stack(xs), *[o.controller_state for o in outs])
+        logits = tree.map_structure(lambda *xs: torch.stack(xs), *[o.logits for o in outs])
+        return ctrl, logits
 
     @staticmethod
     def _prev_record(prev):

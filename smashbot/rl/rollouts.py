@@ -677,6 +677,10 @@ class DolphinRolloutWorker:
             pool.ours_main = self._league_agent.slot_ref(self._league_slots.index(slot))
         return pool.ours_main, "ours"
 
+    def slot_weights_changed(self, slot: int) -> None:
+        if self._league_agent is not None and slot in self._league_slots:
+            self._league_agent.slot_weights_changed(self._league_slots.index(slot))
+
     def _rows_on(self, slot: int, key: str | None) -> list[int]:
         if key is None:
             return []

@@ -534,4 +534,5 @@ def apply_assignments(
             slot_policy.load_state_dict(torch.load(key, map_location=device))
         worker.slot_desired[slot] = "policy"
         worker.slot_char_lock[slot] = lock  # (cpu keeps the previous lock)
+        worker.slot_weights_changed(slot)
         slot_keys[slot] = key

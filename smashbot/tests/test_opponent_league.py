@@ -885,6 +885,9 @@ def test_apply_assignments_teacher_copy_and_cpu_lazy(tmp_path):
             self.slot_char_lock = {}
             self.announced = []
 
+        def slot_weights_changed(self, slot):
+            pass
+
         def begin_transition(self, slot, key, lock, slot_policy=None):
             # the announcement must see the PREVIOUS weights: snapshot them
             self.announced.append((
@@ -2103,3 +2106,58 @@ def test_harvest_rows_carry_their_own_seat_records(monkeypatch):
     assert contains(lstream[1], seat_logits(seats0["outgoing"], 1)[:T])
     assert not contains(lstream[0], seat_logits(seats0["outgoing"], 0)[:T])
     assert not contains(lstream[1], seat_logits(seats0["current"], 1)[:T])
+
+
+@pytest.mark.skipif(
+    not (os.environ.get("SMASHBOT_GPU_TESTS") and torch.cuda.is_available()),
+    reason="production capture path needs CUDA (SMASHBOT_GPU_TESTS=1)",
+)
+def test_league_capture_path_matches_loop_on_gpu():
+    """The manual CUDA-graph capture path (production) produces the same
+    controller rows and records as the per-slot loop, frame after frame,
+    with saturated sampling — including after a mid-stream weight load via
+    slot_weights_changed."""
+    from smashbot.rl.agent import LeagueAgent
+
+    torch.manual_seed(0)
+    S, N = 3, 4
+    mk = lambda seeds: [_tiny_policy(seed=s).cuda().eval() for s in seeds]
+    pols_a, pols_b = mk([11, 12, 13]), mk([11, 12, 13])
+    for pl in (pols_a, pols_b):
+        for p in pl:
+            p.requires_grad_(False)
+    cap = LeagueAgent(pols_a, N, name_code=1, device="cuda", temperature=1e-6)
+    loop = LeagueAgent(pols_b, N, name_code=1, device="cuda", temperature=1e-6)
+    assert cap._use_capture
+    loop._use_capture = False
+    game = embed_lib.EmbedConfig().make_game_embedding()
+    rng = np.random.default_rng(0)
+    for frame in range(6):
+        raw = _rand_raw_game(game, (N,), rng)
+        enc = game.from_state(raw)
+        view = tree.map_structure(
+            lambda x: torch.from_numpy(np.ascontiguousarray(
+                x.astype(np.int64) if x.dtype.kind in "iu" else x)).cuda(), enc)
+        views = [view] * S
+        resets = torch.zeros(S, N, dtype=torch.bool, device="cuda")
+        ridx = [(0, 0)] if frame == 3 else []
+        if frame == 3:
+            resets[0, 0] = True
+        rows_c, recs_c = cap.step(views, resets, ridx)
+        rows_l, recs_l = loop.step(views, resets, ridx)
+        for k in range(S):
+            assert np.array_equal(rows_c[k], rows_l[k]), f"frame {frame} slot {k} rows"
+            for rc, rl in zip(recs_c, recs_l):
+                # states / prev actions / names: bitwise. Logits: vmap's
+                # batched kernels sum in a different order than per-slot
+                # matmuls -> fp epsilon (harvest logits are unused anyway).
+                for x, y in zip(tree.flatten(rc._replace(logits=0)), tree.flatten(rl._replace(logits=0))):
+                    if isinstance(x, torch.Tensor):
+                        assert torch.equal(x, y), f"frame {frame} slot {k} record"
+                for x, y in zip(tree.flatten(rc.logits), tree.flatten(rl.logits)):
+                    assert torch.allclose(x, y, atol=1e-4, rtol=1e-4), f"frame {frame} slot {k} logits"
+        if frame == 2:  # swap slot 1's weights through the refresh hook
+            donor = _tiny_policy(seed=99).cuda().state_dict()
+            for pl, ag in ((pols_a, cap), (pols_b, loop)):
+                pl[1].load_state_dict(donor)
+                ag.slot_weights_changed(1)
