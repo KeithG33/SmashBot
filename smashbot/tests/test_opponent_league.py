@@ -330,12 +330,12 @@ def test_whitelist_gates_imitation_harvest(monkeypatch):
 
     # and the harvested trajectory feeds the imitation learner path
     learner = Learner(
-        RLConfig(imitation_slots=1, imitation_lambda=0.1),
+        RLConfig(imitation_rows=-1, imitation_lambda=0.1),
         _tiny_policy(seed=0), _tiny_policy(seed=0), _tiny_value(),
     )
     imf = learner._imitation_fixed(imit)
     assert imf is not None
-    loss = learner._imitation_policy_loss(imf)
+    loss = learner._imitation_chunk_loss(imf, float(imf.valid.sum()))
     assert torch.isfinite(loss)
 
 
@@ -364,26 +364,22 @@ def _imitation_traj(policy, B, seed=1) -> Trajectory:
     )
 
 
-def test_batch_invariant_substitution():
-    """With imitation_slots=k the learner's policy pass covers EXACTLY
-    num_envs rows: (num_envs - k) PPO rows + k imitation rows. Self-play
-    rows are never substituted out; teacher/cpu drop first, then snapshot."""
+def test_imitation_trains_all_rows_in_ppo_sized_chunks():
+    """No substitution: the PPO pass covers EVERY PPO row and the imitation
+    term covers EVERY harvested row (or a uniform cap), accumulated in
+    chunks no larger than the PPO micro-batch chunk."""
     policy = _tiny_policy(seed=0)
-    kinds = ["cpu", "teacher", "teacher", "snapshot", "self", "self"]
     main = _rollout(policy, B=6, T=8, seed=0)
 
-    for slots, expect_k, allowed in [
-        (2, 2, {0, 1, 2}),          # tier1 (cpu/teacher) preferred
-        (5, 4, {0, 1, 2, 3}),       # tier1 exhausted -> snapshot; never self
-    ]:
+    def run(rows_cfg, k, imit_B):
         learner = Learner(
             RLConfig(
-                imitation_slots=slots, imitation_lambda=0.1,
+                imitation_rows=rows_cfg, imitation_lambda=0.1, micro_batches=k,
                 ppo=PPOConfig(max_mean_actor_kl=1e9),
             ),
             _tiny_policy(seed=0), _tiny_policy(seed=0), _tiny_value(),
         )
-        imit = _imitation_traj(policy, B=4)
+        imit = _imitation_traj(policy, B=imit_B)
         unroll_rows = []
         orig_unroll = learner.policy.unroll
 
@@ -392,35 +388,111 @@ def test_batch_invariant_substitution():
             return orig_unroll(frames, st, **kw)
 
         learner.policy.unroll = counting_unroll
-        _, metrics = learner.step(
-            [main, imit], learner.initial_state(6), progress=0.0,
-            row_kinds=kinds,
-        )
-        im = metrics["imitation"]
-        assert im["traj_count"] == expect_k
-        assert set(im["substituted_rows"]) <= allowed
-        assert len(im["substituted_rows"]) == expect_k
-        assert 4 not in im["substituted_rows"] and 5 not in im["substituted_rows"]
-        # epoch policy passes: one PPO minibatch + one imitation minibatch,
-        # totalling exactly num_envs rows (the OOM ceiling)
-        assert unroll_rows[0] + unroll_rows[1] == 6
-        assert unroll_rows[0] == 6 - expect_k
+        _, metrics = learner.step([main, imit], learner.initial_state(6))
+        # epoch passes only: drop the post-update full-batch check
+        return metrics, unroll_rows[:-1]
 
-    # slot cap respects available droppable rows: all-self batch drops none
-    learner = Learner(
-        RLConfig(imitation_slots=3, imitation_lambda=0.1,
-                 ppo=PPOConfig(max_mean_actor_kl=1e9)),
-        _tiny_policy(seed=0), _tiny_policy(seed=0), _tiny_value(),
-    )
-    _, metrics = learner.step(
-        [main, _imitation_traj(policy, B=4)], learner.initial_state(6),
-        row_kinds=["self"] * 6,
-    )
-    assert "imitation" not in metrics  # nothing droppable => nothing used
+    # all rows, k=2: PPO chunks 3+3, imitation 7 rows -> chunks <= 3
+    m, rows = run(-1, 2, 7)
+    assert m["imitation"]["traj_count"] == 7
+    assert rows[:2] == [3, 3]
+    assert sum(rows[2:]) == 7 and max(rows[2:]) <= 3
+    # all rows, k=1: one PPO pass of 6, imitation 7 -> chunks <= 6
+    m, rows = run(-1, 1, 7)
+    assert rows[0] == 6 and sum(rows[1:]) == 7 and max(rows[1:]) <= 6
+    # uniform cap: 3 of 7 harvested rows
+    m, rows = run(3, 1, 7)
+    assert m["imitation"]["traj_count"] == 3
+    assert rows[0] == 6 and sum(rows[1:]) == 3
+
+
+def test_imitation_loss_is_exact_mean_over_all_rows():
+    """The accumulated imitation loss equals -(w * log pi * valid).sum() /
+    valid.sum() over ALL harvested rows, whatever the chunking (one epoch,
+    so the reported loss is at the pre-update parameters)."""
+    policy = _tiny_policy(seed=0)
+    main = _rollout(policy, B=4, T=8, seed=0)
+    imit = _imitation_traj(policy, B=5)
+    for k in (1, 3):
+        learner = Learner(
+            RLConfig(imitation_rows=-1, imitation_lambda=0.1, micro_batches=k,
+                     ppo=PPOConfig(max_mean_actor_kl=1e9, num_epochs=1)),
+            _tiny_policy(seed=0), _tiny_policy(seed=0), _tiny_value(),
+        )
+        captured = []
+        orig_plan = learner._plan_imitation
+
+        def plan(trajs):
+            out = orig_plan(trajs)
+            captured.extend(out[0])
+            return out
+
+        learner._plan_imitation = plan
+        _, metrics = learner.step([main, imit], learner.initial_state(4))
+        assert len(captured) == 1
+        imf = captured[0]
+        ref_policy = _tiny_policy(seed=0)  # == learner.policy before the step
+        with torch.no_grad():
+            out = ref_policy.unroll(
+                imf.frames, ref_policy.initial_state(imf.rows),
+                discount=learner.config.discount,
+            )
+            ref = (-(imf.weights * out.log_probs * imf.valid).sum()
+                   / imf.valid.sum()).item()
+        assert metrics["imitation"]["loss"] == pytest.approx(ref, rel=1e-5)
+
+
+@pytest.mark.parametrize("k", [2, 3])
+def test_imitation_accumulation_is_chunk_invariant(k):
+    """PPO + imitation accumulated over k chunks each gives the same
+    GRADIENT as k=1 (the 'accumulate separately == one joint backward'
+    property), and hence the same update up to Adam amplifying fp-order
+    noise on near-zero-gradient elements."""
+    policy = _tiny_policy(seed=0)
+    main = _rollout(policy, B=6, T=8, seed=0)
+    imit = _imitation_traj(policy, B=5)
+
+    def run(k):
+        torch.manual_seed(0)
+        learner = Learner(
+            RLConfig(imitation_rows=-1, imitation_lambda=0.5, micro_batches=k,
+                     learning_rate=1e-3, ppo=PPOConfig(max_mean_actor_kl=1e9)),
+            _tiny_policy(seed=0), _tiny_policy(seed=0), _tiny_value(),
+        )
+        with torch.no_grad():
+            g = torch.Generator().manual_seed(1)
+            for a in learner.policy.parameters():
+                a.add_(torch.randn(a.shape, generator=g) * 1e-2)
+        grads = []
+        orig_step = learner.policy_optimizer.step
+
+        def capturing_step(*args, **kw):
+            grads.extend(
+                None if p.grad is None else p.grad.detach().clone()
+                for p in learner.policy.parameters()
+            )
+            return orig_step(*args, **kw)
+
+        learner.policy_optimizer.step = capturing_step
+        _, m = learner.step([main, imit], learner.initial_state(6))
+        return learner, m, grads
+
+    full, mf, gf = run(1)
+    chunked, mc, gc = run(k)
+    assert gf and len(gf) == len(gc)
+    assert any(g is not None for g in gf)
+    for ga, gb in zip(gf, gc):
+        assert (ga is None) == (gb is None)
+        if ga is not None:
+            torch.testing.assert_close(ga, gb, rtol=1e-4, atol=1e-7)
+    for pa, pb in zip(full.policy.parameters(), chunked.policy.parameters()):
+        torch.testing.assert_close(pa, pb, rtol=1e-3, atol=1e-5)
+    assert mf["imitation"]["loss"] == pytest.approx(mc["imitation"]["loss"], rel=1e-5)
+    assert mf["imitation"]["traj_count"] == mc["imitation"]["traj_count"] == 5
 
 
 def test_default_config_learner_ignores_imitation_trajs():
-    """Dormant path: imitation_slots=0 (default) => imitation trajectories
+    """Dormant path: imitation_rows=0 (default) => imitation trajectories
     are ignored entirely and metrics carry no imitation key."""
     policy = _tiny_policy(seed=0)
     main = _rollout(policy, B=3, T=8, seed=0)
@@ -474,7 +546,7 @@ def test_imitation_advantage_is_g_minus_v_and_detached():
     torch.manual_seed(0)
     policy = _tiny_policy(seed=0)
     learner = Learner(
-        RLConfig(imitation_slots=2, imitation_lambda=0.1),
+        RLConfig(imitation_rows=-1, imitation_lambda=0.1),
         policy, _tiny_policy(seed=0), _tiny_value(),
     )
     traj = _imitation_traj(policy, B=2)
@@ -507,7 +579,7 @@ def test_imitation_advantage_is_g_minus_v_and_detached():
 
     # actor loss must not leak gradient into the critic
     learner.value_optimizer.zero_grad(set_to_none=True)
-    loss = learner._imitation_policy_loss(imf)
+    loss = learner._imitation_chunk_loss(imf, float(imf.valid.sum()))
     loss.backward()
     assert all(p.grad is None for p in learner.value_function.parameters())
     assert any(
@@ -530,23 +602,19 @@ def test_lambda_decay_endpoints():
 def test_lambda_zero_actor_term_exactly_absent():
     """imitation_lambda=0: the actor-side term contributes NOTHING — two
     runs with radically different imitation ACTIONS produce bitwise-equal
-    policies, and the PPO loss equals plain PPO on the same rows."""
+    policies, and the PPO loss equals plain PPO on the same (full) rows."""
     policy = _tiny_policy(seed=0)
     main = _rollout(policy, B=4, T=8, seed=0)
-    kinds = ["teacher", "teacher", "teacher", "teacher"]
 
     def run(imit_seed, lam):
         learner = Learner(
-            RLConfig(imitation_slots=2, imitation_lambda=lam,
+            RLConfig(imitation_rows=-1, imitation_lambda=lam,
                      ppo=PPOConfig(max_mean_actor_kl=1e9)),
             _tiny_policy(seed=0), _tiny_policy(seed=0), _tiny_value(),
         )
-        learner._subst_rng = random.Random(7)  # identical row drops
         imit = _imitation_traj(_tiny_policy(seed=imit_seed), B=2,
                                seed=imit_seed)
-        _, metrics = learner.step(
-            [main, imit], learner.initial_state(4), row_kinds=kinds
-        )
+        _, metrics = learner.step([main, imit], learner.initial_state(4))
         return learner, metrics
 
     l_a, m_a = run(imit_seed=5, lam=0.0)
@@ -555,30 +623,15 @@ def test_lambda_zero_actor_term_exactly_absent():
     for k, v in l_a.policy.state_dict().items():
         assert torch.equal(v, l_b.policy.state_dict()[k]), k
 
-    # same rows through a plain-PPO learner: identical first-epoch loss
-    dropped = m_a["imitation"]["substituted_rows"]
-    keep = [i for i in range(4) if i not in dropped]
+    # the full PPO batch through a plain-PPO learner: identical first-epoch
+    # loss (no rows are dropped any more, so this is the same forward)
     plain = Learner(
         RLConfig(ppo=PPOConfig(max_mean_actor_kl=1e9)),
         _tiny_policy(seed=0), _tiny_policy(seed=0), _tiny_value(),
     )
-    _, m_plain = plain.step(
-        [slice_trajectory_rows(main, keep)], plain.initial_state(len(keep))
-    )
-    # approx (not bitwise): the plain learner forwards a batch of 2 rows
-    # while the substituting learner slices its 4-row fixed pass — BLAS
-    # kernels differ by shape at ~1e-8. The bitwise guarantee (imitation
-    # data contributes nothing to the actor) is the A/B check above.
+    _, m_plain = plain.step([main], plain.initial_state(4))
     assert m_a["epochs"][0]["loss"] == pytest.approx(
-        m_plain["epochs"][0]["loss"], rel=1e-5
-    )
-
-    # ...while lambda > 0 with different imitation data changes the policy
-    l_c, m_c = run(imit_seed=5, lam=0.5)
-    assert m_c["imitation"]["loss"] != 0.0
-    assert any(
-        not torch.equal(v, l_c.policy.state_dict()[k])
-        for k, v in l_a.policy.state_dict().items()
+        m_plain["epochs"][0]["loss"], rel=1e-6
     )
 
 

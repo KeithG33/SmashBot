@@ -555,7 +555,7 @@ def run_lambda_calib(learner, trajectories, target_shares=(0.10, 0.15, 0.20)):
         imf = learner._imitation_fixed(traj)
         if imf is None:
             continue
-        loss = learner._imitation_policy_loss(imf)
+        loss = learner._imitation_chunk_loss(imf, float(imf.valid.sum()))
         loss.backward()
         imit_losses.append(float(loss.detach()))
     assert imit_losses, "no imitation-eligible trajectories"

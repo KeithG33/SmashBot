@@ -227,9 +227,9 @@ class Learner:
             value_function.parameters(), lr=config.learning_rate
         )
         self._ops = _StructOps(policy.controller_head.controller_embedding)
-        # Substitution/slot RNG (imitation row picks + PPO row drops);
-        # seeded for reproducibility, reseedable in tests.
-        self._subst_rng = random.Random(0)
+        # Imitation row-cap sampling RNG; seeded for reproducibility,
+        # reseedable in tests.
+        self._imit_rng = random.Random(0)
 
     def _autocast(self):
         """fp16-mode autocast for POLICY forward regions; a plain null
@@ -500,10 +500,15 @@ class Learner:
             frames=frames, weights=weights, valid=valid, rows=batch_size
         )
 
-    def _imitation_policy_loss(self, imf: _ImitFixed) -> torch.Tensor:
-        """L_opp = -(w * log pi(a_opp|s)).mean() over valid positions —
-        log pi via the same teacher-forced unroll path PPO uses (and, in
-        fp16 mode, under the same policy autocast + scaled backward)."""
+    def _imitation_chunk_loss(
+        self, imf: _ImitFixed, total_valid: float
+    ) -> torch.Tensor:
+        """One imitation chunk's share of L_opp = -(w * log pi(a_opp|s))
+        averaged over EVERY valid harvested position this step: the chunk's
+        masked sum over the step-wide denominator, so accumulating all
+        chunks reproduces the full-batch mean exactly. Same teacher-forced
+        unroll path (and, in fp16 mode, the same autocast + scaled
+        backward) as PPO."""
         batch_size = imf.valid.shape[0]
         with self._autocast():
             out = self.policy.unroll(
@@ -511,8 +516,24 @@ class Learner:
                 self.policy.initial_state(batch_size, imf.valid.device),
                 discount=self.config.discount,
             )
-            n_valid = imf.valid.sum().clamp(min=1.0)
-            return -(imf.weights * out.log_probs * imf.valid).sum() / n_valid
+            return -(imf.weights * out.log_probs * imf.valid).sum() / total_valid
+
+    @staticmethod
+    def _imit_chunks(imf: _ImitFixed, chunk_rows: int) -> list:
+        """Row-range VIEWS of an imitation fixed pass, each <= chunk_rows
+        (the PPO chunk size) so no imitation chunk can raise the learner's
+        activation peak above what the PPO chunks already set."""
+        n = imf.rows
+        out = []
+        for lo in range(0, n, chunk_rows):
+            hi = min(lo + chunk_rows, n)
+            take = lambda t: t[lo:hi] if isinstance(t, torch.Tensor) else t
+            out.append(_ImitFixed(
+                frames=tree.map_structure(take, imf.frames),
+                weights=imf.weights[lo:hi], valid=imf.valid[lo:hi],
+                rows=hi - lo,
+            ))
+        return out
 
     @classmethod
     def _row_chunks(cls, fixed: _Fixed, k: int) -> list:
@@ -532,7 +553,7 @@ class Learner:
 
     @staticmethod
     def _slice_fixed(fixed: _Fixed, rows: tp.Sequence[int]) -> _Fixed:
-        """Row (env-dim) subset of a fixed pass, for PPO-row substitution."""
+        """Row (env-dim) subset of a fixed pass (copy)."""
         sel = torch.as_tensor(list(rows), dtype=torch.int64)
 
         def take(t):
@@ -542,34 +563,24 @@ class Learner:
 
         return _Fixed(*(tree.map_structure(take, field) for field in fixed))
 
-    def _plan_substitution(
-        self,
-        imit_trajs: list[Trajectory],
-        num_rows: int,
-        row_kinds: tp.Optional[tp.Sequence[str]],
-    ) -> tuple[list[_ImitFixed], tp.Optional[list[int]], dict]:
-        """Memory-neutral batching: pick <= imitation_slots imitation rows and
-        an equal count of PPO rows to drop (never self-play seats; teacher/
-        cpu first, then snapshot), keeping the learner's policy-pass row
-        total exactly num_rows."""
+    def _plan_imitation(
+        self, imit_trajs: list[Trajectory]
+    ) -> tuple[list[_ImitFixed], dict]:
+        """All harvested rows this step (or a uniform sample of
+        imitation_rows of them when capped): per harvest group, the critic
+        update + MARWIL weights. Nothing is substituted out of the PPO
+        batch — micro-batching makes the extra rows a time cost, not a
+        memory one (see step)."""
         cfg = self.config
-        kinds = list(row_kinds) if row_kinds is not None else ["teacher"] * num_rows
-        assert len(kinds) == num_rows, "row_kinds must match the PPO batch"
-        tier1 = [i for i, k in enumerate(kinds) if k in ("cpu", "teacher")]
-        tier2 = [i for i, k in enumerate(kinds) if k == "snapshot"]
-        avail = sum(t.rewards.shape[0] for t in imit_trajs)
-        budget = min(cfg.imitation_slots, avail, len(tier1) + len(tier2))
-
-        # sample the budget UNIFORMLY over every harvested row across all
-        # imitation chunks (several opponent config groups may each emit
-        # one), so no group crowds out another by arriving first
         pool = [
             (ti, r) for ti, t in enumerate(imit_trajs)
             for r in range(t.rewards.shape[0])
         ]
-        chosen = self._subst_rng.sample(pool, budget) if budget < len(pool) else pool
+        cap = cfg.imitation_rows
+        chosen = (
+            self._imit_rng.sample(pool, cap) if 0 < cap < len(pool) else pool
+        )
         imit_fixed: list[_ImitFixed] = []
-        used = 0
         for ti, traj in enumerate(imit_trajs):
             rows = sorted(r for t, r in chosen if t == ti)
             if not rows:
@@ -579,17 +590,8 @@ class Learner:
             imf = self._imitation_fixed(traj)
             if imf is not None:
                 imit_fixed.append(imf)
-                used += imf.rows
-        if used == 0:
-            return [], None, {}
-
-        self._subst_rng.shuffle(tier1)
-        self._subst_rng.shuffle(tier2)
-        dropped = (tier1 + tier2)[:used]
-        assert all(kinds[i] != "self" for i in dropped)
-        keep_rows = [i for i in range(num_rows) if i not in set(dropped)]
-        assert len(keep_rows) + used == num_rows
-
+        if not imit_fixed:
+            return [], {}
         n = sum(imf.valid.sum().clamp(min=1.0) for imf in imit_fixed)
         w_mean = sum(
             (imf.weights * imf.valid).sum() for imf in imit_fixed
@@ -598,19 +600,17 @@ class Learner:
             (imf.weights * imf.valid).max().item() for imf in imit_fixed
         )
         stats = {
-            "traj_count": used,
+            "traj_count": sum(imf.rows for imf in imit_fixed),
             "w_mean": w_mean.item(),
             "w_max": w_max,
-            "substituted_rows": sorted(dropped),
         }
-        return imit_fixed, keep_rows, stats
+        return imit_fixed, stats
 
     def step(
         self,
         trajectories: tp.Sequence[Trajectory],
         state: LearnerState,
         progress: float = 0.0,
-        row_kinds: tp.Optional[tp.Sequence[str]] = None,
     ) -> tuple[LearnerState, dict]:
         """One PPO update over a batch of trajectory chunks (minibatches).
 
@@ -619,12 +619,13 @@ class Learner:
         measure post-update actor KL — reverting the update if it moved the
         policy beyond ppo.max_mean_actor_kl.
 
-        Trajectories tagged kind="imitation" are routed to the opponent-
-        advantage-imitation path (up to imitation_slots rows, substituting an
-        equal number of PPO rows out of the policy pass — see
-        _plan_substitution); ignored while imitation_slots == 0. `progress`
-        (run fraction, for lambda decay) and `row_kinds` (per-row env kinds
-        of the PPO batch) only matter when imitation is active.
+        Trajectories tagged kind="imitation" feed the opponent-advantage-
+        imitation term: EVERY harvested row trains (or a uniform sample of
+        imitation_rows of them), on top of the full PPO batch — nothing is
+        substituted out. Both terms accumulate over row chunks no larger
+        than the PPO micro-batch, so the activation peak is the PPO chunk's
+        and extra rows only cost learner time. Ignored while
+        imitation_rows == 0. `progress` (run fraction) drives lambda decay.
         """
         cfg = self.config
         ppo_trajs = [
@@ -642,33 +643,25 @@ class Learner:
             value_metrics.append(vm)
 
         imit_fixed: list[_ImitFixed] = []
-        keep_rows: tp.Optional[list[int]] = None
         imit_stats: dict = {}
-        if cfg.imitation_slots > 0 and imit_trajs and fixed_list:
-            imit_fixed, keep_rows, imit_stats = self._plan_substitution(
-                imit_trajs, fixed_list[0].valid.shape[0], row_kinds
-            )
+        if cfg.imitation_rows != 0 and imit_trajs and fixed_list:
+            imit_fixed, imit_stats = self._plan_imitation(imit_trajs)
         lambda_t = self.lambda_at(progress)
-        # The k dropped rows leave the POLICY pass only: the fixed passes
-        # above already ran full-batch (carried teacher/value states stay
-        # exact), and the imitation unroll adds the k rows back, so the
-        # per-backward activation footprint never exceeds num_envs rows.
-        train_fixed = (
-            [self._slice_fixed(f, keep_rows) for f in fixed_list]
-            if keep_rows is not None else fixed_list
-        )
-        check_fixed = train_fixed  # post-update KL check: full rows, no grad
-        # free the pre-substitution originals (with substitution active the
-        # sliced copies above fully replace them; without it this name is
-        # just an alias of train_fixed and nothing is freed)
-        del fixed_list
+
+        check_fixed = fixed_list  # post-update KL check: full rows, no grad
+        train_fixed = fixed_list
         if cfg.micro_batches > 1:
             train_fixed = [
-                c for f in train_fixed for c in self._row_chunks(f, cfg.micro_batches)
+                c for f in fixed_list for c in self._row_chunks(f, cfg.micro_batches)
             ]
         # exact accumulation: each chunk's mean-over-valid loss weighted by its
         # share of all valid positions reproduces the full-batch mean
         total_valid = sum(float(f.valid.sum()) for f in train_fixed) or 1.0
+        # imitation chunks are capped at the PPO chunk size (activation peak
+        # unchanged) and share one step-wide denominator (exact mean)
+        chunk_rows = max(f.valid.shape[0] for f in train_fixed) if train_fixed else 1
+        imit_chunks = [c for imf in imit_fixed for c in self._imit_chunks(imf, chunk_rows)]
+        total_imit_valid = sum(float(c.valid.sum()) for c in imit_chunks) or 1.0
 
         snapshot = copy.deepcopy(self.policy.state_dict())
 
@@ -687,19 +680,19 @@ class Learner:
                 self._backward(loss * (float(fixed.valid.sum()) / total_valid))
                 any_backward = True
                 batch_metrics.append(metrics)
-            if imit_fixed and lambda_t > 0.0:
+            if imit_chunks and lambda_t > 0.0:
                 imit_losses = []
-                for imf in imit_fixed:
-                    iloss = self._imitation_policy_loss(imf)
+                for chunk in imit_chunks:
+                    iloss = self._imitation_chunk_loss(chunk, total_imit_valid)
                     if not torch.isfinite(iloss):
                         print("NONFINITE IMITATION LOSS: skipping minibatch",
                               flush=True)
                         continue
-                    self._backward(lambda_t * iloss / len(imit_fixed))
+                    self._backward(lambda_t * iloss)
                     any_backward = True
                     imit_losses.append(iloss.item())
                 if imit_losses:
-                    imit_loss_val = sum(imit_losses) / len(imit_losses)
+                    imit_loss_val = sum(imit_losses)  # = step-wide mean
             use_scaler = self.grad_scaler is not None and any_backward
             if use_scaler:
                 # Divide the loss scale back out BEFORE clipping/guarding so

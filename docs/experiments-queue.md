@@ -93,7 +93,7 @@ anchor-to-zero).
 
 ## Also queued (older)
 
-- Advantage imitation A/B (machinery landed, dormant: imitation-slots /
+- Advantage imitation A/B (machinery landed, dormant: imitation-rows /
   imitation-lambda; see docs/idea-opponent-learning.md)
 - 12-char whitelist flip = v4 all-character student
 - 705-era dump-on-skip forensics (save the culprit batch when a nonfinite

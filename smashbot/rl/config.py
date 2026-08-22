@@ -257,11 +257,11 @@ class RLConfig:
     micro_batches: int = 1
     ppo: PPOConfig = dataclasses.field(default_factory=PPOConfig)
     # --- opponent advantage imitation (docs/idea-opponent-learning.md) ---
-    # Memory-neutral substitution: up to imitation_slots harvested opponent
-    # trajectories per step REPLACE randomly-chosen PPO trajectories (never
-    # self-play seats; teacher/cpu first, then snapshot) so the learner batch
-    # never exceeds num_envs trajectories. 0 = fully dormant.
-    imitation_slots: int = 0
+    # Harvested opponent rows trained per step ON TOP of the full PPO batch
+    # (nothing substituted out): -1 = every eligible row, N > 0 = a uniform
+    # sample of N, 0 = fully dormant. Rows accumulate in chunks no larger
+    # than the PPO micro-batch, so this costs learner time, not VRAM.
+    imitation_rows: int = 0
     # MARWIL/AWR weighting: w = clip(exp(A_norm / beta), max=w_cap).
     imitation_beta: float = 1.0
     imitation_w_cap: float = 20.0

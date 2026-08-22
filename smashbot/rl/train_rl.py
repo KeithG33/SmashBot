@@ -283,7 +283,7 @@ def main() -> None:
     )
     worker = DolphinRolloutWorker(
         args.rollouts, student_agent, opponents=opponents, specs=specs,
-        harvest_imitation=args.learner.imitation_slots > 0,
+        harvest_imitation=args.learner.imitation_rows != 0,
     )
     # payoff attribution: the worker reports the member each env was
     # fighting when its game ended; slot_keys is the auction's log view
@@ -417,7 +417,6 @@ def main() -> None:
             state, metrics = learner.step(
                 trajectories, state,
                 progress=i / max(1, args.runtime.steps),
-                row_kinds=worker.row_kinds,
             )
             if os.environ.get("SMASHBOT_PROFILE") and device == "cuda":
                 torch.cuda.synchronize()
