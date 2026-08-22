@@ -674,8 +674,13 @@ class Learner:
             for fixed in train_fixed:
                 loss, metrics = self._policy_loss(fixed)
                 if not torch.isfinite(loss):
-                    print("NONFINITE LOSS: skipping minibatch")
+                    print("NONFINITE LOSS: skipping minibatch", flush=True)
                     batch_metrics.append(metrics)
+                    # release the skipped chunk's autograd graph NOW: kept
+                    # alive into the next chunk's forward it doubles the
+                    # live activation footprint (live-caught: two weekend
+                    # OOMs, each adjacent to this message)
+                    del loss
                     continue
                 self._backward(loss * (float(fixed.valid.sum()) / total_valid))
                 any_backward = True
@@ -687,6 +692,7 @@ class Learner:
                     if not torch.isfinite(iloss):
                         print("NONFINITE IMITATION LOSS: skipping minibatch",
                               flush=True)
+                        del iloss  # same graph release as above
                         continue
                     self._backward(lambda_t * iloss)
                     any_backward = True

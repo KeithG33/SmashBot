@@ -450,3 +450,43 @@ def test_micro_batches_give_identical_update(k):
     assert mf["reverted"] == mc["reverted"]
     assert mf["post_update"]["actor_kl_mean"] == pytest.approx(
         mc["post_update"]["actor_kl_mean"], rel=1e-5, abs=1e-9)
+
+
+def test_nonfinite_chunk_graph_released_before_next_forward():
+    """A chunk whose loss is nonfinite is skipped AND its autograd graph is
+    released before the next chunk's forward runs (otherwise two chunks'
+    activations are live at once — the weekend OOM). The finite chunks
+    still train."""
+    import weakref
+
+    torch.manual_seed(0)
+    learner, traj = _make_learner(
+        learning_rate=1e-3, micro_batches=2,
+        ppo=PPOConfig(max_mean_actor_kl=1e9),  # no trust-region revert
+    )
+    before = [p.detach().clone() for p in learner.policy.parameters()]
+    orig = learner._policy_loss
+    poisoned = []  # weakref to the skipped chunk's loss (its graph never
+    # ran backward, so only dropping the reference frees its activations;
+    # finite chunks' losses may linger as emptied graphs — harmless)
+    calls = {"n": 0}
+
+    def patched(fixed):
+        for ref in poisoned:
+            assert ref() is None, "skipped chunk's loss still alive at next forward"
+        loss, metrics = orig(fixed)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            loss = loss * float("nan")  # poison the first chunk only
+            poisoned.append(weakref.ref(loss))
+        return loss, metrics
+
+    learner._policy_loss = patched
+    st = learner.initial_state(traj.rewards.shape[0])
+    _, m = learner.step([traj], st)
+    assert calls["n"] >= 3  # 2 epoch chunks + post-update check
+    moved = any(
+        not torch.equal(a, b)
+        for a, b in zip(before, learner.policy.parameters())
+    )
+    assert moved  # the finite chunk trained
