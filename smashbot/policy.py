@@ -194,6 +194,17 @@ class Policy(nn.Module):
         return outs, hidden, used_prevs
 
     @torch.no_grad()
+    def forward(
+        self,
+        state_action: StateAction,
+        initial_state: RecurrentState,
+        is_resetting: tp.Optional[torch.Tensor] = None,
+        temperature: tp.Optional[float] = None,
+    ) -> tuple[SampleOutputs, RecurrentState]:
+        """forward == sample, so torch.func.functional_call (which dispatches
+        to forward) can run inference with stacked per-slot parameters."""
+        return self.sample(state_action, initial_state, is_resetting, temperature)
+
     def sample(
         self,
         state_action: StateAction,  # [B], encoded

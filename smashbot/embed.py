@@ -745,23 +745,25 @@ class _PackedSpec(nn.Module):
         self._shape_fetch = fetches[0]
 
     def compute(self, struct) -> torch.Tensor:
+        # out-of-place writes (index_copy / scatter, identical results) so the
+        # whole forward is vmap-able over stacked per-slot parameters
         lead = self._shape_fetch(struct).shape
         out = torch.zeros(
             *lead, self.total_size, dtype=torch.float32, device=self.bool_cols.device
         )
         if self._bool_fetch:
             b = torch.stack([f(struct) for f in self._bool_fetch], dim=-1)
-            out.index_copy_(-1, self.bool_cols, torch.where(b, self.bool_on, self.bool_off))
+            out = out.index_copy(-1, self.bool_cols, torch.where(b, self.bool_on, self.bool_off))
         if self._float_fetch:
             x = torch.stack([f(struct).float() for f in self._float_fetch], dim=-1)
             x = torch.clamp((x + self.float_bias) * self.float_scale, self.float_lo, self.float_hi)
-            out.index_copy_(-1, self.float_cols, x)
+            out = out.index_copy(-1, self.float_cols, x)
         if self._onehot_fetch:
             idx = torch.stack([f(struct).long() for f in self._onehot_fetch], dim=-1)
             valid = (idx >= 0) & (idx < self.oh_sizes)
             src = (valid | ~self.oh_checked).float()
             dest = self.oh_offsets + torch.minimum(idx.clamp(min=0), self.oh_sizes - 1)
-            out.scatter_(-1, dest, src)
+            out = out.scatter(-1, dest, src)
         return out
 
 
