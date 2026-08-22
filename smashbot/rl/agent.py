@@ -277,3 +277,127 @@ class BatchedPolicyAgent:
             lambda t: t.detach().clone() if isinstance(t, torch.Tensor) else t,
             self.hidden,
         )
+
+
+class LeagueAgent:
+    """All same-config league slots stepped in ONE Python pass per frame:
+    S slot policies x N rows. Per-row state (recurrent state, prev action,
+    delay queues) lives here for every slot; each frame runs one forward per
+    slot (a stacked forward can replace that loop), then a single batched
+    controller transfer/decode/queue update for all S*N rows. Seats point at
+    slot refs (slot_ref) for weight loads and harvest metadata."""
+
+    def __init__(self, policies, num_envs: int, name_code: int, device, temperature=None):
+        assert policies, "LeagueAgent needs at least one slot policy"
+        self.policies = list(policies)
+        self.S, self.N = len(self.policies), num_envs
+        self.device = device
+        self.temperature = temperature
+        p0 = self.policies[0]
+        self.delay = p0.delay
+        self._embed_controller = p0.controller_head.controller_embedding
+        self._name = torch.full((self.S, num_envs), name_code, dtype=torch.int64, device=device)
+        # same construction as BatchedPolicyAgent: the neutral controller
+        # tiled to the row batch, then to every slot -> [S, N, ...]
+        neutral = tree.map_structure(
+            lambda x: np.asarray(x)[None].repeat(num_envs, axis=0), _neutral_controller()
+        )
+        self._neutral = tree.map_structure(
+            lambda x: torch.from_numpy(np.ascontiguousarray(
+                x.astype(np.int64) if x.dtype.kind in "iu" else x
+            )).to(device)[None].expand(self.S, *x.shape).clone(),
+            self._embed_controller.from_state(neutral),
+        )
+        self._prev = tree.map_structure(lambda t: t.clone(), self._neutral)  # [S, N, ...]
+        self.hidden = [p.initial_state(num_envs, device) for p in self.policies]
+        from smashbot import encode
+
+        self._neutral_row = encode.controller_rows(
+            tree.map_structure(lambda x: np.asarray(x)[None], _neutral_controller())
+        )[0]
+        self._queues = [
+            collections.deque([self._neutral_row] * self.delay)
+            for _ in range(self.S * num_envs)
+        ]
+
+    def slot_ref(self, k: int) -> "_SlotRef":
+        return _SlotRef(self, k)
+
+    @torch.no_grad()
+    def step(self, views, resets, reset_indices):
+        """views: per-slot encoded structs [N, ...]; resets: [S, N] bool on
+        device; reset_indices: iterable of (slot, row). Returns per-slot
+        controller rows (list of [N, 13] numpy) and per-slot FrameRecords."""
+        for s, i in reset_indices:
+            self._queues[s * self.N + i] = collections.deque(
+                [self._neutral_row] * self.delay
+            )
+        prev = tree.map_structure(
+            lambda pv, n: torch.where(
+                resets.view(self.S, self.N, *([1] * (pv.dim() - 2))), n, pv
+            ),
+            self._prev, self._neutral,
+        )
+        outs, hiddens = [], []
+        for k, policy in enumerate(self.policies):
+            out, hid = policy.sample(
+                StateAction(state=views[k], action=tree.map_structure(lambda t: t[k], prev), name=self._name[k]),
+                self.hidden[k], is_resetting=resets[k], temperature=self.temperature,
+            )
+            outs.append(out)
+            hiddens.append(hid)
+        self.hidden = [
+            tree.map_structure(lambda t: t.clone() if isinstance(t, torch.Tensor) else t, h)
+            for h in hiddens
+        ]
+        # one stack per leaf across slots (fresh tensors: outputs of
+        # cudagraph replays get overwritten on the next replay)
+        ctrl = tree.map_structure(lambda *xs: torch.stack(xs), *[o.controller_state for o in outs])
+        logits = tree.map_structure(lambda *xs: torch.stack(xs), *[o.logits for o in outs])
+        self._prev = tree.map_structure(
+            lambda t: t.clone() if t.dtype == torch.bool else t.long().clone(), ctrl
+        )
+        prev_rec = self._prev_record(prev)
+        records = [
+            FrameRecord(
+                state=views[k],
+                prev_action=tree.map_structure(lambda t: t[k], prev_rec),
+                logits=tree.map_structure(lambda t: t[k], logits),
+                name=self._name[k],
+            )
+            for k in range(self.S)
+        ]
+        # ONE host transfer + decode for all S*N rows
+        encoded_np = tree.map_structure(
+            lambda x: x.reshape(self.S * self.N, *x.shape[2:]).cpu().numpy(), ctrl
+        )
+        from smashbot import encode
+
+        rows = encode.controller_rows(self._embed_controller.decode(encoded_np))
+        for q, row in zip(self._queues, rows):
+            q.append(row)
+        execute = np.stack([q.popleft() for q in self._queues]).reshape(self.S, self.N, -1)
+        return [execute[k] for k in range(self.S)], records
+
+    @staticmethod
+    def _prev_record(prev):
+        return tree.map_structure(
+            lambda x: x.clone() if x.dtype == torch.bool else x.long().clone(), prev
+        )
+
+
+class _SlotRef:
+    """A seat's handle on one slot of a LeagueAgent: exposes what the worker
+    needs for weight loads (policy), harvest grouping (delay, embedding) and
+    row count; stepping happens in LeagueAgent.step."""
+
+    def __init__(self, league: LeagueAgent, k: int):
+        self.league, self.k = league, k
+        self.policy = league.policies[k]
+        self.num_envs = league.N
+        self.delay = league.delay
+        self._embed_controller = league._embed_controller
+        self.flat_controllers = True
+
+    def set_flat_controllers(self, flat: bool = True) -> None:
+        assert flat, "league slots always speak flat controller rows"

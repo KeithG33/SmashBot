@@ -426,6 +426,22 @@ class DolphinRolloutWorker:
                 f"group {name} envs not contiguous: {idx}"
             )
 
+        # all same-config slots are stepped by ONE LeagueAgent (one Python
+        # pass per frame); seats hold slot refs into it. Spares and Phillip
+        # keep their own agents.
+        slot_names = sorted(n for n in self.groups if isinstance(n, tuple))
+        self._league_slots = [n[1] for n in slot_names]
+        self._league_agent = None
+        if slot_names:
+            from smashbot.rl.agent import LeagueAgent
+
+            first = self.opponents[slot_names[0]]
+            self._league_agent = LeagueAgent(
+                [self.opponents[n].policy for n in slot_names],
+                len(self.groups[slot_names[0]]),
+                name_code=int(first._name[0].item()), device=first.device,
+                temperature=first.temperature,
+            )
         # dolphin-level seat mask (for the opponent-view mix)
         self.seat2 = torch.tensor(
             [sp.student_port == 2 for sp in self.specs]
@@ -658,7 +674,7 @@ class DolphinRolloutWorker:
                 pool.phillip.set_flat_controllers(True)
             return pool.phillip, "phillip"
         if pool.ours_main is None:
-            pool.ours_main = self.opponents[("slot", slot)]
+            pool.ours_main = self._league_agent.slot_ref(self._league_slots.index(slot))
         return pool.ours_main, "ours"
 
     def _rows_on(self, slot: int, key: str | None) -> list[int]:
@@ -924,6 +940,20 @@ class DolphinRolloutWorker:
             # config -> slot -> [(row mask over the slot batch, records,
             # agent)] per occupied seat of that config
             harvest_parts: dict[str, dict[int, list]] = {}
+            league_rows: dict = {}
+            league_recs: dict = {}
+            if self._league_agent is not None and self._seats:
+                views, rsts, ridx = [], [], []
+                for pos, k in enumerate(self._league_slots):
+                    idx_k = self.groups[("slot", k)]
+                    views.append(self._group_view(("slot", k), opponent_view))
+                    rsts.append(resets_dev[idx_k[0]:idx_k[-1] + 1])
+                    ridx.extend((pos, j) for j, i in enumerate(idx_k) if resets_cpu[i])
+                rows_by_pos, recs_by_pos = self._league_agent.step(
+                    views, torch.stack(rsts), ridx
+                )
+                for pos, k in enumerate(self._league_slots):
+                    league_rows[k], league_recs[k] = rows_by_pos[pos], recs_by_pos[pos]
             for name, idx in self.groups.items():
                 if isinstance(name, tuple):
                     # slot group: each occupied seat steps the full batch;
@@ -955,10 +985,13 @@ class DolphinRolloutWorker:
                         ]
                         if not live:
                             continue
-                        ctrls, recs, _ = seat.agent.step(
-                            view, g_resets, reset_indices=g_reset_idx,
-                            want_snapshot=False,
-                        )
+                        if k in league_rows and getattr(seat.agent, "league", None) is self._league_agent:
+                            ctrls, recs = list(league_rows[k]), [league_recs[k]]
+                        else:
+                            ctrls, recs, _ = seat.agent.step(
+                                view, g_resets, reset_indices=g_reset_idx,
+                                want_snapshot=False,
+                            )
                         for j, env_i in enumerate(idx):
                             if env_i in live:
                                 opp_controllers[env_i] = ctrls[j]

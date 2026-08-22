@@ -10,6 +10,9 @@ then compare:
     .venv/bin/python scripts/golden_trajs.py /tmp/new.pt      # on branch
     .venv/bin/python scripts/golden_trajs.py --compare /tmp/ref.pt /tmp/new.pt
 
+Add --deterministic (both sides) when the change reorders agent calls:
+sampling at temperature 1e-3 makes trajectories independent of RNG order.
+
 A refactor that preserves behavior must report 0 differing leaves.
 """
 import sys, random, torch, numpy as np, tree
@@ -31,6 +34,18 @@ if sys.argv[1] == "--compare":
 
 torch.manual_seed(0); random.seed(0); np.random.seed(0)
 mp = MonkeyPatch()
+if "--deterministic" in sys.argv:
+    # near-zero temperature: every Bernoulli/multinomial draw saturates, so
+    # trajectories no longer depend on the ORDER random numbers are drawn
+    # in — the right reference when a refactor reorders agent calls
+    sys.argv.remove("--deterministic")
+    from smashbot.rl import agent as _agent_mod
+    _orig_init = _agent_mod.BatchedPolicyAgent.__init__
+
+    def _det_init(self, *a, **k):
+        _orig_init(self, *a, **k)
+        self.temperature = 1e-6
+    mp.setattr(_agent_mod.BatchedPolicyAgent, "__init__", _det_init)
 worker, envs = T._make_worker(
     mp, num_envs=8, teacher_envs=2, snapshot_slots=2, self_envs=1,
     league_phillip=True, harvest=True,
