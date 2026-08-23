@@ -341,6 +341,8 @@ def _env_process_main(
                 while True:
                     signal.alarm(120)
                     _t0 = time.perf_counter() if _prof else 0.0
+                    if _cprof is not None and os.environ.get("SMASHBOT_PROFILE_PARSE") == "2":
+                        _cprof.enable()
                     try:
                         gs = next(gs_iter)
                     except AlarmTimeout:

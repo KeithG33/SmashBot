@@ -521,7 +521,25 @@ class LeagueAgent:
                 ))
             return out.controller_state, out.logits, hid2
 
-        return vmap(fmodel, in_dims=(0, 0, 0, 0, 0, 0), randomness="different")
+        if self.S > 1:
+            return vmap(fmodel, in_dims=(0, 0, 0, 0, 0, 0), randomness="different")
+
+        # one slice: no vmap needed (and none possible for cores without a
+        # batching rule, e.g. the ported medium-v2's cuDNN LSTM). Same
+        # [1, N, ...] signature: squeeze the slice dim in, add it back out.
+        sq = lambda t: t[0] if isinstance(t, torch.Tensor) else t
+        un = lambda t: t[None] if isinstance(t, torch.Tensor) else t
+
+        def single(p, b, st, ac, hid, rst):
+            ctrl, logits, hid2 = fmodel(
+                {k: v[0] for k, v in p.items()}, {k: v[0] for k, v in b.items()},
+                tree.map_structure(sq, st), tree.map_structure(sq, ac),
+                tree.map_structure(sq, hid), rst[0],
+            )
+            return (tree.map_structure(un, ctrl), tree.map_structure(un, logits),
+                    tree.map_structure(un, hid2))
+
+        return single
 
     def _captured_forward(self, views, prev, resets):
         """Copy this frame's inputs into the static buffers, replay, return

@@ -594,3 +594,28 @@ def test_grid_move_cell_is_exact():
         src = rows_r[0 * N + 0]
         dst = rows_m[(1 * N + 1) if t >= 3 else 0]
         assert np.array_equal(src, dst), f"frame {t}"
+
+
+def test_single_slice_grid_matches_vmap_grid():
+    """S=1 takes the no-vmap path; its rows/records must equal slice 0 of
+    a 2-slice vmap grid loaded with the same weights (saturated sampling)."""
+    from smashbot import embed as embed_lib
+
+    sd = _tiny_policy(seed=5).state_dict()
+    one = LeagueAgent(_tiny_policy(seed=0), 1, 3, name_code=1, device="cpu", temperature=1e-6)
+    two = LeagueAgent(_tiny_policy(seed=0), 2, 3, name_code=1, device="cpu", temperature=1e-6)
+    one.load_slice(0, sd); two.load_slice(0, sd); two.load_slice(1, sd)
+    game = embed_lib.EmbedConfig().make_game_embedding()
+    rng = np.random.default_rng(0)
+    for t in range(4):
+        raw = _rand_raw_game(game, (2, 3), rng)
+        v2 = tree.map_structure(lambda x: torch.from_numpy(np.ascontiguousarray(
+            x.astype(np.int64) if x.dtype.kind in "iu" else x)), game.from_state(raw))
+        v1 = tree.map_structure(lambda x: x[:1], v2)
+        r2 = torch.zeros(2, 3, dtype=torch.bool); r1 = r2[:1]
+        if t == 2:
+            r2[0, 1] = True; one.reset_cell(0, 1); two.reset_cell(0, 1)
+        rows1, rec1 = one.step(v1, r1)
+        rows2, rec2 = two.step(v2, r2)
+        assert np.array_equal(rows1, rows2[:3]), f"frame {t}"
+        assert torch.equal(rec1.name, rec2.name[:3])
