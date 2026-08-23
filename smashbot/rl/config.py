@@ -83,7 +83,14 @@ class RolloutConfig:
     # fp16 slices cost less VRAM and time than 12 fp32; 94.6% of controller
     # rows identical to fp32 at saturated sampling — opponents' play, not
     # the student's, is perturbed). CUDA only.
-    league_weights_dtype: str = "float32"
+    league_weights_dtype: str = "float16"
+    # Student (and Phillip) rollout inference precision: "fp16" runs the
+    # networks under fp16 autocast (sampling math stays fp32). Gated by
+    # scripts/precision_probe.py fidelity on a batch captured at that
+    # precision: with the fp16 learner, |ratio_mean - 1| = 9.6e-6 on an
+    # fp16-rollout batch vs 1.8e-5 on an fp32 one (2026-08-23, rl-pool-v4
+    # step 2470 policy) — same precision both sides agrees better.
+    rollout_precision: str = "fp16"
     # Phillip's agent capacity (his architecture never fits a slice): the
     # max envs fighting him at once; draws beyond it fall back to a
     # resident-member draw. 0 = three slices' worth of cells (he held 2-3

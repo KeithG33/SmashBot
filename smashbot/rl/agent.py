@@ -78,11 +78,18 @@ class BatchedPolicyAgent:
         temperature: float | None = None,
         device: str = "cpu",
         batch_steps: int = 1,
+        precision: str = "fp32",
     ):
         self.policy = policy
         self.num_envs = num_envs
         self.device = device
         self.temperature = temperature
+        # "fp16": the network runs under fp16 autocast (sampling math stays
+        # fp32 — embed.py casts logits up); logits are stored fp16. Gated by
+        # the precision probe (docs/precision): the learner's ratio
+        # invariant must hold on batches captured this way.
+        assert precision in ("fp32", "fp16"), precision
+        self.precision = precision
         self.delay = policy.delay
         self._embed_controller = policy.controller_head.controller_embedding
         self._name = torch.full((num_envs,), name_code, dtype=torch.int64, device=device)
@@ -217,10 +224,11 @@ class BatchedPolicyAgent:
                 ),
                 self._prev_action, self._neutral_encoded,
             )
-            out, hidden = self.policy.sample(
-                StateAction(state=states, action=prev, name=self._name),
-                self.hidden, is_resetting=reset_t, temperature=self.temperature,
-            )
+            with self._autocast():
+                out, hidden = self.policy.sample(
+                    StateAction(state=states, action=prev, name=self._name),
+                    self.hidden, is_resetting=reset_t, temperature=self.temperature,
+                )
             self.hidden = tree.map_structure(
                 lambda t: t.clone() if isinstance(t, torch.Tensor) else t, hidden
             )
@@ -250,15 +258,16 @@ class BatchedPolicyAgent:
             stack = lambda seq: tree.map_structure(
                 lambda *xs: torch.stack(xs, dim=1), *seq
             )
-            outs, hidden, used_prevs = self.policy.sample_n(
-                states=stack(self._buf_states),
-                names=self._name[:, None].expand(-1, self.batch_steps),
-                prev_action=self._prev_action,
-                neutral_action=self._neutral_encoded,
-                initial_state=self.hidden,
-                is_resetting=torch.stack(self._buf_resets, dim=1),
-                temperature=self.temperature,
-            )
+            with self._autocast():
+                outs, hidden, used_prevs = self.policy.sample_n(
+                    states=stack(self._buf_states),
+                    names=self._name[:, None].expand(-1, self.batch_steps),
+                    prev_action=self._prev_action,
+                    neutral_action=self._neutral_encoded,
+                    initial_state=self.hidden,
+                    is_resetting=torch.stack(self._buf_resets, dim=1),
+                    temperature=self.temperature,
+                )
             # clones: retained across flushes / fed back next flush, and
             # compiled (cudagraph) replay reuses output buffers
             self.hidden = tree.map_structure(
@@ -288,6 +297,11 @@ class BatchedPolicyAgent:
                 self._enqueue(decoded)
             self._buf_states, self._buf_resets = [], []
         return records, hidden_before
+
+    def _autocast(self):
+        dev = torch.device(self.device).type
+        return torch.autocast(dev, dtype=torch.float16,
+                              enabled=self.precision == "fp16" and dev == "cuda")
 
     def hidden_snapshot(self) -> tp.Any:
         """Detached copy of the recurrent state (for Trajectory.initial_state)."""

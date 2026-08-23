@@ -186,6 +186,7 @@ def main() -> None:
     student_agent = BatchedPolicyAgent(
         policy, args.rollouts.num_envs, name_code=name_code, device=device,
         batch_steps=args.rollouts.batch_steps,
+        precision=args.rollouts.rollout_precision,
     )
 
     from smashbot.rl.pool import (
@@ -297,7 +298,7 @@ def main() -> None:
             cap = rcfg.phillip_capacity or 3 * N
             phillip_agent = BatchedPolicyAgent(
                 ph_policy, cap, name_code=ph_code, device=device,
-                batch_steps=rcfg.batch_steps,
+                batch_steps=rcfg.batch_steps, precision=rcfg.rollout_precision,
             )
             print(f"phillip (league member): {rcfg.ref_ckpt} "
                   f"(delay {ph_policy.delay}, name code {ph_code}, "

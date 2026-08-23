@@ -351,14 +351,16 @@ def _load_policies(args, device: str):
     return policies, codes, rl_step, label
 
 
-def _make_agents(policies: dict, codes: dict, num_envs: int, device: str):
+def _make_agents(policies: dict, codes: dict, num_envs: int, device: str,
+                 precision: str = "fp32"):
     """Fresh per-phase agents: recurrent state, delay queues, and prev-action
     buffers all start clean for the phase's new env processes."""
     from smashbot.rl.agent import BatchedPolicyAgent
 
     half = num_envs // 2
     student_agent = BatchedPolicyAgent(
-        policies["student"], num_envs, name_code=codes["student"], device=device
+        policies["student"], num_envs, name_code=codes["student"], device=device,
+        precision=precision,
     )
     opponents = {
         "teacher": BatchedPolicyAgent(

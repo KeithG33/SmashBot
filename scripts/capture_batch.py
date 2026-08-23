@@ -82,6 +82,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--env-timeout", type=float, default=300.0)
     ap.add_argument("--yardstick-teacher", default=battery.YARDSTICK_TEACHER)
     ap.add_argument("--yardstick-phillip", default=battery.YARDSTICK_PHILLIP)
+    ap.add_argument("--device", default="cpu", choices=("cpu", "cuda"),
+                    help="cpu (default: safe beside a live run) or cuda (idle GPU; "
+                         "required for an fp16 rollout capture)")
+    ap.add_argument("--rollout-precision", default="fp32", choices=("fp32", "fp16"),
+                    help="student inference precision for the captured batch")
     ap.add_argument("--dry-run", action="store_true",
                     help="load policies, build specs/config, print the "
                          "plan, then exit WITHOUT booting Dolphins")
@@ -111,7 +116,7 @@ def build_rollout_config(args) -> RolloutConfig:
 
 def main() -> None:
     args = parse_args()
-    device = "cpu"  # always: the live training run owns the GPU
+    device = args.device  # cpu beside a live run; cuda only in a gap
 
     policies, codes, rl_step, label = battery._load_policies(args, device)
     specs = battery.build_specs(args.envs, CAPTURE_SLATE)
@@ -133,7 +138,7 @@ def main() -> None:
     from smashbot.rl.rollouts import DolphinRolloutWorker
 
     student_agent, opponents = battery._make_agents(
-        policies, codes, args.envs, device
+        policies, codes, args.envs, device, precision=args.rollout_precision,
     )
     worker = DolphinRolloutWorker(
         rcfg, student_agent, opponents=opponents, specs=specs
