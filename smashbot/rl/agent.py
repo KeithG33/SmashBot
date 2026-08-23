@@ -375,6 +375,24 @@ class LeagueAgent:
     # ---------------------------------------------------------- weights
 
     @torch.no_grad()
+    def move_cell(self, src: tuple[int, int], dst: tuple[int, int]) -> None:
+        """Move a seat's state (recurrent state, prev action, delay queue)
+        to another cell — between frames, and only between slices holding
+        the SAME weights (compaction: a member donates a slice by packing
+        its few occupants into its other slices). Bit-exact for the env."""
+        (s0, n0), (s1, n1) = src, dst
+        tree.map_structure(lambda t: t[s1, n1].copy_(t[s0, n0]), self._prev)
+        hidden = self._out_hidden if self._use_capture and self._graph is not None else self._hidden
+        tree.map_structure(
+            lambda t: t[s1, n1].copy_(t[s0, n0]) if isinstance(t, torch.Tensor) else None,
+            hidden,
+        )
+        self._queues[s1 * self.N + n1] = self._queues[s0 * self.N + n0]
+        self._queues[s0 * self.N + n0] = collections.deque(
+            [self._neutral_row] * self.delay
+        )
+
+    @torch.no_grad()
     def load_slice(self, s: int, state_dict: dict) -> None:
         """Copy a member's weights (any device) into slice s, in place —
         captured replays read the stack by pointer, so they see it."""

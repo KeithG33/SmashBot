@@ -127,9 +127,12 @@ class LeagueSeats:
     def __init__(
         self, slices: int, cells: int, loader: tp.Callable[[int, str], None],
         phillip_capacity: int = 0,
+        mover: tp.Callable[[Seat, Seat], None] | None = None,
     ):
         self.S, self.N = slices, cells
         self._load = loader
+        self._move = mover  # cell state move for compaction (None = off)
+        self.compactions = 0
         self.pools = [_Pool(s, cells, None, True) for s in range(slices)]
         if phillip_capacity > 0:
             self.pools.append(_Pool(slices, phillip_capacity, self.PHILLIP, False))
@@ -193,6 +196,9 @@ class LeagueSeats:
 
     def _load_into_empty(self, member: str) -> _Pool | None:
         empties = self._reclaimable()
+        if not empties and self._move is not None:
+            self._compact()
+            empties = self._reclaimable()
         if not empties:
             return None
         p = empties[0]
@@ -200,6 +206,37 @@ class LeagueSeats:
         p.member = member
         self.loads += 1
         return p
+
+    def _compact(self) -> bool:
+        """Free one slice without touching any brain: a member holding
+        several slices packs the occupants of its emptiest slice into free
+        rows of its other slices (same weights — the moves are exact)."""
+        by_member: dict[str, list[_Pool]] = {}
+        for p in self.pools:
+            if p.loadable and p.member is not None:
+                by_member.setdefault(p.member, []).append(p)
+        best = None
+        for member, pools in by_member.items():
+            if len(pools) < 2:
+                continue
+            donor = min(pools, key=lambda p: len(p.occupants))
+            free = sum(p.capacity - len(p.occupants) for p in pools if p is not donor)
+            if len(donor.occupants) <= free and (
+                best is None or len(donor.occupants) < len(best[0].occupants)
+            ):
+                best = (donor, [p for p in pools if p is not donor])
+        if best is None:
+            return False
+        donor, others = best
+        for env, row in list(donor.occupants.items()):
+            dst = next(p for p in others if len(p.occupants) < p.capacity)
+            dst_row = dst.free_rows()[0]
+            self._move((donor.index, row), (dst.index, dst_row))
+            del donor.occupants[env]
+            dst.occupants[env] = dst_row
+            self._seat_of[env] = (dst.index, dst_row)
+        self.compactions += 1
+        return True
 
     def place(self, env: int, member: str) -> Seat | None:
         assert env not in self._seat_of, f"env {env} already seated"

@@ -538,3 +538,58 @@ def test_fallback_prefers_resident_members():
     lg.on_boundary(1, "policy", "FOX", won=None)
     assert lg.member_now[1] == "g2" and lg.fallbacks == 1
     assert seats.loads == loads_before  # nothing loaded
+
+
+def test_seats_compaction_donates_a_slice_exactly():
+    moves = []
+    loads = []
+    seats = LeagueSeats(2, 3, loader=lambda s, m: loads.append((s, m)),
+                        mover=lambda a, b: moves.append((a, b)))
+    # "a" holds both slices: slice 0 = {0, 1}, slice 1 = {2}
+    for env in (0, 1, 2):
+        seats.place(env, "a")
+    seats.release(2); seats.place(2, "a")
+    assert seats.seat_of(2) == (0, 2)  # filled slice 0 first
+    seats.place(3, "a")  # overflow -> slice 1
+    assert seats.seat_of(3) == (1, 0)
+    # "b" is drawn: no empty slice, but slice 1 (1 occupant) can be packed
+    # into slice 0 only if it has room — release one env from slice 0 first
+    seats.release(1)
+    assert seats.place(4, "b") == (1, 0)  # compaction freed slice 1
+    assert seats.compactions == 1 and moves == [((1, 0), (0, 1))]
+    assert seats.seat_of(3) == (0, 1) and seats.member_at(1) == "b"
+    assert loads[-1] == (1, "b")
+
+
+def test_grid_move_cell_is_exact():
+    from smashbot import embed as embed_lib
+
+    S, N = 2, 2
+    sd = _tiny_policy(seed=3).state_dict()
+    ref = LeagueAgent(_tiny_policy(seed=0), S, N, name_code=1, device="cpu", temperature=1e-6)
+    mv = LeagueAgent(_tiny_policy(seed=0), S, N, name_code=1, device="cpu", temperature=1e-6)
+    for g in (ref, mv):
+        g.load_slice(0, sd); g.load_slice(1, sd)  # same member on both slices
+    game = embed_lib.EmbedConfig().make_game_embedding()
+    rng = np.random.default_rng(0)
+    frames = []
+    for _ in range(5):
+        raw = _rand_raw_game(game, (S, N), rng)
+        frames.append(tree.map_structure(
+            lambda x: torch.from_numpy(np.ascontiguousarray(
+                x.astype(np.int64) if x.dtype.kind in "iu" else x)),
+            game.from_state(raw)))
+    resets = torch.zeros(S, N, dtype=torch.bool)
+    # env sits at (0, 0) in ref; in mv it is moved to (1, 1) after frame 2
+    for t, v in enumerate(frames):
+        rows_r, _ = ref.step(v, resets)
+        if t == 3:
+            mv.move_cell((0, 0), (1, 1))
+        v_mv = v
+        if t >= 3:  # feed the env's view at its new cell
+            v_mv = tree.map_structure(lambda x: x.clone(), v)
+            tree.map_structure(lambda a, b: a[1, 1].copy_(b[0, 0]), v_mv, v)
+        rows_m, _ = mv.step(v_mv, resets)
+        src = rows_r[0 * N + 0]
+        dst = rows_m[(1 * N + 1) if t >= 3 else 0]
+        assert np.array_equal(src, dst), f"frame {t}"

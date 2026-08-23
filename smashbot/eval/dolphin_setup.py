@@ -18,6 +18,7 @@ def make_dolphin(
     mute: bool = False,
     save_replays: bool = False,
     replay_dir: str = "",
+    dual_core: bool = True,
 ) -> dolphin_lib.Dolphin:
     """One Dolphin. Headless uses the ExiAI build (Null video, fast-forward);
     visible play uses the standard netplay build. save_replays writes .slp
@@ -50,12 +51,51 @@ def make_dolphin(
             # Pulse underruns ("Dropping OutputStream") disturb Dolphin's
             # frame pacing; muting removes the audio path entirely.
             console_kwargs["disable_audio"] = True
-    return dolphin_lib.Dolphin(
-        path=str(path),
-        iso=str(MELEE_ISO),
-        players=players,
-        headless=headless,
-        online_delay=online_delay,
-        emulation_speed=0 if headless else 1,
-        **console_kwargs,
-    )
+    with _core_overrides({} if dual_core else {"CPUThread": "False"}):
+        return dolphin_lib.Dolphin(
+            path=str(path),
+            iso=str(MELEE_ISO),
+            players=players,
+            headless=headless,
+            online_delay=online_delay,
+            emulation_speed=0 if headless else 1,
+            **console_kwargs,
+        )
+
+
+import contextlib
+import threading
+
+_override_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _core_overrides(extra: dict):
+    """Extra [Core] keys for the Dolphin.ini libmelee writes at console
+    start (it exposes no hook for them). dual_core=False -> CPUThread=False:
+    single-threaded emulation, which packs better than two threads per
+    Dolphin when a headless fleet oversubscribes the cores."""
+    if not extra:
+        yield
+        return
+    import configparser
+    import os
+
+    orig = melee.Console._setup_dolphin_ini
+
+    def patched(self):
+        orig(self)
+        path = os.path.join(self._get_dolphin_config_path(), "Dolphin.ini")
+        cfg = configparser.ConfigParser()
+        cfg.read(path)
+        for k, v in extra.items():
+            cfg.set("Core", k, v)
+        with open(path, "w") as f:
+            cfg.write(f)
+
+    with _override_lock:
+        melee.Console._setup_dolphin_ini = patched
+        try:
+            yield
+        finally:
+            melee.Console._setup_dolphin_ini = orig

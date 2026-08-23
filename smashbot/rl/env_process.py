@@ -191,6 +191,7 @@ def _env_process_main(
             spare["dolphin"] = make_dolphin(
                 players, headless=cfg.headless, stage=cfg.stage,
                 save_replays=cfg.save_replays, replay_dir=_replay_dir,
+                dual_core=cfg.dolphin_dual_core,
             )
         except Exception as e:  # fall back to a cold boot at swap time
             print(f"spare boot failed (cold boot at swap): {e}", flush=True)
@@ -250,6 +251,7 @@ def _env_process_main(
             return make_dolphin(
                 players, headless=cfg.headless, stage=cfg.stage,
                 save_replays=cfg.save_replays, replay_dir=_replay_dir,
+                dual_core=cfg.dolphin_dual_core,
             )
         finally:
             signal.alarm(0)

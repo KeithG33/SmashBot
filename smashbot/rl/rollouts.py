@@ -780,17 +780,23 @@ class DolphinRolloutWorker:
                         g = self._harvest_groups.get(key)
                         if g is not None:
                             g.push_reward(self._rows_of(-reward, rows_))
-                for i in range(self.num_dolphins):
-                    if resets[i]:
-                        continue  # boundary artifacts belong to no game
-                    kind = self._actual_kind(
-                        i, payloads[i].get("opp_serving")
-                    )
-                    tracker = self.trackers[self._TRACKER_KIND.get(kind, kind)]
-                    if stocks[i, 0] < self._prev_stocks[i, 0]:
-                        tracker.add_death(float(self._prev_percent[i, 0]))
-                    if stocks[i, 1] < self._prev_stocks[i, 1]:
-                        tracker.add_kill(float(self._prev_percent[i, 1]))
+                # stock events are rare: find them with tensor ops and only
+                # loop over the hits (a per-dolphin Python loop with element
+                # indexing cost ~10 ms/frame at 176 Dolphins)
+                D = self.num_dolphins
+                live = ~resets[:D]
+                lost = (stocks[:D] < self._prev_stocks[:D]) & live[:, None]
+                if bool(lost.any()):
+                    prev_pct = self._prev_percent[:D]
+                    for i, seat in lost.nonzero().tolist():
+                        kind = self._actual_kind(
+                            i, payloads[i].get("opp_serving")
+                        )
+                        tracker = self.trackers[self._TRACKER_KIND.get(kind, kind)]
+                        if seat == 0:
+                            tracker.add_death(float(prev_pct[i, 0]))
+                        else:
+                            tracker.add_kill(float(prev_pct[i, 1]))
             self._prev_stocks, self._prev_percent = stocks, percent
 
             # ---- INFER: encode, every forward, append to the queues

@@ -304,6 +304,7 @@ def main() -> None:
         seats = LeagueSeats(
             S, N, loader=lambda s, m: grid.load_slice(s, weights.get(m)),
             phillip_capacity=phillip_agent.num_envs if phillip_agent else 0,
+            mover=grid.move_cell,
         )
         import random as _random
 
@@ -445,6 +446,7 @@ def main() -> None:
                     for k, v in lg.warn.items():
                         log[f"rl/league/warn_{k}"] = v
                     log["rl/league/slice_loads"] = lg.seats.loads
+                    log["rl/league/compactions"] = lg.seats.compactions
                 for kind, tracker in worker.trackers.items():
                     for k, v in tracker.stats().items():
                         log[f"rl/{kind}/{k}"] = v

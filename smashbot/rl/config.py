@@ -63,6 +63,9 @@ class RolloutConfig:
     bot_char: str = "FOX"
     stage: str = "FINAL_DESTINATION"
     games_per_dolphin: int = 20
+    # Dolphin dual-core emulation (CPU + GPU threads). Off packs a big
+    # headless fleet onto the cores better (one thread per Dolphin).
+    dolphin_dual_core: bool = True
     # Opponent pool partition (see rl/pool.py). Defaults replicate the
     # simple all-teacher setup; production: everything not cpu/teacher/
     # reference/self is a LEAGUE env (kind "snapshot").

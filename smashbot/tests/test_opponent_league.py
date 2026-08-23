@@ -254,6 +254,7 @@ def _make_runtime(cfg, league_envs, pool_dir, ghosts, phillip_capacity):
     seats = LeagueSeats(
         S, N, loader=lambda s, m: grid.load_slice(s, weights.get(m)),
         phillip_capacity=phillip.num_envs if phillip else 0,
+        mover=grid.move_cell,
     )
     league = League(
         pool, seats, locks=locks, rng=random.Random(0),
