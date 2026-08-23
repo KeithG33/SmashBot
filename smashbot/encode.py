@@ -88,6 +88,107 @@ def build(spec: tuple):
     raise ValueError(f"unknown encoder spec {kind!r}")
 
 
+class RowEncoder:
+    """build(spec) + flatten_typed in ONE pass over the raw game: the leaf
+    list is compiled once (getter chain + scalar rule per leaf, in the exact
+    order tree.flatten yields the encoded struct), so a frame costs ~122
+    attribute lookups and three np.array calls instead of a dm-tree walk
+    with per-leaf numpy ops (measured 4 ms -> <1 ms per env frame). The
+    scalar rules reproduce the numpy casts bit for bit (uint8 wrap, float32
+    discrete rounding); test_encode pins equality with the slow path."""
+
+    def __init__(self, spec: tuple):
+        import operator
+
+        self._leaves: list = []  # (kind, getter, rule)
+        self._compile(spec, ())
+        for i, (kind, path, rule) in enumerate(self._leaves):
+            self._leaves[i] = (kind, operator.attrgetter(".".join(path)), rule)
+        self.counts = {
+            k: sum(1 for kind, _, _ in self._leaves if kind == k)
+            for k in ("bool", "int", "float")
+        }
+
+    def _compile(self, spec, path):
+        kind = spec[0]
+        if kind == "struct":
+            _, fields, (mod, qual), fixed = spec
+            ctor: tp.Any = importlib.import_module(mod)
+            for part in qual.split("."):
+                ctor = getattr(ctor, part)
+            subs = dict(fields)
+            # tree.flatten walks the encoded namedtuple in ctor field order
+            for name in ctor._fields:
+                if name in subs:
+                    self._compile(subs[name], path + (name,))
+                else:
+                    v = fixed[name]
+                    assert v == () or v is None or isinstance(v, (tuple, list)) and not v, (
+                        f"RowEncoder: fixed struct field {name}={v!r} is a leaf"
+                    )  # empty containers flatten to nothing
+            return
+        dtype = np.dtype(spec[1] if kind != "onehot" else spec[3])
+        k = _KIND[dtype.kind]
+        self._leaves.append((k, path, self._rule(kind, spec, dtype)))
+
+    @staticmethod
+    def _rule(kind, spec, dtype):
+        wrap = _int_wrap(dtype)
+        if kind == "astype":
+            if dtype.kind == "b":
+                return bool
+            if dtype.kind == "f":
+                return float
+            return lambda v: wrap(int(v))
+        if kind == "onehot":
+            _, policy, n, _d, name = spec
+            if policy == "CLAMP":
+                return lambda v: wrap(min(max(int(v), 0), n - 1))
+            if policy == "EXTRA":
+                return lambda v: wrap(int(v) if 0 <= int(v) < n else n)
+            if policy == "ERROR":
+                def rule(v):
+                    v = int(v)
+                    if v < 0:
+                        raise ValueError(f"Got negative input in {name}")
+                    if v >= n:
+                        raise ValueError(f"Invalid input {v} >= {n} in {name}")
+                    return wrap(v)
+                return rule
+            raise ValueError(f"unknown one-hot policy {policy!r}")
+        if kind == "discrete":
+            _, n, _d = spec
+            f32 = np.float32
+            # (state * n + 0.5) in float32, then truncating cast
+            return lambda v: wrap(int(f32(f32(v) * n) + f32(0.5)))
+        raise ValueError(f"unknown encoder spec {kind!r}")
+
+    def encode(self, raw) -> tuple:
+        """(bools, ints, floats) for one raw game — flatten_typed's output."""
+        parts: dict = {"bool": [], "int": [], "float": []}
+        for kind, get, rule in self._leaves:
+            parts[kind].append(rule(get(raw)))
+        return (
+            np.array(parts["bool"], dtype=np.bool_),
+            np.array(parts["int"], dtype=np.int32),
+            np.array(parts["float"], dtype=np.float32),
+        )
+
+
+def _int_wrap(dtype: np.dtype):
+    """Python equivalent of numpy's integer cast to `dtype` (low bits,
+    two's complement), as the slow path's .astype does before flatten_typed
+    widens to int32."""
+    if dtype.kind == "u":
+        mask = (1 << (8 * dtype.itemsize)) - 1
+        return lambda v: v & mask
+    if dtype.kind == "i":
+        bits = 8 * dtype.itemsize
+        half, full = 1 << (bits - 1), 1 << bits
+        return lambda v: ((v + half) % full) - half
+    return lambda v: v
+
+
 # ---------------------------------------------------------------------------
 # Typed flat layout: env processes ship an encoded frame as three 1-D arrays
 # (bool / int32 / float32, leaves in tree order) instead of a ~150-leaf

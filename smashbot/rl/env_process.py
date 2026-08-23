@@ -44,6 +44,7 @@ def _env_process_main(
     a Pipe: sends per-frame payloads, receives {port: Controller} commands
     (None = shut down)."""
     import os
+    import time
     import sys
 
     # Dolphin banners/spam would hit the parent terminal on every boot and
@@ -64,7 +65,6 @@ def _env_process_main(
 
     import melee
     import numpy as np
-    import tree as tree_lib
 
     from slippi_ai import controller_lib
     from slippi_ai import dolphin as dolphin_lib
@@ -78,7 +78,7 @@ def _env_process_main(
     # the 32 env processes parallelize it instead of the main loop. Must match
     # the policy's embed schema — both use the default EmbedConfig (verified
     # by test_worker_side_encode_matches_policy_encode).
-    embed_game = encode.build(encoder_spec)  # torch-free numpy encoder
+    row_encoder = encode.RowEncoder(encoder_spec)  # torch-free, one pass per frame
 
     import random as random_lib
 
@@ -113,6 +113,19 @@ def _env_process_main(
     # recycle at the boundary). Never sent outside league mode.
     char_lock = None
     opp_next = None
+    # SMASHBOT_PROFILE=1: per-frame phase timing for THIS env (printed every
+    # 600 frames): dolphin = waiting for the emulator's next frame, parse =
+    # libmelee parse + numpy encode, ipc = send payload + wait for the
+    # worker's command, apply = controller writes
+    _prof = bool(os.environ.get("SMASHBOT_PROFILE"))
+    _acc = {"dolphin": 0.0, "parse": 0.0, "ipc": 0.0, "apply": 0.0}
+    _nf = 0
+    # SMASHBOT_PROFILE_PARSE=1: cProfile the parse segment of env 0 (top
+    # functions printed once at frame 1200)
+    _cprof = None
+    if os.environ.get("SMASHBOT_PROFILE_PARSE") and idx == 0:
+        import cProfile
+        _cprof = cProfile.Profile()
 
     def _draw_char() -> str:
         if cur_kind == "cpu":
@@ -327,6 +340,7 @@ def _env_process_main(
                 gs_iter = iter(dolphin.iter_gamestates(skip_menu_frames=True))
                 while True:
                     signal.alarm(120)
+                    _t0 = time.perf_counter() if _prof else 0.0
                     try:
                         gs = next(gs_iter)
                     except AlarmTimeout:
@@ -390,23 +404,27 @@ def _env_process_main(
                         parser = Parser(ports=[1, 2])
                     if games >= cfg.games_per_dolphin - 1:
                         _start_spare()  # entering this Dolphin's final game
+                    if _prof:
+                        _t1 = time.perf_counter(); _acc["dolphin"] += _t1 - _t0
                     last_frame = gs.frame
-                    raw = tree_lib.map_structure(
-                        np.asarray, parser.get_game(gs)
-                    )
-                    game = encode.flatten_typed(embed_game.from_state(raw))
+                    if _cprof is not None:
+                        _cprof.enable()
+                    game = row_encoder.encode(parser.get_game(gs))
+                    if _cprof is not None:
+                        _cprof.disable()
+                        if _nf == 1200:
+                            import pstats
+                            pstats.Stats(_cprof).sort_stats("tottime").print_stats(18)
                     # armor at the source: never ship a nonfinite frame
-                    finite = all(
-                        np.all(np.isfinite(leaf))
-                        for leaf in tree_lib.flatten(game)
-                        if np.issubdtype(np.asarray(leaf).dtype, np.floating)
-                    )
-                    if not finite:
+                    # (game = (bools, ints, floats); only floats can be)
+                    if not np.isfinite(game[2]).all():
                         print(f"nonfinite frame dropped (frame {gs.frame})",
                               flush=True)
                         continue
                     p1, p2 = gs.players[1], gs.players[2]
                     last_stocks = (int(p1.stock), int(p2.stock))
+                    if _prof:
+                        _t2 = time.perf_counter(); _acc["parse"] += _t2 - _t1
                     conn.send(
                         dict(
                             game=game,
@@ -426,6 +444,8 @@ def _env_process_main(
                         )
                     )
                     controllers = conn.recv()
+                    if _prof:
+                        _t3 = time.perf_counter(); _acc["ipc"] += _t3 - _t2
                     if controllers is None:
                         return
                     opp_next = controllers.pop("opp_next", opp_next)
@@ -482,6 +502,12 @@ def _env_process_main(
                         controller_lib.send_controller(
                             dolphin.controllers[port], controller_state
                         )
+                    if _prof:
+                        _acc["apply"] += time.perf_counter() - _t3
+                        _nf += 1
+                        if _nf % 600 == 0:
+                            parts = " ".join(f"{k} {v / _nf * 1e3:5.1f}" for k, v in _acc.items())
+                            print(f"[env-profile] ms/frame {parts}", flush=True)
               except WrongCharacterSelected as e:
                 # menu cursor race under fast-forward (notably the Sheik/
                 # Zelda slot): scrap this Dolphin and retry with a fresh one.

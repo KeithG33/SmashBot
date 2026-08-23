@@ -158,3 +158,71 @@ def test_flat_controller_round_trip():
     got = encode.controller_from_flat(row)
     for x, y in zip(tree.flatten(got), tree.flatten(neutral)):
         assert np.array_equal(x, y)
+
+
+def test_row_encoder_matches_slow_path():
+    """RowEncoder == flatten_typed(build(spec).from_state(asarray-mapped
+    raw)) bit for bit: random games plus adversarial leaves (negative /
+    huge ints for the wrap and one-hot policies, float edge values)."""
+    import tree
+
+    from smashbot import embed as embed_lib, encode
+    from smashbot.tests.test_rollouts import _rand_raw_game
+
+    game = embed_lib.EmbedConfig().make_game_embedding()
+    spec = game.spec()
+    slow = encode.build(spec)
+    fast = encode.RowEncoder(spec)
+    assert sum(fast.counts.values()) == 122
+    rng = np.random.default_rng(0)
+
+    def both(raw):
+        a = encode.flatten_typed(slow.from_state(tree.map_structure(np.asarray, raw)))
+        b = fast.encode(raw)
+        for x, y in zip(a, b):
+            assert x.dtype == y.dtype and x.shape == y.shape
+            np.testing.assert_array_equal(x, y)
+
+    for _ in range(200):
+        both(_rand_raw_game(game, (), rng))
+    # python-scalar leaves (libmelee hands us ints/floats/bools, not arrays)
+    raw = _rand_raw_game(game, (), rng)
+    both(tree.map_structure(lambda x: x.item() if hasattr(x, "item") else x, raw))
+    # adversarial integer leaves: every int leaf pushed out of range, both
+    # signs (int64 so numpy accepts them); the two paths must agree on the
+    # result OR both raise the one-hot ERROR-policy ValueError
+    def outcome(fn):
+        try:
+            return fn()
+        except ValueError as e:
+            return ("raised", "input" in str(e))
+
+    # leaves under the ERROR policy raise on both paths; everything else
+    # (CLAMP / EXTRA / plain casts incl. uint8 wrap) must agree on values
+    def error_paths(sp, path=()):
+        if sp[0] == "struct":
+            return [q for k, sub in sp[1] for q in error_paths(sub, path + (k,))]
+        return [path] if sp[0] == "onehot" and sp[1] == "ERROR" else []
+
+    errs = set(error_paths(spec))
+    assert errs  # the policy exists in this embedding
+    for bad in (-1, -300, 2 ** 31 - 1, 70000):
+        for spare_errors in (False, True):
+            adv = tree.map_structure_with_path(
+                lambda p_, x: (
+                    np.asarray(bad, dtype=np.int64)
+                    if np.asarray(x).dtype.kind in "iu" and not (spare_errors and p_ in errs)
+                    else x
+                ),
+                raw,
+            )
+            a = outcome(lambda: encode.flatten_typed(slow.from_state(tree.map_structure(np.asarray, adv))))
+            b = outcome(lambda: fast.encode(adv))
+            if isinstance(a[0], str):  # ("raised", ...)
+                assert a == b, bad
+                assert not spare_errors
+            else:
+                assert spare_errors
+                for x, y in zip(a, b):
+                    np.testing.assert_array_equal(x, y)
+
