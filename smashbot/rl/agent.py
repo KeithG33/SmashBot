@@ -284,37 +284,59 @@ class BatchedPolicyAgent:
 
 
 class LeagueAgent:
-    """All same-config league slots stepped in ONE Python pass per frame:
-    S slot policies x N rows. Per-row state (recurrent state, prev action,
-    delay queues) lives here for every slot; each frame runs one forward per
-    slot (a stacked forward can replace that loop), then a single batched
-    controller transfer/decode/queue update for all S*N rows. Seats point at
-    slot refs (slot_ref) for weight loads and harvest metadata."""
+    """The league GRID: S weight slices x N cells, stepped as ONE forward.
 
-    def __init__(self, policies, num_envs: int, name_code: int, device,
-                 temperature=None, capture: bool | None = None):
-        assert policies, "LeagueAgent needs at least one slot policy"
-        self.policies = list(policies)
-        self.S, self.N = len(self.policies), num_envs
-        self.device = device
+    A slice holds one league member's weights (a stacked copy, loaded in
+    place by load_slice); a cell is a seat with its own recurrent state,
+    prev action and delay queue. Who sits where is the worker's business
+    (rollouts._Grid routes envs to cells per match); this class only knows
+    the [S, N] batch. CUDA: the vmap forward over the stacked parameters is
+    captured once into a manual CUDA graph and replayed per frame. CPU: the
+    same vmap forward runs eagerly — one code path, no per-slice loop.
+    """
+
+    def __init__(
+        self, template: Policy, slices: int, cells: int, name_code: int,
+        device, temperature=None, capture: bool | None = None,
+    ):
+        import copy
+
+        self.S, self.N = slices, cells
+        self.device = torch.device(device)
         self.temperature = temperature
-        p0 = self.policies[0]
-        self.delay = p0.delay
-        self._embed_controller = p0.controller_head.controller_embedding
-        self._name = torch.full((self.S, num_envs), name_code, dtype=torch.int64, device=device)
-        # same construction as BatchedPolicyAgent: the neutral controller
-        # tiled to the row batch, then to every slot -> [S, N, ...]
+        self.delay = template.delay
+        self._embed_controller = template.controller_head.controller_embedding
+        # functional_call's skeleton: a THROWAWAY copy (never read back).
+        # The policy has tied parameters (one item MLP shared across item
+        # slots and between the game/state-action embeddings) and
+        # functional_call under vmap leaves a tied template holding an
+        # escaped BatchedTensor — live-caught at the first park.
+        self._template = copy.deepcopy(template).to("cpu")
+        self._template.__dict__.pop("sample", None)  # any compiled wrapper
+        self._template.requires_grad_(False).eval()
+        # stacked weights [S, ...]: slice s serves cells (s, 0..N-1)
+        with torch.no_grad():
+            params = dict(self._template.named_parameters())
+            buffers = dict(self._template.named_buffers())
+            stack = lambda t: t.detach().to(self.device).unsqueeze(0).repeat(
+                self.S, *([1] * t.dim())
+            ).clone()
+            self._stacked_params = {k: stack(v) for k, v in params.items()}
+            self._stacked_buffers = {k: stack(v) for k, v in buffers.items()}
+        self._name = torch.full(
+            (self.S, self.N), name_code, dtype=torch.int64, device=self.device
+        )
         neutral = tree.map_structure(
-            lambda x: np.asarray(x)[None].repeat(num_envs, axis=0), _neutral_controller()
+            lambda x: np.asarray(x)[None].repeat(self.N, axis=0),
+            _neutral_controller(),
         )
         self._neutral = tree.map_structure(
             lambda x: torch.from_numpy(np.ascontiguousarray(
                 x.astype(np.int64) if x.dtype.kind in "iu" else x
-            )).to(device)[None].expand(self.S, *x.shape).clone(),
+            )).to(self.device)[None].expand(self.S, *x.shape).clone(),
             self._embed_controller.from_state(neutral),
         )
-        self._prev = tree.map_structure(lambda t: t.clone(), self._neutral)  # [S, N, ...]
-        self.hidden = [p.initial_state(num_envs, device) for p in self.policies]
+        self._prev = tree.map_structure(lambda t: t.clone(), self._neutral)
         from smashbot import encode
 
         self._neutral_row = encode.controller_rows(
@@ -322,73 +344,51 @@ class LeagueAgent:
         )[0]
         self._queues = [
             collections.deque([self._neutral_row] * self.delay)
-            for _ in range(self.S * num_envs)
+            for _ in range(self.S * self.N)
         ]
-        # CUDA production path: ONE eager-vmap forward over stacked per-slot
-        # parameters, captured into a manual CUDA graph (inductor's cudagraph
-        # trees choke on 12 compiled callables in a tight loop). The slot
-        # MODULES stay the source of truth for weights; slot_weights_changed
-        # refreshes the stack slice in place, which captured replays see
-        # (graphs hold pointers). CPU / tests use the per-slot loop below.
         if capture is None:
-            capture = torch.device(device).type == "cuda"
-        if capture:
-            assert torch.device(device).type == "cuda", (
-                "LeagueAgent capture=True needs a CUDA device"
-            )
+            capture = self.device.type == "cuda"
+        assert not capture or self.device.type == "cuda", (
+            "LeagueAgent capture=True needs a CUDA device"
+        )
         self._use_capture = capture
         self._graph = None
-        if self._use_capture:
-            from torch.func import stack_module_state
+        self._vm = self._make_vmap()
+        # eager-path recurrent state [S, N, ...] (the captured path keeps
+        # it in static buffers)
+        self._hidden = self._initial_hidden()
 
-            # The GPU reads weights ONLY from the stacked copy: the modules
-            # are pure bookkeeping (auction loads, teacher copies, park
-            # sources), so keep them on CPU — otherwise the league weights
-            # sit on the card twice (12 x 107MB modules + the stack).
-            for p in self.policies:
-                p.to("cpu")
-            # functional_call's template: a THROWAWAY copy. The policy has
-            # tied parameters (one item MLP shared across item slots and
-            # between the game/state-action embeddings) and functional_call
-            # under vmap leaves a tied template holding an escaped
-            # BatchedTensor — live-caught at the first auction as
-            # state_dict() failing on slot 0. No live slot module is ever
-            # reparametrized.
-            import copy as _copy
-
-            self._template = _copy.deepcopy(self.policies[0])
-            self._template.__dict__.pop("sample", None)  # drop any compiled wrapper
-            stk_p, stk_b = stack_module_state([p for p in self.policies])
-            dev = torch.device(device)
-            self._stacked_params = {k: v.to(dev) for k, v in stk_p.items()}
-            self._stacked_buffers = {k: v.to(dev) for k, v in stk_b.items()}
-
-    def slot_weights_changed(self, k: int) -> None:
-        """Refresh stack slice k from the slot's module (weights are loaded
-        into modules by apply_assignments/parking; the captured graph reads
-        the stack in place)."""
-        if not self._use_capture:
-            return
-        sd = self.policies[k].state_dict()
-        with torch.no_grad():
-            for name, t in self._stacked_params.items():
-                t[k].copy_(sd[name])
-            for name, t in self._stacked_buffers.items():
-                if name in sd:
-                    t[k].copy_(sd[name])
-
-    def slot_ref(self, k: int) -> "_SlotRef":
-        return _SlotRef(self, k)
+    # ---------------------------------------------------------- weights
 
     @torch.no_grad()
-    def step(self, views, resets, reset_indices):
-        """views: per-slot encoded structs [N, ...]; resets: [S, N] bool on
-        device; reset_indices: iterable of (slot, row). Returns per-slot
-        controller rows (list of [N, 13] numpy) and per-slot FrameRecords."""
-        for s, i in reset_indices:
-            self._queues[s * self.N + i] = collections.deque(
-                [self._neutral_row] * self.delay
-            )
+    def load_slice(self, s: int, state_dict: dict) -> None:
+        """Copy a member's weights (any device) into slice s, in place —
+        captured replays read the stack by pointer, so they see it."""
+        for name, t in self._stacked_params.items():
+            t[s].copy_(state_dict[name])
+        for name, t in self._stacked_buffers.items():
+            if name in state_dict:
+                t[s].copy_(state_dict[name])
+
+    # ---------------------------------------------------------- stepping
+
+    def reset_cell(self, s: int, n: int) -> None:
+        """Fresh game in cell (s, n): neutral prev action + delay queue (the
+        recurrent state is zeroed by the forward's reset mask)."""
+        self._queues[s * self.N + n] = collections.deque(
+            [self._neutral_row] * self.delay
+        )
+        tree.map_structure(
+            lambda dst, src: dst[s, n].copy_(src[s, n]), self._prev, self._neutral
+        )
+
+    @torch.no_grad()
+    def step(self, views, resets: torch.Tensor):
+        """views: encoded Game struct batched [S, N, ...] on device; resets:
+        [S, N] bool on device (True on a cell's first frame of a game —
+        zeroes its recurrent state and substitutes the neutral prev action).
+        Returns controller rows to execute NOW ([S*N, 13] numpy, popped from
+        the delay queues) and ONE FrameRecord over all S*N cells."""
         prev = tree.map_structure(
             lambda pv, n: torch.where(
                 resets.view(self.S, self.N, *([1] * (pv.dim() - 2))), n, pv
@@ -398,42 +398,60 @@ class LeagueAgent:
         if self._use_capture:
             ctrl, logits = self._captured_forward(views, prev, resets)
         else:
-            ctrl, logits = self._loop_forward(views, prev, resets)
+            ctrl, logits, self._hidden = self._vm(
+                self._stacked_params, self._stacked_buffers, views, prev,
+                self._hidden, resets,
+            )
         self._prev = tree.map_structure(
             lambda t: t.clone() if t.dtype == torch.bool else t.long().clone(), ctrl
         )
-        prev_rec = self._prev_record(prev)
-        records = [
-            FrameRecord(
-                state=views[k],
-                prev_action=tree.map_structure(lambda t: t[k], prev_rec),
-                logits=tree.map_structure(lambda t: t[k], logits),
-                name=self._name[k],
-            )
-            for k in range(self.S)
-        ]
-        # ONE host transfer + decode for all S*N rows
-        encoded_np = tree.map_structure(
-            lambda x: x.reshape(self.S * self.N, *x.shape[2:]).cpu().numpy(), ctrl
+        flat = lambda t: t.reshape(self.S * self.N, *t.shape[2:])
+        record = FrameRecord(
+            state=tree.map_structure(flat, views),
+            prev_action=tree.map_structure(
+                lambda x: flat(x.clone() if x.dtype == torch.bool else x.long().clone()),
+                prev,
+            ),
+            logits=tree.map_structure(flat, logits),
+            name=flat(self._name).clone(),
         )
         from smashbot import encode
 
+        encoded_np = tree.map_structure(lambda x: flat(x).cpu().numpy(), ctrl)
         rows = encode.controller_rows(self._embed_controller.decode(encoded_np))
         for q, row in zip(self._queues, rows):
             q.append(row)
-        execute = np.stack([q.popleft() for q in self._queues]).reshape(self.S, self.N, -1)
-        return [execute[k] for k in range(self.S)], records
+        return np.stack([q.popleft() for q in self._queues]), record
+
+    # ---------------------------------------------------------- forward
+
+    def _initial_hidden(self):
+        h0 = [self._template.initial_state(self.N, self.device) for _ in range(self.S)]
+        return tree.map_structure(
+            lambda *xs: torch.stack(xs) if isinstance(xs[0], torch.Tensor) else xs[0],
+            *h0,
+        )
+
+    def _make_vmap(self):
+        from torch.func import functional_call, vmap
+
+        base, name, temperature = self._template, self._name, self.temperature
+
+        def fmodel(p, b, st, ac, hid, rst):
+            out, hid2 = functional_call(base, (p, b), (
+                StateAction(state=st, action=ac, name=name[0]), hid, rst, temperature,
+            ))
+            return out.controller_state, out.logits, hid2
+
+        return vmap(fmodel, in_dims=(0, 0, 0, 0, 0, 0), randomness="different")
 
     def _captured_forward(self, views, prev, resets):
-        """One vmap'd forward over the stacked slot parameters, executed as a
-        manual CUDA-graph replay: copy this frame's inputs into the static
-        buffers, replay, return clones of the static outputs. Captured once
-        at first use (shapes never change); in-place stack-slice weight
-        updates are visible to replays."""
-        stk_views = tree.map_structure(lambda *xs: torch.stack(xs), *views)
+        """Copy this frame's inputs into the static buffers, replay, return
+        clones of the static outputs. Captured once at first use (shapes
+        never change); in-place slice loads are visible to replays."""
         if self._graph is None:
-            self._capture(stk_views, prev, resets)
-        tree.map_structure(lambda d, s: d.copy_(s), self._in_views, stk_views)
+            self._capture(views, prev, resets)
+        tree.map_structure(lambda d, s: d.copy_(s), self._in_views, views)
         tree.map_structure(lambda d, s: d.copy_(s), self._in_prev, prev)
         self._in_resets.copy_(resets)
         # recurrent state: static in <- last replay's static out
@@ -446,26 +464,11 @@ class LeagueAgent:
         logits = tree.map_structure(lambda t: t.clone(), self._out_logits)
         return ctrl, logits
 
-    def _capture(self, stk_views, prev, resets):
-        from torch.func import functional_call, vmap
-
-        base = self._template
-        name = self._name
-
-        def fmodel(p, b, st, ac, hid, rst):
-            out, hid2 = functional_call(base, (p, b), (
-                StateAction(state=st, action=ac, name=name[0]), hid, rst, self.temperature,
-            ))
-            return out.controller_state, out.logits, hid2
-
-        self._vm = vmap(fmodel, in_dims=(0, 0, 0, 0, 0, 0), randomness="different")
-        self._in_views = tree.map_structure(lambda t: t.clone(), stk_views)
+    def _capture(self, views, prev, resets):
+        self._in_views = tree.map_structure(lambda t: t.clone(), views)
         self._in_prev = tree.map_structure(lambda t: t.clone(), prev)
         self._in_resets = resets.clone()
-        h0 = [p.initial_state(self.N, self.device) for p in self.policies]
-        self._in_hidden = tree.map_structure(
-            lambda *xs: torch.stack(xs) if isinstance(xs[0], torch.Tensor) else xs[0], *h0
-        )
+        self._in_hidden = self._initial_hidden()
         args = (self._stacked_params, self._stacked_buffers, self._in_views,
                 self._in_prev, self._in_hidden, self._in_resets)
         s = torch.cuda.Stream()
@@ -477,57 +480,9 @@ class LeagueAgent:
         self._graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self._graph):
             self._out_ctrl, self._out_logits, self._out_hidden = self._vm(*args)
-        # the just-captured pass ran with the warm-up inputs; hidden restarts
-        # from the stacked initial state on the first real replay
+        # the just-captured pass ran with warm-up inputs; hidden restarts
+        # from the initial state on the first real replay
         tree.map_structure(
             lambda d, s_: d.copy_(s_) if isinstance(d, torch.Tensor) else None,
             self._out_hidden, self._in_hidden,
         )
-
-    def _loop_forward(self, views, prev, resets):
-        outs, hiddens = [], []
-        for k, policy in enumerate(self.policies):
-            # contiguous per-slot inputs: a strided slice of the [S, N, ...]
-            # stack would miss the compiled sample's guards and re-record a
-            # CUDA graph per slot (live-caught as an OOM)
-            out, hid = policy.sample(
-                StateAction(
-                    state=views[k],
-                    action=tree.map_structure(lambda t: t[k].contiguous(), prev),
-                    name=self._name[k].contiguous(),
-                ),
-                self.hidden[k], is_resetting=resets[k].contiguous(),
-                temperature=self.temperature,
-            )
-            outs.append(out)
-            hiddens.append(hid)
-        self.hidden = [
-            tree.map_structure(lambda t: t.clone() if isinstance(t, torch.Tensor) else t, h)
-            for h in hiddens
-        ]
-        ctrl = tree.map_structure(lambda *xs: torch.stack(xs), *[o.controller_state for o in outs])
-        logits = tree.map_structure(lambda *xs: torch.stack(xs), *[o.logits for o in outs])
-        return ctrl, logits
-
-    @staticmethod
-    def _prev_record(prev):
-        return tree.map_structure(
-            lambda x: x.clone() if x.dtype == torch.bool else x.long().clone(), prev
-        )
-
-
-class _SlotRef:
-    """A seat's handle on one slot of a LeagueAgent: exposes what the worker
-    needs for weight loads (policy), harvest grouping (delay, embedding) and
-    row count; stepping happens in LeagueAgent.step."""
-
-    def __init__(self, league: LeagueAgent, k: int):
-        self.league, self.k = league, k
-        self.policy = league.policies[k]
-        self.num_envs = league.N
-        self.delay = league.delay
-        self._embed_controller = league._embed_controller
-        self.flat_controllers = True
-
-    def set_flat_controllers(self, flat: bool = True) -> None:
-        assert flat, "league slots always speak flat controller rows"

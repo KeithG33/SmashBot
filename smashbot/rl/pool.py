@@ -1,5 +1,6 @@
-"""Opponent pool: env partition (CPU / teacher / snapshot slots), character
-sampling, random seats, and the student-snapshot lifecycle.
+"""Opponent pool: env partition (CPU / teacher / league), character
+sampling, random seats, the student-snapshot archive and the per-match
+PFSP draw (SnapshotPool.draw_member).
 
 Design (user-decided):
 - Student plays characters from a whitelist (default FOX-only: RL round one
@@ -31,33 +32,25 @@ def make_partition(
     num_envs: int,
     cpu_envs: int,
     teacher_envs: int,
-    snapshot_slots: int,
     main12_prob: float = 0.6,
     seed: int = 0,
     ref_envs: int = 0,
     self_envs: int = 0,
     char_whitelist: tp.Sequence[str] = ("FOX",),
 ) -> list[EnvSpec]:
-    """Fixed env partition. Snapshot envs are split evenly across slots
-    (num_envs - cpu - teacher must divide evenly); seats alternate so each
-    kind is port-balanced.
+    """Fixed env partition; seats alternate so each kind is port-balanced.
+    Every env not cpu/teacher/reference/self is a LEAGUE env (kind
+    "snapshot": its opponent is drawn per match from the league).
 
     num_envs is the LEARNER trajectory budget, not the Dolphin count: a
     self-play env contributes BOTH seats as PPO trajectories, so it costs 2
     budget units while running one Dolphin. The returned list has
     num_envs - self_envs specs (= Dolphins to boot). Order:
-    cpu / teacher / reference / self / snapshot."""
+    cpu / teacher / reference / self / league."""
     if teacher_envs < 0:  # default: teacher takes every env not otherwise used
-        assert snapshot_slots == 0, "specify teacher_envs explicitly with slots"
         teacher_envs = num_envs - cpu_envs - ref_envs - 2 * self_envs
-    snap_envs = num_envs - cpu_envs - teacher_envs - ref_envs - 2 * self_envs
-    assert snap_envs >= 0 and (
-        snapshot_slots == 0 or snap_envs % snapshot_slots == 0
-    ), "snapshot envs must divide evenly across slots"
-    assert snapshot_slots > 0 or snap_envs == 0, (
-        "leftover envs with no snapshot slots — set teacher_envs/cpu_envs "
-        "to cover num_envs"
-    )
+    league_envs = num_envs - cpu_envs - teacher_envs - ref_envs - 2 * self_envs
+    assert league_envs >= 0, "cpu/teacher/reference/self envs exceed num_envs"
     rng = random.Random(seed)
 
     def cpu_char() -> str:
@@ -75,25 +68,18 @@ def make_partition(
 
     specs: list[EnvSpec] = []
     for i in range(cpu_envs):
-        specs.append(EnvSpec("cpu", -1, 1 + (i % 2), cpu_char()))
+        specs.append(EnvSpec("cpu", 1 + (i % 2), cpu_char()))
     for i, ch in enumerate(stratified(teacher_envs)):
-        specs.append(EnvSpec("teacher", -1, 1 + (i % 2), ch))
+        specs.append(EnvSpec("teacher", 1 + (i % 2), ch))
     for i, ch in enumerate(stratified(ref_envs)):
         # reference agent (e.g. medium-v2) plays the main 12 (user-verified)
-        specs.append(EnvSpec("reference", -1, 1 + (i % 2), ch))
+        specs.append(EnvSpec("reference", 1 + (i % 2), ch))
     # self-play: both seats are the student, so the second seat's boot char
-    # draws from the student whitelist (stratified for coverage). NOTE: with
-    # self_envs == 0 this consumes ZERO rng draws, keeping the stream (and
-    # therefore every downstream char draw) identical to the pre-self code.
+    # draws from the student whitelist (stratified for coverage)
     for i, ch in enumerate(stratified(self_envs, list(char_whitelist))):
-        specs.append(EnvSpec("self", -1, 1 + (i % 2), ch))
-    per_slot = snap_envs // snapshot_slots if snapshot_slots else 0
-    snap_chars = stratified(per_slot * snapshot_slots)
-    for slot in range(snapshot_slots):
-        for i in range(per_slot):
-            specs.append(
-                EnvSpec("snapshot", slot, 1 + (i % 2), snap_chars.pop())
-            )
+        specs.append(EnvSpec("self", 1 + (i % 2), ch))
+    for i, ch in enumerate(stratified(league_envs)):
+        specs.append(EnvSpec("snapshot", 1 + (i % 2), ch))
     assert len(specs) == num_envs - self_envs, (
         "dolphin count must be num_envs - self_envs (memory-neutral batching)"
     )
@@ -137,22 +123,20 @@ def f_var(x: float, p: float = 1.0) -> float:
 
 
 class SnapshotPool:
-    """Student snapshots on disk + PFSP (or recency-biased) slot assignments.
+    """Student snapshots on disk + the league's per-match PFSP draw.
 
-    save() freezes the current policy every snapshot_interval learner steps;
-    refresh() reassigns serving slots: slot 0 always the latest snapshot,
-    remaining slots sampled without replacement. With pfsp=True (default)
-    the sampling weight is AlphaStar's f_hard over the student's estimated
-    win rate vs each snapshot (payoff table persisted as pfsp.json in the
-    snapshot directory); pfsp=False keeps the original exponential recency
-    bias exactly."""
+    save() freezes the current policy every snapshot_interval learner steps
+    (a new league member); draw_member() picks one opponent for one match
+    — with pfsp=True (default) weighted by AlphaStar's f_hard / f_var over
+    the student's estimated win rate per member (payoff table persisted as
+    pfsp.json in the snapshot directory); pfsp=False keeps the original
+    exponential recency bias."""
 
     PRIOR_GAMES = 5  # below this, a snapshot's win rate is the 0.5 prior
 
     def __init__(
         self,
         directory: str,
-        slots: int,
         keep: int = 30,
         pfsp: bool = True,
         pfsp_p: float = 2.0,  # exponent on f_hard / f_var (AlphaStar: 2)
@@ -173,7 +157,6 @@ class SnapshotPool:
         league_members: tp.Sequence[str] = (),
     ):
         self.dir = directory
-        self.slots = slots
         self.keep = keep
         self.pfsp = pfsp
         self.pfsp_p = pfsp_p
@@ -351,8 +334,8 @@ class SnapshotPool:
         is interior-only: making the head evictable degenerates the whole
         scheme to FIFO (measured — span/age always prefers the oldest), so
         the earliest snapshot persists as the log-spacing anchor. It rarely
-        actually serves games: assignments() recency bias keeps ancient
-        snapshots to a tiny fraction of slot picks."""
+        actually serves games: PFSP weights keep ancient snapshots to a
+        tiny fraction of draws."""
         recent = min(8, self.keep // 2)
         while len(self.archive) > self.keep:
             olds = self.archive[:-recent] if recent else list(self.archive)
@@ -378,12 +361,12 @@ class SnapshotPool:
 
     def class_hardness(self) -> dict[str, float]:
         """Per-class student win estimate for the two-stage PFSP sampler
-        (and wandb): "ghosts" = mean win_ema over the whole archive minus
-        the latest snapshot (0.5 prior for unmeasured members), each league
+        (and wandb): "ghosts" = mean win estimate over the whole archive
+        (0.5 prior for unmeasured members), each league
         member ("phillip"/"teacher"/"cpu"/"import:NAME") a singleton class
         = its own row. Only nonempty/enabled classes appear."""
         out: dict[str, float] = {}
-        ghosts = self.archive[:-1]
+        ghosts = self.archive
         if ghosts:
             out["ghosts"] = (
                 sum(self.win_estimate(g) for g in ghosts) / len(ghosts)
@@ -397,147 +380,67 @@ class SnapshotPool:
         fn = f_hard if rng.random() < self.pfsp_hard_frac else f_var
         return lambda x: fn(x, self.pfsp_p)
 
-    def _class_weighted_picks(
-        self, rng: random.Random, need: int | None = None,
-    ) -> list[str]:
-        """Two-stage class-weighted PFSP for the non-latest slots (active
-        only when league members exist — user-chosen to stop ghost-mass
-        swamping: ~30 ghosts' collective flat weight must not outvote one
-        hard external member).
+    def draw_member(
+        self, rng: random.Random, allowed: tp.Collection[str] | None = None,
+    ) -> str | None:
+        """ONE per-match PFSP draw over the whole league (AlphaStar draws
+        the opponent per match, not per generation).
 
-        Stage 1, per slot independently (WITH replacement across slots):
-        sample a class with probability ∝ f_hard(class hardness) where the
-        hardness is the class's MEAN win_ema (class_hardness()). Singleton
-        classes can therefore hold multiple slots at once.
-        Stage 2, within "ghosts": the existing per-ghost f_hard, WITHOUT
-        replacement across slots — a ghost serves at most one slot."""
-        ghosts = list(self.archive[:-1])
-        hard = self.class_hardness()
-        picks: list[str] = []
-        need = self.slots - 1 if need is None else need
-        while len(picks) < need:
-            classes = [c for c in hard if c != "ghosts" or ghosts]
-            explore = rng.random() < self.pfsp_explore
-            wfn = self._draw_weight_fn(rng)  # this draw's f_hard-or-f_var
-            if explore:  # probe draw: uniform at BOTH stages
-                weights = [1.0] * len(classes)
-            else:
-                weights = [wfn(hard[c]) for c in classes]
-                if sum(weights) <= 0.0:  # everyone beaten: uniform fallback
-                    weights = [1.0] * len(classes)
-            cls = classes[rng.choices(range(len(classes)), weights=weights)[0]]
-            if cls == "ghosts":
-                if explore:
-                    gw = [1.0] * len(ghosts)
-                else:
-                    gw = [wfn(self.win_estimate(g)) for g in ghosts]
-                    if sum(gw) <= 0.0:
-                        gw = [1.0] * len(ghosts)
-                j = rng.choices(range(len(ghosts)), weights=gw)[0]
-                picks.append(ghosts.pop(j))
-            else:
-                picks.append(cls)
+        Two-stage class weighting (user-chosen to stop ghost-mass swamping:
+        ~30 ghosts' collective weight must not outvote one hard external
+        member): stage 1 picks a class — "ghosts" (the whole snapshot
+        archive, latest included) or a singleton league member — with
+        probability ∝ f(class hardness), f = f_hard or f_var per
+        pfsp_hard_frac; stage 2 picks a ghost ∝ f(its own win estimate).
+        pfsp_explore draws are uniform at both stages. Draws are
+        independent (with replacement): a popular member simply wins many
+        matches. `allowed` restricts the candidates (the worker's
+        resident-only fallback when the grid has no free slice). Returns
+        None when nothing is drawable."""
+        ghosts = [g for g in self.archive if allowed is None or g in allowed]
+        members = [
+            m for m in self.league_members if allowed is None or m in allowed
+        ]
+        if not self.pfsp:
+            # legacy recency bias over the archive (no league members)
+            if not ghosts:
+                return None
+            weights = [
+                2.0 ** (i / max(1, len(ghosts) / 3)) for i in range(len(ghosts))
+            ]
+            return ghosts[rng.choices(range(len(ghosts)), weights=weights)[0]]
+        classes: dict[str, float] = {}
+        if ghosts:
+            classes["ghosts"] = sum(self.win_estimate(g) for g in ghosts) / len(ghosts)
+        for m in members:
+            classes[m] = self.win_estimate(m)
+        if not classes:
+            return None
+        explore = rng.random() < self.pfsp_explore
+        wfn = self._draw_weight_fn(rng)
+        names = list(classes)
+        weights = [1.0] * len(names) if explore else [wfn(classes[c]) for c in names]
+        if sum(weights) <= 0.0:  # everyone beaten: uniform fallback
+            weights = [1.0] * len(names)
+        cls = names[rng.choices(range(len(names)), weights=weights)[0]]
+        if cls != "ghosts":
+            return cls
+        gw = [1.0] * len(ghosts) if explore else [wfn(self.win_estimate(g)) for g in ghosts]
+        if sum(gw) <= 0.0:
+            gw = [1.0] * len(ghosts)
+        return ghosts[rng.choices(range(len(ghosts)), weights=gw)[0]]
+
+    def boot_draws(self, rng: random.Random, n: int) -> list[str]:
+        """First opponents for n envs at boot: every drawable member once
+        (shuffled) so the payoff table gets a reading on everyone, then
+        per-match draws. "cpu" is excluded — a Dolphin boots with a policy
+        seat and adopts cpu only through a recycle (see rollouts)."""
+        members = [m for m in self.league_members if m != "cpu"] + list(self.archive)
+        rng.shuffle(members)
+        picks = members[:n]
+        while len(picks) < n:
+            m = self.draw_member(rng, allowed=[m for m in members])
+            if m is None:
+                break
+            picks.append(m)
         return picks
-
-    def assignments(
-        self, rng: random.Random | None = None, cover: bool = False,
-    ) -> list[str]:
-        """One member key per slot: an archive path, or a special league
-        member ("phillip"/"teacher"/"cpu") when league_members is set.
-        Slot 0 = ALWAYS the latest snapshot. With league members the rest
-        use the two-stage class-weighted PFSP (_class_weighted_picks);
-        without them, the flat per-ghost sampling is byte-identical to the
-        pre-league code — PFSP f_hard weights by default, the original
-        exponential recency bias with pfsp=False. Empty archive -> []
-        (league members only start serving once a first snapshot anchors
-        slot 0).
-
-        cover=True (boot auction): every league member gets one slot
-        first (shuffled), the rest are drawn as usual."""
-        if not self.archive:
-            return []
-        rng = rng or random.Random()
-        picks = [self.archive[-1]]
-        candidates = list(self.archive[:-1])
-        if self.pfsp and self.league_members:
-            if cover:
-                members = list(self.league_members)
-                rng.shuffle(members)
-                picks += members[: self.slots - 1]
-            picks += self._class_weighted_picks(rng, need=self.slots - len(picks))
-        elif self.pfsp:
-            # PFSP (AlphaStar f_hard): weight by how much the student still
-            # struggles vs each snapshot; beaten snapshots fade out.
-            while len(picks) < self.slots and candidates:
-                if rng.random() < self.pfsp_explore:
-                    weights = [1.0] * len(candidates)
-                else:
-                    wfn = self._draw_weight_fn(rng)
-                    weights = [
-                        wfn(self.win_estimate(c)) for c in candidates
-                    ]
-                    if sum(weights) <= 0.0:  # everyone beaten: uniform
-                        weights = [1.0] * len(candidates)
-                chosen = rng.choices(range(len(candidates)), weights=weights)[0]
-                picks.append(candidates.pop(chosen))
-        else:
-            # exponential recency bias: newer snapshots ~2x likelier per halving
-            while len(picks) < self.slots and candidates:
-                weights = [2.0 ** (i / max(1, len(candidates) / 3)) for i in range(len(candidates))]
-                chosen = rng.choices(range(len(candidates)), weights=weights)[0]
-                picks.append(candidates.pop(chosen))
-        while len(picks) < self.slots:
-            picks.append(self.archive[-1])  # early training: duplicate latest
-        return picks
-
-
-def apply_assignments(
-    assigns: tp.Sequence[str],
-    slot_policies: tp.Sequence[tuple[int, tp.Any]],
-    teacher_module,
-    worker,
-    slot_keys: dict[int, str],
-    device: str = "cpu",
-    imports: dict[str, tuple[str, str]] | None = None,
-) -> None:
-    """Route one auction's slot assignments: announce each slot's member to
-    the worker (begin_transition), then load the member's weights into the
-    slot policy — a snapshot path or import from disk, "teacher" as a copy
-    of the live module; "phillip" and "cpu" load nothing (own module /
-    engine AI). Imports carry a char lock into worker.slot_char_lock."""
-    for slot, slot_policy in slot_policies:
-        if slot >= len(assigns):
-            continue
-        key = assigns[slot]
-        lock = (
-            imports[key][1] if imports and _is_import_key(key) else None
-        )
-        worker.begin_transition(slot, key, lock, slot_policy)  # before loading
-        if key == "cpu":
-            worker.slot_desired[slot] = "cpu"
-            slot_keys[slot] = key
-            continue
-        if key == "phillip":
-            pass
-        elif key == "teacher":
-            slot_policy.load_state_dict(teacher_module.state_dict())
-        elif _is_import_key(key):
-            assert imports is not None and key in imports, (
-                f"slot {slot} assigned {key} but the import registry has no "
-                f"entry for it — pass imports={{'import:NAME': (path, "
-                f"char)}} (train_rl builds it from "
-                f"--rollouts.league-imports)"
-            )
-            path, _char = imports[key]
-            # map to the MODULE's device: under league capture the slot
-            # modules live on CPU (the GPU copy is the stacked params,
-            # refreshed by slot_weights_changed below)
-            mod_dev = next(slot_policy.parameters()).device
-            slot_policy.load_state_dict(torch.load(path, map_location=mod_dev))
-        else:
-            mod_dev = next(slot_policy.parameters()).device
-            slot_policy.load_state_dict(torch.load(key, map_location=mod_dev))
-        worker.slot_desired[slot] = "policy"
-        worker.slot_char_lock[slot] = lock  # (cpu keeps the previous lock)
-        worker.slot_weights_changed(slot)
-        slot_keys[slot] = key

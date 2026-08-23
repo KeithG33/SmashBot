@@ -360,18 +360,16 @@ def test_pool_partition_and_snapshots(tmp_path):
     from smashbot.rl.pool import SnapshotPool, make_partition
 
     specs = make_partition(
-        64, cpu_envs=8, teacher_envs=16, snapshot_slots=5, seed=1
+        64, cpu_envs=8, teacher_envs=16, seed=1
     )
     assert len(specs) == 64
     kinds = [s.kind for s in specs]
     assert kinds.count("cpu") == 8
     assert kinds.count("teacher") == 16
     assert kinds.count("snapshot") == 40
-    # slots evenly filled; policy opponents main-12 only; seats balanced
+    # policy opponents main-12 only; seats balanced
     from collections import Counter
 
-    slots = Counter(s.group for s in specs if s.kind == "snapshot")
-    assert all(v == 8 for v in slots.values()) and len(slots) == 5
     from smashbot.rl.pool import CPU_CHARS, OFF_ROSTER, OPPONENT_CHARS
 
     for s_ in specs:
@@ -393,17 +391,15 @@ def test_pool_partition_and_snapshots(tmp_path):
             super().__init__()
             self.w = t.nn.Parameter(t.tensor([v]))
 
-    pool = SnapshotPool(str(tmp_path), slots=3, keep=4)
-    assert pool.assignments() == []
+    pool = SnapshotPool(str(tmp_path), keep=4)
+    import random as r
+
+    assert pool.draw_member(r.Random(0)) is None  # empty archive
     for step, v in enumerate([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]):
         pool.save(P(v), step)
     assert len(pool.archive) == 4  # keep=4 pruned oldest
-    import random as r
-
-    picks = pool.assignments(r.Random(0))
-    assert len(picks) == 3
-    assert picks[0] == pool.archive[-1]  # slot 0 = latest
-    assert len(set(picks)) == 3  # without replacement when possible
+    rng = r.Random(0)
+    assert all(pool.draw_member(rng) in pool.archive for _ in range(20))
 
 
 def test_reset_target_positions_masked():
@@ -456,7 +452,7 @@ def test_pool_partition_reference_envs():
     from smashbot.rl.pool import MAIN_12, make_partition
 
     specs = make_partition(
-        num_envs=16, cpu_envs=4, teacher_envs=-1, snapshot_slots=0,
+        num_envs=16, cpu_envs=4, teacher_envs=-1,
         seed=3, ref_envs=4,
     )
     kinds = [s.kind for s in specs]
@@ -479,7 +475,7 @@ def test_snapshot_pool_exponential_thinning(tmp_path):
         def state_dict(self):
             return {"w": _torch.zeros(1)}
 
-    pool = SnapshotPool(str(tmp_path), slots=3, keep=12)
+    pool = SnapshotPool(str(tmp_path), keep=12)
     for step in range(0, 6000, 100):
         pool.save(Stub(), step)
     steps = [SnapshotPool._step_of(p) for p in pool.archive]

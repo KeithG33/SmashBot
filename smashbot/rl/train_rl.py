@@ -189,7 +189,7 @@ def main() -> None:
     )
 
     from smashbot.rl.pool import (
-        SnapshotPool, apply_assignments, make_partition, student_whitelist,
+        SnapshotPool, make_partition, student_whitelist,
     )
 
     rcfg = args.rollouts
@@ -199,40 +199,31 @@ def main() -> None:
     # loud assert beats 120 Dolphins booting into a mispartitioned run
     league = rcfg.league_members()
     if league:
-        print(f"league members via PFSP slots: {league}")
+        print(f"league members (per-match PFSP draws): {league}")
     # Imported league members (frozen checkpoints from a previous run):
-    # registry {"import:NAME": (path, char_lock)} consumed by
-    # apply_assignments — a slot assigned an import loads that state_dict
-    # into its slot policy (no extra resident module) and its envs pin the
-    # locked char. Validate paths up front: loud assert beats 120 Dolphins
-    # booting into a run whose benchmark opponent can never serve.
+    # {"import:NAME": (path, char_lock)}. Validate paths up front: loud
+    # assert beats 120 Dolphins booting into a run whose benchmark opponent
+    # can never serve.
     import_registry = {
         f"import:{name}": (path, char)
         for name, (path, char) in rcfg.import_members().items()
-    } or None
-    if import_registry:
-        for key, (path, char) in import_registry.items():
-            assert os.path.exists(path), (
-                f"league import {key}: state_dict not found at {path}"
-            )
-            print(f"league import: {key} <- {path} @ {char} (char lock)")
+    }
+    for key, (path, char) in import_registry.items():
+        assert os.path.exists(path), (
+            f"league import {key}: state_dict not found at {path}"
+        )
+        print(f"league import: {key} <- {path} @ {char} (char lock)")
     specs = make_partition(
         rcfg.num_envs, rcfg.cpu_envs, rcfg.teacher_envs,
-        rcfg.snapshot_slots, rcfg.main12_prob, rcfg.partition_seed,
+        rcfg.main12_prob, rcfg.partition_seed,
         ref_envs=rcfg.ref_envs, self_envs=rcfg.self_envs,
         char_whitelist=student_whitelist(rcfg.char_whitelist, rcfg.bot_char),
     )
     opponents = {}
-    slot_policies = []
     counts = {}
     for spec in specs:
-        key = "teacher" if spec.kind == "teacher" else (
-            ("slot", spec.group) if spec.kind == "snapshot" else (
-                "reference" if spec.kind == "reference" else None
-            )
-        )
-        if key is not None:
-            counts[key] = counts.get(key, 0) + 1
+        if spec.kind in ("teacher", "reference", "snapshot"):
+            counts[spec.kind] = counts.get(spec.kind, 0) + 1
     if "teacher" in counts:
         opponents["teacher"] = BatchedPolicyAgent(
             teacher, counts["teacher"], name_code=name_code, device=device,
@@ -259,73 +250,79 @@ def main() -> None:
         )
         print(f"reference: {rcfg.ref_ckpt} (delay {ref_policy.delay}, "
               f"name code {ref_code})")
-    for key, n in counts.items():
-        if key in ("teacher", "reference"):
-            continue
-        slot_policy, _, _ = load_policy(args.ckpt, device)  # init = teacher
-        slot_policy.train_value_head = False
-        slot_policy.requires_grad_(False)
-        slot_policy.eval()
-        if args.runtime.compile:
-            mode = "reduce-overhead" if device == "cuda" else "default"
-            slot_policy.sample = torch.compile(slot_policy.sample, mode=mode)
-        slot_policies.append((key[1], slot_policy))
-        opponents[key] = BatchedPolicyAgent(
-            slot_policy, n, name_code=name_code, device=device,
-            batch_steps=rcfg.batch_steps,
-        )
     snapshot_pool = SnapshotPool(
         f"{args.runtime.run_dir}/{args.runtime.tag}/snapshots",
-        slots=rcfg.snapshot_slots,
         pfsp=rcfg.pfsp, pfsp_p=rcfg.pfsp_p,
         pfsp_hard_frac=rcfg.pfsp_hard_frac, pfsp_explore=rcfg.pfsp_explore,
         league_members=league,
     )
+    runtime = None
+    league_envs = counts.get("snapshot", 0)
+    if league_envs:
+        from smashbot.rl.agent import LeagueAgent
+        from smashbot.rl.league import League, LeagueSeats, MemberWeights
+
+        assert rcfg.league_slices > 0, (
+            f"{league_envs} league envs but league_slices=0"
+        )
+        # the grid: S slices x N cells, one slice's worth of slack cells so
+        # free seats can float to where PFSP demand is (see league.py)
+        S = rcfg.league_slices
+        N = -(-(league_envs + S) // S)
+        template, _, _ = load_policy(args.ckpt, "cpu")
+        template.train_value_head = False
+        grid = LeagueAgent(
+            template, S, N, name_code=name_code, device=device,
+            temperature=None,
+        )
+        # member weights: teacher (frozen copy), imports, snapshots (LRU)
+        fixed = {"teacher": {k: v.detach().cpu() for k, v in teacher.state_dict().items()}}
+        for key, (path, _char) in import_registry.items():
+            fixed[key] = torch.load(path, map_location="cpu")
+        weights = MemberWeights(fixed)
+        phillip_agent = None
+        if rcfg.league_phillip:
+            # Phillip's own module, loaded ONCE (exactly as ref-envs mode
+            # does); his architecture never fits a slice, so envs that draw
+            # him are ROUTED to his agent (fixed capacity)
+            ph_policy, ph_names, _ = load_policy(rcfg.ref_ckpt, device)
+            ph_policy.train_value_head = False
+            ph_policy.requires_grad_(False)
+            ph_policy.eval()
+            if args.runtime.compile:
+                mode = "reduce-overhead" if device == "cuda" else "default"
+                ph_policy.sample = torch.compile(ph_policy.sample, mode=mode)
+            ph_code = resolve_name_code(ph_names, "Master Player")
+            cap = rcfg.phillip_capacity or N
+            phillip_agent = BatchedPolicyAgent(
+                ph_policy, cap, name_code=ph_code, device=device,
+                batch_steps=rcfg.batch_steps,
+            )
+            print(f"phillip (league member): {rcfg.ref_ckpt} "
+                  f"(delay {ph_policy.delay}, name code {ph_code}, "
+                  f"capacity {cap})")
+        seats = LeagueSeats(
+            S, N, loader=lambda s, m: grid.load_slice(s, weights.get(m)),
+            phillip_capacity=phillip_agent.num_envs if phillip_agent else 0,
+        )
+        import random as _random
+
+        league_proto = League(
+            snapshot_pool, seats,
+            locks={k: char for k, (_p, char) in import_registry.items()},
+            rng=_random.Random(rcfg.partition_seed ^ 0xA11A),
+            on_result=snapshot_pool.record_result,
+            cpu_enabled=rcfg.league_cpu,
+        )
+        from smashbot.rl.rollouts import LeagueRuntime
+
+        runtime = LeagueRuntime(league_proto, grid, phillip_agent)
+        print(f"league grid: {S} slices x {N} cells for {league_envs} envs",
+              flush=True)
     worker = DolphinRolloutWorker(
         args.rollouts, student_agent, opponents=opponents, specs=specs,
-        harvest_imitation=args.learner.imitation_rows != 0,
+        harvest_imitation=args.learner.imitation_rows != 0, league=runtime,
     )
-    # payoff attribution: the worker reports the member each env was
-    # fighting when its game ended; slot_keys is the auction's log view
-    slot_keys: dict[int, str] = {}
-
-    def _on_snapshot_game(key: str, won: bool) -> None:
-        snapshot_pool.record_result(key, won)
-
-    worker.on_snapshot_game = _on_snapshot_game
-    # spare brain per slot (eager: transitions last ~one game)
-    def _outgoing_factory(n: int):
-        spare, _, _ = load_policy(args.ckpt, device)
-        spare.train_value_head = False
-        spare.requires_grad_(False)
-        spare.eval()
-        return BatchedPolicyAgent(
-            spare, n, name_code=name_code, device=device,
-            batch_steps=rcfg.batch_steps,
-        )
-
-    if slot_policies:
-        worker.outgoing_factory = _outgoing_factory
-    if rcfg.league_phillip:
-        # Phillip's own module, loaded ONCE (exactly as ref-envs mode does);
-        # his architecture never fits a slot policy, so slots assigned
-        # "phillip" are served by ROUTING their rows to his agent. The agent
-        # wrapper is rebuilt per occupancy change (worker._phillip_agent_for
-        # documents the bounded compile-variant choice).
-        ph_policy, ph_names, _ = load_policy(rcfg.ref_ckpt, device)
-        ph_policy.train_value_head = False
-        ph_policy.requires_grad_(False)
-        ph_policy.eval()
-        if args.runtime.compile:
-            mode = "reduce-overhead" if device == "cuda" else "default"
-            ph_policy.sample = torch.compile(ph_policy.sample, mode=mode)
-        ph_code = resolve_name_code(ph_names, "Master Player")
-        worker.phillip_factory = lambda n: BatchedPolicyAgent(
-            ph_policy, n, name_code=ph_code, device=device,
-            batch_steps=rcfg.batch_steps,
-        )
-        print(f"phillip (league member): {rcfg.ref_ckpt} "
-              f"(delay {ph_policy.delay}, name code {ph_code})")
     if restored_trackers:
         for kind, st in restored_trackers.items():
             if kind in worker.trackers:
@@ -343,65 +340,32 @@ def main() -> None:
     )
 
     run_dir = f"{args.runtime.run_dir}/{args.runtime.tag}"
-    last_assigns: list = []  # latest refresh's slot keys (class-slot wandb)
-    # Boot auction: assign slots now rather than at the first
-    # snapshot_interval. Needs a latest snapshot for slot 0, so a fresh run
-    # seeds its archive with the init weights.
-    if rcfg.snapshot_slots and not snapshot_pool.archive:
+    # a fresh run seeds its archive with the init weights so the league
+    # has a ghost to draw from the first match on
+    if league_envs and not snapshot_pool.archive:
         snapshot_pool.save(policy, start_step)
         print(f"boot snapshot: seeded empty archive at step {start_step}",
               flush=True)
-    if rcfg.snapshot_slots and snapshot_pool.archive:
-        import random as _random
-
-        assigns = snapshot_pool.assignments(
-            _random.Random(start_step), cover=True,
-        )
-        if assigns:
-            last_assigns = assigns
-            apply_assignments(
-                assigns, slot_policies, teacher, worker, slot_keys, device,
-                imports=import_registry,
-            )
-            served = [
-                os.path.basename(k) if os.sep in k else k for k in assigns
-            ]
-            print(f"boot auction: slots -> {served}", flush=True)
     state = learner.initial_state(args.rollouts.num_envs, device)
     watcher = TeacherWatcher(args.runtime.teacher_watch or args.ckpt)
     teacher_swaps = 0
     t0 = time.time()
     try:
         for i in range(start_step, args.runtime.steps):
-            if (
-                rcfg.snapshot_slots
-                and i > 0
-                and i % rcfg.snapshot_interval == 0
-            ):
-                snapshot_pool.save(policy, i)
-                import random as _random
-
-                assigns = snapshot_pool.assignments(_random.Random(i))
-                last_assigns = assigns
-                # snapshot paths hot-swap instantly; "teacher" copies the
-                # LIVE teacher module's weights (stale at most until the
-                # next refresh if the watcher swaps mid-epoch); "phillip"
-                # reroutes the slot's rows to his agent; "cpu" only flips
-                # the desired kind — envs adopt at recycle
-                apply_assignments(
-                    assigns, slot_policies, teacher, worker, slot_keys,
-                    device, imports=import_registry,
-                )
-                served = [
-                    os.path.basename(k) if os.sep in k else k
-                    for k in assigns
-                ]
-                print(f"[{i}] snapshot saved; slots refreshed -> {served}")
-
+            if league_envs and i > 0 and i % rcfg.snapshot_interval == 0:
+                # a new ghost joins the league; envs draw it per match
+                # from now on (no auction, no swaps)
+                path = snapshot_pool.save(policy, i)
+                print(f"[{i}] snapshot saved: {os.path.basename(path)} "
+                      f"joins the league", flush=True)
             if i > 0 and i % args.runtime.teacher_check_interval == 0:
                 new_teacher = watcher.poll()
                 if new_teacher is not None:
                     teacher.load_state_dict(new_teacher)  # in-place copy
+                    if runtime is not None:
+                        weights.set("teacher", {
+                            k: v.detach().cpu() for k, v in teacher.state_dict().items()
+                        })
                     state = state._replace(
                         teacher=teacher.initial_state(
                             args.rollouts.num_envs, device
@@ -456,21 +420,17 @@ def main() -> None:
                     log["rl/imitation/w_max"] = im["w_max"]
                     log["rl/imitation/traj_count"] = im["traj_count"]
                     log["rl/imitation/lambda"] = im["lambda"]
-                for slot, key in slot_keys.items():
-                    log[f"rl/pfsp/slot{slot}_winrate"] = (
-                        snapshot_pool.win_estimate(key)
-                    )
-                if league:
+                if league_envs:
                     # class view of the two-stage PFSP: per-class hardness
-                    # and how many non-latest slots each class holds now.
+                    # and how many league envs each class is fighting NOW.
                     # Imports log as rl/pfsp/import_{NAME}_* — the
                     # import_..._winrate row IS the cross-generation
                     # progress bar (are we beating the old model yet?)
                     hard = snapshot_pool.class_hardness()
                     held = {c: 0 for c in ("phillip", "teacher", "cpu",
                                            "ghosts", *hard)}
-                    for k in last_assigns[1:]:
-                        held[k if k in held else "ghosts"] += 1
+                    for m in worker.league.member_now.values():
+                        held[m if m in held else "ghosts"] += 1
                     for cname, h in hard.items():
                         tag = (
                             f"import_{cname[len('import:'):]}"
@@ -478,7 +438,12 @@ def main() -> None:
                             else f"class_{cname}"
                         )
                         log[f"rl/pfsp/{tag}_winrate"] = h
-                        log[f"rl/pfsp/{tag}_slots"] = held[cname]
+                        log[f"rl/pfsp/{tag}_envs"] = held[cname]
+                    lg = worker.league
+                    log["rl/league/fallback_rate"] = lg.fallback_rate
+                    log["rl/league/draws"] = lg.draws
+                    log["rl/league/warnings"] = lg.warnings
+                    log["rl/league/slice_loads"] = lg.seats.loads
                 for kind, tracker in worker.trackers.items():
                     for k, v in tracker.stats().items():
                         log[f"rl/{kind}/{k}"] = v
@@ -494,7 +459,7 @@ def main() -> None:
                 # '--' = no league-era games yet. SP (self-play) has no
                 # payoff row; it stays the tracker's ~50% health gauge.
                 # kill@/die@ + per-kind EMAs remain in wandb only.
-                cat = snapshot_pool.category_estimates() if rcfg.snapshot_slots else {}
+                cat = snapshot_pool.category_estimates() if league_envs else {}
 
                 def _pct(x):  # "decayed/raw%" from the payoff ledger
                     if x is None:

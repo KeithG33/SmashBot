@@ -49,8 +49,7 @@ def student_whitelist(
 class EnvSpec:
     """Per-env assignment, fixed for the run."""
 
-    kind: str  # "cpu" | "teacher" | "reference" | "self" | "snapshot"
-    group: int  # snapshot slot index (0 = freshest); -1 otherwise
+    kind: str  # "cpu" | "teacher" | "reference" | "self" | "snapshot" (league)
     student_port: int  # 1 or 2
     opponent_char: str
     cpu_level: int = 9
@@ -65,11 +64,21 @@ class RolloutConfig:
     stage: str = "FINAL_DESTINATION"
     games_per_dolphin: int = 20
     # Opponent pool partition (see rl/pool.py). Defaults replicate the
-    # simple all-teacher setup; production: cpu_envs=8, teacher_envs=16,
-    # snapshot_slots=5 at num_envs=64.
+    # simple all-teacher setup; production: everything not cpu/teacher/
+    # reference/self is a LEAGUE env (kind "snapshot").
     cpu_envs: int = 0
-    teacher_envs: int = -1  # -1 = all envs not assigned to cpu/snapshots
-    snapshot_slots: int = 0
+    teacher_envs: int = -1  # -1 = all envs not assigned to cpu/league
+    # The league grid (rl/agent.LeagueAgent): league_slices weight slices,
+    # each serving league_envs / league_slices cells. A slice is a weight
+    # cache entry — at most league_slices DISTINCT league members are
+    # resident at once (107 MB each); envs draw their opponent per match
+    # and sit wherever that member is loaded (rollouts._Grid). 0 = no
+    # league envs.
+    league_slices: int = 0
+    # Phillip's agent capacity (his architecture never fits a slice): the
+    # max envs fighting him at once; draws beyond it fall back to a
+    # resident-member draw. 0 = size to one slice's worth of cells.
+    phillip_capacity: int = 0
     main12_prob: float = 0.6
     snapshot_interval: int = 500  # learner steps between student snapshots
     partition_seed: int = 0
@@ -139,11 +148,11 @@ class RolloutConfig:
     # cross-generation benchmark (the payoff row vs an import = "are we
     # beating the old model yet"). Entries are "NAME=/path/to/state_dict.pt"
     # (bare policy state_dict, snapshot-pool format, same architecture as
-    # the student — loaded exactly like a ghost slot load), optionally with
-    # a per-import character lock "NAME=PATH@CHAR" (default lock: FOX —
-    # these are trained-fox opponents). While a slot serves an import, its
-    # envs pin the locked character instead of redrawing per game.
-    # Requires pfsp=True and snapshot_slots > 0.
+    # the student — loaded exactly like a ghost), optionally with a
+    # per-import character lock "NAME=PATH@CHAR" (default lock: FOX —
+    # these are trained-fox opponents). An env fighting an import pins the
+    # locked character for that match instead of redrawing.
+    # Requires pfsp=True and league_slices > 0.
     league_imports: list[str] = dataclasses.field(default_factory=list)
 
     def import_members(self) -> dict[str, tuple[str, str]]:
@@ -187,14 +196,14 @@ class RolloutConfig:
             assert self.teacher_envs == 0, (
                 f"league_teacher folds the teacher into the PFSP league — "
                 f"set teacher_envs=0 (got {self.teacher_envs}) and move "
-                f"those envs into the snapshot slots"
+                f"those envs into the league"
             )
             members.append("teacher")
         if self.league_cpu:
             assert self.cpu_envs == 0, (
                 f"league_cpu folds the lvl-9 CPU into the PFSP league — "
                 f"set cpu_envs=0 (got {self.cpu_envs}) and move those envs "
-                f"into the snapshot slots"
+                f"into the league"
             )
             members.append("cpu")
         if self.league_phillip:
@@ -206,9 +215,9 @@ class RolloutConfig:
             members.append("phillip")
         imports = self.import_members()
         if imports:
-            assert self.snapshot_slots > 0, (
-                f"league_imports serve through snapshot slots — set "
-                f"snapshot_slots > 0 (got {self.snapshot_slots})"
+            assert self.league_slices > 0, (
+                f"league_imports serve through the league grid — set "
+                f"league_slices > 0 (got {self.league_slices})"
             )
             members += [f"import:{name}" for name in imports]
         if members:

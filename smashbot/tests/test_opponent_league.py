@@ -59,7 +59,7 @@ def test_partition_default_noop_golden():
         golden = json.load(f)
     for key, expect in golden.items():
         specs = make_partition(**json.loads(key))
-        got = [[s.kind, s.group, s.student_port, s.opponent_char] for s in specs]
+        got = [[s.kind, s.student_port, s.opponent_char] for s in specs]
         assert got == expect, f"partition drifted for {key}"
 
 
@@ -68,7 +68,7 @@ def test_partition_self_envs_arithmetic_and_order():
 
     # self envs cost 2 budget units, run 1 dolphin each
     specs = make_partition(
-        num_envs=24, cpu_envs=2, teacher_envs=6, snapshot_slots=2,
+        num_envs=24, cpu_envs=2, teacher_envs=6,
         seed=0, ref_envs=4, self_envs=4,
         char_whitelist=["FOX", "FALCO"],
     )
@@ -86,7 +86,7 @@ def test_partition_self_envs_arithmetic_and_order():
 
     # teacher_envs=-1 accounts for the doubled self budget
     specs = make_partition(
-        num_envs=16, cpu_envs=2, teacher_envs=-1, snapshot_slots=0,
+        num_envs=16, cpu_envs=2, teacher_envs=-1,
         seed=0, ref_envs=2, self_envs=3,
     )
     assert len(specs) == 13
@@ -128,6 +128,12 @@ class _FakeEnvs:
 
     def install(self, monkeypatch):
         w = self.worker
+        if w.league_idx and not w.league.member_now:
+            locks = w.league.boot(w.league_idx)
+            for i, lock in locks.items():
+                if lock is not None:
+                    w.specs[i].opponent_char = lock
+                    self.opp_chars.setdefault(i, lock)
         monkeypatch.setattr(w, "_ensure_started", lambda: None)
         monkeypatch.setattr(w, "_gather_all", self.gather)
         w._conns = [_FakeConn() for _ in range(w.num_dolphins)]
@@ -158,7 +164,13 @@ class _FakeEnvs:
 
 
 def _make_worker(monkeypatch, num_envs, seed=0, opp_chars=None,
-                 harvest=False, ref_controller_config=None, **cfg_kwargs):
+                 harvest=False, ref_controller_config=None, pool_dir=None,
+                 members=None, phillip_capacity=0, **cfg_kwargs):
+    """A real DolphinRolloutWorker over fake env pipes. League envs (any
+    env not cpu/teacher/reference/self) get a LeagueRuntime: a tiny-policy
+    grid, a SnapshotPool in `pool_dir` seeded with the ghosts listed in
+    `members` (archive paths) plus the config's league members, and a
+    Phillip agent under league_phillip."""
     cfg = RolloutConfig(
         num_envs=num_envs, unroll_length=4, games_per_dolphin=10**9,
         **cfg_kwargs,
@@ -167,22 +179,15 @@ def _make_worker(monkeypatch, num_envs, seed=0, opp_chars=None,
     from smashbot.rl.pool import make_partition, student_whitelist
 
     specs = make_partition(
-        cfg.num_envs, cfg.cpu_envs, cfg.teacher_envs, cfg.snapshot_slots,
+        cfg.num_envs, cfg.cpu_envs, cfg.teacher_envs,
         cfg.main12_prob, cfg.partition_seed, ref_envs=cfg.ref_envs,
         self_envs=cfg.self_envs,
         char_whitelist=student_whitelist(cfg.char_whitelist, cfg.bot_char),
     )
     opponents = {}
     counts = {}
-    slot_counts = {}
     for sp in specs:
         counts[sp.kind] = counts.get(sp.kind, 0) + 1
-        if sp.kind == "snapshot":
-            slot_counts[sp.group] = slot_counts.get(sp.group, 0) + 1
-    for g, n in slot_counts.items():
-        opponents[("slot", g)] = BatchedPolicyAgent(
-            _tiny_policy(seed=3 + g), n, name_code=1
-        )
     if counts.get("teacher"):
         opponents["teacher"] = BatchedPolicyAgent(
             _tiny_policy(seed=1), counts["teacher"], name_code=1
@@ -192,27 +197,69 @@ def _make_worker(monkeypatch, num_envs, seed=0, opp_chars=None,
         opponents["reference"] = BatchedPolicyAgent(
             ref_policy, counts["reference"], name_code=2
         )
+    runtime = None
+    if counts.get("snapshot"):
+        runtime = _make_runtime(
+            cfg, counts["snapshot"], pool_dir, members or [], phillip_capacity,
+        )
     worker = DolphinRolloutWorker(
         cfg, student, opponents=opponents, specs=specs,
-        harvest_imitation=harvest,
+        harvest_imitation=harvest, league=runtime,
     )
-    # spare brain for deferred adoption (train_rl always provides one)
-    worker.outgoing_factory = lambda n: BatchedPolicyAgent(
-        _tiny_policy(seed=50), n, name_code=1
-    )
-    if cfg.league_phillip:
-        # a differently-discretized policy, like the real Phillip module
-        # (exercises the harvest re-encode path); ONE module, agent rebuilt
-        # per occupancy — mirrors train_rl's factory
-        ph_policy = _phillip_like_policy(
-            embed_lib.ControllerConfig(axis_spacing=8)
-        )
-        worker.phillip_factory = lambda n: BatchedPolicyAgent(
-            ph_policy, n, name_code=2
-        )
     envs = _FakeEnvs(worker, seed=seed, opp_chars=opp_chars)
     envs.install(monkeypatch)
     return worker, envs
+
+
+def _make_runtime(cfg, league_envs, pool_dir, ghosts, phillip_capacity):
+    """LeagueRuntime over tiny policies: the grid template is the teacher-
+    seed policy; ghosts are saved into the pool as distinct tiny policies;
+    imports (cfg.league_imports) resolve to files written here too."""
+    import tempfile
+
+    from smashbot.rl.agent import LeagueAgent
+    from smashbot.rl.league import League, LeagueSeats, MemberWeights
+    from smashbot.rl.pool import SnapshotPool
+    from smashbot.rl.rollouts import LeagueRuntime
+
+    pool_dir = pool_dir or tempfile.mkdtemp(prefix="league-")
+    members = cfg.league_members()
+    pool = SnapshotPool(
+        str(pool_dir), pfsp=cfg.pfsp, pfsp_p=cfg.pfsp_p,
+        pfsp_hard_frac=cfg.pfsp_hard_frac, pfsp_explore=cfg.pfsp_explore,
+        league_members=members,
+    )
+    for j, step in enumerate(ghosts):
+        pool.save(_tiny_policy(seed=10 + j), step)
+    S = cfg.league_slices or 1
+    N = -(-(league_envs + S) // S)
+    grid = LeagueAgent(_tiny_policy(seed=0), S, N, name_code=1, device="cpu")
+    fixed = {"teacher": _tiny_policy(seed=1).state_dict()}
+    locks = {}
+    for name, (path, char) in cfg.import_members().items():
+        key = f"import:{name}"
+        fixed[key] = _tiny_policy(seed=100 + len(fixed)).state_dict()
+        locks[key] = char
+    weights = MemberWeights(fixed)
+    phillip = None
+    if cfg.league_phillip:
+        # a differently-discretized policy, like the real Phillip module
+        # (exercises the harvest re-encode path)
+        ph_policy = _phillip_like_policy(
+            embed_lib.ControllerConfig(axis_spacing=8)
+        )
+        phillip = BatchedPolicyAgent(
+            ph_policy, phillip_capacity or N, name_code=2
+        )
+    seats = LeagueSeats(
+        S, N, loader=lambda s, m: grid.load_slice(s, weights.get(m)),
+        phillip_capacity=phillip.num_envs if phillip else 0,
+    )
+    league = League(
+        pool, seats, locks=locks, rng=random.Random(0),
+        on_result=pool.record_result, cpu_enabled=cfg.league_cpu,
+    )
+    return LeagueRuntime(league, grid, phillip)
 
 
 def _phillip_like_policy(controller_config=None):
@@ -657,7 +704,7 @@ class _Stub:
 def test_pfsp_prior_and_payoff_updates(tmp_path):
     from smashbot.rl.pool import SnapshotPool
 
-    pool = SnapshotPool(str(tmp_path), slots=3)
+    pool = SnapshotPool(str(tmp_path))
     p = pool.save(_Stub(), 100)
     assert pool.win_estimate(p) == 0.5  # no games: prior
     for won in [True, True, True, False]:
@@ -677,7 +724,7 @@ def test_pfsp_prior_and_payoff_updates(tmp_path):
 def test_pfsp_persistence_roundtrip_and_prune(tmp_path):
     from smashbot.rl.pool import SnapshotPool
 
-    pool = SnapshotPool(str(tmp_path), slots=2)
+    pool = SnapshotPool(str(tmp_path))
     a = pool.save(_Stub(), 100)
     b = pool.save(_Stub(), 200)
     for _ in range(6):
@@ -689,7 +736,7 @@ def test_pfsp_persistence_roundtrip_and_prune(tmp_path):
     }
     pool._save_payoff()
 
-    fresh = SnapshotPool(str(tmp_path), slots=2)
+    fresh = SnapshotPool(str(tmp_path))
     assert fresh.win_estimate(a) == pytest.approx(pool.win_estimate(a))
     assert fresh.win_estimate(b) == pytest.approx(pool.win_estimate(b))
     assert "/nonexistent/snapshot-999.pt" not in fresh.payoff  # pruned
@@ -699,7 +746,7 @@ def test_pfsp_persistence_roundtrip_and_prune(tmp_path):
 def test_pfsp_thinning_drops_payoff_rows(tmp_path):
     from smashbot.rl.pool import SnapshotPool
 
-    pool = SnapshotPool(str(tmp_path), slots=2, keep=4)
+    pool = SnapshotPool(str(tmp_path), keep=4)
     for s in range(0, 800, 100):
         p = pool.save(_Stub(), s)
         for _ in range(3):
@@ -714,7 +761,7 @@ def test_pfsp_thinning_drops_payoff_rows(tmp_path):
 def test_pfsp_sampling_prefers_hard_opponents(tmp_path):
     from smashbot.rl.pool import SnapshotPool
 
-    pool = SnapshotPool(str(tmp_path), slots=2)
+    pool = SnapshotPool(str(tmp_path))
     easy = pool.save(_Stub(), 100)   # student dominates: x ~ 1
     hard = pool.save(_Stub(), 200)   # student loses: x ~ 0
     mid = pool.save(_Stub(), 250)
@@ -723,60 +770,22 @@ def test_pfsp_sampling_prefers_hard_opponents(tmp_path):
         pool.record_result(easy, True)
         pool.record_result(hard, False)
 
-    counts = {easy: 0, hard: 0, mid: 0}
-    for s in range(400):
-        picks = pool.assignments(random.Random(s))
-        assert picks[0] == latest  # slot 0 always the latest
-        assert len(picks) == 2
-        counts[picks[1]] += 1
-    # prior-seeded EMA after 120 straight wins: x ~ 0.85, so easy is
-    # strongly suppressed but no longer EXACTLY zero-weight
+    counts = {easy: 0, hard: 0, mid: 0, latest: 0}
+    rng = random.Random(0)
+    for _ in range(800):
+        counts[pool.draw_member(rng)] += 1
+    # per-match draws over the whole archive (the latest competes too);
+    # after 120 straight wins easy is strongly suppressed
     assert counts[easy] < counts[mid] < counts[hard]
-    assert counts[easy] < 0.15 * 400
-    assert counts[hard] > counts[mid]  # hardest opponent served most
+    assert counts[easy] < 0.15 * 800
+    assert counts[latest] > 0
 
-    # everyone beaten: uniform fallback still fills the slots
+    # everyone beaten: uniform fallback still draws
     for _ in range(120):
         pool.record_result(mid, True)
         pool.record_result(hard, True)
-    picks = pool.assignments(random.Random(0))
-    assert len(picks) == 2 and picks[0] == latest
-
-
-def test_pfsp_off_matches_old_recency_behavior(tmp_path):
-    """pfsp=False must reproduce the original recency-biased sampler
-    exactly (reference implementation below is a verbatim copy of the
-    pre-PFSP code), even with payoff data present."""
-    from smashbot.rl.pool import SnapshotPool
-
-    pool = SnapshotPool(str(tmp_path), slots=4, pfsp=False)
-    for s in range(0, 1200, 100):
-        pool.save(_Stub(), s)
-    for p in pool.archive[:3]:
-        for _ in range(10):
-            pool.record_result(p, True)  # must be IGNORED with pfsp off
-
-    def old_assignments(archive, slots, rng):
-        picks = [archive[-1]]
-        candidates = list(archive[:-1])
-        while len(picks) < slots and candidates:
-            weights = [
-                2.0 ** (i / max(1, len(candidates) / 3))
-                for i in range(len(candidates))
-            ]
-            chosen = rng.choices(range(len(candidates)), weights=weights)[0]
-            picks.append(candidates.pop(chosen))
-        while len(picks) < slots:
-            picks.append(archive[-1])
-        return picks
-
-    for seed in range(25):
-        assert pool.assignments(random.Random(seed)) == old_assignments(
-            pool.archive, 4, random.Random(seed)
-        )
-
-
-# ------------------------------------------------------- dual-seat rewards
+        pool.record_result(latest, True)
+    assert pool.draw_member(random.Random(0)) in counts
 
 
 def test_compute_reward_is_zero_sum_mirror():
@@ -816,19 +825,17 @@ def test_league_flags_default_off_golden(tmp_path):
     assert RolloutConfig(league_imports=[]).league_members() == []
     assert RolloutConfig().import_members() == {}
 
-    pool_a = SnapshotPool(str(tmp_path / "a"), slots=3)
-    pool_b = SnapshotPool(str(tmp_path / "b"), slots=3, league_members=())
+    pool_a = SnapshotPool(str(tmp_path / "a"))
+    pool_b = SnapshotPool(str(tmp_path / "b"), league_members=())
     for s in range(0, 600, 100):
         pool_a.save(_Stub(), s)
         pool_b.save(_Stub(), s)
         pool_a.record_result(pool_a.archive[-1], s % 200 == 0)
         pool_b.record_result(pool_b.archive[-1], s % 200 == 0)
     for seed in range(25):
-        a = pool_a.assignments(random.Random(seed))
-        b = pool_b.assignments(random.Random(seed))
-        assert [os.path.basename(p) for p in a] == [
-            os.path.basename(p) for p in b
-        ]
+        a = pool_a.draw_member(random.Random(seed))
+        b = pool_b.draw_member(random.Random(seed))
+        assert os.path.basename(a) == os.path.basename(b)
 
 
 def test_league_flag_asserts():
@@ -854,7 +861,7 @@ def test_league_flag_asserts():
     from smashbot.rl.pool import SnapshotPool
 
     with pytest.raises(AssertionError, match="pfsp"):
-        SnapshotPool("/tmp/never-used", slots=2, pfsp=False,
+        SnapshotPool("/tmp/never-used", pfsp=False,
                      league_members=("teacher",))
     # valid combos pass
     assert RolloutConfig(
@@ -868,26 +875,18 @@ def test_league_flag_asserts():
 
 
 def test_league_teacher_candidates_and_fhard(tmp_path):
-    """"teacher" joins the candidate set for non-latest slots, starts at the
-    0.5 prior, and fades out via f_hard as the student's win_ema vs it
-    rises. Slot 0 stays the latest snapshot always."""
+    """"teacher" joins the per-match candidate set, starts at the 0.5
+    prior, and fades out via f_hard as the student's win rate vs it
+    rises."""
     from smashbot.rl.pool import SnapshotPool
 
-    pool = SnapshotPool(str(tmp_path), slots=2, league_members=("teacher",))
-    latest = pool.save(_Stub(), 100)
-    # archive of one: the only non-latest candidate is the teacher
-    assert pool.assignments(random.Random(0)) == [latest, "teacher"]
+    pool = SnapshotPool(str(tmp_path), league_members=("teacher",))
+    pool.save(_Stub(), 100)
+    pool.save(_Stub(), 200)
 
-    pool.save(_Stub(), 200)  # a second snapshot: teacher vs ghost
-    latest = pool.archive[-1]
-
-    def teacher_share(n=400):
-        c = 0
-        for s in range(n):
-            picks = pool.assignments(random.Random(s))
-            assert picks[0] == latest  # slot 0 ALWAYS the latest
-            c += picks[1] == "teacher"
-        return c / n
+    def teacher_share(n=800):
+        rng = random.Random(0)
+        return sum(pool.draw_member(rng) == "teacher" for _ in range(n)) / n
 
     prior_share = teacher_share()  # fresh row: 0.5 prior, ~even with ghost
     assert 0.35 < prior_share < 0.65
@@ -898,114 +897,13 @@ def test_league_teacher_candidates_and_fhard(tmp_path):
     assert pool.win_estimate("teacher") > 0.9
 
 
-def test_league_singletons_repeat_ghosts_dont(tmp_path):
-    """Class-weighted sampling semantics: a singleton member class CAN hold
-    multiple slots per epoch; a ghost serves at most one (stage-2 without
-    replacement); slot 0 stays the (single) latest snapshot."""
-    from smashbot.rl.pool import SnapshotPool
-
-    pool = SnapshotPool(
-        str(tmp_path), slots=5, league_members=("teacher", "cpu")
-    )
-    latest = None
-    for s in (100, 200):
-        latest = pool.save(_Stub(), s)
-    ghost = pool.archive[0]
-    saw_multi_singleton = False
-    for seed in range(100):
-        picks = pool.assignments(random.Random(seed))
-        assert len(picks) == 5 and picks[0] == latest
-        assert picks.count(latest) == 1  # classes fill every slot: no pads
-        assert picks.count(ghost) <= 1  # without replacement within ghosts
-        saw_multi_singleton |= (
-            picks.count("teacher") > 1 or picks.count("cpu") > 1
-        )
-    assert saw_multi_singleton  # singletons may hold several slots at once
-
-
-def test_apply_assignments_teacher_copy_and_cpu_lazy(tmp_path):
-    """Slot refresh routing: a "teacher" assignment copies the LIVE teacher
-    module's weights (state_dict copy — later teacher mutations must NOT
-    propagate until the next refresh); "cpu" only records the desired kind
-    and leaves attribution on the previous member (lazy adoption)."""
-    from smashbot.rl.pool import apply_assignments
-
-    class _Worker:
-        """Records begin_transition announcements (the worker's deferred
-        adoption bookkeeping is exercised by the collect-loop tests)."""
-        def __init__(self):
-            self.slot_desired = {}
-            self.slot_char_lock = {}
-            self.announced = []
-
-        def slot_weights_changed(self, slot):
-            pass
-
-        def begin_transition(self, slot, key, lock, slot_policy=None):
-            # the announcement must see the PREVIOUS weights: snapshot them
-            self.announced.append((
-                slot, key, lock,
-                None if slot_policy is None
-                else slot_policy.weight.detach().clone(),
-            ))
-
-    torch.manual_seed(0)
-    teacher = torch.nn.Linear(3, 2)
-    slot0, slot1 = torch.nn.Linear(3, 2), torch.nn.Linear(3, 2)
-    init1 = slot1.weight.detach().clone()
-    ghost = torch.nn.Linear(3, 2)
-    snap = str(tmp_path / "snapshot-0000100.pt")
-    torch.save(ghost.state_dict(), snap)
-
-    w, keys = _Worker(), {}
-    apply_assignments([snap, "teacher"], [(0, slot0), (1, slot1)],
-                      teacher, w, keys)
-    torch.testing.assert_close(slot0.weight, ghost.weight)
-    torch.testing.assert_close(slot1.weight, teacher.weight)
-    assert keys == {0: snap, 1: "teacher"}
-    assert w.slot_desired == {0: "policy", 1: "policy"}
-    # non-import members never set a char lock
-    assert w.slot_char_lock == {0: None, 1: None}
-    # announced BEFORE the load: slot1 still held its init weights
-    assert [(a[0], a[1], a[2]) for a in w.announced] == [
-        (0, snap, None), (1, "teacher", None)]
-    torch.testing.assert_close(w.announced[1][3], init1)
-
-    # the copy is a snapshot of the live module, not a reference: a teacher
-    # hot-swap mid-epoch leaves the serving slot on its copy until refresh
-    with torch.no_grad():
-        teacher.weight.add_(1.0)
-    assert not torch.equal(slot1.weight, teacher.weight)
-
-    # "cpu": desired flips; the slot policy is left alone (envs adopt cpu
-    # at their recycle; until then they play the parked weights)
-    frozen = {k: v.detach().clone() for k, v in slot1.state_dict().items()}
-    apply_assignments([snap, "cpu"], [(1, slot1)], teacher, w, keys)
-    assert w.slot_desired[1] == "cpu" and keys[1] == "cpu"
-    for k, v in slot1.state_dict().items():
-        assert torch.equal(v, frozen[k])
-
-    # "phillip": routing only — the slot policy module is NEVER touched
-    # (his architecture differs); desired returns to "policy"
-    apply_assignments([snap, "phillip"], [(1, slot1)], teacher, w, keys)
-    assert keys[1] == "phillip"
-    assert w.slot_desired[1] == "policy"
-    for k, v in slot1.state_dict().items():
-        assert torch.equal(v, frozen[k])
-
-    # short assignment list (early training): out-of-range slots untouched
-    before = (w.slot_desired[1], keys[1], len(w.announced))
-    apply_assignments([snap], [(0, slot0), (1, slot1)], teacher, w, keys)
-    assert (w.slot_desired[1], keys[1], len(w.announced) - 1) == before
-
-
 def test_league_payoff_persistence_and_thinning(tmp_path):
     """Special member rows persist in pfsp.json exactly like ghost rows,
     survive thinning (which only evicts archive paths), and survive a
     reload WITHOUT the league flags (toggling flags loses no data)."""
     from smashbot.rl.pool import SnapshotPool
 
-    pool = SnapshotPool(str(tmp_path), slots=2, keep=4,
+    pool = SnapshotPool(str(tmp_path), keep=4,
                         league_members=("teacher", "cpu", "phillip"))
     for s in range(0, 800, 100):
         pool.save(_Stub(), s)
@@ -1023,174 +921,15 @@ def test_league_payoff_persistence_and_thinning(tmp_path):
     assert pool.win_estimate("phillip") == pytest.approx(0.0)
 
     # round-trip through a league-flag-less pool: rows kept, not pruned
-    fresh = SnapshotPool(str(tmp_path), slots=2, keep=4)
+    fresh = SnapshotPool(str(tmp_path), keep=4)
     assert fresh.win_estimate("teacher") == pytest.approx(
         pool.win_estimate("teacher")
     )
     assert fresh.payoff["cpu"]["games"] == 6
     assert fresh.payoff["phillip"]["games"] == 6
-    # and its assignments ignore the members (flags off = ghosts only)
-    for seed in range(25):
-        picks = fresh.assignments(random.Random(seed))
-        assert "teacher" not in picks and "phillip" not in picks
-
-
-def test_league_cpu_lazy_adoption_worker(monkeypatch):
-    """Worker-level league_cpu mechanics: the desired kind is piggybacked on
-    the command dicts, envs adopt only when THEY report cpu serving,
-    attribution (trackers + on_snapshot_game) follows actual serving before
-    and after, and a fully-cpu slot is excluded from opponent inference
-    without breaking the collect() row bookkeeping."""
-    worker, envs = _make_worker(
-        monkeypatch, num_envs=4, teacher_envs=2, snapshot_slots=1,
-        cpu_envs=0, league_cpu=True,
-    )
-    slot_envs = [i for i, sp in enumerate(worker.specs)
-                 if sp.kind == "snapshot"]
-    assert slot_envs == [2, 3]
-    calls = []
-    worker.on_snapshot_game = lambda key, w: calls.append((key, w))
-    slot_policy = worker.opponents[("slot", 0)].policy
-
-    def cmds(i):
-        got = worker._conns[i].sent[-1]
-        return got
-
-    # phase 1: boot assignment (adopted immediately — nothing in flight);
-    # desired=policy: slot envs get both seats' inputs plus the opp_kind
-    # marker; teacher envs are untouched
-    worker.begin_transition(0, "ghostA", None, slot_policy)
-    assert {worker.env_member[i] for i in slot_envs} == {"ghostA"}
-    envs.final_stocks[2] = (4, 0)  # port1 (student) wins on a slot env
-    worker.collect(1)
-    for i in slot_envs:
-        port = worker.specs[i].student_port
-        assert set(cmds(i)) == {port, 3 - port, "opp_kind"}
-        assert cmds(i)["opp_kind"] == "policy"
-    for i in (0, 1):
-        port = worker.specs[i].student_port
-        assert set(cmds(i)) == {port, 3 - port}
-    assert worker.trackers["snapshot"].wins == 1
-    assert calls == [("ghostA", True)]
-
-    # phase 1b: the slot moves to live-teacher weights (deferred: ghostA
-    # is parked and keeps serving until each env's boundary). Once both
-    # envs cross, games log under the teacher kind for ticker/wandb
-    # continuity and credit "teacher"
-    worker.begin_transition(0, "teacher", None, slot_policy)
-    assert {worker.env_member[i] for i in slot_envs} == {"ghostA"}
-    assert worker._seats[0]["outgoing"].member == "ghostA"
-    for i in slot_envs:
-        envs.final_stocks[i] = (4, 0)
-    worker.collect(1)  # both boundaries: ended games credit ghostA
-    assert {worker.env_member[i] for i in slot_envs} == {"teacher"}
-    assert worker._seats[0]["outgoing"] is None
-    envs.final_stocks[3] = (0, 4)
-    worker.collect(1)
-    tracked = (worker.trackers["teacher"].wins,
-               worker.trackers["teacher"].losses)
-    assert tracked == ((1, 0) if worker.specs[3].student_port == 2
-                       else (0, 1))
-    assert calls[-1][0] == "teacher"
-    worker.begin_transition(0, "ghostA", None, slot_policy)
-    for i in slot_envs:
-        envs.final_stocks[i] = (4, 0)
-    worker.collect(1)  # back on ghostA for the cpu phases below
-    assert {worker.env_member[i] for i in slot_envs} == {"ghostA"}
-
-    # phase 2: refresh desires cpu — envs have NOT adopted yet: inputs still
-    # flow to the opponent seat FROM THE SLOT POLICY IN PLACE (cpu never
-    # overwrites it), results still attribute to the snapshot
-    worker.begin_transition(0, "cpu", None, slot_policy)
-    worker.slot_desired[0] = "cpu"
-    assert worker._seats[0]["outgoing"].member == "ghostA"  # served in place
-    assert worker._seats[0]["current"] is None  # cpu occupies no seat
-    assert worker.slot_pending[0] == set(slot_envs)
-    envs.final_stocks[2] = (4, 0)
-    worker.collect(1)
-    for i in slot_envs:
-        port = worker.specs[i].student_port
-        assert set(cmds(i)) == {port, 3 - port, "opp_kind"}
-        assert cmds(i)["opp_kind"] == "cpu"
-    assert worker.trackers["snapshot"].wins == 3  # phase 1 + 1b + now
-    assert worker.trackers["cpu"].wins == 0
-    assert calls[-1] == ("ghostA", True)
-
-    # phase 3: env 2 adopts at its recycle; env 3 hasn't — mixed slot still
-    # runs the (full-batch) policy, but the cpu env gets no opponent input
-    envs.serving[2] = "cpu"
-    envs.final_stocks[2] = (4, 0)  # port-1 student wins
-    envs.final_stocks[3] = (0, 4)  # env 3 seats the student on port 2
-    worker.collect(1)
-    p2 = worker.specs[2].student_port
-    assert set(cmds(2)) == {p2, "opp_kind"}
-    p3 = worker.specs[3].student_port
-    assert set(cmds(3)) == {p3, 3 - p3, "opp_kind"}
-    assert worker.trackers["cpu"].wins == 1  # env 2's game: actual cpu
-    assert worker.trackers["snapshot"].wins == 4  # env 3: still policy
-    assert {calls[-1], calls[-2]} == {("cpu", True), ("ghostA", True)}
-    # env 2 adopted cpu at its boundary; env 3 is still pending on ghostA
-    assert worker.env_member[2] == "cpu" and worker.env_member[3] == "ghostA"
-    assert worker.slot_pending[0] == {3}
-
-    # phase 4: whole slot serving cpu: opponent inference skipped for the
-    # slot, and collect() still yields well-formed full-budget trajectories
-    envs.serving[3] = "cpu"
-    step_calls = []
-    slot_agent = worker.opponents[("slot", 0)]
-    orig_step = slot_agent.step
-    slot_agent.step = lambda *a, **k: (
-        step_calls.append(1) or orig_step(*a, **k)
-    )
-    trajs = worker.collect(2)
-    assert not step_calls  # no brain to run
-    assert len(trajs) == 2
-    for t in trajs:
-        assert t.rewards.shape[0] == 4  # full learner-row budget
-        assert torch.isfinite(t.rewards).all()
-        for leaf in tree.flatten(t.actions.logits):
-            if leaf.is_floating_point():
-                assert torch.isfinite(leaf).all()
-    for i in slot_envs:
-        port = worker.specs[i].student_port
-        assert set(cmds(i)) == {port, "opp_kind"}
-    # teacher group still ran and got inputs
-    for i in (0, 1):
-        port = worker.specs[i].student_port
-        assert set(cmds(i)) == {port, 3 - port}
-
-
-def test_league_composed_with_self_play(monkeypatch):
-    """league_teacher + league_cpu + self_envs + ref_envs compose: partition
-    arithmetic holds (rows == num_envs, dolphins == num_envs - self_envs)
-    and collect() runs clean with slots serving cpu."""
-    worker, envs = _make_worker(
-        monkeypatch, num_envs=12, cpu_envs=0, teacher_envs=0,
-        snapshot_slots=2, ref_envs=2, self_envs=2,
-        league_teacher=True, league_cpu=True,
-        char_whitelist=["FOX", "FALCO"],
-    )
-    assert worker.num_dolphins == 10 and worker.num_rows == 12
-    kinds = [sp.kind for sp in worker.specs]
-    assert kinds.count("snapshot") == 6 and kinds.count("teacher") == 0
-    assert kinds.count("cpu") == 0
-    assert worker.row_kinds.count("self") == 4  # both seats of 2 dolphins
-
-    # one slot flips to cpu mid-run; self-play rows keep their mirror
-    worker.slot_desired[0] = "cpu"
-    for i, sp in enumerate(worker.specs):
-        if sp.kind == "snapshot" and sp.group == 0:
-            envs.serving[i] = "cpu"
-    (traj,) = worker.collect(1)
-    assert traj.rewards.shape[0] == 12
-    assert torch.isfinite(traj.rewards).all()
-    for d in worker.self_idx:
-        torch.testing.assert_close(
-            traj.rewards[d], -traj.rewards[worker._self_row_of[d]]
-        )
-
-
-# ------------------------- phillip league member + class-weighted sampling
+    # and its draws ignore the members (flags off = ghosts only)
+    rng = random.Random(0)
+    assert all(fresh.draw_member(rng) in fresh.archive for _ in range(50))
 
 
 def test_pfsp_class_weighting_math(tmp_path):
@@ -1201,222 +940,34 @@ def test_pfsp_class_weighting_math(tmp_path):
     0.5/(0.5+30*0.25) ~= 0.06 that ghost mass would give."""
     from smashbot.rl.pool import SnapshotPool
 
-    pool = SnapshotPool(str(tmp_path), slots=2, keep=64,
+    pool = SnapshotPool(str(tmp_path), keep=64,
                         league_members=("phillip",))
     for s in range(0, 3100, 100):  # 30 ghosts + the latest
         pool.save(_Stub(), s)
     for g in pool.archive[:-1]:
         pool.payoff[g] = {"wins": 8, "games": 10, "win_ema": 0.75}
-    # legacy rate-EMA rows fall back to their RAW lifetime rate (8/10)
-    assert pool.class_hardness() == {"ghosts": 0.8, "phillip": 0.5}
-
-    latest = pool.archive[-1]
-    n, ph = 4000, 0
-    for s in range(n):
-        picks = pool.assignments(random.Random(s))
-        assert picks[0] == latest and len(picks) == 2
-        ph += picks[1] == "phillip"
+    # legacy rate-EMA rows fall back to their RAW lifetime rate (8/10);
+    # the latest (unmeasured, 0.5 prior) is in the ghosts class now:
+    # class mean = (30 * 0.8 + 0.5) / 31
+    ghosts_x = (30 * 0.8 + 0.5) / 31
+    assert pool.class_hardness() == pytest.approx({"ghosts": ghosts_x, "phillip": 0.5})
+    n, ph, rng = 4000, 0, random.Random(0)
+    for _ in range(n):
+        ph += pool.draw_member(rng) == "phillip"
     share = ph / n
-    # squared f_hard (p=2 default): phillip 0.5^2=0.25 vs ghosts-at-RAW-0.8
-    # 0.2^2=0.04 -> share 0.25/0.29
-    assert share == pytest.approx(0.25 / 0.29, abs=0.03)
+    # squared f_hard (p=2 default): phillip 0.25 vs ghosts (1-x)^2
+    expect = 0.25 / (0.25 + (1 - ghosts_x) ** 2)
+    assert share == pytest.approx(expect, abs=0.03)
     assert share > 0.5  # far above any ghost-mass-proportional share
-
-
-def test_pfsp_class_sampler_ghost_stage2(tmp_path):
-    """Stage 2 within the ghosts class keeps the existing per-ghost f_hard
-    (harder ghosts serve more) and without-replacement across slots (a
-    ghost holds at most one slot; singletons may repeat)."""
-    from smashbot.rl.pool import SnapshotPool
-
-    pool = SnapshotPool(str(tmp_path), slots=4, keep=10,
-                        league_members=("teacher",))
-    hard = pool.save(_Stub(), 100)
-    easy = pool.save(_Stub(), 200)
-    latest = pool.save(_Stub(), 300)
-    pool.payoff[hard] = {"wins": 1, "games": 10, "win_ema": 0.1}
-    pool.payoff[easy] = {"wins": 9, "games": 10, "win_ema": 0.9}
-
-    hard_epochs = easy_epochs = 0
-    teacher_multi = False
-    for s in range(500):
-        picks = pool.assignments(random.Random(s))
-        assert picks[0] == latest
-        tail = picks[1:]
-        assert tail.count(hard) <= 1 and tail.count(easy) <= 1
-        teacher_multi |= tail.count("teacher") > 1
-        hard_epochs += hard in tail
-        easy_epochs += easy in tail
-    assert teacher_multi  # singleton class held several slots at once
-    assert hard_epochs > easy_epochs  # per-ghost f_hard preserved
-
-
-def test_league_phillip_routing_and_multislot(monkeypatch):
-    """A slot assigned phillip routes its rows to Phillip's own agent (the
-    slot policy idles); occupancy can span multiple slots (agent rebuilt to
-    the summed row count); rows still yield full-budget student-seat PPO
-    trajectories; games log under tracker kind "reference" and pay off to
-    the "phillip" key."""
-    worker, envs = _make_worker(
-        monkeypatch, num_envs=6, teacher_envs=2, snapshot_slots=2,
-        league_phillip=True,
-    )
-    slot_of = {i: sp.group for i, sp in enumerate(worker.specs)
-               if sp.kind == "snapshot"}
-    assert slot_of == {2: 0, 3: 0, 4: 1, 5: 1}
-    calls = []
-    worker.on_snapshot_game = lambda key, w: calls.append((key, w))
-    pol = {g: worker.opponents[("slot", g)].policy for g in (0, 1)}
-    steps = {0: 0, 1: 0}
-
-    def wrap(g):
-        _wrap_steps(worker.opponents[("slot", g)], steps, g)
-
-    wrap(0)
-    wrap(1)
-
-    # boot assignments; no phillip serving: both slot agents run, no
-    # phillip agent exists
-    worker.begin_transition(0, "ghostA", None, pol[0])
-    worker.begin_transition(1, "ghostB", None, pol[1])
-    worker.collect(1)
-    assert steps[0] > 0 and steps[1] > 0
-    assert worker._pool[0].phillip is None
-
-    # slot 0 -> phillip (deferred): rows keep ghostA until THEIR game ends.
-    # Deliver both boundaries on the first frame: the ended games still
-    # credit ghostA; from that frame on phillip covers the rows and the
-    # slot-0 policy idles
-    worker.begin_transition(0, "phillip", None, pol[0])
-    assert worker.slot_pending[0] == {2, 3}
-    assert worker._seats[0]["outgoing"].member == "ghostA"  # in place
-    assert worker._seats[0]["current"].member == "phillip"
-    s0 = steps[0]
-    envs.final_stocks[2] = (4, 0)  # port-1 student wins on a ghostA game
-    envs.final_stocks[3] = (4, 0)
-    (traj,) = worker.collect(1)
-    # (the LeagueAgent steps every slot each frame; routing is what matters)
-    # phillip seat = a batch-(slot size) wrapper, fixed shape
-    assert worker._seats[0]["current"].agent.num_envs == 2
-    assert worker.trackers["snapshot"].wins >= 1
-    assert worker.trackers["reference"].wins == 0
-    assert {c[0] for c in calls[-2:]} == {"ghostA"}  # both ended games
-    assert 0 not in worker.slot_pending
-    assert worker._seats[0]["outgoing"] is None  # released: nobody on ghostA
-    assert worker.env_member[2] == worker.env_member[3] == "phillip"
-    for i in (2, 3):
-        port = worker.specs[i].student_port
-        assert all(set(cmd) == {port, 3 - port}
-                   for cmd in worker._conns[i].sent)
-    assert traj.rewards.shape[0] == 6  # full learner-row budget
-    assert torch.isfinite(traj.rewards).all()
-
-    # a game played by phillip logs under "reference" and pays "phillip"
-    envs.final_stocks[2] = (4, 0)
-    worker.collect(1)
-    assert worker.trackers["reference"].wins == 1
-    assert calls[-1] == ("phillip", True)
-
-    # multi-slot occupancy: agent rebuilt over both slots' rows once slot
-    # 1's envs cross their boundaries
-    worker.begin_transition(1, "phillip", None, pol[1])
-    s1 = steps[1]
-    envs.final_stocks[4] = (4, 0)
-    envs.final_stocks[5] = (4, 0)
-    worker.collect(1)
-    # a second slot draws phillip: its OWN batch-2 wrapper (shared weights)
-    assert worker._seats[1]["current"].agent.num_envs == 2
-    assert worker._seats[1]["current"].member == "phillip"
-    assert {worker.env_member[i] for i in (2, 3, 4, 5)} == {"phillip"}
-
-    # back to snapshots: rows leave phillip at their boundaries and the
-    # slot policies (now holding the new ghosts) resume stepping
-    worker.begin_transition(0, "ghostC", None, pol[0])
-    worker.begin_transition(1, "ghostD", None, pol[1])
-    for i in (2, 3, 4, 5):
-        envs.final_stocks[i] = (4, 0)
-    worker.collect(1)
-    assert steps[0] > s0 and steps[1] > s1
-    assert {worker.env_member[i] for i in (2, 3)} == {"ghostC"}
-    assert {worker.env_member[i] for i in (4, 5)} == {"ghostD"}
-
-
-def test_league_phillip_imitation_follows_serving(monkeypatch):
-    """The imitation harvest keys off the rows each opponent ACTUALLY
-    serves: no output before any seat exists; once Phillip holds the slot
-    exactly his rows are harvested (config group "phillip": re-encoded,
-    name-reconditioned, opponent-seat reward mirror); when a ghost takes
-    over, its seat is harvested the same way (group "ours")."""
-    worker, envs = _make_worker(
-        monkeypatch, num_envs=4, teacher_envs=2, snapshot_slots=1,
-        league_phillip=True, harvest=True,
-        opp_chars={2: "FOX", 3: "MARTH"},  # slot rows: one whitelisted
-    )
-    assert worker.harvest_imitation
-    assert worker.ref_idx == []  # no fixed reference group
-
-    trajs = worker.collect(1)
-    assert [t.kind for t in trajs] == ["ppo"]  # phillip serving nothing
-
-    # slot 0 -> phillip; rows adopt at their boundaries (delivered now)
-    slot_envs = [i for i, sp in enumerate(worker.specs)
-                 if sp.kind == "snapshot"]
-    worker.begin_transition(0, "ghostA", None)
-    worker.begin_transition(0, "phillip", None)
-    for i in slot_envs:
-        envs.final_stocks[i] = (4, 0)
-    trajs = worker.collect(3)
-    imits = [t for t in trajs if t.kind == "imitation"]
-    assert imits  # harvested once his chunks fill
-    for imit in imits:
-        assert imit.rewards.shape[0] == 1  # only the FOX (whitelisted) row
-        assert imit.initial_state is None
-        # name re-conditioned on the student's code (1), not phillip's (2)
-        assert torch.equal(imit.name, torch.ones_like(imit.name))
-        # opponent-seat mirror of the fake envs' +0.01/frame student reward
-        torch.testing.assert_close(
-            imit.rewards, torch.full_like(imit.rewards, -0.01)
-        )
-        # actions round-trip the STUDENT embedding despite phillip's
-        # different discretization (axis_spacing 8 vs 16)
-        stu_embed = worker.student._embed_controller
-        stu_embed.decode(stu_embed.map(
-            lambda e, x: x.astype(getattr(e, "dtype", x.dtype)),
-            tree.map_structure(
-                lambda x: x.cpu().numpy(), imit.actions.controller_state
-            ),
-        ))
-
-    # the slot moves to a ghost: harvest is agnostic to who the opponent
-    # is, so the ghost's seat is harvested too — through the "ours" config
-    # group (no re-encoding; same delay), still whitelist-gated (row 2 FOX
-    # only) with the same reward mirror
-    worker.begin_transition(0, "ghostB", None)
-    for i in slot_envs:
-        envs.final_stocks[i] = (4, 0)
-    trajs = worker.collect(4)
-    # phillip's group is dropped while he has no seat; only "ours" remains
-    assert set(worker._harvest_groups) == {"ours"}
-    ours = [t for t in trajs if t.kind == "imitation"]
-    assert ours
-    for imit in ours:
-        assert imit.rewards.shape[0] == 1
-        assert torch.equal(imit.name, torch.ones_like(imit.name))
-        torch.testing.assert_close(
-            imit.rewards, torch.full_like(imit.rewards, -0.01)
-        )
-
-
-# ------------------------------- imported league members (previous-run bots)
 
 
 def test_league_imports_parse():
     """"NAME=PATH" (implicit @FOX) and "NAME=PATH@CHAR" forms; bad forms
-    fail loudly; imports require snapshot_slots and pfsp."""
+    fail loudly; imports require league_slices and pfsp."""
     cfg = RolloutConfig(
         league_imports=["v3best=/m/rl-best-step0010000.pt",
                         "old=/m/old.pt@marth"],
-        snapshot_slots=2,
+        league_slices=2,
     )
     assert cfg.import_members() == {
         "v3best": ("/m/rl-best-step0010000.pt", "FOX"),  # default lock FOX
@@ -1426,7 +977,7 @@ def test_league_imports_parse():
     # composes with the other league flags (imports appended last)
     combo = RolloutConfig(
         league_teacher=True, teacher_envs=0,
-        league_imports=["v3=/m/x.pt"], snapshot_slots=2,
+        league_imports=["v3=/m/x.pt"], league_slices=2,
     )
     assert combo.league_members() == ["teacher", "import:v3"]
 
@@ -1440,190 +991,62 @@ def test_league_imports_parse():
     ]:
         with pytest.raises(AssertionError):
             RolloutConfig(
-                league_imports=[bad], snapshot_slots=1
+                league_imports=[bad], league_slices=1
             ).import_members()
     with pytest.raises(AssertionError):  # duplicate names
         RolloutConfig(
-            league_imports=["a=/m/x.pt", "a=/m/y.pt"], snapshot_slots=1
+            league_imports=["a=/m/x.pt", "a=/m/y.pt"], league_slices=1
         ).import_members()
-    with pytest.raises(AssertionError, match="snapshot_slots"):
+    with pytest.raises(AssertionError, match="league_slices"):
         RolloutConfig(league_imports=["a=/m/x.pt"]).league_members()
     with pytest.raises(AssertionError, match="pfsp"):
         RolloutConfig(
-            league_imports=["a=/m/x.pt"], snapshot_slots=1, pfsp=False
+            league_imports=["a=/m/x.pt"], league_slices=1, pfsp=False
         ).league_members()
     # SnapshotPool accepts import keys as members; rejects junk keys
     from smashbot.rl.pool import SnapshotPool
 
     with pytest.raises(AssertionError, match="unknown league members"):
-        SnapshotPool("/tmp/never-used", slots=2,
-                     league_members=("imported:v3",))
-
-
-def test_import_default_noop_worker(monkeypatch):
-    """league_imports=[] leaves the worker byte-identical: no char-lock
-    state, and the opp_char_lock command key is NEVER sent (env-side lock
-    stays None forever = today's redraw behavior)."""
-    worker, _ = _make_worker(
-        monkeypatch, num_envs=4, teacher_envs=2, snapshot_slots=2,
-    )
-    assert worker.slot_char_lock == {}
-    assert not worker._has_imports
-    worker.collect(1)
-    for i, conn in enumerate(worker._conns):
-        port = worker.specs[i].student_port
-        expect = {port, 3 - port}
-        assert all(set(cmd) == expect for cmd in conn.sent)
+        SnapshotPool("/tmp/never-used", league_members=("imported:v3",))
 
 
 def test_import_auction_singleton_class(tmp_path):
-    """An import joins the auction as its OWN singleton class: weight from
-    its payoff row via f_hard(p=2), may hold multiple non-latest slots at
-    once (with-replacement class draws), slot 0 stays the latest snapshot,
-    and it fades as the student starts beating it."""
+    """An import joins the per-match draw as its OWN singleton class:
+    weight from its payoff row via f_hard(p=2), and it fades as the
+    student starts beating it."""
     from smashbot.rl.pool import SnapshotPool
 
     # exact class-share math: 1 ghost at raw 0.8 vs import at the 0.5 prior
     # -> f_hard(p=2): 0.04 vs 0.25 -> import share 0.25/0.29
-    pool = SnapshotPool(str(tmp_path / "m"), slots=2,
-                        league_members=("import:v3best",))
+    pool = SnapshotPool(str(tmp_path / "m"), league_members=("import:v3best",))
     pool.save(_Stub(), 100)
     latest = pool.save(_Stub(), 200)
     pool.payoff[pool.archive[0]] = {"wins": 8, "games": 10, "win_ema": 0.75}
-    assert pool.class_hardness() == {"ghosts": 0.8, "import:v3best": 0.5}
-    n, imp = 4000, 0
-    for s in range(n):
-        picks = pool.assignments(random.Random(s))
-        assert picks[0] == latest and len(picks) == 2
-        imp += picks[1] == "import:v3best"
-    assert imp / n == pytest.approx(0.25 / 0.29, abs=0.03)
+    ghosts_x = (0.8 + 0.5) / 2  # the unmeasured latest is a ghost too
+    assert pool.class_hardness() == pytest.approx({"ghosts": ghosts_x, "import:v3best": 0.5})
+    n, imp, rng = 4000, 0, random.Random(0)
+    for _ in range(n):
+        imp += pool.draw_member(rng) == "import:v3best"
+    assert imp / n == pytest.approx(0.25 / (0.25 + (1 - ghosts_x) ** 2), abs=0.03)
 
     # multi-slot occupancy + fade-out once beaten (3 ghosts >= 2 tail
     # slots, so the ghost class never exhausts into the uniform fallback)
-    pool = SnapshotPool(str(tmp_path / "s"), slots=3,
-                        league_members=("import:v3best",))
+    pool = SnapshotPool(str(tmp_path / "s"), league_members=("import:v3best",))
     for s in (100, 200, 300, 400):
         latest = pool.save(_Stub(), s)
     ghosts = pool.archive[:-1]
 
-    def import_slots(n=300):
-        held, multi = 0, False
-        for s in range(n):
-            picks = pool.assignments(random.Random(s))
-            assert picks[0] == latest
-            tail = picks[1:]
-            for g in ghosts:
-                assert tail.count(g) <= 1  # ghosts: without replacement
-            held += tail.count("import:v3best")
-            multi |= tail.count("import:v3best") > 1
-        return held, multi
+    def import_draws(n=600):
+        rng = random.Random(1)
+        return sum(pool.draw_member(rng) == "import:v3best" for _ in range(n))
 
-    held_prior, saw_multi = import_slots()
-    assert saw_multi  # singleton class held several slots at once
+    held_prior = import_draws()
     assert held_prior > 0
     for _ in range(300):
         pool.record_result("import:v3best", True)  # student now dominates
     assert pool.win_estimate("import:v3best") > 0.9
-    held_beaten, _ = import_slots()
+    held_beaten = import_draws()
     assert held_beaten < held_prior * 0.6  # f_hard fade-out
-
-
-def test_import_serving_char_lock_and_attribution(monkeypatch, tmp_path):
-    """Fake-env collect() run: a slot assigned an import loads the given
-    state_dict into its slot policy, the char lock reaches the slot's env
-    conns (opp_char_lock command key), results attribute to the
-    "import:NAME" payoff row via slot_keys, and reassignment clears the
-    lock so redraws resume."""
-    from smashbot.rl.pool import SnapshotPool, apply_assignments
-
-    donor = _tiny_policy(seed=9)  # the "previous run's battery best"
-    w_path = str(tmp_path / "rl-best-step0010000.pt")
-    torch.save(donor.state_dict(), w_path)
-    ghost = _tiny_policy(seed=7)
-    snap = str(tmp_path / "snapshot-0000100.pt")
-    torch.save(ghost.state_dict(), snap)
-
-    worker, envs = _make_worker(
-        monkeypatch, num_envs=4, teacher_envs=2, snapshot_slots=2,
-        league_imports=[f"v3={w_path}@MARTH"],
-    )
-    assert worker._has_imports
-    # specs: 2 teacher + slot-0 env (2) + slot-1 env (3)
-    assert [sp.kind for sp in worker.specs] == (
-        ["teacher"] * 2 + ["snapshot"] * 2
-    )
-    m0 = worker.opponents[("slot", 0)].policy
-    m1 = worker.opponents[("slot", 1)].policy
-    teacher_module = worker.opponents["teacher"].policy
-    imports = {"import:v3": (w_path, "MARTH")}
-    keys = {}
-    apply_assignments(
-        [snap, "import:v3"], [(0, m0), (1, m1)], teacher_module, worker,
-        keys, imports=imports,
-    )
-    # import state_dict loaded into the slot policy (stub-weight check);
-    # slot 0 loaded the plain ghost
-    for k, v in donor.state_dict().items():
-        assert torch.equal(v, m1.state_dict()[k]), k
-    for k, v in ghost.state_dict().items():
-        assert torch.equal(v, m0.state_dict()[k]), k
-    assert keys == {0: snap, 1: "import:v3"}
-    assert worker.slot_char_lock == {0: None, 1: "MARTH"}
-    # boot assignment: envs adopt immediately and the locked import's env
-    # spec already pins the character for its very first game
-    assert worker.env_member == {2: snap, 3: "import:v3"}
-    assert worker.specs[3].opponent_char == "MARTH"
-    assert not worker.slot_pending
-
-    # an import assignment without the registry fails loudly
-    with pytest.raises(AssertionError, match="import registry"):
-        apply_assignments(
-            [snap, "import:v3"], [(1, m1)], teacher_module, worker, {},
-        )
-
-    # payoff attribution exactly as train_rl wires it
-    pool = SnapshotPool(str(tmp_path / "pool"), slots=2,
-                        league_members=("import:v3",))
-    worker.on_snapshot_game = lambda key, won: pool.record_result(key, won)
-    envs.final_stocks[3] = (4, 0)  # student (port 1) beats the import
-    worker.collect(1)
-    assert pool.payoff["import:v3"] == pytest.approx(
-        {"wins": 1, "games": 1, "wins_d": 1.0, "games_d": 1.0}
-    )
-    assert worker.trackers["snapshot"].wins == 1  # imports are policy ghosts
-
-    # char-lock command channel: slot envs get the lock (import slot MARTH,
-    # ghost slot None); teacher envs get no such key
-    for i, conn in enumerate(worker._conns):
-        port = worker.specs[i].student_port
-        if worker.specs[i].kind == "snapshot":
-            assert all(set(c) == {port, 3 - port, "opp_char_lock"}
-                       for c in conn.sent)
-            lock = "MARTH" if worker.specs[i].group == 1 else None
-            assert all(c["opp_char_lock"] == lock for c in conn.sent)
-        else:
-            assert all(set(c) == {port, 3 - port} for c in conn.sent)
-
-    # slot moves off the import: lock clears, envs are told to unlock —
-    # but env 3 keeps FIGHTING the import (parked on the spare, weights
-    # intact) until its game ends; the label follows the brain
-    apply_assignments(
-        [snap, "teacher"], [(0, m0), (1, m1)], teacher_module, worker,
-        keys, imports=imports,
-    )
-    assert worker.slot_char_lock == {0: None, 1: None}
-    assert keys[1] == "teacher"
-    assert worker.env_member[3] == "import:v3"
-    assert worker.slot_pending[1] == {3}
-    out = worker._seats[1]["outgoing"]
-    assert out.member == "import:v3"
-    for k, v in donor.state_dict().items():
-        assert torch.equal(v, out.agent.policy.state_dict()[k]), k  # parked
-    envs.final_stocks[3] = (4, 0)
-    worker.collect(1)
-    assert worker.env_member[3] == "teacher" and not worker.slot_pending
-    worker.collect(1)
-    assert worker._conns[3].sent[-1]["opp_char_lock"] is None
 
 
 def test_import_char_lock_redraw_helper():
@@ -1666,7 +1089,7 @@ def test_import_payoff_persistence_never_pruned(tmp_path):
     the import keys for the ticker."""
     from smashbot.rl.pool import SnapshotPool
 
-    pool = SnapshotPool(str(tmp_path), slots=2, keep=4,
+    pool = SnapshotPool(str(tmp_path), keep=4,
                         league_members=("import:v3",))
     for s in range(0, 800, 100):
         pool.save(_Stub(), s)
@@ -1680,15 +1103,15 @@ def test_import_payoff_persistence_never_pruned(tmp_path):
 
     # reload WITHOUT the import configured: row kept, but neither served
     # nor surfaced (flags off = ghosts only)
-    fresh = SnapshotPool(str(tmp_path), slots=2, keep=4)
+    fresh = SnapshotPool(str(tmp_path), keep=4)
     assert fresh.payoff["import:v3"]["games"] == 6
     assert "import:v3" not in fresh.category_estimates()
-    for seed in range(25):
-        assert "import:v3" not in fresh.assignments(random.Random(seed))
+    rng = random.Random(0)
+    assert all(fresh.draw_member(rng) != "import:v3" for _ in range(50))
 
     # reload WITH it again: estimates resume where they left off; a fresh
     # unmeasured import sits at the 0.5 prior with a None ticker estimate
-    back = SnapshotPool(str(tmp_path), slots=2, keep=4,
+    back = SnapshotPool(str(tmp_path), keep=4,
                         league_members=("import:v3", "import:new"))
     assert back.win_estimate("import:v3") == pytest.approx(0.0)
     assert back.win_estimate("import:new") == 0.5
@@ -1722,10 +1145,10 @@ def test_self_seat_pipeline_equivalence(monkeypatch):
     def build(student_port):
         cfg = RolloutConfig(
             num_envs=2, cpu_envs=0, teacher_envs=0, ref_envs=0,
-            snapshot_slots=0, self_envs=1, unroll_length=4,
+            league_slices=0, self_envs=1, unroll_length=4,
             games_per_dolphin=10**9,
         )
-        specs = [EnvSpec("self", -1, student_port, "FOX")]
+        specs = [EnvSpec("self", student_port, "FOX")]
         student = BatchedPolicyAgent(_tiny_policy(seed=0), 2, name_code=1)
         return DolphinRolloutWorker(cfg, student, opponents={}, specs=specs)
 
@@ -1759,7 +1182,7 @@ def test_category_estimates_pools_imports(tmp_path):
     all import members (ticker I: bit), None with no import games."""
     from smashbot.rl.pool import SnapshotPool
 
-    pool = SnapshotPool(str(tmp_path), slots=3, league_members=[
+    pool = SnapshotPool(str(tmp_path), league_members=[
         "teacher", "import:a", "import:b"])
     assert pool.category_estimates()["imports"] is None
     for won in (True, True, False):
@@ -1789,7 +1212,7 @@ def test_pfsp_explore_resurrects_benched_members(tmp_path):
 
     def build(explore):
         pool = SnapshotPool(
-            str(tmp_path), slots=6, pfsp_hard_frac=0.0,
+            str(tmp_path), pfsp_hard_frac=0.0,
             pfsp_explore=explore,
             league_members=["teacher", "phillip", "import:a"])
         for step in (100, 200):
@@ -1801,15 +1224,13 @@ def test_pfsp_explore_resurrects_benched_members(tmp_path):
         return pool
 
     pool = build(explore=0.0)
-    picks = set()
-    for seed in range(30):
-        picks.update(pool.assignments(random.Random(seed)))
+    rng = random.Random(0)
+    picks = {pool.draw_member(rng) for _ in range(200)}
     assert "phillip" not in picks and "teacher" not in picks
 
     pool = build(explore=1.0)
-    picks = set()
-    for seed in range(30):
-        picks.update(pool.assignments(random.Random(seed)))
+    rng = random.Random(0)
+    picks = {pool.draw_member(rng) for _ in range(200)}
     assert "phillip" in picks and "teacher" in picks
 
 
@@ -1821,7 +1242,7 @@ def test_pfsp_hard_frac_blend_serves_unbeatable(tmp_path):
 
     def build(hard_frac):
         pool = SnapshotPool(
-            str(tmp_path), slots=6, pfsp_hard_frac=hard_frac,
+            str(tmp_path), pfsp_hard_frac=hard_frac,
             pfsp_explore=0.0,
             league_members=["phillip", "import:a"])
         for step in (100, 200):
@@ -1831,405 +1252,14 @@ def test_pfsp_hard_frac_blend_serves_unbeatable(tmp_path):
             pool.record_result("import:a", random.random() < 0.5)
         return pool
 
-    picks = set()
     pool = build(hard_frac=0.0)
-    for seed in range(30):
-        picks.update(pool.assignments(random.Random(seed)))
+    rng = random.Random(0)
+    picks = {pool.draw_member(rng) for _ in range(200)}
     assert "phillip" not in picks  # pure f_var: zero weight at 0%
 
-    picks = set()
     pool = build(hard_frac=0.25)
-    for seed in range(30):
-        picks.update(pool.assignments(random.Random(seed)))
+    rng = random.Random(0)
+    picks = {pool.draw_member(rng) for _ in range(200)}
     assert "phillip" in picks  # hard draws bring him back
 
 
-def _wrap_steps(agent, counter, key):
-    """Count forwards of the agent's policy (implementation-agnostic: slot
-    refs are stepped by the LeagueAgent, spares/Phillip by their wrappers)."""
-    pol = agent.policy
-    orig = pol.sample
-
-    def sampled(*a, **k):
-        counter[key] += 1
-        return orig(*a, **k)
-
-    pol.sample = sampled
-
-
-def test_deferred_adoption_parks_old_brain_until_boundary(monkeypatch):
-    """Policy->policy reassignment with a spare-brain factory: the OLD
-    weights are parked in the spare module and keep driving the slot's envs
-    (brain + payoff label) until each env's own game boundary; rows flip
-    one by one; the slot policy (new weights) only steps once a row has
-    adopted; the spare is released when the last row crosses."""
-    worker, envs = _make_worker(
-        monkeypatch, num_envs=4, teacher_envs=2, snapshot_slots=1,
-    )
-    slot_envs = [i for i, sp in enumerate(worker.specs)
-                 if sp.kind == "snapshot"]
-    assert slot_envs == [2, 3]
-    worker.outgoing_factory = lambda n: BatchedPolicyAgent(
-        _tiny_policy(seed=50), n, name_code=1
-    )
-    calls = []
-    worker.on_snapshot_game = lambda key, w: calls.append((key, w))
-    slot_agent = worker.opponents[("slot", 0)]
-    pol = slot_agent.policy
-    steps = {"slot": 0, "spare": 0}
-    _wrap_steps(slot_agent, steps, "slot")
-
-    worker.begin_transition(0, "ghostA", None, pol)
-    worker.collect(1)
-    assert steps["slot"] > 0 and worker._pool[0].ours_spare is None
-
-    # auction: ghostA -> ghostB. Announce, THEN overwrite the slot policy
-    # (exactly apply_assignments' order)
-    old_w = {k: v.detach().clone() for k, v in pol.state_dict().items()}
-    worker.begin_transition(0, "ghostB", None, pol)
-    pol.load_state_dict(_tiny_policy(seed=8).state_dict())
-    spare = worker._pool[0].ours_spare
-    _wrap_steps(spare, steps, "spare")
-    for k, v in spare.policy.state_dict().items():
-        assert torch.equal(v, old_w[k]), k  # parked = the OLD brain
-    assert worker._seats[0]["outgoing"].member == "ghostA"
-    assert worker._seats[0]["outgoing"].agent is spare
-    assert worker._seats[0]["current"].member == "ghostB"
-    assert worker.slot_pending[0] == {2, 3}
-    assert {worker.env_member[i] for i in slot_envs} == {"ghostA"}
-
-    # no boundary yet: only the spare drives the rows; every env still
-    # receives an opponent-seat controller
-    s_slot, s_spare = steps["slot"], steps["spare"]
-    worker.collect(1)
-    assert steps["spare"] > s_spare  # the parked brain drives the rows
-    for i in slot_envs:
-        port = worker.specs[i].student_port
-        assert all({port, 3 - port} <= set(c) for c in worker._conns[i].sent)
-
-    # env 2's game ends: that game is ghostA's; env 2 adopts ghostB, env 3
-    # is still on ghostA -> both brains step, routed per row
-    envs.final_stocks[2] = (4, 0)
-    s_slot, s_spare = steps["slot"], steps["spare"]
-    worker.collect(1)
-    assert calls[-1][0] == "ghostA"
-    assert worker.env_member[2] == "ghostB" and worker.env_member[3] == "ghostA"
-    assert worker.slot_pending[0] == {3}
-    assert steps["slot"] > s_slot and steps["spare"] > s_spare
-
-    # env 3 crosses: transition complete, spare released
-    envs.final_stocks[3] = (4, 0)
-    worker.collect(1)
-    assert {worker.env_member[i] for i in slot_envs} == {"ghostB"}
-    assert 0 not in worker.slot_pending
-    assert worker._seats[0]["outgoing"] is None  # released
-    s_spare = steps["spare"]
-    envs.final_stocks[2] = (4, 0)
-    worker.collect(1)
-    assert steps["spare"] == s_spare  # idle
-    assert calls[-1][0] == "ghostB"  # ghostB's game, ghostB's row
-
-
-def test_deferred_adoption_waits_for_char_lock(monkeypatch):
-    """A char-locked incoming import is adopted only at a boundary whose
-    new game actually plays the locked character (the CSS pick lags the
-    arming by one game): a boundary with the wrong char keeps the env on
-    the old brain + label; the matching one flips it."""
-    worker, envs = _make_worker(
-        monkeypatch, num_envs=4, teacher_envs=2, snapshot_slots=1,
-        league_imports=["x=/dev/null@MARTH"],
-    )
-    worker.outgoing_factory = lambda n: BatchedPolicyAgent(
-        _tiny_policy(seed=50), n, name_code=1
-    )
-    calls = []
-    worker.on_snapshot_game = lambda key, w: calls.append((key, w))
-    pol = worker.opponents[("slot", 0)].policy
-    worker.begin_transition(0, "ghostA", None, pol)
-    worker.collect(1)
-
-    worker.begin_transition(0, "import:x", "MARTH", pol)
-    worker.slot_char_lock[0] = "MARTH"  # as apply_assignments does
-    # boundary on env 2 but the new game is still FOX (lock not yet at
-    # the CSS): stays on ghostA
-    envs.opp_chars[2] = "FOX"
-    envs.final_stocks[2] = (4, 0)
-    worker.collect(1)
-    assert calls[-1][0] == "ghostA"
-    assert worker.env_member[2] == "ghostA"
-    assert 2 in worker.slot_pending[0]
-    # next boundary: the game starting now IS Marth -> adopt
-    envs.opp_chars[2] = "MARTH"
-    envs.final_stocks[2] = (4, 0)
-    worker.collect(1)
-    assert calls[-1][0] == "ghostA"  # the ended (FOX) game was ghostA's
-    assert worker.env_member[2] == "import:x"
-    envs.final_stocks[2] = (4, 0)
-    worker.collect(1)
-    assert calls[-1][0] == "import:x"  # first Marth game credits the import
-
-
-def test_boot_auction_cover_serves_every_member(tmp_path):
-    """cover=True (boot auction): with slots >= members + 1, every league
-    member holds a slot; the remainder is drawn normally. cover=False
-    keeps the weighted draw (no coverage guarantee)."""
-    from smashbot.rl.pool import SnapshotPool
-
-    members = ["teacher", "cpu", "phillip", "import:a", "import:b"]
-    pool = SnapshotPool(str(tmp_path), slots=8, league_members=members)
-    pool.save(_Stub(), 0)
-    for seed in range(20):
-        picks = pool.assignments(random.Random(seed), cover=True)
-        assert len(picks) == 8 and picks[0].endswith("snapshot-0000000.pt")
-        assert set(members) <= set(picks)
-    # tighter than the roster: still valid, first slots-1 members served
-    small = SnapshotPool(str(tmp_path / "s"), slots=3, league_members=members)
-    small.save(_Stub(), 0)
-    picks = small.assignments(random.Random(0), cover=True)
-    assert len(picks) == 3 and len(set(picks[1:]) & set(members)) == 2
-    missed = any(
-        not set(members) <= set(pool.assignments(random.Random(s)))
-        for s in range(40)
-    )
-    assert missed  # plain draw makes no such promise
-
-
-def test_phillip_multi_slot_fixed_shape_and_merged_harvest(monkeypatch):
-    """Uniform brains: two slots on Phillip each run their OWN wrapper at
-    the slot's fixed batch size (shared frozen module), every frame, and
-    the imitation harvest merges their live rows into one chunk whose row
-    count is exactly the whitelisted Phillip rows across both slots."""
-    worker, envs = _make_worker(
-        monkeypatch, num_envs=6, teacher_envs=2, snapshot_slots=2,
-        league_phillip=True, harvest=True,
-        opp_chars={2: "FOX", 3: "FOX", 4: "MARTH", 5: "FOX"},
-    )
-    pol = {g: worker.opponents[("slot", g)].policy for g in (0, 1)}
-    worker.begin_transition(0, "ghostA", None, pol[0])
-    worker.begin_transition(1, "ghostB", None, pol[1])
-    worker.collect(1)
-    worker.begin_transition(0, "phillip", None, pol[0])
-    worker.begin_transition(1, "phillip", None, pol[1])
-    for i in (2, 3, 4, 5):
-        envs.final_stocks[i] = (4, 0)
-    steps = {0: 0, 1: 0}
-    for g in (0, 1):
-        _wrap_steps(worker._seats[g]["current"].agent, steps, g)
-    trajs = worker.collect(4)
-    assert steps[0] > 0 and steps[1] > 0  # both wrappers step every frame
-    for g in (0, 1):
-        assert worker._seats[g]["current"].agent.num_envs == 2  # fixed
-    # the two wrappers share ONE module (frozen weights, per-slot state)
-    assert (worker._seats[0]["current"].agent.policy
-            is worker._seats[1]["current"].agent.policy)
-    imits = [t for t in trajs if t.kind == "imitation"]
-    assert imits
-    for imit in imits:
-        assert imit.rewards.shape[0] == 3  # FOX rows 2, 3, 5 — merged across slots
-
-
-def test_harvest_group_dormancy_keeps_rewards_aligned(monkeypatch):
-    """A config group whose seats all leave is dropped while dormant and
-    recreated fresh on return, so its reward stream never runs ahead of
-    its records: chunks emitted after the gap still carry the exact
-    opponent-seat reward mirror (-0.01/frame in this harness)."""
-    worker, envs = _make_worker(
-        monkeypatch, num_envs=4, teacher_envs=2, snapshot_slots=1,
-        league_phillip=True, harvest=True, opp_chars={2: "FOX", 3: "MARTH"},
-    )  # only env 2 (student on port 1) is harvested: mirror reward -0.01
-    slot_envs = [2, 3]
-    worker.begin_transition(0, "ghostA", None)
-    worker.collect(1)
-    # phillip serves -> his group exists and emits
-    worker.begin_transition(0, "phillip", None)
-    for i in slot_envs:
-        envs.final_stocks[i] = (4, 0)
-    trajs = worker.collect(3)
-    assert "phillip" in worker._harvest_groups
-    assert any(t.kind == "imitation" for t in trajs)
-    # phillip leaves entirely (cpu occupies no seat): the group is dropped
-    worker.begin_transition(0, "cpu", None)
-    worker.slot_desired[0] = "cpu"
-    envs.serving[2] = envs.serving[3] = "cpu"
-    worker.collect(3)  # dormant frames: rewards must NOT accumulate
-    assert "phillip" not in worker._harvest_groups
-    # phillip returns: fresh group, rewards aligned from its first frame
-    envs.serving.clear()
-    worker.begin_transition(0, "phillip", None)
-    for i in slot_envs:
-        envs.final_stocks[i] = (4, 0)
-    trajs = worker.collect(4)
-    imits = [t for t in trajs if t.kind == "imitation"]
-    assert imits
-    for imit in imits:
-        torch.testing.assert_close(
-            imit.rewards, torch.full_like(imit.rewards, -0.01)
-        )
-
-
-def test_harvest_rows_carry_their_own_seat_records(monkeypatch):
-    """Content check of the per-slot merge: every harvested row's state
-    stream equals, frame for frame, the record its SEAT produced for that
-    env — across two slots and through a two-seat (ours->ours) transition
-    where the slot's rows are split between current and outgoing."""
-    worker, envs = _make_worker(
-        monkeypatch, num_envs=6, teacher_envs=2, snapshot_slots=2,
-        league_phillip=True, harvest=True,
-        opp_chars={2: "FOX", 3: "FOX", 4: "FOX", 5: "FOX"},
-    )
-    pol = {g: worker.opponents[("slot", g)].policy for g in (0, 1)}
-    worker.begin_transition(0, "ghostA", None, pol[0])
-    worker.begin_transition(1, "ghostB", None, pol[1])
-    worker.collect(1)
-    # slot 0 -> ghostC; only env 2 crosses, so slot 0 runs two seats
-    worker.begin_transition(0, "ghostC", None, pol[0])
-    envs.final_stocks[2] = (4, 0)
-    worker.collect(1)
-    assert worker.env_member[2] == "ghostC" and worker.env_member[3] == "ghostA"
-
-    # record every seat agent's step outputs: (slot idx, records per frame)
-    captured = {}  # agent id -> list of FrameRecord per frame
-    league = worker._league_agent
-    lorig = league.step
-    slot_of = {}  # id(slot ref agent) -> slot position
-
-    def lstepped(views, resets, ridx):
-        rows, recs = lorig(views, resets, ridx)
-        for aid, pos in slot_of.items():
-            captured.setdefault(aid, []).append(recs[pos])
-        return rows, recs
-    league.step = lstepped
-
-    def wrap(agent):
-        if getattr(agent, "league", None) is league:
-            slot_of[id(agent)] = agent.k
-            return
-        orig = agent.step
-        def stepped(view, resets, **kw):
-            out = orig(view, resets, **kw)
-            captured.setdefault(id(agent), []).extend(out[1])
-            return out
-        agent.step = stepped
-    seats0 = worker._seats[0]; seats1 = worker._seats[1]
-    for seat in (seats0["current"], seats0["outgoing"], seats1["current"]):
-        wrap(seat.agent)
-    start = {id(s.agent): 0 for s in (seats0["current"], seats0["outgoing"], seats1["current"])}
-    trajs = worker.collect(6)
-    imits = [t for t in trajs if t.kind == "imitation"]
-    assert len(imits) >= 2
-    # harvested rows are in slot order: env 2,3 (slot 0), env 4,5 (slot 1)
-    assert all(t.states.p0.percent.shape[0] == 4 for t in imits)
-    T = imits[0].rewards.shape[1]
-    # stitch the chunks (they overlap by one frame) into one stream per row
-    stream = torch.cat(
-        [t.states.p0.percent[:, :T] for t in imits[:-1]]
-        + [imits[-1].states.p0.percent], dim=1
-    )
-
-    def seat_states(seat, local):
-        recs = captured[id(seat.agent)]
-        return torch.stack([r.state.p0.percent[local] for r in recs], 0)
-
-    def seat_logits(seat, local):
-        recs = captured[id(seat.agent)]
-        return torch.stack([tree.flatten(r.logits)[0][local] for r in recs], 0)
-
-    def contains(long, short):
-        n = short.shape[0]
-        return any(torch.equal(long[i:i + n], short)
-                   for i in range(long.shape[0] - n + 1))
-
-    # env 2 on ghostC (current), env 3 on ghostA (outgoing), env 4/5 on ghostB
-    expect = {
-        0: seat_states(seats0["current"], 0),
-        1: seat_states(seats0["outgoing"], 1),
-        2: seat_states(seats1["current"], 0),
-        3: seat_states(seats1["current"], 1),
-    }
-    for row, exp in expect.items():
-        probe = exp[:T]  # a full chunk's worth of this env's frames
-        assert contains(stream[row], probe), f"row {row} carries the wrong env's state"
-    # seat identity (states are the shared observation; logits are the
-    # brain's): row 0 = slot 0's CURRENT seat, row 1 = its OUTGOING seat
-    lstream = torch.cat(
-        [tree.flatten(t.actions.logits)[0][:, :T] for t in imits[:-1]]
-        + [tree.flatten(imits[-1].actions.logits)[0]], dim=1
-    )
-    assert contains(lstream[0], seat_logits(seats0["current"], 0)[:T])
-    assert contains(lstream[1], seat_logits(seats0["outgoing"], 1)[:T])
-    assert not contains(lstream[0], seat_logits(seats0["outgoing"], 0)[:T])
-    assert not contains(lstream[1], seat_logits(seats0["current"], 1)[:T])
-
-
-@pytest.mark.skipif(
-    not (os.environ.get("SMASHBOT_GPU_TESTS") and torch.cuda.is_available()),
-    reason="production capture path needs CUDA (SMASHBOT_GPU_TESTS=1)",
-)
-def test_league_capture_path_matches_loop_on_gpu():
-    """The manual CUDA-graph capture path (production) produces the same
-    controller rows and records as the per-slot loop, frame after frame,
-    with saturated sampling — including after a mid-stream weight load via
-    slot_weights_changed."""
-    from smashbot.rl.agent import LeagueAgent
-
-    torch.manual_seed(0)
-    S, N = 3, 4
-    mk = lambda seeds: [_tiny_policy(seed=s).cuda().eval() for s in seeds]
-    pols_a, pols_b = mk([11, 12, 13]), mk([11, 12, 13])
-    for pl in (pols_a, pols_b):
-        for p in pl:
-            p.requires_grad_(False)
-    cap = LeagueAgent(pols_a, N, name_code=1, device="cuda", temperature=1e-6)
-    loop = LeagueAgent(
-        pols_b, N, name_code=1, device="cuda", temperature=1e-6, capture=False
-    )
-    assert cap._use_capture
-    assert not loop._use_capture
-    # capture moves the slot MODULES to CPU (the stack is the GPU copy)
-    for p in pols_a:
-        assert next(p.parameters()).device.type == "cpu"
-    for p in pols_b:
-        assert next(p.parameters()).device.type == "cuda"
-    game = embed_lib.EmbedConfig().make_game_embedding()
-    rng = np.random.default_rng(0)
-    for frame in range(6):
-        raw = _rand_raw_game(game, (N,), rng)
-        enc = game.from_state(raw)
-        view = tree.map_structure(
-            lambda x: torch.from_numpy(np.ascontiguousarray(
-                x.astype(np.int64) if x.dtype.kind in "iu" else x)).cuda(), enc)
-        views = [view] * S
-        resets = torch.zeros(S, N, dtype=torch.bool, device="cuda")
-        ridx = [(0, 0)] if frame == 3 else []
-        if frame == 3:
-            resets[0, 0] = True
-        rows_c, recs_c = cap.step(views, resets, ridx)
-        rows_l, recs_l = loop.step(views, resets, ridx)
-        for k in range(S):
-            assert np.array_equal(rows_c[k], rows_l[k]), f"frame {frame} slot {k} rows"
-            for rc, rl in zip(recs_c, recs_l):
-                # states / prev actions / names: bitwise. Logits: vmap's
-                # batched kernels sum in a different order than per-slot
-                # matmuls -> fp epsilon (harvest logits are unused anyway).
-                for x, y in zip(tree.flatten(rc._replace(logits=0)), tree.flatten(rl._replace(logits=0))):
-                    if isinstance(x, torch.Tensor):
-                        assert torch.equal(x, y), f"frame {frame} slot {k} record"
-                for x, y in zip(tree.flatten(rc.logits), tree.flatten(rl.logits)):
-                    assert torch.allclose(x, y, atol=1e-4, rtol=1e-4), f"frame {frame} slot {k} logits"
-        if frame == 2:  # swap slot 1's weights through the refresh hook
-            donor = _tiny_policy(seed=99).cuda().state_dict()
-            for pl, ag in ((pols_a, cap), (pols_b, loop)):
-                pl[1].load_state_dict(donor)
-                ag.slot_weights_changed(1)
-        if frame == 4:  # park-style read of EVERY slot module, slot 0
-            # included: functional_call's template must not be a live
-            # module (tied params leak an escaped BatchedTensor into it —
-            # live-caught at the first auction)
-            for k, pl in enumerate(pols_a):
-                sd = pl.state_dict()
-                assert all(
-                    type(v) is torch.Tensor for v in sd.values()
-                ), f"slot {k} holds a non-plain tensor"
-            # and a refresh from a slot-0 state_dict round-trips
-            pols_a[0].load_state_dict(pols_a[0].state_dict())
-            cap.slot_weights_changed(0)

@@ -99,7 +99,7 @@ def build_rollout_config(args) -> RolloutConfig:
         cpu_envs=0,
         teacher_envs=half,
         ref_envs=half,
-        snapshot_slots=0,
+        league_slices=0,
         games_per_dolphin=200,   # high: recycles never interfere
         redraw_chars=False,      # fixed matchups
         double_buffer=False,     # proven env path

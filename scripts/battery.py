@@ -95,7 +95,6 @@ def build_specs(num_envs: int, slate: list[str]) -> list[EnvSpec]:
             specs.append(
                 EnvSpec(
                     kind=kind,
-                    group=-1,
                     student_port=1 + (i % 2),
                     opponent_char=slate[i % len(slate)],
                 )
@@ -469,7 +468,7 @@ def main() -> None:
         cpu_envs=0,
         teacher_envs=half,
         ref_envs=half,
-        snapshot_slots=0,
+        league_slices=0,
         games_per_dolphin=args.games_per_dolphin,
         redraw_chars=False,     # fixed matchups: the yardstick must not drift
         double_buffer=False,    # proven recycle path only

@@ -196,7 +196,6 @@ def build_pair_specs(num_envs: int, char_mode: str) -> list[EnvSpec]:
     return [
         EnvSpec(
             kind="teacher",
-            group=-1,
             student_port=1 + (i % 2),
             opponent_char=(
                 "FOX" if char_mode == "fox" else MAIN_12[i % len(MAIN_12)]
@@ -491,7 +490,7 @@ def _run_pair(
         cpu_envs=0,
         teacher_envs=n,
         ref_envs=0,
-        snapshot_slots=0,
+        league_slices=0,
         bot_char="FOX",
         stage=resolve_stage(args.stage),
         games_per_dolphin=args.games_per_dolphin,

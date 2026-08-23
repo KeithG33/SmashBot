@@ -25,11 +25,12 @@ import typing as tp
 import torch
 import tree
 
-from smashbot.rl.agent import BatchedPolicyAgent, FrameRecord
+from smashbot.rl.agent import BatchedPolicyAgent, FrameRecord, LeagueAgent
 from smashbot.rl.config import RolloutConfig  # noqa: F401  (re-export)
 from smashbot.rl.env_process import (  # noqa: F401  (re-export)
     _env_process_main, next_opponent_char,
 )
+from smashbot.rl.league import League
 from smashbot.rl.ppo import ActionData, Trajectory, slice_trajectory_rows
 
 
@@ -293,36 +294,25 @@ class _HarvestGroup:
                 imit_out.append(traj)
 
 
-class _Seat:
-    """A slot role (`current` or `outgoing`): member key, the agent serving
-    it, and the agent's model-config label (for harvest grouping)."""
+class LeagueRuntime(tp.NamedTuple):
+    """Everything the worker needs to serve the league (built by train_rl):
+    the per-match protocol, the S x N grid agent, Phillip's agent (None
+    outside league_phillip)."""
 
-    __slots__ = ("member", "agent", "config")
-
-    def __init__(self, member: str, agent, config: str):
-        self.member = member
-        self.agent = agent
-        self.config = config
-
-
-class _SlotPool:
-    """Agents a slot's seats borrow from — the only place model configs are
-    named: `ours_main` (the slot policy), `ours_spare` (parks outgoing
-    weights), `phillip` (wrapper over the shared Phillip module)."""
-
-    __slots__ = ("ours_main", "ours_spare", "phillip")
-
-    def __init__(self):
-        self.ours_main = None
-        self.ours_spare = None
-        self.phillip = None
+    league: League
+    agent: LeagueAgent
+    phillip: BatchedPolicyAgent | None
 
 
 class DolphinRolloutWorker:
     """N Dolphins, one batched student agent covering every student-driven
     seat (each env's student seat + BOTH seats of self-play envs — one wide
-    forward, no second policy copy), plus batched opponent agents; sync-
-    barrier frame loop.
+    forward, no second policy copy), plus the opponent side; sync-barrier
+    frame loop.
+
+    Opponent side: fixed-kind envs (cpu / teacher / reference) keep their
+    own agents; LEAGUE envs draw an opponent per match and are ROUTED to a
+    cell of the league grid (or a row of Phillip's agent) — see league.py.
 
     Learner-row layout: rows 0..D-1 are the D dolphins' primary (student)
     seats; rows D.. are the second seats of self-play dolphins. Row count is
@@ -333,9 +323,10 @@ class DolphinRolloutWorker:
         self,
         config: RolloutConfig,
         student: BatchedPolicyAgent,
-        opponents: dict | None = None,  # {"teacher": agent, ("slot", i): agent}
+        opponents: dict | None = None,  # {"teacher": agent, "reference": agent}
         specs: list | None = None,  # per-env EnvSpec; default from make_partition
-        harvest_imitation: bool = False,  # collect whitelisted ref seats
+        harvest_imitation: bool = False,  # collect whitelisted opponent seats
+        league: LeagueRuntime | None = None,
     ):
         # Imported lazily: this class needs Dolphin, the rest of the module
         # doesn't.
@@ -346,38 +337,13 @@ class DolphinRolloutWorker:
         self.config = config
         self.student = student
         # validates the league flags (env counts must be 0, pfsp required)
-        self._league = config.league_members()
-        self._league_cpu = config.league_cpu
-        # Deferred adoption: an env changes opponent (brain, char, payoff
-        # label) only at its own game boundary. The auction announces a
-        # slot's incoming member; each env adopts it when its game ends.
-        # Seats: `current` / `outgoing` per slot, each a full-batch agent
-        # (fixed shape; controllers routed per row). CPU is the exception:
-        # no seat, adopted at a Dolphin recycle via slot_desired.
-        #   env_member[i]    member env i is fighting now
-        #   slot_incoming[k] announced member
-        #   _seats[k]        {"current", "outgoing"} -> _Seat | None
-        #   slot_pending[k]  envs yet to adopt the incoming
-        self.env_member: dict[int, str] = {}
-        self.slot_incoming: dict[int, str] = {}
-        self.slot_pending: dict[int, set] = {}
-        self._seats: dict[int, dict[str, "_Seat | None"]] = {}
-        self._pool: dict[int, _SlotPool] = {}
-        # n -> agent over a fresh our-config module (the per-slot spare)
-        self.outgoing_factory: tp.Optional[tp.Callable[[int], tp.Any]] = None
-        self.slot_desired: dict[int, str] = {}
-        # slot -> char lock ("FOX"/... or None) while the slot serves a
-        # char-locked import; written by pool.apply_assignments and
-        # piggybacked to the slot's envs ("opp_char_lock") so they pin the
-        # member's character instead of redrawing per game. Empty / all-None
-        # outside league_imports (the key is then never sent at all).
-        self.slot_char_lock: dict[int, str | None] = {}
-        self._has_imports = bool(config.league_imports)
+        self._league_keys = config.league_members()
+        self._runtime = league
         whitelist = student_whitelist(config.char_whitelist, config.bot_char)
         self._whitelist = set(whitelist)
         self.specs = specs or make_partition(
             config.num_envs, config.cpu_envs, config.teacher_envs,
-            config.snapshot_slots, config.main12_prob, config.partition_seed,
+            config.main12_prob, config.partition_seed,
             ref_envs=config.ref_envs, self_envs=config.self_envs,
             char_whitelist=whitelist,
         )
@@ -403,14 +369,15 @@ class DolphinRolloutWorker:
         student.set_flat_controllers(True)
         for ag in self.opponents.values():
             ag.set_flat_controllers(True)
-        # group name -> env index list (fixed membership = stable batch shapes)
+        # fixed-kind group name -> env index list (stable batch shapes)
         self.groups: dict = {}
         self.ref_idx: list[int] = []
+        self.league_idx: list[int] = []
         for i, spec in enumerate(self.specs):
             if spec.kind == "teacher":
                 self.groups.setdefault("teacher", []).append(i)
             elif spec.kind == "snapshot":
-                self.groups.setdefault(("slot", spec.group), []).append(i)
+                self.league_idx.append(i)
             elif spec.kind == "reference":
                 # served in-process by the ported torch checkpoint (see
                 # scripts/port_ref_model.py) — same path as teacher/slots.
@@ -425,23 +392,16 @@ class DolphinRolloutWorker:
             assert idx == list(range(idx[0], idx[0] + len(idx))), (
                 f"group {name} envs not contiguous: {idx}"
             )
-
-        # all same-config slots are stepped by ONE LeagueAgent (one Python
-        # pass per frame); seats hold slot refs into it. Spares and Phillip
-        # keep their own agents.
-        slot_names = sorted(n for n in self.groups if isinstance(n, tuple))
-        self._league_slots = [n[1] for n in slot_names]
-        self._league_agent = None
-        if slot_names:
-            from smashbot.rl.agent import LeagueAgent
-
-            first = self.opponents[slot_names[0]]
-            self._league_agent = LeagueAgent(
-                [self.opponents[n].policy for n in slot_names],
-                len(self.groups[slot_names[0]]),
-                name_code=int(first._name[0].item()), device=first.device,
-                temperature=first.temperature,
+        if self.league_idx:
+            assert league is not None, "league envs need a LeagueRuntime"
+            grid = league.agent
+            self._grid_cells = grid.S * grid.N
+            assert self._grid_cells >= len(self.league_idx), (
+                f"league grid {grid.S}x{grid.N} cannot seat "
+                f"{len(self.league_idx)} league envs"
             )
+            if league.phillip is not None:
+                league.phillip.set_flat_controllers(True)
         # dolphin-level seat mask (for the opponent-view mix)
         self.seat2 = torch.tensor(
             [sp.student_port == 2 for sp in self.specs]
@@ -466,32 +426,16 @@ class DolphinRolloutWorker:
             k: GameTracker()
             for k in ("cpu", "teacher", "snapshot", "reference", "self")
         }
-        # slot-game callback for PFSP payoff attribution: (slot, student_won,
-        # actual_kind) per decided game on a snapshot-slot env — actual_kind
-        # is "snapshot"/"teacher"/"cpu", following what the env really served
-        # (league members share this pathway). Wired by train_rl.
-        self.on_snapshot_game: tp.Optional[
-            tp.Callable[[int, bool, str], None]
-        ] = None
-        # n -> wrapper over the shared Phillip module (set by train_rl)
-        self.phillip_factory: tp.Optional[tp.Callable[[int], tp.Any]] = None
         # Imitation harvest of opponent seats: the fixed reference group
-        # (ref_envs mode) and/or every league policy seat, grouped by model
-        # config into _HarvestGroups.
+        # (ref_envs mode) and/or every league seat, grouped by model config
+        # ("ours" = the grid, "phillip" = his agent) into _HarvestGroups.
         self.harvest_imitation = harvest_imitation and (
-            bool(self.ref_idx) or bool(self._league)
+            bool(self.ref_idx) or bool(self.league_idx)
         )
         self._harvest_groups: dict[str, _HarvestGroup] = {}
         if self.harvest_imitation:
             self._stu_embed = student._embed_controller
             self._student_name_code = int(student._name[0].item())
-            self._slot_order = sorted(
-                {sp.group for sp in self.specs if sp.kind == "snapshot"}
-            )
-            self._slot_rows = [
-                i for k in self._slot_order for i in self.groups[("slot", k)]
-            ]
-            assert len({len(self.groups[("slot", k)]) for k in self._slot_order}) <= 1
             if self.ref_idx:
                 ref_agent = self.opponents["reference"]
                 self._imit_elig: list[torch.Tensor] = []
@@ -500,17 +444,39 @@ class DolphinRolloutWorker:
                     config.unroll_length, ref_agent.delay
                 )
                 self._ref_embed = ref_agent._embed_controller
+            if self.league_idx:
+                T, dev = config.unroll_length, student.device
+                self._harvest_groups["ours"] = _HarvestGroup(
+                    "ours", range(self._grid_cells), T, league.agent.delay, None, dev,
+                )
+                if league.phillip is not None:
+                    ph = league.phillip
+                    self._harvest_groups["phillip"] = _HarvestGroup(
+                        "phillip", range(ph.num_envs), T, ph.delay,
+                        self._traj_reencoder(ph), dev,
+                    )
         self._procs: list = []
         self._conns: list = []
         import os as _os
 
         self._prof = _PhaseProfiler() if _os.environ.get("SMASHBOT_PROFILE") else None
 
+    @property
+    def league(self) -> League | None:
+        return self._runtime.league if self._runtime is not None else None
+
     def _ensure_started(self) -> None:
         if self._procs:
             return
         import multiprocessing as mp
 
+        if self.league_idx:
+            # first opponents (every member once, then draws); a char-locked
+            # import's character goes into the cold-boot spec
+            locks = self.league.boot(self.league_idx)
+            for i, lock in locks.items():
+                if lock is not None:
+                    self.specs[i].opponent_char = lock
         # forkserver, preloading ONLY the torch-free env module: a spawned
         # child would re-import __main__ (train_rl -> torch, ~0.26 GB private
         # per env); forked-from-server envs stay ~10 MB and share its pages
@@ -649,168 +615,22 @@ class DolphinRolloutWorker:
             return sp.kind
         if serving == "cpu":
             return "cpu"
-        return self.member_kind(self.env_member.get(i))
+        return self.member_kind(self.league.member_now.get(i))
 
-    def _result_key(self, i: int, result_serving: str | None) -> str | None:
-        """Payoff-row key for a game that ended on slot env i."""
-        if result_serving == "cpu":
-            return "cpu"
-        return self.env_member.get(i)
-
-    _POLICY_KINDS = ("snapshot", "teacher")
-
-    def _pool_agent(self, slot: int, member: str):
-        """(agent, config label) serving `member`, created lazily."""
-        pool = self._pool.setdefault(slot, _SlotPool())
-        n = len(self.groups[("slot", slot)])
-        if member == "phillip":
-            if pool.phillip is None:
-                assert self.phillip_factory is not None, (
-                    "a slot is assigned to phillip but worker.phillip_factory "
-                    "was never set (train_rl sets it at startup under "
-                    "league_phillip)"
-                )
-                pool.phillip = self.phillip_factory(n)
-                pool.phillip.set_flat_controllers(True)
-            return pool.phillip, "phillip"
-        if pool.ours_main is None:
-            pool.ours_main = self._league_agent.slot_ref(self._league_slots.index(slot))
-        return pool.ours_main, "ours"
-
-    def slot_weights_changed(self, slot: int) -> None:
-        if self._league_agent is not None and slot in self._league_slots:
-            self._league_agent.slot_weights_changed(self._league_slots.index(slot))
-
-    def _rows_on(self, slot: int, key: str | None) -> list[int]:
-        if key is None:
-            return []
-        return [
-            i for i in self.groups.get(("slot", slot), [])
-            if self.env_member.get(i) == key
-        ]
-
-    def _release_outgoing(self, slot: int) -> None:
-        seats = self._seats.get(slot)
-        if seats and seats["outgoing"] is not None:
-            if not self._rows_on(slot, seats["outgoing"].member):
-                self._drop_spare(slot, seats["outgoing"])
-                seats["outgoing"] = None
-
-    def _drop_spare(self, slot: int, seat: "_Seat") -> None:
-        """Free the slot's parked spare brain when its seat retires (107MB
-        of GPU weights each; kept forever they'd accrete to 12 spares over
-        a long run). _park recreates one on demand."""
-        pool = self._pool.get(slot)
-        if pool is not None and pool.ours_spare is not None \
-                and seat.agent is pool.ours_spare:
-            pool.ours_spare = None
-
-    def _needs_slot_policy(self, member: str) -> bool:
-        """Does `member` live in the slot policy module? (cpu has none,
-        phillip has his own.)"""
-        return member != "cpu" and member != "phillip"
-
-    def _seat_for(self, slot: int, member: str) -> "_Seat | None":
-        if member == "cpu":
-            return None  # engine AI: no brain, no seat
-        return _Seat(member, *self._pool_agent(slot, member))
-
-    def _park(self, slot: int, seat: _Seat, slot_policy) -> _Seat:
-        """Copy the slot policy's weights into the spare and re-seat the
-        occupant there (the slot policy is about to be overwritten)."""
-        assert self.outgoing_factory is not None and slot_policy is not None, (
-            "deferred adoption needs a spare-brain factory (train_rl sets "
-            "worker.outgoing_factory) and the slot policy to park"
-        )
-        pool = self._pool[slot]
-        if pool.ours_spare is None:
-            pool.ours_spare = self.outgoing_factory(len(self.groups[("slot", slot)]))
-            pool.ours_spare.set_flat_controllers(True)
-        pool.ours_spare.policy.load_state_dict(slot_policy.state_dict())
-        return _Seat(seat.member, pool.ours_spare, seat.config)
-
-    def _evict_outgoing(self, slot: int, onto: str) -> None:
-        """Free the outgoing seat; any rows still on it take one mid-game
-        swap (only when a game outlasts a whole snapshot_interval)."""
-        out = self._seats[slot]["outgoing"]
-        if out is None:
-            return
-        rows = self._rows_on(slot, out.member)
-        if rows:
-            print(f"slot {slot}: {len(rows)} env(s) still on {out.member} "
-                  f"when the next member arrived — forcing onto {onto} "
-                  f"(one mid-game swap)", flush=True)
-            for i in rows:
-                self.env_member[i] = onto
-        self._drop_spare(slot, out)
-        self._seats[slot]["outgoing"] = None
-
-    def begin_transition(
-        self, slot: int, new_key: str, char_lock: str | None,
-        slot_policy=None,
-    ) -> None:
-        """Announce the slot's next member (before apply_assignments loads
-        any weights). Boot: envs adopt immediately and a char lock goes
-        into the env specs. Later: the current occupant becomes outgoing
-        if envs still fight it (parked when the newcomer needs the slot
-        policy), and every env is pending until its own game boundary."""
-        idx = self.groups.get(("slot", slot), [])
-        seats = self._seats.setdefault(slot, {"current": None, "outgoing": None})
-        old = self.slot_incoming.get(slot)
-        if old == new_key:
-            return
-        if old is None:  # boot
-            for i in idx:
-                self.env_member[i] = new_key
-                if char_lock is not None and new_key != "cpu":
-                    self.specs[i].opponent_char = char_lock
-        else:
-            cur = seats["current"]
-            if cur is not None and self._rows_on(slot, cur.member):
-                self._evict_outgoing(slot, onto=cur.member)
-                seats["outgoing"] = (
-                    self._park(slot, cur, slot_policy)
-                    if self._needs_slot_policy(cur.member)
-                    and self._needs_slot_policy(new_key)
-                    else cur  # agent undisturbed: serves in place
-                )
-        seats["current"] = self._seat_for(slot, new_key)
-        self.slot_incoming[slot] = new_key
-        pend = {i for i in idx if self.env_member.get(i) != new_key}
-        if pend:
-            self.slot_pending[slot] = pend
-        else:
-            self.slot_pending.pop(slot, None)
-        self._release_outgoing(slot)
-
-    def _adopt_pending(self, payloads: list[dict], resets_d) -> None:
-        """Flip pending envs at their game boundary (resetting frame). A
-        char-locked incoming waits until the new game's opp_char is the
-        lock; cpu waits for the env's recycle report. Runs after the
-        frame's results are attributed."""
-        for slot, pend in list(self.slot_pending.items()):
-            inc = self.slot_incoming[slot]
-            lock = self.slot_char_lock.get(slot)
-            for i in list(pend):
-                p = payloads[i]
-                if inc == "cpu":
-                    ok = p.get("opp_serving") == "cpu"
-                else:
-                    ok = (
-                        bool(resets_d[i])
-                        and p.get("opp_serving") != "cpu"
-                        and (lock is None or p.get("opp_char") == lock)
-                    )
-                if ok:
-                    self.env_member[i] = inc
-                    pend.discard(i)
-            if not pend:
-                del self.slot_pending[slot]
-            self._release_outgoing(slot)
+    def _seat_tables(self):
+        """Row -> env maps for the grid cells and Phillip's rows (None =
+        idle), from the current seating."""
+        seats = self.league.seats
+        grid = seats.S
+        cells: list[int | None] = []
+        for s in range(grid):
+            cells += seats.env_of_rows(s)
+        phillip = seats.env_of_rows(grid) if len(seats.pools) > grid else []
+        return cells, phillip
 
     def collect(self, num_trajectories: int) -> list[Trajectory]:
         """Run the sync-barrier loop until N PPO trajectory chunks are
-        assembled; any imitation chunks harvested along the way (reference
+        assembled; any imitation chunks harvested along the way (opponent
         seats with whitelisted chars) are appended after them."""
         self._ensure_started()
         cfg = self.config
@@ -827,48 +647,50 @@ class DolphinRolloutWorker:
         pending_resets = self._pending_resets
         records_pushed = getattr(self, "_records_pushed", 0)
         row_dolphin = self._row_dolphin
+        league = self.league
+        rt = self._runtime
 
         prof = self._prof  # opt-in per-phase timing (SMASHBOT_PROFILE=1)
         while len(out) < num_trajectories:
             t0 = prof.t() if prof else None
             payloads = self._gather_all()
             prof and prof.lap("gather", t0)
-            # envs whose opponent seat is engine-AI-driven THIS frame (league
-            # cpu adoption is lazy at recycle, so this follows each env's own
-            # report, never the desired assignment). Empty outside league_cpu.
+            # envs whose opponent seat is engine-AI-driven THIS frame
+            # (reported by the env itself, never the desired assignment)
             cpu_now = {
                 i for i, p in enumerate(payloads)
                 if p.get("opp_serving") == "cpu"
             }
+            fresh: list = []  # league seats that start a new game this frame
             for i, p in enumerate(payloads):
-                if p.get("final_stocks") is not None:
-                    a, b = p["final_stocks"]  # (port1, port2)
-                    sp = self.specs[i]
-                    if sp.kind == "self":
-                        # both seats are the student: track the PORT-1 seat's
-                        # win rate (a ~50% health metric, not a skill signal)
-                        self.trackers["self"].add_game((a, b))
-                        continue
-                    if sp.student_port == 2:
-                        a, b = b, a
-                    # attribute to the kind that PLAYED the ended game
-                    # (result_serving: carried alongside the result so a
-                    # recycle-boundary kind flip can't misattribute it)
-                    kind = self._actual_kind(i, p.get("result_serving"))
-                    self.trackers[
-                        self._TRACKER_KIND.get(kind, kind)
-                    ].add_game((a, b))
-                    if (
-                        sp.kind == "snapshot"
-                        and self.on_snapshot_game is not None
-                        and a != b
-                    ):
-                        key = self._result_key(i, p.get("result_serving"))
-                        if key is not None:
-                            self.on_snapshot_game(key, a > b)
+                if p.get("final_stocks") is None:
+                    continue
+                a, b = p["final_stocks"]  # (port1, port2)
+                sp = self.specs[i]
+                if sp.kind == "self":
+                    # both seats are the student: track the PORT-1 seat's
+                    # win rate (a ~50% health metric, not a skill signal)
+                    self.trackers["self"].add_game((a, b))
+                    continue
+                if sp.student_port == 2:
+                    a, b = b, a
+                # attribute to the kind that PLAYED the ended game
+                # (result_serving: carried alongside the result so a
+                # recycle-boundary kind flip can't misattribute it)
+                kind = self._actual_kind(i, p.get("result_serving"))
+                self.trackers[
+                    self._TRACKER_KIND.get(kind, kind)
+                ].add_game((a, b))
+                if sp.kind == "snapshot":
+                    # credit the ended game, take a seat for the drawn
+                    # member, draw the one after
+                    league.on_boundary(
+                        i, p.get("opp_serving"), p.get("opp_char"),
+                        (a > b) if a != b else None,
+                    )
+            if league is not None:
+                fresh, league.fresh_seats = league.fresh_seats, []
             resets_d = torch.tensor([p["resetting"] for p in payloads])
-            if self.slot_pending:  # after results: ended games credit the old member
-                self._adopt_pending(payloads, resets_d)
 
             resets = resets_d[row_dolphin]  # row-level
             resets_cpu = resets_d.tolist()
@@ -882,6 +704,7 @@ class DolphinRolloutWorker:
             flip = self.row_seat2
             stocks[flip] = stocks[flip].flip(-1)
             percent[flip] = percent[flip].flip(-1)
+            cells, ph_rows = self._seat_tables() if self.league_idx else ([], [])
             if self._frame_count > 0:
                 reward = compute_reward(
                     self._prev_stocks, stocks,
@@ -889,13 +712,15 @@ class DolphinRolloutWorker:
                 ).to(device)
                 self.assembler.push_reward(reward)
                 if self.harvest_imitation:
-                    # the reference seat's reward is the zero-sum mirror of
+                    # the opponent seat's reward is the zero-sum mirror of
                     # the student seat's (both terms are antisymmetric)
                     if self.ref_idx:
                         ref_rows = torch.tensor(self.ref_idx, device=device)
                         self._imit_assembler.push_reward(-reward[ref_rows])
-                    for g in self._harvest_groups.values():
-                        g.push_reward(-reward[g.rows_t])
+                    for key, rows in (("ours", cells), ("phillip", ph_rows)):
+                        g = self._harvest_groups.get(key)
+                        if g is not None:
+                            g.push_reward(self._rows_of(-reward, rows))
             if self._frame_count > 0:
                 for i in range(self.num_dolphins):
                     if resets[i]:
@@ -952,87 +777,41 @@ class DolphinRolloutWorker:
 
             opp_controllers: dict[int, tp.Any] = {}
             ref_records: list[FrameRecord] = []
-            # config -> slot -> [(row mask over the slot batch, records,
-            # agent)] per occupied seat of that config
-            harvest_parts: dict[str, dict[int, list]] = {}
-            league_rows: dict = {}
-            league_recs: dict = {}
-            # league pass runs whenever the league exists (pre-auction too:
-            # the no-seats branch below serves its rows — the slot MODULES
-            # live on CPU under capture and must never be stepped directly)
-            if self._league_agent is not None:
-                views, rsts, ridx = [], [], []
-                for pos, k in enumerate(self._league_slots):
-                    idx_k = self.groups[("slot", k)]
-                    views.append(self._group_view(("slot", k), opponent_view))
-                    rsts.append(resets_dev[idx_k[0]:idx_k[-1] + 1])
-                    ridx.extend((pos, j) for j, i in enumerate(idx_k) if resets_cpu[i])
-                rows_by_pos, recs_by_pos = self._league_agent.step(
-                    views, torch.stack(rsts), ridx
+            harvest: dict[str, tuple] = {}  # key -> (rows, resets, records)
+            if self.league_idx:
+                grid = rt.agent
+                # ---- the grid: gather every cell's env view, one forward
+                cell_env, cell_reset = self._route(cells, resets_cpu, fresh, 0)
+                gv = tree.map_structure(
+                    lambda x: x.index_select(0, cell_env).view(grid.S, grid.N, *x.shape[1:]),
+                    opponent_view,
                 )
-                for pos, k in enumerate(self._league_slots):
-                    league_rows[k], league_recs[k] = rows_by_pos[pos], recs_by_pos[pos]
+                for s, n in [f for f in fresh if f[0] < grid.S]:
+                    grid.reset_cell(s, n)
+                rows, record = grid.step(gv, cell_reset.view(grid.S, grid.N))
+                for r, env in enumerate(cells):
+                    if env is not None:
+                        opp_controllers[env] = rows[r]
+                harvest["ours"] = (cells, cell_reset, [record])
+                # ---- Phillip: his own agent, same routing
+                if rt.phillip is not None:
+                    ph = rt.phillip
+                    ph_env, ph_reset = self._route(ph_rows, resets_cpu, fresh, grid.S)
+                    pv = tree.map_structure(
+                        lambda x: x.index_select(0, ph_env), opponent_view
+                    )
+                    ctrls, recs, _ = ph.step(
+                        pv, ph_reset,
+                        reset_indices=ph_reset.nonzero().flatten().tolist(),
+                        want_snapshot=False,
+                    )
+                    for r, env in enumerate(ph_rows):
+                        if env is not None:
+                            opp_controllers[env] = ctrls[r]
+                    harvest["phillip"] = (ph_rows, ph_reset, recs)
             for name, idx in self.groups.items():
-                if isinstance(name, tuple):
-                    # slot group: each occupied seat steps the full batch;
-                    # controllers routed per row. No seats yet (pre-auction)
-                    # = the slot policy serves every row, unlabeled.
-                    k = name[1]
-                    seats = self._seats.get(k)
-                    view = self._group_view(name, opponent_view)
-                    g_resets = resets_dev[idx[0]:idx[-1] + 1]
-                    g_reset_idx = [j for j, i in enumerate(idx) if resets_cpu[i]]
-                    if not seats:
-                        live = [i for i in idx if i not in cpu_now]
-                        if live:
-                            if k in league_rows:
-                                ctrls = list(league_rows[k])
-                            else:
-                                ctrls, _, _ = self.opponents[name].step(
-                                    view, g_resets, reset_indices=g_reset_idx,
-                                    want_snapshot=False,
-                                )
-                            for j, env_i in enumerate(idx):
-                                if env_i in live:
-                                    opp_controllers[env_i] = ctrls[j]
-                        continue
-                    for seat in (seats["current"], seats["outgoing"]):
-                        if seat is None:
-                            continue
-                        live = [
-                            i for i in idx
-                            if self.env_member.get(i) == seat.member
-                            and i not in cpu_now
-                        ]
-                        if not live:
-                            continue
-                        if k in league_rows and getattr(seat.agent, "league", None) is self._league_agent:
-                            ctrls, recs = list(league_rows[k]), [league_recs[k]]
-                        else:
-                            ctrls, recs, _ = seat.agent.step(
-                                view, g_resets, reset_indices=g_reset_idx,
-                                want_snapshot=False,
-                            )
-                        for j, env_i in enumerate(idx):
-                            if env_i in live:
-                                opp_controllers[env_i] = ctrls[j]
-                        if self.harvest_imitation:
-                            mask = torch.tensor(
-                                [env_i in live for env_i in idx], device=device
-                            )
-                            harvest_parts.setdefault(seat.config, {}).setdefault(
-                                k, []
-                            ).append((mask, recs, seat.agent))
-                    continue
                 if cpu_now and all(i in cpu_now for i in idx):
-                    # whole slot serving CPU lvl-9: no brain to run — skip
-                    # the group's inference entirely. Safe for the agent's
-                    # recurrent state: an env only returns to policy serving
-                    # via a recycle, whose first frame is resetting=True.
-                    # (Mixed groups mid-adoption still run the FULL batch —
-                    # stable shapes for compile — and routing below drops
-                    # the cpu rows' controllers.)
-                    continue
+                    continue  # whole group engine-driven: no brain to run
                 agent = self.opponents[name]
                 group_view = self._group_view(name, opponent_view)
                 ctrls, g_records, _ = agent.step(
@@ -1056,19 +835,10 @@ class DolphinRolloutWorker:
                     # cpu_now rows have no policy seat: the engine AI drives
                     # the opponent port (like dedicated cpu envs today)
                     cmd[3 - port] = opp_controllers[i]
-                if self._league_cpu and self.specs[i].kind == "snapshot":
-                    # piggyback the desired serving kind; the env adopts a
-                    # policy<->cpu change at its next recycle boundary
-                    cmd["opp_kind"] = self.slot_desired.get(
-                        self.specs[i].group, "policy"
-                    )
-                if self._has_imports and self.specs[i].kind == "snapshot":
-                    # piggyback the slot's char lock (None = unlocked): the
-                    # env pins a locked import's character at its next game
-                    # boundary and resumes redraws once the lock clears
-                    cmd["opp_char_lock"] = self.slot_char_lock.get(
-                        self.specs[i].group
-                    )
+                if self.specs[i].kind == "snapshot":
+                    # what the opponent seat should be for the env's NEXT
+                    # game (kind + char lock), drawn one game ahead
+                    cmd["opp_next"] = league.next_command(i)
                 conn.send(cmd)
 
             prof and prof.lap("send", t0)
@@ -1091,10 +861,15 @@ class DolphinRolloutWorker:
                         payloads, resets_d, self.ref_idx, ref_records,
                         imit_out,
                     )
-                else:
-                    self._league_harvest(
-                        payloads, resets_d, harvest_parts, imit_out
-                    )
+                for key, (rows, rst, recs) in harvest.items():
+                    g = self._harvest_groups.get(key)
+                    if g is not None:
+                        elig = torch.tensor([
+                            env is not None
+                            and payloads[env].get("opp_char") in self._whitelist
+                            for env in rows
+                        ], dtype=torch.bool)
+                        g.step(rst.cpu(), elig, recs, imit_out)
 
             prof and prof.lap("assemble+harvest", t0)
             self._frame_count += 1
@@ -1104,92 +879,29 @@ class DolphinRolloutWorker:
         self._records_pushed = records_pushed
         return out + imit_out
 
-    def _league_harvest(
-        self,
-        payloads: list[dict],
-        resets_d: torch.Tensor,
-        parts: dict[str, dict[int, list]],
-        imit_out: list[Trajectory],
-    ) -> None:
-        """Per config group: one record per flushed frame over the fixed row
-        set (all slot envs, slot order) = the slots' full-batch seat records
-        concatenated (zeros for a slot with no seat of this config; a
-        per-row select when a slot's two seats share the config), plus the
-        eligibility mask (row on such a seat AND opponent char whitelisted).
-        Groups with no live seat are dropped (their assembler would take
-        rewards without records)."""
-        T = self.config.unroll_length
-        for cfg_key in [k for k in self._harvest_groups if k not in parts]:
-            del self._harvest_groups[cfg_key]
-        for cfg_key, by_slot in parts.items():
-            group = self._harvest_groups.get(cfg_key)
-            if group is None:
-                agent = next(iter(by_slot.values()))[0][2]
-                group = _HarvestGroup(
-                    cfg_key, self._slot_rows, T, agent.delay,
-                    self._traj_reencoder(agent) if cfg_key != "ours" else None,
-                    self.student.device,
-                )
-                self._harvest_groups[cfg_key] = group
-            # eligibility over the fixed row set
-            elig = []
-            for k in self._slot_order:
-                idx = self.groups[("slot", k)]
-                seats = by_slot.get(k)
-                if not seats:
-                    elig.extend([False] * len(idx))
-                    continue
-                on = torch.stack([m for m, _, _ in seats]).any(0).tolist()
-                elig.extend(
-                    o and payloads[i].get("opp_char") in self._whitelist
-                    for o, i in zip(on, idx)
-                )
-            nrec = {len(recs) for seats in by_slot.values() for _, recs, _ in seats}
-            assert len(nrec) == 1, (
-                f"seats of config {cfg_key} flushed unevenly {nrec}: "
-                "wrappers must share flush cadence (batch_steps)"
-            )
-            merged = []
-            for j in range(nrec.pop()):
-                pieces = []
-                template = None
-                for k in self._slot_order:
-                    seats = by_slot.get(k)
-                    if seats:
-                        rec = seats[0][1][j]
-                        for mask, recs, _ in seats[1:]:
-                            mk = mask
-                            rec = tree.map_structure(
-                                lambda a, b: torch.where(
-                                    mk.view(-1, *([1] * (a.dim() - 1))), b, a
-                                ),
-                                rec, recs[j],
-                            )
-                        template = rec
-                        pieces.append(rec)
-                    else:
-                        pieces.append(None)
-                assert template is not None
-                n = len(self.groups[("slot", self._slot_order[0])])
-                zeros = self._zero_record(cfg_key, template, n)
-                pieces = [zeros if p is None else p for p in pieces]
-                merged.append(
-                    tree.map_structure(lambda *xs: torch.cat(xs, 0), *pieces)
-                )
-            group.step(
-                resets_d[group.rows_cpu],
-                torch.tensor(elig, dtype=torch.bool), merged, imit_out,
-            )
+    def _route(self, rows, resets_cpu, fresh, pool_index):
+        """Per-row env index (idle rows read env 0: harmless, always reset)
+        and reset flags for one seat pool: an env's own reset, a fresh seat
+        (new game in this row), or idle."""
+        device = self.student.device
+        env_idx = torch.tensor(
+            [0 if e is None else e for e in rows], dtype=torch.int64, device=device
+        )
+        fresh_rows = {r for p, r in fresh if p == pool_index}
+        reset = torch.tensor([
+            e is None or resets_cpu[e] or r in fresh_rows
+            for r, e in enumerate(rows)
+        ], dtype=torch.bool, device=device)
+        return env_idx, reset
 
-    def _zero_record(self, cfg_key: str, template, n: int):
-        """Cached zero record of one slot batch for a config (placeholder
-        for slots with no seat of that config)."""
-        cache = self.__dict__.setdefault("_zero_records", {})
-        if cfg_key not in cache:
-            cache[cfg_key] = tree.map_structure(
-                lambda x: x.new_zeros((n,) + tuple(x.shape[1:])), template
-            )
-        return cache[cfg_key]
+    def _rows_of(self, per_env: torch.Tensor, rows) -> torch.Tensor:
+        """Gather a per-learner-row vector onto seat rows (0 when idle)."""
+        idx = torch.tensor(
+            [0 if e is None else e for e in rows], dtype=torch.int64,
+            device=per_env.device,
+        )
+        keep = torch.tensor([e is not None for e in rows], device=per_env.device)
+        return torch.where(keep, per_env.index_select(0, idx), torch.zeros_like(idx, dtype=per_env.dtype))
 
     def _traj_reencoder(self, agent):
         """Trajectory-level version of _reencode_record for an opponent

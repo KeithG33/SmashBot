@@ -98,20 +98,21 @@ def _env_process_main(
     whitelist = student_whitelist(cfg.char_whitelist, cfg.bot_char)
     student_rng = random_lib.Random(((cfg.partition_seed + 0x51EC7) << 16) ^ idx)
 
-    # Kind ACTUALLY serving on the opponent seat. Normally fixed (= spec.kind
-    # for the whole run); under league_cpu a snapshot-slot env can be asked
-    # (via the "opp_kind" command key) to flip policy<->cpu — Dolphin players
-    # are only built at (re)boot and a CPU port cannot hot-swap mid-game, so
-    # the flip is adopted LAZILY at the next recycle boundary. Until then the
-    # env keeps serving its previous kind and reports what it serves, so
-    # attribution follows reality, not the desired assignment.
+    # Kind ACTUALLY serving on the opponent seat (policy agent or engine
+    # CPU). Dolphin players are built at (re)boot only and a CPU port cannot
+    # hot-swap mid-game, so a kind change is adopted at a RECYCLE; the env
+    # always reports what it serves, so attribution follows reality.
     cur_kind = spec.kind
-    desired_kind = None  # latest "policy"/"cpu" wish from the worker
-    # Character lock piggybacked by the worker while this env's slot serves
-    # a char-locked import ("opp_char_lock" command key; None = unlocked).
-    # While locked, the opponent seat pins this char instead of redrawing
-    # per game — see next_opponent_char. Never sent outside league_imports.
+    desired_kind = None  # kind to adopt at the next recycle
+    # The worker's "opp_next" command (league envs): what the opponent seat
+    # should be for the NEXT game — {"kind": "policy"|"cpu", "char_lock":
+    # CHAR|None}. Read at game boundaries AFTER that frame's command, so a
+    # draw made when game g starts shapes game g+1: the lock pins the
+    # next game's character (see next_opponent_char); a kind change turns
+    # the current game into this Dolphin's last (spare pre-booted now,
+    # recycle at the boundary). Never sent outside league mode.
     char_lock = None
+    opp_next = None
 
     def _draw_char() -> str:
         if cur_kind == "cpu":
@@ -380,38 +381,6 @@ def _env_process_main(
                             pending_reset, pending_result = True, result
                             pending_result_kind = serving
                             break
-                        # per-GAME character rotation: the vendor's menu
-                        # helper and misselect guard both read
-                        # player.character LIVE each menu pass, so
-                        # mutating it between games retargets the next
-                        # rematch CSS pick — no recycle needed. A char lock
-                        # (import serving) pins the seat instead — no rng
-                        # draw consumed; unlock resumes normal redraws.
-                        nc = next_opponent_char(
-                            cur_kind, char_lock, cfg.redraw_chars,
-                            armed_opp_char, _draw_char,
-                        )
-                        if nc is not None:
-                            players[opp_port].character = (
-                                melee.Character[nc.upper()]
-                            )
-                            armed_opp_char = nc
-                            verb = (
-                                "pinned (char lock)"
-                                if char_lock is not None and cur_kind != "cpu"
-                                else "redrawn"
-                            )
-                            print(f"game end: opponent {verb} -> {nc}",
-                                  flush=True)
-                        if cfg.redraw_chars and len(whitelist) > 1:
-                            # student-seat whitelist draws are unaffected by
-                            # any opponent char lock (own rng stream)
-                            sc = _draw_student_char()
-                            players[spec.student_port].character = (
-                                melee.Character[sc.upper()]
-                            )
-                            print(f"game end: student redrawn -> {sc}",
-                                  flush=True)
                         parser = Parser(ports=[1, 2])
                     if games >= cfg.games_per_dolphin - 1:
                         _start_spare()  # entering this Dolphin's final game
@@ -453,15 +422,51 @@ def _env_process_main(
                     controllers = conn.recv()
                     if controllers is None:
                         return
-                    # league_cpu: the worker piggybacks its desired serving
-                    # kind on the command dict; stash it for the next recycle
-                    desired = controllers.pop("opp_kind", None)
-                    if desired is not None:
-                        desired_kind = desired
-                    # league_imports: piggybacked char lock (None = unlock);
-                    # absent key (imports not configured) keeps the current
-                    # value — i.e. stays None forever, today's behavior
-                    char_lock = controllers.pop("opp_char_lock", char_lock)
+                    opp_next = controllers.pop("opp_next", opp_next)
+                    if boundary:
+                        # arm the NEXT game's opponent seat from the command
+                        # just received (one game ahead). A char lock pins
+                        # the character; a kind change makes this game the
+                        # Dolphin's last so the recycle adopts it.
+                        if opp_next is not None:
+                            char_lock = opp_next.get("char_lock")
+                            want = opp_next.get("kind", "policy")
+                            want = "cpu" if want == "cpu" else spec.kind
+                            if want != cur_kind:
+                                desired_kind = want
+                                games = max(games, cfg.games_per_dolphin - 1)
+                        # per-GAME character rotation: the vendor's menu
+                        # helper and misselect guard both read
+                        # player.character LIVE each menu pass, so
+                        # mutating it between games retargets the next
+                        # rematch CSS pick — no recycle needed. A char lock
+                        # (import serving) pins the seat instead — no rng
+                        # draw consumed; unlock resumes normal redraws.
+                        nc = next_opponent_char(
+                            cur_kind, char_lock, cfg.redraw_chars,
+                            armed_opp_char, _draw_char,
+                        )
+                        if nc is not None:
+                            players[opp_port].character = (
+                                melee.Character[nc.upper()]
+                            )
+                            armed_opp_char = nc
+                            verb = (
+                                "pinned (char lock)"
+                                if char_lock is not None and cur_kind != "cpu"
+                                else "redrawn"
+                            )
+                            print(f"game end: opponent {verb} -> {nc}",
+                                  flush=True)
+                        if cfg.redraw_chars and len(whitelist) > 1:
+                            # student-seat whitelist draws are unaffected by
+                            # any opponent char lock (own rng stream)
+                            sc = _draw_student_char()
+                            players[spec.student_port].character = (
+                                melee.Character[sc.upper()]
+                            )
+                            print(f"game end: student redrawn -> {sc}",
+                                  flush=True)
                     for port, controller_state in controllers.items():
                         if cur_kind == "cpu" and port == opp_port:
                             continue  # engine AI drives this port; no inputs

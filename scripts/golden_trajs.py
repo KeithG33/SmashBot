@@ -1,19 +1,22 @@
 """Bit-exact regression tool for rollout-loop refactors.
 
 Builds the fake-env worker exactly as the test harness does, drives a
-scripted league scenario (boot, ghost->ghost parking, phillip in and out,
-imports, self-play rows, harvest), and saves every tensor leaf of the
-emitted trajectories. Run it on the reference commit and on the change,
-then compare:
+scripted league scenario over the per-match routing (boot over every
+member, scripted game boundaries with draws of ghosts / the teacher /
+Phillip / a char-locked import, self-play rows, harvest), and saves every
+tensor leaf of the emitted trajectories. Run it on the reference commit
+and on the change, then compare:
 
     .venv/bin/python scripts/golden_trajs.py /tmp/ref.pt      # on main
     .venv/bin/python scripts/golden_trajs.py /tmp/new.pt      # on branch
     .venv/bin/python scripts/golden_trajs.py --compare /tmp/ref.pt /tmp/new.pt
 
 Add --deterministic (both sides) when the change reorders agent calls:
-sampling at temperature 1e-3 makes trajectories independent of RNG order.
+sampling at temperature 1e-6 makes trajectories independent of RNG order.
 
 A refactor that preserves behavior must report 0 differing leaves.
+(The league-routing baseline starts at the league-routing branch: the
+per-match design is not comparable to the generation/slot design.)
 """
 import sys, random, torch, numpy as np, tree
 sys.path.insert(0, "smashbot/tests")
@@ -46,23 +49,42 @@ if "--deterministic" in sys.argv:
         _orig_init(self, *a, **k)
         self.temperature = 1e-6
     mp.setattr(_agent_mod.BatchedPolicyAgent, "__init__", _det_init)
+import tempfile
+from smashbot.rl import agent as _agent_mod
+import test_league_routing as R
+
+if "--deterministic" in sys.argv or _agent_mod.BatchedPolicyAgent.__init__.__name__ == "_det_init":
+    _orig_league = _agent_mod.LeagueAgent.__init__
+
+    def _det_league(self, *a, **k):
+        k["temperature"] = 1e-6
+        _orig_league(self, *a, **k)
+    mp.setattr(_agent_mod.LeagueAgent, "__init__", _det_league)
+
+pool_dir = tempfile.mkdtemp(prefix="golden-league-")
+imp = pool_dir + "/import-v3.pt"
+torch.save(T._tiny_policy(seed=9).state_dict(), imp)
 worker, envs = T._make_worker(
-    mp, num_envs=8, teacher_envs=2, snapshot_slots=2, self_envs=1,
-    league_phillip=True, harvest=True,
-    opp_chars={3: "FOX", 4: "FOX", 5: "MARTH", 6: "FOX"},
+    mp, num_envs=8, teacher_envs=0, self_envs=1, league_slices=2,
+    league_teacher=True, league_phillip=True, harvest=True,
+    league_imports=[f"v3={imp}@FOX"], members=[0, 100], pool_dir=pool_dir,
+    pfsp_explore=1.0, phillip_capacity=2,
+    char_whitelist=["FOX", "MARTH", "FALCO", "PEACH"],
 )
-pol = {g: worker.opponents[("slot", g)].policy for g in (0, 1)}
-worker.begin_transition(0, "ghostA", None, pol[0])
-worker.begin_transition(1, "phillip", None, pol[1])
+envs = R._ProtocolEnvs(worker, seed=1, opp_chars=dict(envs.opp_chars))
+envs.install(mp)
+lg = worker.league
 out = list(worker.collect(2))
-worker.begin_transition(0, "ghostB", None, pol[0])   # park ghostA
-envs.final_stocks[3] = (4, 0)
+# scripted boundaries: every league env ends a game at a different frame,
+# so adoptions, locks and fallbacks all happen mid-chunk
+for i, st in zip(worker.league_idx, [(4, 0), (0, 4), (4, 1), (2, 4)]):
+    envs.end_game(i, st)
+    out += worker.collect(1)
+for i in worker.league_idx:
+    envs.end_game(i)
 out += worker.collect(2)
-envs.final_stocks[4] = (0, 4)
-worker.begin_transition(1, "ghostC", None, pol[1])   # phillip -> ghost
-for i in (5, 6):
-    envs.final_stocks[i] = (4, 0)
-out += worker.collect(3)
+print(f"members now: {[lg.member_now[i] for i in worker.league_idx]} | "
+      f"draws {lg.draws} fallbacks {lg.fallbacks} warnings {lg.warnings}")
 leaves = []; offsets = []; names = []
 for ti, t in enumerate(out):
     offsets.append(len(leaves))

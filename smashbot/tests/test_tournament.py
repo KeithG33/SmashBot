@@ -140,7 +140,7 @@ def test_plan_waves_budget_respected_odd_shapes():
 def test_build_pair_specs_fox_mode():
     specs = tourn.build_pair_specs(8, "fox")
     assert len(specs) == 8
-    assert all(s.kind == "teacher" and s.group == -1 for s in specs)
+    assert all(s.kind == "teacher" for s in specs)
     assert all(s.opponent_char == "FOX" for s in specs)
     # seat balance: half the envs on each port
     ports = [s.student_port for s in specs]
