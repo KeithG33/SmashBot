@@ -409,7 +409,7 @@ def _env_process_main(
                     if _prof:
                         _t1 = time.perf_counter(); _acc["dolphin"] += _t1 - _t0
                     last_frame = gs.frame
-                    if _cprof is not None:
+                    if _cprof is not None and os.environ.get("SMASHBOT_PROFILE_PARSE") != "2":
                         _cprof.enable()
                     game = row_encoder.encode(parser.get_game(gs))
                     if _cprof is not None:
