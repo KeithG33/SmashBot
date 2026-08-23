@@ -481,6 +481,13 @@ def main() -> None:
                     f"I:{_pct(cat.get('imports'))} "
                     if rcfg.league_imports else ""
                 )
+                # league routing health: fallback share of draws, protocol
+                # warnings (recycle/lock mismatches), slice loads
+                lg_bit = (
+                    f"lg:{worker.league.fallback_rate:.0%}fb/"
+                    f"{worker.league.warnings}w/{worker.league.seats.loads}ld "
+                    if league_envs else ""
+                )
                 print(
                     f"[{i:4d}/{args.runtime.steps}] "
                     f"T:{_pct(cat.get('teacher'))} "
@@ -489,6 +496,7 @@ def main() -> None:
                     f"{ref_bit}"
                     f"{imp_bit}"
                     f"{sp_bit}"
+                    f"{lg_bit}"
                     f"({games:.0f}g) | "
                     f"tKL {log['rl/teacher_kl']:.4f} "
                     f"aKL {log['rl/actor_kl_mean']:.5f} "

@@ -631,7 +631,14 @@ class DolphinRolloutWorker:
     def collect(self, num_trajectories: int) -> list[Trajectory]:
         """Run the sync-barrier loop until N PPO trajectory chunks are
         assembled; any imitation chunks harvested along the way (opponent
-        seats with whitelisted chars) are appended after them."""
+        seats with whitelisted chars) are appended after them.
+
+        Per frame: gather -> bookkeeping (results, seats) -> EXECUTE (pop
+        every agent's delay queue) -> SEND -> infer (encode + every forward,
+        appending to the queues) -> assemble/harvest. Sending before
+        inferring lets the Dolphins step the next frame while the GPU works:
+        the controller executed now was sampled `delay` frames ago, so it is
+        already in the queue (see BatchedPolicyAgent.execute)."""
         self._ensure_started()
         cfg = self.config
         out: list[Trajectory] = []
@@ -649,19 +656,21 @@ class DolphinRolloutWorker:
         row_dolphin = self._row_dolphin
         league = self.league
         rt = self._runtime
+        grid = rt.agent if rt is not None else None
+        ph = rt.phillip if rt is not None else None
 
         prof = self._prof  # opt-in per-phase timing (SMASHBOT_PROFILE=1)
         while len(out) < num_trajectories:
             t0 = prof.t() if prof else None
             payloads = self._gather_all()
             prof and prof.lap("gather", t0)
+            t0 = prof.t() if prof else None
             # envs whose opponent seat is engine-AI-driven THIS frame
             # (reported by the env itself, never the desired assignment)
             cpu_now = {
                 i for i, p in enumerate(payloads)
                 if p.get("opp_serving") == "cpu"
             }
-            fresh: list = []  # league seats that start a new game this frame
             for i, p in enumerate(payloads):
                 if p.get("final_stocks") is None:
                     continue
@@ -688,13 +697,64 @@ class DolphinRolloutWorker:
                         i, p.get("opp_serving"), p.get("opp_char"),
                         (a > b) if a != b else None,
                     )
+            fresh: list = []  # league seats that start a new game this frame
             if league is not None:
                 fresh, league.fresh_seats = league.fresh_seats, []
             resets_d = torch.tensor([p["resetting"] for p in payloads])
-
             resets = resets_d[row_dolphin]  # row-level
             resets_cpu = resets_d.tolist()
+            reset_rows = resets.nonzero().flatten().tolist()
 
+            # ---- EXECUTE: pop this frame's controllers from every queue
+            controllers1 = self.student.execute(reset_rows)
+            opp_controllers: dict[int, tp.Any] = {}
+            cells, ph_rows = self._seat_tables() if self.league_idx else ([], [])
+            if self.league_idx:
+                cell_env, cell_reset = self._route(cells, resets_cpu, fresh, 0)
+                for s_, n_ in [f for f in fresh if f[0] < grid.S]:
+                    grid.reset_cell(s_, n_)
+                rows = grid.execute()
+                for r, env in enumerate(cells):
+                    if env is not None:
+                        opp_controllers[env] = rows[r]
+                if ph is not None:
+                    ph_env, ph_reset = self._route(ph_rows, resets_cpu, fresh, grid.S)
+                    ctrls = ph.execute(ph_reset.nonzero().flatten().tolist())
+                    for r, env in enumerate(ph_rows):
+                        if env is not None:
+                            opp_controllers[env] = ctrls[r]
+            group_live = {}
+            for name, idx in self.groups.items():
+                if cpu_now and all(i in cpu_now for i in idx):
+                    continue  # whole group engine-driven: no brain to run
+                group_live[name] = idx
+                ctrls = self.opponents[name].execute(
+                    [j for j, i in enumerate(idx) if resets_cpu[i]]
+                )
+                for j, env_i in enumerate(idx):
+                    opp_controllers[env_i] = ctrls[j]
+            prof and prof.lap("bookkeeping+execute", t0)
+            t0 = prof.t() if prof else None
+
+            # ---- SEND: the envs step the next frame while we infer below
+            for i, conn in enumerate(self._conns):
+                port = self.specs[i].student_port
+                cmd = {port: controllers1[i]}
+                if i in self._self_row_of:
+                    cmd[3 - port] = controllers1[self._self_row_of[i]]
+                elif i in opp_controllers and i not in cpu_now:
+                    # cpu_now rows have no policy seat: the engine AI drives
+                    # the opponent port (like dedicated cpu envs today)
+                    cmd[3 - port] = opp_controllers[i]
+                if self.specs[i].kind == "snapshot":
+                    # what the opponent seat should be for the env's NEXT
+                    # game (kind + char lock), drawn one game ahead
+                    cmd["opp_next"] = league.next_command(i)
+                conn.send(cmd)
+            prof and prof.lap("send", t0)
+            t0 = prof.t() if prof else None
+
+            # ---- rewards / trackers (this frame's transition)
             stocks_d = torch.tensor([p["stocks"] for p in payloads], dtype=torch.float32)
             percent_d = torch.tensor([p["percent"] for p in payloads], dtype=torch.float32)
             # payloads are (port1, port2) per dolphin; expand to learner rows
@@ -704,7 +764,6 @@ class DolphinRolloutWorker:
             flip = self.row_seat2
             stocks[flip] = stocks[flip].flip(-1)
             percent[flip] = percent[flip].flip(-1)
-            cells, ph_rows = self._seat_tables() if self.league_idx else ([], [])
             if self._frame_count > 0:
                 reward = compute_reward(
                     self._prev_stocks, stocks,
@@ -717,11 +776,10 @@ class DolphinRolloutWorker:
                     if self.ref_idx:
                         ref_rows = torch.tensor(self.ref_idx, device=device)
                         self._imit_assembler.push_reward(-reward[ref_rows])
-                    for key, rows in (("ours", cells), ("phillip", ph_rows)):
+                    for key, rows_ in (("ours", cells), ("phillip", ph_rows)):
                         g = self._harvest_groups.get(key)
                         if g is not None:
-                            g.push_reward(self._rows_of(-reward, rows))
-            if self._frame_count > 0:
+                            g.push_reward(self._rows_of(-reward, rows_))
                 for i in range(self.num_dolphins):
                     if resets[i]:
                         continue  # boundary artifacts belong to no game
@@ -735,10 +793,10 @@ class DolphinRolloutWorker:
                         tracker.add_kill(float(self._prev_percent[i, 1]))
             self._prev_stocks, self._prev_percent = stocks, percent
 
+            # ---- INFER: encode, every forward, append to the queues
             games = [p["game"] for p in payloads]
-            t0 = prof.t() if prof else None
             encoded = self._encode(games)
-            prof and prof.lap("encode", t0)
+            prof and prof.lap("rewards+encode", t0)
             # perspective swap commutes with encoding: both seat views are
             # pointer swaps of one encoded struct. The parser fixes p0=port1;
             # each agent must see ITSELF as p0, so seat-2 envs get the
@@ -766,83 +824,41 @@ class DolphinRolloutWorker:
             resets_dev = resets.to(device)
             pending_resets.append(resets_dev)
             t0 = prof.t() if prof else None
-            controllers1, records, hidden_before = self.student.step(
+            records, hidden_before = self.student.infer(
                 student_view, resets_dev,
-                reset_indices=resets.nonzero().flatten().tolist(),
                 # the snapshot is only consumed at a chunk boundary
                 want_snapshot=(records_pushed % cfg.unroll_length == 0),
             )
-            prof and prof.lap("student_step", t0)
+            prof and prof.lap("student_infer", t0)
             t0 = prof.t() if prof else None
 
-            opp_controllers: dict[int, tp.Any] = {}
             ref_records: list[FrameRecord] = []
             harvest: dict[str, tuple] = {}  # key -> (rows, resets, records)
             if self.league_idx:
-                grid = rt.agent
                 # ---- the grid: gather every cell's env view, one forward
-                cell_env, cell_reset = self._route(cells, resets_cpu, fresh, 0)
                 gv = tree.map_structure(
                     lambda x: x.index_select(0, cell_env).view(grid.S, grid.N, *x.shape[1:]),
                     opponent_view,
                 )
-                for s, n in [f for f in fresh if f[0] < grid.S]:
-                    grid.reset_cell(s, n)
-                rows, record = grid.step(gv, cell_reset.view(grid.S, grid.N))
-                for r, env in enumerate(cells):
-                    if env is not None:
-                        opp_controllers[env] = rows[r]
+                record = grid.infer(gv, cell_reset.view(grid.S, grid.N))
                 harvest["ours"] = (cells, cell_reset, [record])
-                # ---- Phillip: his own agent, same routing
-                if rt.phillip is not None:
-                    ph = rt.phillip
-                    ph_env, ph_reset = self._route(ph_rows, resets_cpu, fresh, grid.S)
+                if ph is not None:
                     pv = tree.map_structure(
                         lambda x: x.index_select(0, ph_env), opponent_view
                     )
-                    ctrls, recs, _ = ph.step(
-                        pv, ph_reset,
-                        reset_indices=ph_reset.nonzero().flatten().tolist(),
-                        want_snapshot=False,
-                    )
-                    for r, env in enumerate(ph_rows):
-                        if env is not None:
-                            opp_controllers[env] = ctrls[r]
+                    recs, _ = ph.infer(pv, ph_reset, want_snapshot=False)
                     harvest["phillip"] = (ph_rows, ph_reset, recs)
-            for name, idx in self.groups.items():
-                if cpu_now and all(i in cpu_now for i in idx):
-                    continue  # whole group engine-driven: no brain to run
-                agent = self.opponents[name]
+            for name, idx in group_live.items():
                 group_view = self._group_view(name, opponent_view)
-                ctrls, g_records, _ = agent.step(
-                    group_view, resets_dev[idx[0]:idx[-1] + 1],
-                    reset_indices=[j for j, i in enumerate(idx) if resets_cpu[i]],
-                    want_snapshot=False,
+                g_records, _ = self.opponents[name].infer(
+                    group_view, resets_dev[idx[0]:idx[-1] + 1], want_snapshot=False,
                 )
                 if name == "reference" and self.harvest_imitation:
                     ref_records = g_records
-                for j, env_i in enumerate(idx):
-                    opp_controllers[env_i] = ctrls[j]
-
-            prof and prof.lap("seat_steps", t0)
+            prof and prof.lap("opponent_infer", t0)
             t0 = prof.t() if prof else None
-            for i, conn in enumerate(self._conns):
-                port = self.specs[i].student_port
-                cmd = {port: controllers1[i]}
-                if i in self._self_row_of:
-                    cmd[3 - port] = controllers1[self._self_row_of[i]]
-                elif i in opp_controllers and i not in cpu_now:
-                    # cpu_now rows have no policy seat: the engine AI drives
-                    # the opponent port (like dedicated cpu envs today)
-                    cmd[3 - port] = opp_controllers[i]
-                if self.specs[i].kind == "snapshot":
-                    # what the opponent seat should be for the env's NEXT
-                    # game (kind + char lock), drawn one game ahead
-                    cmd["opp_next"] = league.next_command(i)
-                conn.send(cmd)
 
-            prof and prof.lap("send", t0)
-            t0 = prof.t() if prof else None
+            # ---- assemble / harvest
             for j, record in enumerate(records):
                 snap = None
                 if records_pushed % cfg.unroll_length == 0:
@@ -861,13 +877,13 @@ class DolphinRolloutWorker:
                         payloads, resets_d, self.ref_idx, ref_records,
                         imit_out,
                     )
-                for key, (rows, rst, recs) in harvest.items():
+                for key, (rows_, rst, recs) in harvest.items():
                     g = self._harvest_groups.get(key)
                     if g is not None:
                         elig = torch.tensor([
                             env is not None
                             and payloads[env].get("opp_char") in self._whitelist
-                            for env in rows
+                            for env in rows_
                         ], dtype=torch.bool)
                         g.step(rst.cpu(), elig, recs, imit_out)
 

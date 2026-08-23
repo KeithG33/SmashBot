@@ -159,31 +159,48 @@ class BatchedPolicyAgent:
             for i, c in enumerate(_split_rows(decoded, self.num_envs)):
                 self._queues[i].append(c)
 
-    @torch.no_grad()  # rollout stepping is inference: without this the
-    # compiled sample runs its TRAINING graph and every frame's activations
-    # are saved for a backward that never comes (live-caught: 21GB OOM at
-    # 200 rows, and cudagraph trees' "pending, uninvoked backwards" stall)
+    def execute(self, reset_indices: tp.Sequence[int] = ()) -> list:
+        """Controllers to execute NOW: one pop per env from the delay
+        queues (envs whose game just reset get a fresh neutral queue first).
+        Instant — never waits on inference — so the worker sends these
+        BEFORE running this frame's forward and the envs step while the
+        GPU works. The controller popped is the same whether infer() has
+        appended this frame's output yet or not (FIFO of length delay)."""
+        for i in reset_indices:
+            self._queues[i] = collections.deque([self._neutral()] * self.delay)
+        return [self._queues[i].popleft() for i in range(self.num_envs)]
+
     def step(
         self, states: tp.Any, resets: torch.Tensor | None = None,
         reset_indices: tp.Sequence[int] | None = None,
         want_snapshot: bool = True,
     ) -> tuple[list[Controller], list[FrameRecord], tp.Any]:
-        """states: encoded Game struct batched [N, ...]; resets: [N] bool.
-
-        Buffers the frame; every `batch_steps` frames one sample_n call
-        processes the buffer (amortizing launch overhead). Returns the
-        controllers to execute NOW (popped from the delay queue — instant,
-        never waits on inference), the flushed FrameRecords ([] between
-        flushes), and the recurrent snapshot from just before the flush
-        (None between flushes) for chunk-boundary bookkeeping.
-        """
+        """execute() then infer(): returns (controllers to execute now,
+        flushed FrameRecords, recurrent snapshot). Convenience for callers
+        that do not pipeline the send (tests, eval)."""
         if resets is None:
             resets = torch.zeros(self.num_envs, dtype=torch.bool, device=self._name.device)
         if reset_indices is None:  # caller without a CPU copy: one sync
             reset_indices = torch.nonzero(resets).flatten().tolist()
-        for i in reset_indices:
-            self._queues[i] = collections.deque([self._neutral()] * self.delay)
+        to_execute = self.execute(reset_indices)
+        records, hidden_before = self.infer(states, resets, want_snapshot)
+        return to_execute, records, hidden_before
 
+    @torch.no_grad()  # rollout stepping is inference: without this the
+    # compiled sample runs its TRAINING graph and every frame's activations
+    # are saved for a backward that never comes (live-caught: 21GB OOM at
+    # 200 rows, and cudagraph trees' "pending, uninvoked backwards" stall)
+    def infer(
+        self, states: tp.Any, resets: torch.Tensor, want_snapshot: bool = True,
+    ) -> tuple[list[FrameRecord], tp.Any]:
+        """states: encoded Game struct batched [N, ...]; resets: [N] bool.
+
+        Buffers the frame; every `batch_steps` frames one sample_n call
+        processes the buffer (amortizing launch overhead) and appends the
+        sampled controllers to the delay queues. Returns the flushed
+        FrameRecords ([] between flushes) and the recurrent snapshot from
+        just before the flush (None between flushes) for chunk-boundary
+        bookkeeping."""
         self._buf_states.append(states)
         self._buf_resets.append(resets)
 
@@ -226,8 +243,7 @@ class BatchedPolicyAgent:
             decoded = self._embed_controller.decode(encoded_np)
             self._enqueue(decoded)
             self._buf_states, self._buf_resets = [], []
-            to_execute = [self._queues[i].popleft() for i in range(self.num_envs)]
-            return to_execute, records, hidden_before
+            return records, hidden_before
 
         if len(self._buf_states) == self.batch_steps:
             hidden_before = self.hidden_snapshot() if want_snapshot else None
@@ -271,9 +287,7 @@ class BatchedPolicyAgent:
                 decoded = self._embed_controller.decode(encoded_np)
                 self._enqueue(decoded)
             self._buf_states, self._buf_resets = [], []
-
-        to_execute = [self._queues[i].popleft() for i in range(self.num_envs)]
-        return to_execute, records, hidden_before
+        return records, hidden_before
 
     def hidden_snapshot(self) -> tp.Any:
         """Detached copy of the recurrent state (for Trajectory.initial_state)."""
@@ -382,13 +396,24 @@ class LeagueAgent:
             lambda dst, src: dst[s, n].copy_(src[s, n]), self._prev, self._neutral
         )
 
-    @torch.no_grad()
+    def execute(self) -> np.ndarray:
+        """Controller rows to execute NOW, [S*N, 13]: one pop per cell
+        (reset_cell first for cells starting a game). Sent before this
+        frame's forward — see BatchedPolicyAgent.execute."""
+        return np.stack([q.popleft() for q in self._queues])
+
     def step(self, views, resets: torch.Tensor):
+        """execute() then infer(): (rows to execute now, FrameRecord)."""
+        rows = self.execute()
+        return rows, self.infer(views, resets)
+
+    @torch.no_grad()
+    def infer(self, views, resets: torch.Tensor) -> FrameRecord:
         """views: encoded Game struct batched [S, N, ...] on device; resets:
         [S, N] bool on device (True on a cell's first frame of a game —
         zeroes its recurrent state and substitutes the neutral prev action).
-        Returns controller rows to execute NOW ([S*N, 13] numpy, popped from
-        the delay queues) and ONE FrameRecord over all S*N cells."""
+        One forward; the sampled controllers are appended to the delay
+        queues. Returns ONE FrameRecord over all S*N cells."""
         prev = tree.map_structure(
             lambda pv, n: torch.where(
                 resets.view(self.S, self.N, *([1] * (pv.dim() - 2))), n, pv
@@ -421,7 +446,7 @@ class LeagueAgent:
         rows = encode.controller_rows(self._embed_controller.decode(encoded_np))
         for q, row in zip(self._queues, rows):
             q.append(row)
-        return np.stack([q.popleft() for q in self._queues]), record
+        return record
 
     # ---------------------------------------------------------- forward
 
