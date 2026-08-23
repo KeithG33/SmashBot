@@ -442,7 +442,8 @@ def main() -> None:
                     lg = worker.league
                     log["rl/league/fallback_rate"] = lg.fallback_rate
                     log["rl/league/draws"] = lg.draws
-                    log["rl/league/warnings"] = lg.warnings
+                    for k, v in lg.warn.items():
+                        log[f"rl/league/warn_{k}"] = v
                     log["rl/league/slice_loads"] = lg.seats.loads
                 for kind, tracker in worker.trackers.items():
                     for k, v in tracker.stats().items():
@@ -485,7 +486,8 @@ def main() -> None:
                 # warnings (recycle/lock mismatches), slice loads
                 lg_bit = (
                     f"lg:{worker.league.fallback_rate:.0%}fb/"
-                    f"{worker.league.warnings}w/{worker.league.seats.loads}ld "
+                    + "/".join(f"{v}{k[:4]}" for k, v in worker.league.warn.items())
+                    + f"/{worker.league.seats.loads}ld "
                     if league_envs else ""
                 )
                 print(

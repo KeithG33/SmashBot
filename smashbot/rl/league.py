@@ -255,7 +255,8 @@ class League:
         self.fresh_seats: list[Seat] = []
         self.draws = 0
         self.fallbacks = 0
-        self.warnings = 0
+        # protocol mismatches the env reported vs what was asked, by kind
+        self.warn = {"cpu_not_adopted": 0, "still_cpu": 0, "lock_mismatch": 0}
 
     # ------------------------------------------------------------ draws
 
@@ -325,11 +326,11 @@ class League:
                 self.seats.release(env)
                 self.member_now[env] = self.CPU
             else:  # the recycle into cpu did not happen: keep the old seat
-                self.warnings += 1
+                self.warn["cpu_not_adopted"] += 1
                 self._keep_seat(env)
         else:
             if serving == "cpu":  # still engine-driven: nothing to seat yet
-                self.warnings += 1
+                self.warn["still_cpu"] += 1
             else:
                 self._adopt(env, wanted, opp_char)
         self._draw_next(env)
@@ -344,7 +345,9 @@ class League:
         m = wanted
         lock = self.lock_of(m)
         if lock is not None and opp_char is not None and opp_char != lock:
-            self.warnings += 1  # env armed a different char: not this import
+            # the env armed a different char (e.g. a menu-misselect recycle
+            # redrew it): this game is NOT the import's
+            self.warn["lock_mismatch"] += 1
             m = None
         seat = self.seats.place(env, m) if m is not None else None
         if seat is None:
@@ -365,6 +368,10 @@ class League:
             self.fallbacks += 1
         self.member_now[env] = m
         self.fresh_seats.append(seat)
+
+    @property
+    def warnings(self) -> int:
+        return sum(self.warn.values())
 
     @property
     def fallback_rate(self) -> float:
