@@ -77,7 +77,8 @@ class RolloutConfig:
     league_slices: int = 0
     # Phillip's agent capacity (his architecture never fits a slice): the
     # max envs fighting him at once; draws beyond it fall back to a
-    # resident-member draw. 0 = size to one slice's worth of cells.
+    # resident-member draw. 0 = three slices' worth of cells (he held 2-3
+    # of 12 slots under the auction design).
     phillip_capacity: int = 0
     main12_prob: float = 0.6
     snapshot_interval: int = 500  # learner steps between student snapshots

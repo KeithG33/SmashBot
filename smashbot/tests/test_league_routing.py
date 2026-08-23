@@ -512,3 +512,29 @@ def test_grid_capture_matches_eager_on_gpu():
         if frame == 2:  # reload slice 0 mid-stream (the template's slice)
             donor = _tiny_policy(seed=99).state_dict()
             cap.load_slice(0, donor); eag.load_slice(0, donor)
+
+
+def test_member_weights_warm_loads_in_background(tmp_path):
+    pth = str(tmp_path / "snapshot-0000001.pt")
+    torch.save(_tiny_policy(seed=1).state_dict(), pth)
+    w = MemberWeights({})
+    w.warm(pth)
+    w.warm(pth)  # idempotent while in flight / cached
+    sd = w.get(pth)  # joins the load; no second read
+    assert pth in w._cache and w._inflight == {}
+    assert w.get(pth) is sd
+
+
+def test_fallback_prefers_resident_members():
+    # 2x2 grid, boot g1,g2,g1,g2. env 1 draws g3 (not resident): its old
+    # slice still holds env 3, g1's slice is full -> no empty slice -> the
+    # fallback must sit on a RESIDENT member with a free row (g2) and load
+    # nothing inside the frame loop
+    lg, pool, seats = _league([], archive=["g1", "g2", "g3"], draws=["g3"], S=2, N=2)
+    lg.boot([0, 1, 2, 3])
+    assert [lg.member_now[i] for i in range(4)] == ["g1", "g2", "g1", "g2"]
+    lg.member_next[1] = "g3"
+    loads_before = seats.loads
+    lg.on_boundary(1, "policy", "FOX", won=None)
+    assert lg.member_now[1] == "g2" and lg.fallbacks == 1
+    assert seats.loads == loads_before  # nothing loaded

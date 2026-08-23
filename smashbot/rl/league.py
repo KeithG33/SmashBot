@@ -33,29 +33,62 @@ from smashbot.rl.pool import SnapshotPool, _is_import_key
 
 class MemberWeights:
     """member key -> state_dict (CPU). Teacher and imports are held for the
-    run; snapshots load from the archive through an LRU (107 MB each)."""
+    run; snapshots load from the archive through an LRU (107 MB each).
+    warm(member) loads in a background thread — draws happen a game ahead,
+    so by the time a seat needs the weights the disk read is long done and
+    get() never stalls the frame loop."""
 
     def __init__(self, fixed: dict[str, dict], lru: int = 16):
+        import threading
+
         self._fixed = dict(fixed)
         self._cache: "collections.OrderedDict[str, dict]" = collections.OrderedDict()
         self.lru = lru
+        self._lock = threading.Lock()
+        self._inflight: dict[str, threading.Thread] = {}
 
     def set(self, member: str, state_dict: dict) -> None:
         """Replace a fixed member's weights (teacher swap); resident slices
         refresh at their next load."""
         self._fixed[member] = state_dict
 
+    def _put(self, member: str, sd: dict) -> None:
+        with self._lock:
+            self._cache[member] = sd
+            self._cache.move_to_end(member)
+            while len(self._cache) > self.lru:
+                self._cache.popitem(last=False)
+
+    def warm(self, member: str) -> None:
+        """Start loading `member` from disk if it is not cached (no-op for
+        fixed members and loads already in flight)."""
+        import threading
+
+        if member in self._fixed:
+            return
+        with self._lock:
+            if member in self._cache or member in self._inflight:
+                return
+            t = threading.Thread(
+                target=lambda: self._put(member, torch.load(member, map_location="cpu")),
+                daemon=True,
+            )
+            self._inflight[member] = t
+        t.start()
+
     def get(self, member: str) -> dict:
         if member in self._fixed:
             return self._fixed[member]
-        sd = self._cache.get(member)
-        if sd is None:
-            sd = torch.load(member, map_location="cpu")
-            self._cache[member] = sd
-            while len(self._cache) > self.lru:
-                self._cache.popitem(last=False)
-        else:
-            self._cache.move_to_end(member)
+        t = self._inflight.pop(member, None)
+        if t is not None:
+            t.join()
+        with self._lock:
+            sd = self._cache.get(member)
+            if sd is not None:
+                self._cache.move_to_end(member)
+                return sd
+        sd = torch.load(member, map_location="cpu")
+        self._put(member, sd)
         return sd
 
 
@@ -122,7 +155,17 @@ class LeagueSeats:
             n += self.N
         return n
 
-    def members_with_room(self, candidates: tp.Iterable[str]) -> list[str]:
+    def members_with_room(
+        self, candidates: tp.Iterable[str], resident_only: bool = False,
+    ) -> list[str]:
+        """Candidates that can be seated now; resident_only = without
+        loading anything (a free row on a pool already holding them)."""
+        if resident_only:
+            free = {
+                p.member for p in self.pools
+                if p.member is not None and len(p.occupants) < p.capacity
+            }
+            return [m for m in candidates if m in free]
         return [m for m in candidates if self.room(m) > 0]
 
     def env_of_rows(self, pool: int) -> list[int | None]:
@@ -196,6 +239,7 @@ class League:
         rng: random.Random,
         on_result: tp.Callable[[str, bool], None] | None = None,
         cpu_enabled: bool = False,
+        warm: tp.Callable[[str], None] | None = None,
     ):
         self.pool = pool
         self.seats = seats
@@ -203,6 +247,7 @@ class League:
         self.rng = rng
         self.on_result = on_result
         self.cpu_enabled = cpu_enabled
+        self.warm = warm  # e.g. MemberWeights.warm: disk read off the frame loop
         self.member_now: dict[int, str] = {}
         self.member_next: dict[int, str] = {}
         # reset flags to raise on the league grid this frame: seats whose
@@ -232,6 +277,8 @@ class League:
         self.member_next[env] = m
         self.draws += 1
         if m not in (self.CPU, LeagueSeats.PHILLIP):
+            if self.warm is not None:
+                self.warm(m)
             self.seats.prefetch(m)
 
     def next_command(self, env: int) -> dict:
@@ -301,12 +348,15 @@ class League:
             m = None
         seat = self.seats.place(env, m) if m is not None else None
         if seat is None:
-            # fallback: a PFSP draw over members that have room NOW and can
-            # play the character the env already armed
+            # fallback: a PFSP draw over members that have room NOW (resident
+            # ones first — no load in the frame loop) and can play the
+            # character the env already armed
+            fits = lambda k: self.lock_of(k) is None or self.lock_of(k) == opp_char
+            keys = self._league_keys()
             allowed = [
-                k for k in self.seats.members_with_room(self._league_keys())
-                if self.lock_of(k) is None or self.lock_of(k) == opp_char
-            ]
+                k for k in self.seats.members_with_room(keys, resident_only=True)
+                if fits(k)
+            ] or [k for k in self.seats.members_with_room(keys) if fits(k)]
             m = self._draw(allowed) if allowed else None
             if m is None:  # nothing fits: sit back down where we were
                 m = self.member_now[env]

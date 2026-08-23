@@ -293,7 +293,7 @@ def main() -> None:
                 mode = "reduce-overhead" if device == "cuda" else "default"
                 ph_policy.sample = torch.compile(ph_policy.sample, mode=mode)
             ph_code = resolve_name_code(ph_names, "Master Player")
-            cap = rcfg.phillip_capacity or N
+            cap = rcfg.phillip_capacity or 3 * N
             phillip_agent = BatchedPolicyAgent(
                 ph_policy, cap, name_code=ph_code, device=device,
                 batch_steps=rcfg.batch_steps,
@@ -312,7 +312,7 @@ def main() -> None:
             locks={k: char for k, (_p, char) in import_registry.items()},
             rng=_random.Random(rcfg.partition_seed ^ 0xA11A),
             on_result=snapshot_pool.record_result,
-            cpu_enabled=rcfg.league_cpu,
+            cpu_enabled=rcfg.league_cpu, warm=weights.warm,
         )
         from smashbot.rl.rollouts import LeagueRuntime
 
