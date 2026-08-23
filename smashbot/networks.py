@@ -466,7 +466,9 @@ class SGUBlock(nn.Module):
         u, v = self.uv(xn).chunk(2, dim=-1)
 
         # static mixing: causal depthwise conv over [cache || current]
-        v_full = torch.cat([v_cache, v], dim=1)  # [B, W-1+T, d]
+        # (caches follow the activation dtype: under fp16 autocast the
+        # fp32-initialized state must not promote the whole window)
+        v_full = torch.cat([v_cache.to(v.dtype), v], dim=1)  # [B, W-1+T, d]
         if T == 1:
             # Grouped conv with one output position is just a per-channel
             # weighted sum over the window; conv kernels handle B=1/groups=d
@@ -480,7 +482,7 @@ class SGUBlock(nn.Module):
         qkv = self.attn_qkv(xn)  # [B, T, 3*dk]
         q, k_new, va_new = qkv.chunk(3, dim=-1)
         kv_new = torch.cat([k_new, va_new], dim=-1)
-        kv_full = torch.cat([kv_cache, kv_new], dim=1)  # [B, W-1+T, 2*dk]
+        kv_full = torch.cat([kv_cache.to(kv_new.dtype), kv_new], dim=1)  # [B, W-1+T, 2*dk]
         keys, vals = kv_full.chunk(2, dim=-1)
 
         # Same windowed-causal rule as the conv: key attendable iff at most

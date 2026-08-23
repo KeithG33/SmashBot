@@ -312,12 +312,19 @@ class LeagueAgent:
     def __init__(
         self, template: Policy, slices: int, cells: int, name_code: int,
         device, temperature=None, capture: bool | None = None,
+        weights_dtype: torch.dtype = torch.float32,
     ):
         import copy
 
         self.S, self.N = slices, cells
         self.device = torch.device(device)
         self.temperature = temperature
+        # fp16 stacked weights halve the per-slice VRAM (107 -> 54 MB); the
+        # forward then runs under fp16 autocast (norms stay fp32)
+        self.weights_dtype = weights_dtype
+        assert weights_dtype == torch.float32 or self.device.type == "cuda", (
+            "fp16 league weights need CUDA (fp16 autocast)"
+        )
         self.delay = template.delay
         self._embed_controller = template.controller_head.controller_embedding
         # functional_call's skeleton: a THROWAWAY copy (never read back).
@@ -332,10 +339,14 @@ class LeagueAgent:
         with torch.no_grad():
             params = dict(self._template.named_parameters())
             buffers = dict(self._template.named_buffers())
-            stack = lambda t: t.detach().to(self.device).unsqueeze(0).repeat(
-                self.S, *([1] * t.dim())
-            ).clone()
-            self._stacked_params = {k: stack(v) for k, v in params.items()}
+            def stack(t, dtype=None):
+                t = t.detach().to(self.device)
+                if dtype is not None and t.is_floating_point():
+                    t = t.to(dtype)  # parameters only; buffers are constants
+                return t.unsqueeze(0).repeat(self.S, *([1] * t.dim())).clone()
+            self._stacked_params = {
+                k: stack(v, self.weights_dtype) for k, v in params.items()
+            }
             self._stacked_buffers = {k: stack(v) for k, v in buffers.items()}
         self._name = torch.full(
             (self.S, self.N), name_code, dtype=torch.int64, device=self.device
@@ -480,10 +491,13 @@ class LeagueAgent:
 
         base, name, temperature = self._template, self._name, self.temperature
 
+        half = self.weights_dtype == torch.float16 and self.device.type == "cuda"
+
         def fmodel(p, b, st, ac, hid, rst):
-            out, hid2 = functional_call(base, (p, b), (
-                StateAction(state=st, action=ac, name=name[0]), hid, rst, temperature,
-            ))
+            with torch.autocast("cuda", dtype=torch.float16, enabled=half):
+                out, hid2 = functional_call(base, (p, b), (
+                    StateAction(state=st, action=ac, name=name[0]), hid, rst, temperature,
+                ))
             return out.controller_state, out.logits, hid2
 
         return vmap(fmodel, in_dims=(0, 0, 0, 0, 0, 0), randomness="different")

@@ -65,7 +65,7 @@ class RolloutConfig:
     games_per_dolphin: int = 20
     # Dolphin dual-core emulation (CPU + GPU threads). Off packs a big
     # headless fleet onto the cores better (one thread per Dolphin).
-    dolphin_dual_core: bool = True
+    dolphin_dual_core: bool = False  # measured: -4 ms/frame at 176 Dolphins
     # Opponent pool partition (see rl/pool.py). Defaults replicate the
     # simple all-teacher setup; production: everything not cpu/teacher/
     # reference/self is a LEAGUE env (kind "snapshot").
@@ -78,6 +78,12 @@ class RolloutConfig:
     # and sit wherever that member is loaded (rollouts._Grid). 0 = no
     # league envs.
     league_slices: int = 0
+    # Stacked league weights dtype: "float16" halves VRAM per slice (107 ->
+    # 54 MB) and runs the grid forward under fp16 autocast (measured: 24
+    # fp16 slices cost less VRAM and time than 12 fp32; 94.6% of controller
+    # rows identical to fp32 at saturated sampling — opponents' play, not
+    # the student's, is perturbed). CUDA only.
+    league_weights_dtype: str = "float32"
     # Phillip's agent capacity (his architecture never fits a slice): the
     # max envs fighting him at once; draws beyond it fall back to a
     # resident-member draw. 0 = three slices' worth of cells (he held 2-3

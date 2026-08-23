@@ -274,6 +274,7 @@ def main() -> None:
         grid = LeagueAgent(
             template, S, N, name_code=name_code, device=device,
             temperature=None,
+            weights_dtype=getattr(torch, rcfg.league_weights_dtype),
         )
         # member weights: teacher (frozen copy), imports, snapshots (LRU)
         fixed = {"teacher": {k: v.detach().cpu() for k, v in teacher.state_dict().items()}}

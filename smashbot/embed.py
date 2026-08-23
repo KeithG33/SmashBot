@@ -110,7 +110,7 @@ class BoolEmbedding(Embedding[bool, np.bool_]):
         return F.binary_cross_entropy_with_logits(logits, labels, reduction="none")
 
     def sample(self, embedded: torch.Tensor, temperature=None) -> torch.Tensor:
-        logits = embedded.squeeze(-1)
+        logits = embedded.squeeze(-1).float()  # sample in fp32 (fp16 trunks)
         if temperature is not None:
             logits = logits / temperature
         return torch.bernoulli(torch.sigmoid(logits)).bool()
@@ -225,7 +225,7 @@ class OneHotEmbedding(Embedding[int, np.ndarray]):
         return -logprobs.gather(-1, target.long().unsqueeze(-1)).squeeze(-1)
 
     def sample(self, embedded: torch.Tensor, temperature=None) -> torch.Tensor:
-        logits = embedded
+        logits = embedded.float()  # sample in fp32 (fp16 trunks)
         if temperature is not None:
             logits = logits / temperature
         flat = logits.reshape(-1, logits.shape[-1])
