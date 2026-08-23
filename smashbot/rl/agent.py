@@ -393,6 +393,7 @@ class LeagueAgent:
         self._use_capture = capture
         self._graph = None
         self._vm = self._make_vmap()
+        self._timer = None  # optional profiler callback (name) -> None
         # eager-path recurrent state [S, N, ...] (the captured path keeps
         # it in static buffers)
         self._hidden = self._initial_hidden()
@@ -470,6 +471,8 @@ class LeagueAgent:
                 self._stacked_params, self._stacked_buffers, views, prev,
                 self._hidden, resets,
             )
+        if self._timer is not None:
+            self._timer("forward")
         self._prev = tree.map_structure(
             lambda t: t.clone() if t.dtype == torch.bool else t.long().clone(), ctrl
         )
@@ -486,9 +489,13 @@ class LeagueAgent:
         from smashbot import encode
 
         encoded_np = tree.map_structure(lambda x: flat(x).cpu().numpy(), ctrl)
+        if self._timer is not None:
+            self._timer("record+to_cpu")
         rows = encode.controller_rows(self._embed_controller.decode(encoded_np))
         for q, row in zip(self._queues, rows):
             q.append(row)
+        if self._timer is not None:
+            self._timer("decode+queues")
         return record
 
     # ---------------------------------------------------------- forward

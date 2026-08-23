@@ -244,16 +244,17 @@ def _make_runtime(cfg, league_envs, pool_dir, ghosts, phillip_capacity):
     phillip = None
     if cfg.league_phillip:
         # a differently-discretized policy, like the real Phillip module
-        # (exercises the harvest re-encode path)
+        # (exercises the harvest re-encode path): his own 1-slice grid
         ph_policy = _phillip_like_policy(
             embed_lib.ControllerConfig(axis_spacing=8)
         )
-        phillip = BatchedPolicyAgent(
-            ph_policy, phillip_capacity or N, name_code=2
+        phillip = LeagueAgent(
+            ph_policy, 1, phillip_capacity or N, name_code=2, device="cpu"
         )
+        phillip.load_slice(0, ph_policy.state_dict())
     seats = LeagueSeats(
         S, N, loader=lambda s, m: grid.load_slice(s, weights.get(m)),
-        phillip_capacity=phillip.num_envs if phillip else 0,
+        phillip_capacity=phillip.N if phillip else 0,
         mover=grid.move_cell,
     )
     league = League(

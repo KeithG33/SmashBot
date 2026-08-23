@@ -296,12 +296,13 @@ class _HarvestGroup:
 
 class LeagueRuntime(tp.NamedTuple):
     """Everything the worker needs to serve the league (built by train_rl):
-    the per-match protocol, the S x N grid agent, Phillip's agent (None
-    outside league_phillip)."""
+    the per-match protocol, the S x N grid, and Phillip's grid — a 1-slice
+    LeagueAgent over his own architecture (None outside league_phillip).
+    Both grids share one code path: execute() / infer() over fixed cells."""
 
     league: League
     agent: LeagueAgent
-    phillip: BatchedPolicyAgent | None
+    phillip: LeagueAgent | None
 
 
 class DolphinRolloutWorker:
@@ -400,8 +401,6 @@ class DolphinRolloutWorker:
                 f"league grid {grid.S}x{grid.N} cannot seat "
                 f"{len(self.league_idx)} league envs"
             )
-            if league.phillip is not None:
-                league.phillip.set_flat_controllers(True)
         # dolphin-level seat mask (for the opponent-view mix)
         self.seat2 = torch.tensor(
             [sp.student_port == 2 for sp in self.specs]
@@ -452,7 +451,7 @@ class DolphinRolloutWorker:
                 if league.phillip is not None:
                     ph = league.phillip
                     self._harvest_groups["phillip"] = _HarvestGroup(
-                        "phillip", range(ph.num_envs), T, ph.delay,
+                        "phillip", range(ph.S * ph.N), T, ph.delay,
                         self._traj_reencoder(ph), dev,
                     )
         self._procs: list = []
@@ -460,6 +459,17 @@ class DolphinRolloutWorker:
         import os as _os
 
         self._prof = _PhaseProfiler() if _os.environ.get("SMASHBOT_PROFILE") else None
+        if self._prof is not None and league is not None:
+            # grid sub-phases (forward / record+to_cpu / decode+queues)
+            t = {"t0": None}
+
+            def timer(name):
+                now = self._prof.t()
+                if t["t0"] is not None:
+                    self._prof.acc[f"grid:{name}"] = self._prof.acc.get(f"grid:{name}", 0.0) + (now - t["t0"]) * 1e3
+                t["t0"] = now
+            league.agent._timer = timer
+            league.agent._timer_reset = lambda: t.__setitem__("t0", self._prof.t())
 
     @property
     def league(self) -> League | None:
@@ -719,7 +729,9 @@ class DolphinRolloutWorker:
                         opp_controllers[env] = rows[r]
                 if ph is not None:
                     ph_env, ph_reset = self._route(ph_rows, resets_cpu, fresh, grid.S)
-                    ctrls = ph.execute(ph_reset.nonzero().flatten().tolist())
+                    for s_, n_ in [f for f in fresh if f[0] == grid.S]:
+                        ph.reset_cell(0, n_)
+                    ctrls = ph.execute()
                     for r, env in enumerate(ph_rows):
                         if env is not None:
                             opp_controllers[env] = ctrls[r]
@@ -846,14 +858,22 @@ class DolphinRolloutWorker:
                     lambda x: x.index_select(0, cell_env).view(grid.S, grid.N, *x.shape[1:]),
                     opponent_view,
                 )
+                prof and prof.lap("grid_gather", t0)
+                t0 = prof.t() if prof else None
+                prof and grid._timer_reset()
                 record = grid.infer(gv, cell_reset.view(grid.S, grid.N))
                 harvest["ours"] = (cells, cell_reset, [record])
+                prof and prof.lap("grid_infer", t0)
+                t0 = prof.t() if prof else None
                 if ph is not None:
                     pv = tree.map_structure(
-                        lambda x: x.index_select(0, ph_env), opponent_view
+                        lambda x: x.index_select(0, ph_env).view(1, ph.N, *x.shape[1:]),
+                        opponent_view,
                     )
-                    recs, _ = ph.infer(pv, ph_reset, want_snapshot=False)
-                    harvest["phillip"] = (ph_rows, ph_reset, recs)
+                    rec = ph.infer(pv, ph_reset.view(1, ph.N))
+                    harvest["phillip"] = (ph_rows, ph_reset, [rec])
+                prof and prof.lap("phillip_infer", t0)
+                t0 = prof.t() if prof else None
             for name, idx in group_live.items():
                 group_view = self._group_view(name, opponent_view)
                 g_records, _ = self.opponents[name].infer(
@@ -861,7 +881,7 @@ class DolphinRolloutWorker:
                 )
                 if name == "reference" and self.harvest_imitation:
                     ref_records = g_records
-            prof and prof.lap("opponent_infer", t0)
+            prof and prof.lap("groups_infer", t0)
             t0 = prof.t() if prof else None
 
             # ---- assemble / harvest

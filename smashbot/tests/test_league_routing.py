@@ -410,6 +410,7 @@ def test_worker_phillip_is_routed_to_his_agent_and_harvest_reencodes(monkeypatch
     assert any(m == "phillip" for m in lg.member_now.values()) or lg.draws > 0
     imit = [tr for tr in out if tr.kind == "imitation"]
     assert imit  # whitelisted opponent seats were harvested
+    assert ph.S == 1 and ph.N == 2  # Phillip = a 1-slice grid
     n_student_leaves = len(tree.flatten(worker.student._neutral_encoded))
     for tr in imit:
         # student schema everywhere (phillip rows re-encoded)

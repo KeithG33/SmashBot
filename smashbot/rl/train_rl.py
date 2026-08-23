@@ -284,28 +284,24 @@ def main() -> None:
         weights = MemberWeights(fixed)
         phillip_agent = None
         if rcfg.league_phillip:
-            # Phillip's own module, loaded ONCE (exactly as ref-envs mode
-            # does); his architecture never fits a slice, so envs that draw
-            # him are ROUTED to his agent (fixed capacity)
-            ph_policy, ph_names, _ = load_policy(rcfg.ref_ckpt, device)
+            # Phillip: his own architecture, so his own 1-slice grid (same
+            # captured-vmap path as the league; fixed capacity of cells)
+            ph_policy, ph_names, _ = load_policy(rcfg.ref_ckpt, "cpu")
             ph_policy.train_value_head = False
-            ph_policy.requires_grad_(False)
-            ph_policy.eval()
-            if args.runtime.compile:
-                mode = "reduce-overhead" if device == "cuda" else "default"
-                ph_policy.sample = torch.compile(ph_policy.sample, mode=mode)
             ph_code = resolve_name_code(ph_names, "Master Player")
             cap = rcfg.phillip_capacity or 3 * N
-            phillip_agent = BatchedPolicyAgent(
-                ph_policy, cap, name_code=ph_code, device=device,
-                batch_steps=rcfg.batch_steps, precision=rcfg.rollout_precision,
+            phillip_agent = LeagueAgent(
+                ph_policy, 1, cap, name_code=ph_code, device=device,
+                temperature=None,
+                weights_dtype=getattr(torch, rcfg.league_weights_dtype),
             )
+            phillip_agent.load_slice(0, ph_policy.state_dict())
             print(f"phillip (league member): {rcfg.ref_ckpt} "
                   f"(delay {ph_policy.delay}, name code {ph_code}, "
                   f"capacity {cap})")
         seats = LeagueSeats(
             S, N, loader=lambda s, m: grid.load_slice(s, weights.get(m)),
-            phillip_capacity=phillip_agent.num_envs if phillip_agent else 0,
+            phillip_capacity=phillip_agent.N if phillip_agent else 0,
             mover=grid.move_cell,
         )
         import random as _random
