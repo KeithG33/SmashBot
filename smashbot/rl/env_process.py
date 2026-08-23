@@ -289,6 +289,10 @@ def _env_process_main(
             try:
                 dolphin = _take_spare() or _cold_boot()
                 consecutive_boot_failures = 0
+                # the first command after a boot carries the NEXT game's
+                # seat (drawn while this game's players were being built):
+                # arm it then, exactly as a boundary would
+                arm_pending = True
             except (AlarmTimeout, dolphin_lib.ConnectFailed) as e:
                 # transient boot flakes (slow boot, console connect refusal
                 # during a 128-wide boot storm) are retriable, not fatal
@@ -425,11 +429,13 @@ def _env_process_main(
                     if controllers is None:
                         return
                     opp_next = controllers.pop("opp_next", opp_next)
-                    if boundary:
+                    if boundary or arm_pending:
                         # arm the NEXT game's opponent seat from the command
-                        # just received (one game ahead). A char lock pins
-                        # the character; a kind change makes this game the
+                        # just received (one game ahead): at every boundary
+                        # and once right after boot. A char lock pins the
+                        # character; a kind change makes this game the
                         # Dolphin's last so the recycle adopts it.
+                        arm_pending = False
                         if opp_next is not None:
                             char_lock = opp_next.get("char_lock")
                             want = opp_next.get("kind", "policy")
