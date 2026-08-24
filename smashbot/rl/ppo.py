@@ -366,6 +366,24 @@ class Learner:
         # live-caught on rl-pool-v5 (65536 -> 1024 in 1700 steps). clamp's
         # backward zeroes the saturated branch, killing both failure modes;
         # inert for healthy logits.
+        # Pre-clamp observability: max |logit| split by validity — the
+        # in-vivo check of the masked-inf diagnosis. If it holds, the
+        # masked column spikes to fp16-inf now and then while the valid
+        # column stays ~20 and loss/grads stay finite (clamp). NaN counts
+        # as a blowup (nan -> inf) so it can't hide from max().
+        with torch.no_grad():
+            vb = fixed.valid.bool()
+            v_maxs, m_maxs = [], []
+            for t in tree.flatten(out.logits):
+                a = torch.nan_to_num(
+                    t.detach().abs(), nan=float("inf"), posinf=float("inf")
+                )
+                v = vb.reshape(vb.shape + (1,) * (a.dim() - vb.dim())).expand_as(a)
+                z = torch.zeros((), dtype=a.dtype, device=a.device)
+                v_maxs.append(torch.where(v, a, z).amax())
+                m_maxs.append(torch.where(v, z, a).amax())
+            logit_absmax_valid = torch.stack(v_maxs).max().item()
+            logit_absmax_masked = torch.stack(m_maxs).max().item()
         out = out._replace(logits=tree.map_structure(
             lambda t: t.clamp(-self.LOGIT_CLAMP, self.LOGIT_CLAMP), out.logits
         ))
@@ -422,6 +440,8 @@ class Learner:
             "ratio_mean": vmean(log_rhos.exp() * valid + (1 - valid)),
             "log_rho_abs_max": raw_abs_max,
             "anomalous_samples": anomalies,
+            "logit_absmax_valid": logit_absmax_valid,
+            "logit_absmax_masked": logit_absmax_masked,
         }
         return loss, metrics
 
@@ -687,7 +707,12 @@ class Learner:
             for fixed in train_fixed:
                 loss, metrics = self._policy_loss(fixed)
                 if not torch.isfinite(loss):
-                    print("NONFINITE LOSS: skipping minibatch", flush=True)
+                    print(
+                        "NONFINITE LOSS: skipping minibatch (pre-clamp "
+                        f"|logit| valid {metrics['logit_absmax_valid']:.1f} "
+                        f"masked {metrics['logit_absmax_masked']:.1f})",
+                        flush=True,
+                    )
                     batch_metrics.append(metrics)
                     # release the skipped chunk's autograd graph NOW: kept
                     # alive into the next chunk's forward it doubles the
@@ -771,7 +796,8 @@ def _mean_dicts(dicts: tp.Sequence[dict]) -> dict:
     out = {}
     for key in dicts[0]:
         vals = [d[key] for d in dicts]
-        if key in ("actor_kl_max", "log_rho_abs_max"):
+        if key in ("actor_kl_max", "log_rho_abs_max",
+                   "logit_absmax_valid", "logit_absmax_masked"):
             out[key] = max(vals)
         elif key == "anomalous_samples":
             out[key] = sum(vals)

@@ -528,3 +528,40 @@ def test_masked_inf_logit_cannot_poison_gradients():
     for p_ in learner.policy.parameters():
         if p_.grad is not None:
             assert torch.isfinite(p_.grad).all()
+
+
+def test_logit_absmax_probe_attributes_blowups_to_the_right_column():
+    """The pre-clamp diagnostic must report an inf poked at a masked
+    position in logit_absmax_masked (inf), leave logit_absmax_valid
+    finite, and count a NaN as a blowup rather than hiding it."""
+    torch.manual_seed(0)
+    learner, traj = _make_learner(
+        learning_rate=1e-3, ppo=PPOConfig(max_mean_actor_kl=1e9)
+    )
+    fixed, _, _ = learner._fixed_pass(traj, learner.initial_state(3))
+    if not bool((fixed.valid == 0).any()):
+        fixed = fixed._replace(valid=fixed.valid.clone())
+        fixed.valid[0, 0] = 0.0
+    orig_unroll = learner.policy.unroll
+
+    def poison(value):
+        def poisoned_unroll(frames, st, **kw):
+            out = orig_unroll(frames, st, **kw)
+            b, t = (fixed.valid == 0).nonzero()[0].tolist()
+            leaves = tree.flatten(out.logits)
+            poked = leaves[0].clone()
+            poked[b, t, 0] = value
+            leaves[0] = poked
+            return out._replace(logits=tree.unflatten_as(out.logits, leaves))
+        return poisoned_unroll
+
+    # clean pass: both columns finite and modest
+    _, clean = learner._policy_loss(fixed)
+    assert clean["logit_absmax_valid"] < 1e3
+    assert clean["logit_absmax_masked"] < 1e3
+    for bad in (float("inf"), float("nan")):
+        learner.policy.unroll = poison(bad)
+        _, metrics = learner._policy_loss(fixed)
+        assert metrics["logit_absmax_masked"] == float("inf"), bad
+        assert metrics["logit_absmax_valid"] < 1e3, bad
+    learner.policy.unroll = orig_unroll
