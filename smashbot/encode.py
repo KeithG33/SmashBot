@@ -232,20 +232,49 @@ def layout_of(struct) -> list:
 
 
 def unflatten_typed_torch(struct_template, layout, bools, ints, floats):
-    """Rebuild a batched struct [N, ...] from the three batched flat tensors
-    ([N, L_kind], already on the target device). Int leaves come back as
-    int64, bools as bool, floats as float32 — the learner's conventions."""
+    """Rebuild a batched struct [*leading, ...] from the three batched flat
+    tensors ([*leading, L_kind], already on the target device; any number of
+    leading dims). Int leaves come back as int64, bools as bool, floats as
+    float32 — the learner's conventions. One kernel (the int64 cast); every
+    leaf is a view."""
     import tree
 
-    src = {"bool": bools, "int": ints, "float": floats}
-    n = bools.shape[0] if bools.numel() else (ints.shape[0] if ints.numel() else floats.shape[0])
+    src = {"bool": bools, "int": ints.long(), "float": floats}
+    lead = tuple(bools.shape[:-1])
     leaves = []
     for kind, off, size, shape in layout:
-        t = src[kind][:, off:off + size].reshape((n,) + shape)
-        if kind == "int":
-            t = t.long()
-        leaves.append(t)
+        leaves.append(src[kind][..., off:off + size].reshape(lead + shape))
     return tree.unflatten_as(struct_template, leaves)
+
+
+def swap_perm(struct_template, layout) -> dict:
+    """Per-kind column permutations implementing the p0 <-> p1 perspective
+    swap AT THE FLAT LEVEL: applying them to the typed flat tensors equals
+    swapping the players in the struct (bit-exact — it is a permutation).
+    Returns {"bool"/"int"/"float": np.ndarray | None} (None = identity)."""
+    import tree
+
+    paths = [p for p, _ in tree.flatten_with_path(struct_template)]
+    assert len(paths) == len(layout)
+    sizes = {"bool": 0, "int": 0, "float": 0}
+    for kind, off, size, _ in layout:
+        sizes[kind] = max(sizes[kind], off + size)
+    perm = {k: np.arange(n) for k, n in sizes.items()}
+    spans = {}  # (player, suffix) -> (kind, off, size)
+    for path, (kind, off, size, _shape) in zip(paths, layout):
+        if path and path[0] in ("p0", "p1"):
+            spans[(path[0], path[1:])] = (kind, off, size)
+    for (player, suffix), (kind, off, size) in spans.items():
+        if player != "p0":
+            continue
+        okind, ooff, osize = spans[("p1", suffix)]
+        assert okind == kind and osize == size, suffix
+        perm[kind][off:off + size] = np.arange(ooff, ooff + size)
+        perm[kind][ooff:ooff + size] = np.arange(off, off + size)
+    return {
+        k: (None if np.array_equal(p_, np.arange(len(p_))) else p_)
+        for k, p_ in perm.items()
+    }
 
 
 # ---------------------------------------------------------------------------

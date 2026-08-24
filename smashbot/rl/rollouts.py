@@ -545,10 +545,12 @@ class DolphinRolloutWorker:
                 raise RuntimeError(f"env {i} died") from e
         return payloads
 
-    def _encode(self, games: list) -> tp.Any:
+    def _encode_flats(self, games: list) -> tuple:
         """games: per-env (bools, ints, floats) flat vectors of the ALREADY
         encoded frame (encode.flatten_typed, env-side). Three stacks, three
-        host->GPU copies, then split back into the struct on the GPU."""
+        host->GPU copies; view construction stays at the flat level (see
+        _flat_view) so perspective swaps, seat mixes and row gathers are a
+        handful of whole-tensor kernels instead of ~120 per-leaf launches."""
         import numpy as np
 
         from smashbot import encode
@@ -563,21 +565,38 @@ class DolphinRolloutWorker:
             with torch.random.fork_rng(devices=[]):
                 self._game_template = embed_lib.EmbedConfig().make_game_embedding().dummy()
             self._game_layout = encode.layout_of(self._game_template)
-        b, i, f = (
+            self._swap_perm = {
+                k: (None if p is None else torch.from_numpy(p).to(device))
+                for k, p in encode.swap_perm(
+                    self._game_template, self._game_layout
+                ).items()
+            }
+        return tuple(
             torch.from_numpy(np.stack([g[k] for g in games])).to(device, non_blocking=True)
             for k in range(3)
         )
-        return encode.unflatten_typed_torch(self._game_template, self._game_layout, b, i, f)
 
-    def _group_view(self, name, opponent_view):
-        """The group's rows of the opponent view, as zero-copy slices."""
-        idx = self.groups[name]
-        lo, hi = idx[0], idx[-1] + 1
-        return tree.map_structure(lambda x: x[lo:hi], opponent_view)
+    _KINDS = ("bool", "int", "float")
 
-    @staticmethod
-    def _swap_perspective(game):
-        return game._replace(p0=game.p1, p1=game.p0)
+    def _swap_flats(self, flats: tuple) -> tuple:
+        """p0 <-> p1 perspective swap as a column permutation (bit-exact)."""
+        return tuple(
+            t if self._swap_perm[k] is None else t.index_select(-1, self._swap_perm[k])
+            for k, t in zip(self._KINDS, flats)
+        )
+
+    def _flat_view(self, flats: tuple, rows=None, lead=None) -> tp.Any:
+        """Struct view of the flat tensors: optional row gather (index
+        tensor) and leading reshape, then one unflatten (views)."""
+        from smashbot import encode
+
+        if rows is not None:
+            flats = tuple(t.index_select(0, rows) for t in flats)
+        if lead is not None:
+            flats = tuple(t.view(*lead, t.shape[-1]) for t in flats)
+        return encode.unflatten_typed_torch(
+            self._game_template, self._game_layout, *flats
+        )
 
     def _reencode_record(self, rec: FrameRecord, embed=None) -> FrameRecord:
         """Opponent-seat record -> student schema: actions re-encoded through
@@ -813,32 +832,26 @@ class DolphinRolloutWorker:
 
             # ---- INFER: encode, every forward, append to the queues
             games = [p["game"] for p in payloads]
-            encoded = self._encode(games)
+            flats = self._encode_flats(games)
             prof and prof.lap("rewards+encode", t0)
-            # perspective swap commutes with encoding: both seat views are
-            # pointer swaps of one encoded struct. The parser fixes p0=port1;
-            # each agent must see ITSELF as p0, so seat-2 envs get the
-            # swapped view (per-leaf where over the seat mask).
-            swapped = encoded._replace(p0=encoded.p1, p1=encoded.p0)
-            seat2 = self.seat2.to(device)
-
-            def mix(a, b, mask):  # a where mask else b, per leaf
-                return tree.map_structure(
-                    lambda x, y: torch.where(
-                        mask.view(-1, *([1] * (x.dim() - 1))), x, y
-                    ),
-                    a, b,
-                )
-
-            opponent_view = mix(encoded, swapped, seat2)
+            # perspective swap commutes with encoding: the parser fixes
+            # p0=port1; each agent must see ITSELF as p0, so seat-2 envs
+            # get the swapped columns. All view construction happens on the
+            # THREE flat tensors (a few whole-tensor kernels), structs are
+            # built as views at the end (_flat_view).
+            swapped = self._swap_flats(flats)
+            seat2 = self.seat2.to(device)[:, None]
+            opp_flats = tuple(
+                torch.where(seat2, a, b) for a, b in zip(flats, swapped)
+            )
             # learner rows: primary seats of every dolphin + the second seat
             # of each self-play dolphin, all served by ONE student forward
             rows_dev = row_dolphin.to(device)
-            rowsel = lambda s: tree.map_structure(
-                lambda x: x.index_select(0, rows_dev), s
-            )
-            row_seat2 = self.row_seat2.to(device)
-            student_view = mix(rowsel(swapped), rowsel(encoded), row_seat2)
+            row_seat2 = self.row_seat2.to(device)[:, None]
+            student_view = self._flat_view(tuple(
+                torch.where(row_seat2, a.index_select(0, rows_dev), b.index_select(0, rows_dev))
+                for a, b in zip(swapped, flats)
+            ))
             resets_dev = resets.to(device)
             pending_resets.append(resets_dev)
             t0 = prof.t() if prof else None
@@ -854,10 +867,7 @@ class DolphinRolloutWorker:
             harvest: dict[str, tuple] = {}  # key -> (rows, resets, records)
             if self.league_idx:
                 # ---- the grid: gather every cell's env view, one forward
-                gv = tree.map_structure(
-                    lambda x: x.index_select(0, cell_env).view(grid.S, grid.N, *x.shape[1:]),
-                    opponent_view,
-                )
+                gv = self._flat_view(opp_flats, rows=cell_env, lead=(grid.S, grid.N))
                 prof and prof.lap("grid_gather", t0)
                 t0 = prof.t() if prof else None
                 prof and grid._timer_reset()
@@ -866,16 +876,15 @@ class DolphinRolloutWorker:
                 prof and prof.lap("grid_infer", t0)
                 t0 = prof.t() if prof else None
                 if ph is not None:
-                    pv = tree.map_structure(
-                        lambda x: x.index_select(0, ph_env).view(1, ph.N, *x.shape[1:]),
-                        opponent_view,
-                    )
+                    pv = self._flat_view(opp_flats, rows=ph_env, lead=(1, ph.N))
                     rec = ph.infer(pv, ph_reset.view(1, ph.N))
                     harvest["phillip"] = (ph_rows, ph_reset, [rec])
                 prof and prof.lap("phillip_infer", t0)
                 t0 = prof.t() if prof else None
             for name, idx in group_live.items():
-                group_view = self._group_view(name, opponent_view)
+                group_view = self._flat_view(
+                    tuple(t[idx[0]:idx[-1] + 1] for t in opp_flats)
+                )
                 g_records, _ = self.opponents[name].infer(
                     group_view, resets_dev[idx[0]:idx[-1] + 1], want_snapshot=False,
                 )

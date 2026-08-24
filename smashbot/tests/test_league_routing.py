@@ -619,3 +619,42 @@ def test_single_slice_grid_matches_vmap_grid():
         rows2, rec2 = two.step(v2, r2)
         assert np.array_equal(rows1, rows2[:3]), f"frame {t}"
         assert torch.equal(rec1.name, rec2.name[:3])
+
+
+def test_flat_view_construction_matches_struct_path():
+    """swap_perm + unflatten views == the struct-level swap/mix/gather,
+    bit for bit (they are permutations of the same data)."""
+    from smashbot import embed as embed_lib, encode
+
+    game = embed_lib.EmbedConfig().make_game_embedding()
+    with torch.random.fork_rng(devices=[]):
+        tmpl = game.dummy()
+    layout = encode.layout_of(tmpl)
+    perm = encode.swap_perm(tmpl, layout)
+    rng = np.random.default_rng(0)
+    D = 6
+    raws = [_rand_raw_game(game, (), rng) for _ in range(D)]
+    flats_np = [encode.flatten_typed(game.from_state(r)) for r in raws]
+    flats = tuple(
+        torch.from_numpy(np.stack([f[k] for f in flats_np])) for k in range(3)
+    )
+    struct = encode.unflatten_typed_torch(tmpl, layout, *flats)
+    # 1) swap: permuted columns == struct-level player swap
+    swapped_flat = tuple(
+        t if perm[k] is None else t[:, torch.from_numpy(perm[k])]
+        for k, t in zip(("bool", "int", "float"), flats)
+    )
+    swapped_struct = struct._replace(p0=struct.p1, p1=struct.p0)
+    got = encode.unflatten_typed_torch(tmpl, layout, *swapped_flat)
+    for a, b in zip(tree.flatten(got), tree.flatten(swapped_struct)):
+        assert torch.equal(a, b)
+    # 2) leading reshape: [2, 3, ...] views match row slicing
+    idx = torch.tensor([3, 1, 4, 0, 2, 5])
+    lead = encode.unflatten_typed_torch(
+        tmpl, layout, *(t.index_select(0, idx).view(2, 3, -1) for t in flats)
+    )
+    flat_rows = encode.unflatten_typed_torch(
+        tmpl, layout, *(t.index_select(0, idx) for t in flats)
+    )
+    for a, b in zip(tree.flatten(lead), tree.flatten(flat_rows)):
+        assert torch.equal(a.reshape(6, *a.shape[2:]), b)
