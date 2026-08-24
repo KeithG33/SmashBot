@@ -295,7 +295,6 @@ def main() -> None:
                 temperature=None,
                 weights_dtype=getattr(torch, rcfg.league_weights_dtype),
             )
-            phillip_agent.load_slice(0, ph_policy.state_dict())
             print(f"phillip (league member): {rcfg.ref_ckpt} "
                   f"(delay {ph_policy.delay}, name code {ph_code}, "
                   f"capacity {cap})")
@@ -454,9 +453,9 @@ def main() -> None:
                     log.get(f"rl/{k}/games_played", 0)
                     for k in ("cpu", "teacher", "snapshot", "reference", "self")
                 )
-                # Ticker categories come from the SAME ledger the auction
+                # Ticker categories come from the SAME ledger the draw
                 # uses (pfsp decayed counts — user: "log what is in our
-                # json"), so a member's ticker % IS its auction basis.
+                # json"), so a member's ticker % IS its draw basis.
                 # '--' = no league-era games yet. SP (self-play) has no
                 # payoff row; it stays the tracker's ~50% health gauge.
                 # kill@/die@ + per-kind EMAs remain in wandb only.

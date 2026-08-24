@@ -175,7 +175,7 @@ class RolloutConfig:
     def import_members(self) -> dict[str, tuple[str, str]]:
         """Parsed league_imports: {NAME: (path, char_lock)}. Bad entries
         fail loudly (a silently dropped import would serve nothing and skew
-        the auction)."""
+        the per-match draw)."""
         out: dict[str, tuple[str, str]] = {}
         for entry in self.league_imports:
             name, eq, rest = entry.partition("=")

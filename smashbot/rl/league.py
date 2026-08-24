@@ -332,6 +332,10 @@ class League:
         """First members for `envs` (every member once, then draws) and
         seats for them. Returns env -> char lock for the cold boot."""
         picks = self.pool.boot_draws(self.rng, len(envs))
+        assert len(picks) == len(envs), (
+            f"league has nothing to draw for {len(envs)} envs — seed the "
+            f"snapshot archive before booting the worker"
+        )
         locks: dict[int, str | None] = {}
         for env, m in zip(envs, picks):
             seat = self.seats.place(env, m)

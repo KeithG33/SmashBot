@@ -254,7 +254,7 @@ class SnapshotPool:
 
     def category_estimates(self) -> dict[str, tuple[float, float] | None]:
         """Ticker-facing (decayed_rate, raw_lifetime_rate) pairs from the
-        SAME ledger the auction uses. 'ghosts' pools across all archive
+        SAME ledger the per-match draw uses. 'ghosts' pools across all archive
         rows (a rate over the league's actual serving mix); members with
         no games -> None."""
         out: dict[str, tuple[float, float] | None] = {}

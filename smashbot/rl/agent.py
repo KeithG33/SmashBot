@@ -345,7 +345,8 @@ class LeagueAgent:
         # The policy has tied parameters (one item MLP shared across item
         # slots and between the game/state-action embeddings) and
         # functional_call under vmap leaves a tied template holding an
-        # escaped BatchedTensor — live-caught at the first park.
+        # escaped BatchedTensor — live-caught in the pre-routing design's
+        # first weight-park, and inherent to tied modules under vmap.
         self._template = copy.deepcopy(template).to("cpu")
         self._template.__dict__.pop("sample", None)  # any compiled wrapper
         self._template.requires_grad_(False).eval()
