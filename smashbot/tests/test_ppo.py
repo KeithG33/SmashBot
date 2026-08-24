@@ -565,3 +565,27 @@ def test_logit_absmax_probe_attributes_blowups_to_the_right_column():
         assert metrics["logit_absmax_masked"] == float("inf"), bad
         assert metrics["logit_absmax_valid"] < 1e3, bad
     learner.policy.unroll = orig_unroll
+
+
+def test_inf_stored_logits_cannot_make_loss_nonfinite():
+    """A rare fp16 inf/NaN in the STORED sample-time logits is a loss
+    CONSTANT (no grad path) but un-sanitized turns the loss nonfinite
+    through the KL terms (the post-clamp skip events live-caught on
+    rl-pool-v5). _fixed_pass must sanitize stored logits so the loss and
+    gradients stay finite."""
+    torch.manual_seed(0)
+    for bad in (float("inf"), float("-inf"), float("nan")):
+        learner, traj = _make_learner(
+            learning_rate=1e-3, ppo=PPOConfig(max_mean_actor_kl=1e9)
+        )
+        tree.flatten(traj.actions.logits)[0][0, 0, 0] = bad
+        fixed, _, _ = learner._fixed_pass(traj, learner.initial_state(3))
+        for t in tree.flatten((fixed.actor_logits, fixed.teacher_logits)):
+            assert torch.isfinite(t).all(), bad
+        loss, _ = learner._policy_loss(fixed)
+        assert torch.isfinite(loss), bad
+        learner.policy_optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        for p_ in learner.policy.parameters():
+            if p_.grad is not None:
+                assert torch.isfinite(p_.grad).all(), bad

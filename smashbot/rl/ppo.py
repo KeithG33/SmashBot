@@ -317,11 +317,19 @@ class Learner:
         actor_actions = tree.map_structure(
             lambda t: t[:, 1:], traj.actions.controller_state
         )
-        # Rollout/inference precision is untouched by fp16 mode: these are
-        # sample-time fp32 logits, and the log_prob math bottoms out in ops
-        # autocast pins to fp32 — the fidelity probe measured exactly this
-        # rollout-fp32/learner-fp16 combination and the ratio_mean==1
-        # invariant held (dev 8.2e-4, inside tol — fp32's own dev was 9.7e-4).
+        # Stored/frozen logits are loss CONSTANTS (no grad path), but under
+        # rollout_precision=fp16 the sample-time logits are produced and
+        # stored fp16, and the teacher unroll above runs fp16 autocast — a
+        # rare inf in either turns the loss nonfinite (inf * 0-valid = NaN),
+        # live-caught as post-clamp skip events on rl-pool-v5. Sanitize once
+        # per batch; ±LOGIT_CLAMP clears real logits (~125 max) by ~4x.
+        # (The fidelity probe validated this rollout/learner precision
+        # pairing: ratio_mean==1 held, dev 8.2e-4 vs fp32's own 9.7e-4.)
+        san = lambda t: torch.nan_to_num(
+            t, nan=0.0, posinf=self.LOGIT_CLAMP, neginf=-self.LOGIT_CLAMP
+        )
+        actor_logits = tree.map_structure(san, actor_logits)
+        teacher_logits = tree.map_structure(san, teacher_out.logits)
         with self._autocast(), torch.no_grad():
             actor_log_probs = self._ops.log_prob(actor_logits, actor_actions)
 
@@ -329,7 +337,7 @@ class Learner:
             frames=frames,
             initial_policy_state=initial_policy_state,
             advantages=value_out.advantages,
-            teacher_logits=teacher_out.logits,
+            teacher_logits=teacher_logits,
             actor_logits=actor_logits,
             actor_log_probs=actor_log_probs,
             valid=(~traj.is_resetting[:, 1:]).float(),
@@ -353,7 +361,12 @@ class Learner:
         with self._autocast():
             return self._policy_loss_inner(fixed)
 
-    LOGIT_CLAMP = 50.0  # real logits stay under ~20; only fp16 blowups hit it
+    # Live-measured (rl-pool-v5 probe): real |logit| maxes sit at ~110-125
+    # per batch (confidently-off components), drifting up as entropy falls.
+    # 500 clears any plausible drift while fp16 blowups (inf / ~65504) still
+    # die; the original 50 was safe too (saturated tails carry ~0 gradient)
+    # but sat below the real tail.
+    LOGIT_CLAMP = 500.0
 
     def _policy_loss_inner(self, fixed: _Fixed) -> tuple[torch.Tensor, dict]:
         cfg = self.config
