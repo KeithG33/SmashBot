@@ -437,6 +437,14 @@ def main() -> None:
                         )
                         log[f"rl/pfsp/{tag}_winrate"] = h
                         log[f"rl/pfsp/{tag}_envs"] = held[cname]
+                    # per-ghost winrates: the sawtooth Keith reads (each
+                    # new ghost joins near parity and pulls the class mean
+                    # down; old ghosts drift toward beaten)
+                    for g_path in snapshot_pool.archive:
+                        g_step = snapshot_pool._step_of(g_path)
+                        log[f"rl/pfsp/ghost_{g_step:07d}_winrate"] = (
+                            snapshot_pool.win_estimate(g_path)
+                        )
                     lg = worker.league
                     log["rl/league/fallback_rate"] = lg.fallback_rate
                     log["rl/league/draws"] = lg.draws
