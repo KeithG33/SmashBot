@@ -353,11 +353,22 @@ class Learner:
         with self._autocast():
             return self._policy_loss_inner(fixed)
 
+    LOGIT_CLAMP = 50.0  # real logits stay under ~20; only fp16 blowups hit it
+
     def _policy_loss_inner(self, fixed: _Fixed) -> tuple[torch.Tensor, dict]:
         cfg = self.config
         out = self.policy.unroll(
             fixed.frames, fixed.initial_policy_state, discount=cfg.discount
         )
+        # NaN-grad armor: a rare fp16 inf logit at a MASKED position keeps
+        # the loss finite (x valid) but still poisons backward (0 cotangent
+        # x inf jacobian = NaN) — the scale-independent GradScaler halvings
+        # live-caught on rl-pool-v5 (65536 -> 1024 in 1700 steps). clamp's
+        # backward zeroes the saturated branch, killing both failure modes;
+        # inert for healthy logits.
+        out = out._replace(logits=tree.map_structure(
+            lambda t: t.clamp(-self.LOGIT_CLAMP, self.LOGIT_CLAMP), out.logits
+        ))
 
         valid = fixed.valid
         n_valid = valid.sum().clamp(min=1.0)
@@ -516,7 +527,9 @@ class Learner:
                 self.policy.initial_state(batch_size, imf.valid.device),
                 discount=self.config.discount,
             )
-            return -(imf.weights * out.log_probs * imf.valid).sum() / total_valid
+            # masked-position NaN-grad armor (see _policy_loss_inner)
+            logp = out.log_probs.clamp(-1e4, 0.0)
+            return -(imf.weights * logp * imf.valid).sum() / total_valid
 
     @staticmethod
     def _imit_chunks(imf: _ImitFixed, chunk_rows: int) -> list:

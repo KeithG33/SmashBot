@@ -490,3 +490,41 @@ def test_nonfinite_chunk_graph_released_before_next_forward():
         for a, b in zip(before, learner.policy.parameters())
     )
     assert moved  # the finite chunk trained
+
+
+def test_masked_inf_logit_cannot_poison_gradients():
+    """A rare inf logit at a position the valid mask excludes must not NaN
+    the gradients: the loss ignores the value AND backward stays finite
+    (the un-armored path gives loss finite / grads NaN — the GradScaler
+    stair-step live-caught on rl-pool-v5)."""
+    torch.manual_seed(0)
+    learner, traj = _make_learner(
+        learning_rate=1e-3, ppo=PPOConfig(max_mean_actor_kl=1e9)
+    )
+    fixed, _, _ = learner._fixed_pass(traj, learner.initial_state(3))
+    orig_unroll = learner.policy.unroll
+
+    def poisoned_unroll(frames, st, **kw):
+        out = orig_unroll(frames, st, **kw)
+        # inf logit at a masked position (valid == 0 there)
+        fixed_valid = fixed.valid
+        b, t = (fixed_valid == 0).nonzero()[0].tolist() if bool((fixed_valid == 0).any()) else (0, 0)
+        leaf = tree.flatten(out.logits)[0]
+        poked = leaf.clone()
+        poked[b, t, 0] = float("inf")
+        leaves = tree.flatten(out.logits)
+        leaves[0] = poked
+        return out._replace(logits=tree.unflatten_as(out.logits, leaves))
+
+    learner.policy.unroll = poisoned_unroll
+    # force a masked position to exist
+    if not bool((fixed.valid == 0).any()):
+        fixed = fixed._replace(valid=fixed.valid.clone())
+        fixed.valid[0, 0] = 0.0
+    loss, metrics = learner._policy_loss(fixed)
+    assert torch.isfinite(loss)
+    learner.policy_optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    for p_ in learner.policy.parameters():
+        if p_.grad is not None:
+            assert torch.isfinite(p_.grad).all()
