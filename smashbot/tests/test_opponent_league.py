@@ -1265,3 +1265,16 @@ def test_pfsp_hard_frac_blend_serves_unbeatable(tmp_path):
     assert "phillip" in picks  # hard draws bring him back
 
 
+
+
+def test_keep_zero_never_prunes(tmp_path):
+    """keep<=0 = immortal archive: save far past any cap, nothing pruned,
+    payoff rows all intact."""
+    from smashbot.rl.pool import SnapshotPool
+
+    pool = SnapshotPool(str(tmp_path), keep=0)
+    policy = _tiny_policy()
+    for step in range(250, 250 * 41, 250):
+        pool.save(policy, step)
+    assert len(pool.archive) == 40
+    assert all(os.path.exists(p) for p in pool.archive)

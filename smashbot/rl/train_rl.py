@@ -253,6 +253,7 @@ def main() -> None:
               f"name code {ref_code})")
     snapshot_pool = SnapshotPool(
         f"{args.runtime.run_dir}/{args.runtime.tag}/snapshots",
+        keep=rcfg.snapshot_keep,
         pfsp=rcfg.pfsp, pfsp_p=rcfg.pfsp_p,
         pfsp_hard_frac=rcfg.pfsp_hard_frac, pfsp_explore=rcfg.pfsp_explore,
         league_members=league,
@@ -281,7 +282,11 @@ def main() -> None:
         fixed = {"teacher": {k: v.detach().cpu() for k, v in teacher.state_dict().items()}}
         for key, (path, _char) in import_registry.items():
             fixed[key] = torch.load(path, map_location="cpu")
-        weights = MemberWeights(fixed)
+        # cache every ghost the archive can hold (fixed members live
+        # outside the LRU); effectively unbounded when pruning is off
+        weights = MemberWeights(fixed, lru=(
+            10 ** 6 if rcfg.snapshot_keep <= 0 else max(16, rcfg.snapshot_keep)
+        ))
         phillip_agent = None
         if rcfg.league_phillip:
             # Phillip: his own architecture, so his own 1-slice grid (same

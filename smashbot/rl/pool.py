@@ -336,6 +336,8 @@ class SnapshotPool:
         the earliest snapshot persists as the log-spacing anchor. It rarely
         actually serves games: PFSP weights keep ancient snapshots to a
         tiny fraction of draws."""
+        if self.keep <= 0:  # <=0: immortal archive, never prune
+            return
         recent = min(8, self.keep // 2)
         while len(self.archive) > self.keep:
             olds = self.archive[:-recent] if recent else list(self.archive)

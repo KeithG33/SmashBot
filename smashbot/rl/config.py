@@ -98,6 +98,7 @@ class RolloutConfig:
     phillip_capacity: int = 0
     main12_prob: float = 0.6
     snapshot_interval: int = 500  # learner steps between student snapshots
+    snapshot_keep: int = 30  # ghost archive cap; <=0 = never prune
     partition_seed: int = 0
     headless: bool = True  # False: rendered window at normal speed (watch mode)
     log_tag: str = ""  # namespaces /tmp/smashbot-env-*.log between runs
