@@ -454,6 +454,14 @@ def main() -> None:
                     log["rl/league/compactions"] = lg.seats.compactions
                 for kind, tracker in worker.trackers.items():
                     for k, v in tracker.stats().items():
+                        # win_rate(_ema) for ledger-covered categories
+                        # duplicates rl/pfsp/class_* (which is prior-free
+                        # and PFSP-authoritative) — skip to halve the
+                        # winrate panel count. Self-play keeps its EMA
+                        # (no payoff row); kill@/die@ stats always kept.
+                        if (league_envs and kind != "self"
+                                and k in ("win_rate", "win_rate_ema")):
+                            continue
                         log[f"rl/{kind}/{k}"] = v
                 log["rl/frames_per_sec"] = frames / (time.time() - t0)
                 wandb.log(log, step=i)
