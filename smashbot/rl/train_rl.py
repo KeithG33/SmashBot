@@ -419,30 +419,25 @@ def main() -> None:
                     log["rl/imitation/traj_count"] = im["traj_count"]
                     log["rl/imitation/lambda"] = im["lambda"]
                 if league_envs:
-                    # class view of the two-stage PFSP: per-class hardness
-                    # and how many league envs each class is fighting NOW.
-                    # Imports log as rl/pfsp/import_{NAME}_* — the
-                    # import_..._winrate row IS the cross-generation
-                    # progress bar (are we beating the old model yet?)
+                    # per-category ledger winrate + current env share;
+                    # per-import and per-ghost series nest in their class
                     hard = snapshot_pool.class_hardness()
                     held = {c: 0 for c in ("phillip", "teacher", "cpu",
                                            "ghosts", *hard)}
                     for m in worker.league.member_now.values():
                         held[m if m in held else "ghosts"] += 1
                     for cname, h in hard.items():
-                        tag = (
-                            f"import_{cname[len('import:'):]}"
-                            if cname.startswith("import:")
-                            else f"class_{cname}"
-                        )
-                        log[f"rl/pfsp/{tag}_winrate"] = h
-                        log[f"rl/pfsp/{tag}_envs"] = held[cname]
-                    # per-ghost winrates: the sawtooth Keith reads (each
-                    # new ghost joins near parity and pulls the class mean
-                    # down; old ghosts drift toward beaten)
+                        if cname.startswith("import:"):
+                            name = cname[len("import:"):]
+                            log[f"rl/imports/{name}"] = h
+                            log[f"rl/imports/{name}_envs"] = held[cname]
+                        else:
+                            c = "snapshots" if cname == "ghosts" else cname
+                            log[f"rl/{c}/winrate"] = h
+                            log[f"rl/{c}/envs"] = held[cname]
                     for g_path in snapshot_pool.archive:
                         g_step = snapshot_pool._step_of(g_path)
-                        log[f"rl/pfsp/ghost_{g_step:07d}_winrate"] = (
+                        log[f"rl/snapshots/s{g_step:07d}"] = (
                             snapshot_pool.win_estimate(g_path)
                         )
                     lg = worker.league
@@ -453,19 +448,28 @@ def main() -> None:
                     log["rl/league/slice_loads"] = lg.seats.loads
                     log["rl/league/compactions"] = lg.seats.compactions
                 for kind, tracker in worker.trackers.items():
+                    # tracker kinds share the ledger's category namespace
+                    kname = (
+                        {"snapshot": "snapshots", "reference": "phillip"}
+                        .get(kind, kind) if league_envs else kind
+                    )
                     for k, v in tracker.stats().items():
-                        # ledger (rl/pfsp/class_*) already covers these;
-                        # self keeps its EMA (no payoff row)
+                        # ledger winrate already covers these; self keeps
+                        # its EMA (no payoff row)
                         if (league_envs and kind != "self"
                                 and k in ("win_rate", "win_rate_ema",
                                           "win_rate_recent")):
                             continue
-                        log[f"rl/{kind}/{k}"] = v
+                        log[f"rl/{kname}/{k}"] = v
                 log["rl/frames_per_sec"] = frames / (time.time() - t0)
                 wandb.log(log, step=i)
                 games = sum(
                     log.get(f"rl/{k}/games_played", 0)
-                    for k in ("cpu", "teacher", "snapshot", "reference", "self")
+                    for k in (
+                        ("cpu", "teacher", "snapshots", "phillip", "self")
+                        if league_envs
+                        else ("cpu", "teacher", "snapshot", "reference", "self")
+                    )
                 )
                 # Ticker categories come from the SAME ledger the draw
                 # uses (pfsp decayed counts — user: "log what is in our
