@@ -317,14 +317,8 @@ class Learner:
         actor_actions = tree.map_structure(
             lambda t: t[:, 1:], traj.actions.controller_state
         )
-        # Stored/frozen logits are loss CONSTANTS (no grad path), but under
-        # rollout_precision=fp16 the sample-time logits are produced and
-        # stored fp16, and the teacher unroll above runs fp16 autocast — a
-        # rare inf in either turns the loss nonfinite (inf * 0-valid = NaN),
-        # live-caught as post-clamp skip events on rl-pool-v5. Sanitize once
-        # per batch; ±LOGIT_CLAMP clears real logits (~125 max) by ~4x.
-        # (The fidelity probe validated this rollout/learner precision
-        # pairing: ratio_mean==1 held, dev 8.2e-4 vs fp32's own 9.7e-4.)
+        # Stored fp16 logits (sample-time + teacher) feed the KLs as
+        # constants; sanitize rare inf/NaN so the loss stays finite.
         san = lambda t: torch.nan_to_num(
             t, nan=0.0, posinf=self.LOGIT_CLAMP, neginf=-self.LOGIT_CLAMP
         )
@@ -361,29 +355,15 @@ class Learner:
         with self._autocast():
             return self._policy_loss_inner(fixed)
 
-    # Live-measured (rl-pool-v5 probe): real |logit| maxes sit at ~110-125
-    # per batch (confidently-off components), drifting up as entropy falls.
-    # 500 clears any plausible drift while fp16 blowups (inf / ~65504) still
-    # die; the original 50 was safe too (saturated tails carry ~0 gradient)
-    # but sat below the real tail.
-    LOGIT_CLAMP = 500.0
+    LOGIT_CLAMP = 500.0  # real |logit| max ~125; kills only fp16 blowups
 
     def _policy_loss_inner(self, fixed: _Fixed) -> tuple[torch.Tensor, dict]:
         cfg = self.config
         out = self.policy.unroll(
             fixed.frames, fixed.initial_policy_state, discount=cfg.discount
         )
-        # NaN-grad armor: a rare fp16 inf logit at a MASKED position keeps
-        # the loss finite (x valid) but still poisons backward (0 cotangent
-        # x inf jacobian = NaN) — the scale-independent GradScaler halvings
-        # live-caught on rl-pool-v5 (65536 -> 1024 in 1700 steps). clamp's
-        # backward zeroes the saturated branch, killing both failure modes;
-        # inert for healthy logits.
-        # Pre-clamp observability: max |logit| split by validity — the
-        # in-vivo check of the masked-inf diagnosis. If it holds, the
-        # masked column spikes to fp16-inf now and then while the valid
-        # column stays ~20 and loss/grads stay finite (clamp). NaN counts
-        # as a blowup (nan -> inf) so it can't hide from max().
+        # Probe: pre-clamp max |logit| split by validity (NaN counted as
+        # inf so it can't hide from max()).
         with torch.no_grad():
             vb = fixed.valid.bool()
             v_maxs, m_maxs = [], []
@@ -397,6 +377,8 @@ class Learner:
                 m_maxs.append(torch.where(v, z, a).amax())
             logit_absmax_valid = torch.stack(v_maxs).max().item()
             logit_absmax_masked = torch.stack(m_maxs).max().item()
+        # Clamp defuses inf logits at masked positions (0-cotangent x
+        # inf-jacobian NaNs backward); inert for real logits.
         out = out._replace(logits=tree.map_structure(
             lambda t: t.clamp(-self.LOGIT_CLAMP, self.LOGIT_CLAMP), out.logits
         ))
@@ -405,9 +387,8 @@ class Learner:
         n_valid = valid.sum().clamp(min=1.0)
         log_rhos = out.log_probs - fixed.actor_log_probs
         masked_abs = (log_rhos.detach().abs() * valid)
-        # NaN comparisons are False, so nonfinite values would sail through
-        # a plain >clamp check uncounted (live-caught via attract-mode demo
-        # frames). Count them as anomalies and scrub before clamping.
+        # NaN compares False, so count nonfinite as anomalies explicitly
+        # and scrub before clamping.
         nonfinite = int((~torch.isfinite(masked_abs)).sum().item())
         raw_abs_max = torch.nan_to_num(masked_abs).max().item()
         anomalies = nonfinite + int(
@@ -727,10 +708,8 @@ class Learner:
                         flush=True,
                     )
                     batch_metrics.append(metrics)
-                    # release the skipped chunk's autograd graph NOW: kept
-                    # alive into the next chunk's forward it doubles the
-                    # live activation footprint (live-caught: two weekend
-                    # OOMs, each adjacent to this message)
+                    # free the skipped chunk's graph before the next forward
+                    # (else the live activation footprint doubles)
                     del loss
                     continue
                 self._backward(loss * (float(fixed.valid.sum()) / total_valid))
@@ -761,10 +740,8 @@ class Learner:
                 cfg.max_grad_norm if cfg.max_grad_norm > 0 else float("inf"),
             )
             if not torch.isfinite(grad_norm):
-                # A finite loss can still yield nonfinite GRADIENTS (inf-inf
-                # cancellation, 0*log0 subgradients); clip_grad_norm_ does
-                # not sanitize NaN. One such step nan'd every policy weight
-                # live (step 705, rl-pool-v3). Skip the update entirely.
+                # A finite loss can still yield nonfinite gradients;
+                # clip_grad_norm_ does not sanitize NaN. Skip the update.
                 print(f"NONFINITE GRAD NORM ({grad_norm}): skipping update",
                       flush=True)
                 self.policy_optimizer.zero_grad(set_to_none=True)
