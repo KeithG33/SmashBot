@@ -677,3 +677,23 @@ def test_tracker_ema_and_persistence():
     t3 = GameTracker()
     t3.load_state({"win_ema": 0.6, "ema_alpha": 0.5, "wins": 1})
     assert t3.ema_alpha == 0.008 and t3.win_ema == 0.6
+
+
+def test_tracker_records_winrate_by_opponent_character():
+    """Per-character record: the hardest league members are all locked to
+    one character, so a rising overall winrate can be matchup-specific.
+    Draws are excluded, matching the win_rate_recent convention."""
+    from smashbot.rl.rollouts import GameTracker
+
+    t = GameTracker()
+    for _ in range(3):
+        t.add_game((4, 0), "FOX")      # 3 wins vs FOX
+    t.add_game((0, 4), "FOX")          # 1 loss vs FOX
+    t.add_game((0, 4), "MARTH")        # 1 loss vs MARTH
+    t.add_game((2, 2), "MARTH")        # draw: not counted
+    t.add_game((4, 0), None)           # unknown char: ignored
+    assert t.by_char["FOX"] == (3, 4)
+    assert t.by_char["MARTH"] == (0, 1)
+    assert set(t.by_char) == {"FOX", "MARTH"}
+    # overall bookkeeping is untouched by the new field
+    assert t.wins == 4 and t.losses == 2 and t.draws == 1

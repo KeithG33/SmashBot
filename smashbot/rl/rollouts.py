@@ -162,10 +162,19 @@ class GameTracker:
         self.ema_alpha = ema_alpha
         self.win_ema: float | None = None
         self.diff_ema: float | None = None
+        self.by_char: dict[str, tuple[int, int]] = {}
 
-    def add_game(self, final_stocks: tuple[int, int]) -> None:
+    def add_game(self, final_stocks: tuple[int, int],
+                 opp_char: str | None = None) -> None:
         bot, opp = final_stocks
         diff = bot - opp
+        # Per-opponent-CHARACTER record. The fixed yardsticks that PFSP
+        # weights hardest (the imports) are all locked to one character,
+        # so "are we getting stronger" and "are we getting better at that
+        # one matchup" are otherwise indistinguishable.
+        if opp_char and diff != 0:
+            w, g = self.by_char.get(opp_char, (0, 0))
+            self.by_char[opp_char] = (w + (1 if diff > 0 else 0), g + 1)
         self.diffs.append(diff)
         if bot > opp:
             self.wins += 1
@@ -729,7 +738,7 @@ class DolphinRolloutWorker:
                 if sp.kind == "self":
                     # both seats are the student: track the PORT-1 seat's
                     # win rate (a ~50% health metric, not a skill signal)
-                    self.trackers["self"].add_game((a, b))
+                    self.trackers["self"].add_game((a, b), p.get("opp_char"))
                     continue
                 if sp.student_port == 2:
                     a, b = b, a
@@ -739,7 +748,7 @@ class DolphinRolloutWorker:
                 kind = self._actual_kind(i, p.get("result_serving"))
                 self.trackers[
                     self._TRACKER_KIND.get(kind, kind)
-                ].add_game((a, b))
+                ].add_game((a, b), p.get("opp_char"))
                 if sp.kind == "snapshot":
                     # credit the ended game, take a seat for the drawn
                     # member, draw the one after

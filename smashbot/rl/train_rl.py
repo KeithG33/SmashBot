@@ -473,6 +473,20 @@ def main() -> None:
                                           "win_rate_recent")):
                             continue
                         log[f"rl/{kname}/{k}"] = v
+                # winrate by OPPONENT CHARACTER, pooled over every tracker:
+                # the imports PFSP weights hardest are all locked to one
+                # character, so this separates "stronger overall" from
+                # "better at that one matchup"
+                by_char: dict[str, list[int]] = {}
+                for tracker in worker.trackers.values():
+                    for ch, (w, g) in tracker.by_char.items():
+                        acc = by_char.setdefault(ch, [0, 0])
+                        acc[0] += w
+                        acc[1] += g
+                for ch, (w, g) in sorted(by_char.items()):
+                    if g >= 20:  # below that it is noise, not a signal
+                        log[f"rl/bychar/{ch}"] = w / g
+                        log[f"rl/bychar/{ch}_games"] = g
                 log["rl/frames_per_sec"] = frames / (time.time() - t0)
                 wandb.log(log, step=i)
                 games = sum(
