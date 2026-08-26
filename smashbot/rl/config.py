@@ -282,6 +282,9 @@ class RLConfig:
     # identical gradient and update, ~1/k the live activation memory
     # (rows x 240 unrolls), ~20 ms/step overhead at k=2 (measured)
     micro_batches: int = 1
+    # fp16 loss-scale doubling interval, in learner steps (torch default
+    # 2000 assumes a far higher step rate; see Learner.__init__)
+    grad_scaler_growth_interval: int = 500
     ppo: PPOConfig = dataclasses.field(default_factory=PPOConfig)
     # --- opponent advantage imitation (docs/idea-opponent-learning.md) ---
     # Harvested opponent rows trained per step ON TOP of the full PPO batch

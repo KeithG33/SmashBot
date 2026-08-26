@@ -213,9 +213,16 @@ class Learner:
         self.precision = precision
         self._amp_enabled = precision == "fp16"
         # One scaler, policy optimizer only (the value path never scales).
-        # init_scale matches the measured probe recipe (make_scaler).
+        # growth_interval is in SCALER STEPS: torch's 2000 default assumes
+        # ~10 steps/s (3 min), but we run ~126 steps/HOUR, making a doubling
+        # take ~16h — so a sparse fault rate can hold the scale down forever
+        # (v5 ratcheted 65536->1024 and never recovered). Probe upward more
+        # often; the cost of an over-high probe is one skipped update.
         self.grad_scaler = (
-            torch.amp.GradScaler(self._device_type, init_scale=2.0 ** 16)
+            torch.amp.GradScaler(
+                self._device_type, init_scale=2.0 ** 16,
+                growth_interval=config.grad_scaler_growth_interval,
+            )
             if self._amp_enabled
             else None
         )
