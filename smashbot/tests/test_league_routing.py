@@ -120,19 +120,19 @@ def test_protocol_boot_covers_members_then_draws_next():
     assert {seats.seat_of(0), seats.seat_of(1)} == {(0, 0), (1, 0)}
     assert lg.member_next == {0: "g1", 1: "g1"}  # drawn one game ahead
     assert lg.next_command(0) == {"kind": "policy", "char_lock": None}
-    assert sorted(lg.fresh_seats) == [(0, 0), (1, 0)]
+    assert sorted(lg.fresh_envs) == [0, 1]
 
 
 def test_protocol_boundary_credits_old_member_and_adopts_drawn():
     lg, pool, seats = _league(["teacher"], archive=["g1"], draws=["g1", "teacher"])
     lg.boot([0])
-    lg.fresh_seats.clear()
+    lg.fresh_envs.clear()
     assert lg.member_now[0] == "teacher" and lg.member_next[0] == "g1"
     lg.on_boundary(0, serving="policy", opp_char="MARTH", won=True)
     assert pool.results == [("teacher", True)]  # credited to who PLAYED
     assert lg.member_now[0] == "g1"
     assert seats.member_at(seats.seat_of(0)[0]) == "g1"
-    assert lg.fresh_seats == [seats.seat_of(0)]  # new game in that cell
+    assert lg.fresh_envs == [0]  # new game in that env's cell
     assert lg.member_next[0] == "teacher"  # the next draw already made
     # an undecided game is adopted but not credited
     lg.on_boundary(0, serving="policy", opp_char="FOX", won=None)
@@ -658,3 +658,37 @@ def test_flat_view_construction_matches_struct_path():
     )
     for a, b in zip(tree.flatten(lead), tree.flatten(flat_rows)):
         assert torch.equal(a.reshape(6, *a.shape[2:]), b)
+
+
+def test_fresh_envs_survive_a_compaction_in_the_same_frame():
+    """fresh entries must be ENVS, not (slice, row) coordinates: a
+    compaction triggered by a LATER boundary in the same frame relocates
+    cells, so a recorded coordinate can end up pointing at a different
+    env's seat — resetting the wrong cell and leaving the real one with a
+    stale delay queue (opponent replays the previous game's inputs)."""
+    lg, pool, seats = _league(
+        ["teacher"], archive=["a", "b", "c"], draws=["a", "b", "c"],
+        S=3, N=3,
+    )
+    envs = list(range(7))
+    lg.boot(envs)
+    lg.fresh_envs.clear()
+
+    # env 6 starts a new game; record where it sits right now
+    lg.on_boundary(6, "policy", None, True)
+    seat_before = seats.seat_of(6)
+
+    # more boundaries on other envs -> allocator pressure -> compaction may
+    # relocate env 6's cell to donate a slice
+    for e in (0, 1, 2, 3):
+        lg.on_boundary(e, "policy", None, True)
+
+    seat_after = seats.seat_of(6)
+    assert 6 in lg.fresh_envs, "env 6 must still be flagged fresh"
+    # whatever moved, resolving the env NOW gives its true seat; the
+    # coordinate captured earlier may be stale, and that was the bug
+    resolved = {e: seats.seat_of(e) for e in lg.fresh_envs}
+    assert resolved[6] == seat_after
+    if seat_after != seat_before:
+        occupant = seats.env_of_rows(seat_before[0])[seat_before[1]]
+        assert occupant != 6, "stale coordinate now belongs to someone else"

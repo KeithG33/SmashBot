@@ -425,6 +425,19 @@ def _env_process_main(
                         continue
                     p1, p2 = gs.players[1], gs.players[2]
                     last_stocks = (int(p1.stock), int(p2.stock))
+                    # libmelee reads percent as a raw float32 with no range
+                    # check. The STATE copy is wrapped to uint16 and clamped
+                    # by the embedding, but the reward reads this value raw —
+                    # so an out-of-range read is invisible in states and
+                    # enormous in the reward. Melee caps percent at 999.
+                    pcts = (float(p1.percent), float(p2.percent))
+                    if not all(0.0 <= p <= 999.0 for p in pcts):
+                        print(f"IMPLAUSIBLE PERCENT {pcts} (frame {gs.frame}): "
+                              "clamping", flush=True)
+                        pcts = tuple(
+                            min(max(p, 0.0), 999.0) if p == p else 0.0
+                            for p in pcts
+                        )
                     if _prof:
                         _t2 = time.perf_counter(); _acc["parse"] += _t2 - _t1
                     conn.send(
@@ -433,7 +446,7 @@ def _env_process_main(
                             resetting=resetting,
                             final_stocks=result,  # ended game's (port1, port2); None mid-game
                             stocks=last_stocks,
-                            percent=(float(p1.percent), float(p2.percent)),
+                            percent=pcts,
                             # opponent seat's char in the CURRENT game — the
                             # worker's imitation-harvest whitelist gate
                             opp_char=cur_opp_char,

@@ -287,9 +287,11 @@ class League:
         self.warm = warm  # e.g. MemberWeights.warm: disk read off the frame loop
         self.member_now: dict[int, str] = {}
         self.member_next: dict[int, str] = {}
-        # reset flags to raise on the league grid this frame: seats whose
-        # env changed (a new game starts in that cell)
-        self.fresh_seats: list[Seat] = []
+        # reset flags to raise on the league grid this frame: ENVS whose
+        # seat starts a new game. Envs, not coordinates: a compaction later
+        # in the same frame can relocate a cell, which would leave a stale
+        # (slice, row) pointing at someone else's seat.
+        self.fresh_envs: list[int] = []
         self.draws = 0
         self.fallbacks = 0
         # protocol mismatches the env reported vs what was asked, by kind
@@ -345,7 +347,7 @@ class League:
                 seat = self.seats.place(env, m)
                 assert seat is not None, "league grid cannot seat its boot envs"
             self.member_now[env] = m
-            self.fresh_seats.append(seat)
+            self.fresh_envs.append(env)
             locks[env] = self.lock_of(m)
             self._draw_next(env)
         return locks
@@ -377,9 +379,8 @@ class League:
         self._draw_next(env)
 
     def _keep_seat(self, env: int) -> None:
-        seat = self.seats.seat_of(env)
-        if seat is not None:
-            self.fresh_seats.append(seat)  # new game in the same cell
+        if self.seats.seat_of(env) is not None:
+            self.fresh_envs.append(env)  # new game in the same cell
 
     def _adopt(self, env: int, wanted: str, opp_char: str | None) -> None:
         self.seats.release(env)
@@ -408,7 +409,7 @@ class League:
             assert seat is not None, f"no seat for env {env} ({m})"
             self.fallbacks += 1
         self.member_now[env] = m
-        self.fresh_seats.append(seat)
+        self.fresh_envs.append(env)
 
     @property
     def warnings(self) -> int:

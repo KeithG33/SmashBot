@@ -731,9 +731,12 @@ class DolphinRolloutWorker:
                         i, p.get("opp_serving"), p.get("opp_char"),
                         (a > b) if a != b else None,
                     )
-            fresh: list = []  # league seats that start a new game this frame
+            # envs whose seat starts a new game this frame; resolved to
+            # coordinates HERE, after every boundary (and so every
+            # compaction) has been applied, so the seats cannot be stale
+            fresh: set = set()
             if league is not None:
-                fresh, league.fresh_seats = league.fresh_seats, []
+                fresh, league.fresh_envs = set(league.fresh_envs), []
             resets_d = torch.tensor([p["resetting"] for p in payloads])
             resets = resets_d[row_dolphin]  # row-level
             resets_cpu = resets_d.tolist()
@@ -744,17 +747,21 @@ class DolphinRolloutWorker:
             opp_controllers: dict[int, tp.Any] = {}
             cells, ph_rows = self._seat_tables() if self.league_idx else ([], [])
             if self.league_idx:
-                cell_env, cell_reset = self._route(cells, resets_cpu, fresh, 0)
-                for s_, n_ in [f for f in fresh if f[0] < grid.S]:
-                    grid.reset_cell(s_, n_)
+                cell_env, cell_reset = self._route(cells, resets_cpu, fresh)
+                for e_ in fresh:
+                    seat_ = league.seats.seat_of(e_)
+                    if seat_ is not None and seat_[0] < grid.S:
+                        grid.reset_cell(*seat_)
                 rows = grid.execute()
                 for r, env in enumerate(cells):
                     if env is not None:
                         opp_controllers[env] = rows[r]
                 if ph is not None:
-                    ph_env, ph_reset = self._route(ph_rows, resets_cpu, fresh, grid.S)
-                    for s_, n_ in [f for f in fresh if f[0] == grid.S]:
-                        ph.reset_cell(0, n_)
+                    ph_env, ph_reset = self._route(ph_rows, resets_cpu, fresh)
+                    for e_ in fresh:
+                        seat_ = league.seats.seat_of(e_)
+                        if seat_ is not None and seat_[0] == grid.S:
+                            ph.reset_cell(0, seat_[1])
                     ctrls = ph.execute()
                     for r, env in enumerate(ph_rows):
                         if env is not None:
@@ -935,18 +942,19 @@ class DolphinRolloutWorker:
         self._records_pushed = records_pushed
         return out + imit_out
 
-    def _route(self, rows, resets_cpu, fresh, pool_index):
+    def _route(self, rows, resets_cpu, fresh):
         """Per-row env index (idle rows read env 0: harmless, always reset)
         and reset flags for one seat pool: an env's own reset, a fresh seat
-        (new game in this row), or idle."""
+        (new game in this row), or idle. `fresh` is a set of ENVS, so this
+        is pool-agnostic — the old (pool, row) form silently matched only
+        one pool and contributed nothing on every other slice."""
         device = self.student.device
         env_idx = torch.tensor(
             [0 if e is None else e for e in rows], dtype=torch.int64, device=device
         )
-        fresh_rows = {r for p, r in fresh if p == pool_index}
         reset = torch.tensor([
-            e is None or resets_cpu[e] or r in fresh_rows
-            for r, e in enumerate(rows)
+            e is None or resets_cpu[e] or e in fresh
+            for e in rows
         ], dtype=torch.bool, device=device)
         return env_idx, reset
 
