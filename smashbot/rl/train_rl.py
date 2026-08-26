@@ -445,6 +445,13 @@ def main() -> None:
                         log[f"rl/snapshots/s{g_step:07d}"] = (
                             snapshot_pool.win_estimate(g_path)
                         )
+                    imp_est = snapshot_pool.category_estimates().get("imports")
+                    if imp_est is not None:
+                        log["rl/imports/winrate"] = imp_est[0]
+                        log["rl/imports/envs"] = sum(
+                            v for c, v in held.items()
+                            if c.startswith("import:")
+                        )
                     lg = worker.league
                     log["rl/league/fallback_rate"] = lg.fallback_rate
                     log["rl/league/draws"] = lg.draws
