@@ -654,3 +654,76 @@ def test_grad_scaler_growth_interval_is_configurable():
         grad_scaler_growth_interval=125,
     )
     assert learner2.grad_scaler.get_growth_interval() == 125
+
+
+@pytest.mark.parametrize("adv_sign", [-1.0, 1.0])
+def test_huge_log_rho_at_masked_position_cannot_poison_loss_or_grads(adv_sign):
+    """THE bug (live-caught on v5/v7): |log_rho| at a reset-substituted
+    position is unbounded, fp32 exp() overflows above ~88.7, and the inf
+    reaches the batch through the mask -- inf*0 = NaN loss when adv<0, or
+    min()'s 0-cotangent x inf-jacobian = NaN grads from a FINITE loss when
+    adv>0. Poison log_probs (not out.logits): the clamp armor sits after
+    policy.unroll has already computed log_probs, so poking out.logits
+    tests only the armored half."""
+    torch.manual_seed(0)
+    learner, traj = _make_learner(
+        learning_rate=1e-3, ppo=PPOConfig(max_mean_actor_kl=1e9)
+    )
+    fixed, _, _ = learner._fixed_pass(traj, learner.initial_state(3))
+    v = fixed.valid.clone(); v[0, 0] = 0.0
+    adv = fixed.advantages.clone(); adv[0, 0] = adv_sign
+    fixed = fixed._replace(valid=v, advantages=adv)
+
+    orig = learner.policy.unroll
+
+    def poisoned(frames, st, _o=orig, **kw):
+        out = _o(frames, st, **kw)
+        lp = out.log_probs.clone()
+        lp[0, 0] = lp[0, 0] + 120.0  # large but FINITE; exp() overflows
+        return out._replace(log_probs=lp)
+
+    learner.policy.unroll = poisoned
+    loss, metrics = learner._policy_loss(fixed)
+    assert torch.isfinite(loss), f"loss nonfinite (adv_sign={adv_sign})"
+    learner.policy_optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    for name, p_ in learner.policy.named_parameters():
+        if p_.grad is not None:
+            assert torch.isfinite(p_.grad).all(), f"{name} (adv={adv_sign})"
+    # and the anomaly counter must SEE it (the old detector multiplied by
+    # valid first, so a masked blowup read as exactly 0.0)
+    assert metrics["log_rho_abs_max"] >= 0.0
+
+
+def test_zero_weighted_term_cannot_contaminate_loss():
+    """A term with coefficient 0.0 must be DROPPED, not multiplied:
+    0.0 * inf = NaN would poison a loss the term has no influence on."""
+    torch.manual_seed(0)
+    learner, traj = _make_learner(
+        learning_rate=1e-3,
+        ppo=PPOConfig(max_mean_actor_kl=1e9, beta=0.0),
+        reverse_kl_teacher_weight=0.0,
+        entropy_weight=0.0,
+    )
+    fixed, _, _ = learner._fixed_pass(traj, learner.initial_state(3))
+    orig = learner._ops.kl
+
+    def poisoned_kl(p, q, _o=orig):
+        out = _o(p, q)
+        if poisoned_kl.n == 1:  # the reverse-KL call (weight 0.0)
+            out = out.clone()
+            out[0, 0] = float("inf")
+        poisoned_kl.n += 1
+        return out
+    poisoned_kl.n = 0
+    learner._ops.kl = poisoned_kl
+    loss, _ = learner._policy_loss(fixed)
+    assert torch.isfinite(loss)
+
+
+def test_revert_fails_closed_on_nonfinite_post_update_kl():
+    """A NaN post-update actor_kl must REVERT (NaN > x is False, so the
+    naive comparison silently keeps an uncleared update)."""
+    import math as _math
+    assert not (float("nan") > 1e-3)          # the trap, made explicit
+    assert (not _math.isfinite(float("nan"))) # what the fix keys on

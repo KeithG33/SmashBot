@@ -123,8 +123,13 @@ def compute_reward(
     """
     own_death = (stocks[:, 0] < prev_stocks[:, 0]).float()
     opp_death = (stocks[:, 1] < prev_stocks[:, 1]).float()
-    own_dmg = (percent[:, 0] - prev_percent[:, 0]).clamp(min=0)
-    opp_dmg = (percent[:, 1] - prev_percent[:, 1]).clamp(min=0)
+    # Percent reaches us as a raw libmelee read with no range check, and
+    # unlike the state path (uint16 wrap + embed clamp) nothing downstream
+    # bounds it — a garbage read would become an enormous reward while the
+    # states looked innocent. Nothing legitimately deals 100% in one frame,
+    # so cap the per-frame delta and keep |reward| <= 2 like the vendor.
+    own_dmg = (percent[:, 0] - prev_percent[:, 0]).clamp(min=0, max=100)
+    opp_dmg = (percent[:, 1] - prev_percent[:, 1]).clamp(min=0, max=100)
     reward = (opp_death - own_death) + damage_ratio * (opp_dmg - own_dmg)
     return torch.where(is_resetting, torch.zeros_like(reward), reward)
 

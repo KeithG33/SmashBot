@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import math
 import random
 import typing as tp
 
@@ -398,25 +399,47 @@ class Learner:
         ))
 
         valid = fixed.valid
+        vbool = valid.bool()
         n_valid = valid.sum().clamp(min=1.0)
         log_rhos = out.log_probs - fixed.actor_log_probs
-        masked_abs = (log_rhos.detach().abs() * valid)
-        # NaN compares False, so count nonfinite as anomalies explicitly
-        # and scrub before clamping.
-        nonfinite = int((~torch.isfinite(masked_abs)).sum().item())
-        raw_abs_max = torch.nan_to_num(masked_abs).max().item()
+        # Masked positions are the reset-substituted targets the actor never
+        # sampled; their AR teacher-forcing chains diverge, so |log_rho|
+        # there is unbounded. exp() overflows above ~88.7 and the resulting
+        # inf poisons the batch through the mask: inf*0 = NaN (loss), or
+        # min()'s 0-cotangent x inf-jacobian = NaN (grads, finite loss).
+        # where() — not a multiply — so an inf is DISCARDED, not multiplied.
+        # Measure the masked tail BEFORE discarding it: this is the
+        # quantity that has to exceed ~88.7 for the failure above, so
+        # logging it is what confirms the diagnosis in production.
+        with torch.no_grad():
+            _m = torch.nan_to_num(
+                log_rhos.detach().abs(), nan=float("inf"), posinf=float("inf")
+            )
+            z = torch.zeros((), dtype=_m.dtype, device=_m.device)
+            log_rho_masked_absmax = torch.where(vbool, z, _m).max().item()
+        log_rhos = torch.where(vbool, log_rhos, torch.zeros_like(log_rhos))
+        # Detect on the post-where tensor but BEFORE clamping, and count
+        # every position (the old code measured |log_rho|*valid, which is
+        # identically 0 at masked positions and so could never see them).
+        raw = log_rhos.detach()
+        nonfinite = int((~torch.isfinite(raw)).sum().item())
+        raw_abs_max = torch.nan_to_num(
+            raw.abs(), nan=float("inf"), posinf=float("inf")
+        ).max().item()
         anomalies = nonfinite + int(
-            (torch.nan_to_num(masked_abs) > cfg.ppo.log_rho_clamp).sum().item()
+            (torch.nan_to_num(raw.abs()) > cfg.ppo.log_rho_clamp).sum().item()
         )
         if anomalies:
             self._dump_anomaly(log_rhos, fixed)
-            log_rhos = torch.nan_to_num(
-                log_rhos, nan=0.0,
-                posinf=cfg.ppo.log_rho_clamp, neginf=-cfg.ppo.log_rho_clamp,
-            )
-            log_rhos = torch.clamp(
-                log_rhos, -cfg.ppo.log_rho_clamp, cfg.ppo.log_rho_clamp
-            )
+        # Bound UNCONDITIONALLY: exp() must never see a value that can
+        # overflow, whether or not the anomaly counter fired.
+        log_rhos = torch.nan_to_num(
+            log_rhos, nan=0.0,
+            posinf=cfg.ppo.log_rho_clamp, neginf=-cfg.ppo.log_rho_clamp,
+        )
+        log_rhos = torch.clamp(
+            log_rhos, -cfg.ppo.log_rho_clamp, cfg.ppo.log_rho_clamp
+        )
         surrogate = clipped_surrogate(
             log_rhos, fixed.advantages, cfg.ppo.epsilon,
         )
@@ -428,13 +451,19 @@ class Learner:
         actor_kl = self._ops.kl(fixed.actor_logits, out.logits)
         entropy = self._ops.entropy(out.logits)
 
-        per_pos = (
-            -cfg.policy_gradient_weight * surrogate
-            + cfg.ppo.beta * actor_kl
-            + cfg.kl_teacher_weight * teacher_kl
-            + cfg.reverse_kl_teacher_weight * reverse_teacher_kl
-            - cfg.entropy_weight * entropy
-        )
+        # Only weighted terms enter the loss: a zero coefficient must DROP
+        # the term, not multiply it (0.0 * inf = NaN would contaminate the
+        # loss with a term that has no influence on it). actor_kl and
+        # entropy are still computed above for metrics either way.
+        per_pos = -cfg.policy_gradient_weight * surrogate
+        for w, term in (
+            (cfg.ppo.beta, actor_kl),
+            (cfg.kl_teacher_weight, teacher_kl),
+            (cfg.reverse_kl_teacher_weight, reverse_teacher_kl),
+            (-cfg.entropy_weight, entropy),
+        ):
+            if w != 0.0:
+                per_pos = per_pos + w * term
         loss = (per_pos * valid).sum() / n_valid
         # per-term nonfinite counts over VALID positions (one sync): a
         # nonfinite loss names the term it came from
@@ -456,6 +485,7 @@ class Learner:
             "entropy": vmean(entropy),
             "ratio_mean": vmean(log_rhos.exp() * valid + (1 - valid)),
             "log_rho_abs_max": raw_abs_max,
+            "log_rho_masked_absmax": log_rho_masked_absmax,
             "anomalous_samples": anomalies,
             "logit_absmax_valid": logit_absmax_valid,
             "logit_absmax_masked": logit_absmax_masked,
@@ -834,7 +864,15 @@ class Learner:
         # Post-update measurement (and trust-region backstop).
         with torch.no_grad():
             post = _mean_dicts([self._policy_loss(f)[1] for f in check_fixed])
-        reverted = post["actor_kl_mean"] > cfg.ppo.max_mean_actor_kl
+        # FAIL CLOSED: NaN compares False, so a contaminated measurement
+        # would silently keep an update the trust region never cleared.
+        post_kl = post["actor_kl_mean"]
+        reverted = (
+            not math.isfinite(post_kl) or post_kl > cfg.ppo.max_mean_actor_kl
+        )
+        if reverted and not math.isfinite(post_kl):
+            print(f"NONFINITE POST-UPDATE actor_kl ({post_kl}): reverting",
+                  flush=True)
         if reverted:
             self.policy.load_state_dict(snapshot)
 
@@ -855,7 +893,7 @@ def _mean_dicts(dicts: tp.Sequence[dict]) -> dict:
     out = {}
     for key in dicts[0]:
         vals = [d[key] for d in dicts]
-        if key in ("actor_kl_max", "log_rho_abs_max",
+        if key in ("actor_kl_max", "log_rho_abs_max", "log_rho_masked_absmax",
                    "logit_absmax_valid", "logit_absmax_masked",
                    "adv_absmax"):
             out[key] = max(vals)
