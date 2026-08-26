@@ -483,10 +483,22 @@ def main() -> None:
                         acc = by_char.setdefault(ch, [0, 0])
                         acc[0] += w
                         acc[1] += g
+                # One key per character (12), NOT per category per character
+                # (72, and most cells would be too thin to read). These share
+                # a prefix so one report panel globs them onto a single
+                # chart; per-character game counts collapse to one min/total
+                # pair rather than 12 more series.
+                thin = 0
                 for ch, (w, g) in sorted(by_char.items()):
                     if g >= 20:  # below that it is noise, not a signal
                         log[f"rl/bychar/{ch}"] = w / g
-                        log[f"rl/bychar/{ch}_games"] = g
+                    else:
+                        thin += 1
+                if by_char:
+                    log["rl/bychar/_games_total"] = sum(
+                        g for _, g in by_char.values()
+                    )
+                    log["rl/bychar/_chars_too_thin"] = thin
                 log["rl/frames_per_sec"] = frames / (time.time() - t0)
                 wandb.log(log, step=i)
                 games = sum(
