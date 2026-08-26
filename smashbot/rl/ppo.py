@@ -629,9 +629,24 @@ class Learner:
         n = fixed.valid.shape[0]
         bounds = [round(j * n / k) for j in range(k + 1)]
 
+        def take(t, lo, hi):
+            if not isinstance(t, torch.Tensor):
+                return t
+            # Batch is dim 0 everywhere EXCEPT torch RNN states, which are
+            # [layers, B, H] — same disambiguation _mask_state uses. Slicing
+            # dim 0 there would hand every chunk the full state and give the
+            # last chunks an empty one.
+            if t.dim() >= 1 and t.shape[0] == n:
+                return t[lo:hi]
+            if t.dim() >= 2 and t.shape[1] == n:
+                return t[:, lo:hi]
+            return t
+
         def rng(lo, hi):
-            take = lambda t: t[lo:hi] if isinstance(t, torch.Tensor) else t
-            return _Fixed(*(tree.map_structure(take, field) for field in fixed))
+            return _Fixed(*(
+                tree.map_structure(lambda t: take(t, lo, hi), field)
+                for field in fixed
+            ))
 
         return [
             rng(bounds[j], bounds[j + 1])
@@ -750,7 +765,14 @@ class Learner:
         imit_chunks = [c for imf in imit_fixed for c in self._imit_chunks(imf, chunk_rows)]
         total_imit_valid = sum(float(c.valid.sum()) for c in imit_chunks) or 1.0
 
-        snapshot = copy.deepcopy(self.policy.state_dict())
+        # Trust-region snapshot: weights AND optimizer slots. Restoring
+        # weights alone leaves Adam's m/v carrying the rejected update, so
+        # the next step still moves in the direction the trust region just
+        # refused. Held on CPU: this is a full extra copy of the model and
+        # VRAM is the scarce resource here, while the copy costs ~0.1% of
+        # a step's wall clock.
+        snapshot = _to_cpu(self.policy.state_dict())
+        opt_snapshot = _to_cpu(self.policy_optimizer.state_dict())
 
         epoch_metrics: list[dict] = []
         imit_loss_val = 0.0
@@ -875,6 +897,7 @@ class Learner:
                   flush=True)
         if reverted:
             self.policy.load_state_dict(snapshot)
+            self.policy_optimizer.load_state_dict(opt_snapshot)
 
         metrics = {
             "epochs": epoch_metrics,
@@ -887,6 +910,17 @@ class Learner:
                 imit_stats, loss=imit_loss_val, **{"lambda": lambda_t}
             )
         return state, metrics
+
+
+def _to_cpu(obj):
+    """Deep copy of a state dict with every tensor moved off the device."""
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().to("cpu", copy=True)
+    if isinstance(obj, dict):
+        return {k: _to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_to_cpu(v) for v in obj)
+    return copy.deepcopy(obj)
 
 
 def _mean_dicts(dicts: tp.Sequence[dict]) -> dict:

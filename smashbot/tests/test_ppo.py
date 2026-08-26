@@ -727,3 +727,51 @@ def test_revert_fails_closed_on_nonfinite_post_update_kl():
     import math as _math
     assert not (float("nan") > 1e-3)          # the trap, made explicit
     assert (not _math.isfinite(float("nan"))) # what the fix keys on
+
+
+def test_revert_restores_optimizer_state_not_just_weights():
+    """A trust-region revert must undo Adam's slots too: restoring weights
+    alone leaves m/v carrying the rejected update, so the next step keeps
+    moving in the direction the trust region just refused."""
+    torch.manual_seed(0)
+    learner, traj = _make_learner(
+        learning_rate=1e-2,
+        ppo=PPOConfig(num_epochs=1, max_mean_actor_kl=1e9),  # no revert yet
+    )
+    st = learner.initial_state(3)
+    learner.step([traj], st)                     # populate Adam slots
+    before = _adam_fingerprint(learner.policy_optimizer)
+    assert before, "optimizer should have state after a step"
+
+    learner.config.ppo.max_mean_actor_kl = -1.0  # force a revert
+    _, metrics = learner.step([traj], st)
+    assert metrics["reverted"]
+    after = _adam_fingerprint(learner.policy_optimizer)
+    assert set(before) == set(after)
+    for k in before:
+        assert torch.allclose(before[k], after[k]), f"Adam slot {k} not restored"
+
+
+def _adam_fingerprint(opt):
+    out = {}
+    for i, (_p, st) in enumerate(opt.state.items()):
+        for name, v in st.items():
+            if isinstance(v, torch.Tensor):
+                out[f"{i}.{name}"] = v.detach().float().cpu().clone()
+    return out
+
+
+def test_row_chunks_slices_rnn_state_on_the_batch_dim():
+    """RNN states are [layers, B, H]; slicing dim 0 would give every chunk
+    the full state and later chunks an empty one."""
+    torch.manual_seed(0)
+    learner, traj = _make_learner(learning_rate=1e-3)
+    fixed, _, _ = learner._fixed_pass(traj, learner.initial_state(3))
+    B = fixed.valid.shape[0]
+    rnn_like = torch.zeros(1, B, 8)          # [layers, B, H]
+    fixed = fixed._replace(initial_policy_state=(rnn_like,))
+    chunks = learner._row_chunks(fixed, 3)
+    assert sum(c.valid.shape[0] for c in chunks) == B
+    for c in chunks:
+        assert c.initial_policy_state[0].shape[1] == c.valid.shape[0]
+        assert c.initial_policy_state[0].shape[0] == 1  # layers untouched

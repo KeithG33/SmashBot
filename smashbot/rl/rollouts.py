@@ -455,6 +455,22 @@ class DolphinRolloutWorker:
                 )
                 if league.phillip is not None:
                     ph = league.phillip
+                    if ph.delay != student.delay:
+                        # Harvested chunks are assembled on the OPPONENT's
+                        # delay and then trained under the student's
+                        # convention, so imitating him teaches a mapping
+                        # whose state->action gap differs by this much.
+                        # Accepted deliberately: delay is baked into the BC
+                        # teacher and ours is the lower (more reactive) of
+                        # the two — but it is an approximation, not an
+                        # equality, so say so out loud.
+                        print(
+                            f"NOTE: imitation harvest delay mismatch — "
+                            f"phillip {ph.delay} vs student {student.delay} "
+                            f"({ph.delay - student.delay:+d} frames); his "
+                            "imitation targets are timed to his reaction, "
+                            "not ours", flush=True,
+                        )
                     self._harvest_groups["phillip"] = _HarvestGroup(
                         "phillip", range(ph.S * ph.N), T, ph.delay,
                         self._traj_reencoder(ph), dev,
