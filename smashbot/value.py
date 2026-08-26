@@ -76,8 +76,26 @@ class ValueFunction(nn.Module):
             advantages = targets - values
             loss = torch.square(advantages).mean()
             uev = loss / (targets.var() + 1e-8)
+            # full-chain finiteness probe (one sync): reward -> value ->
+            # target -> advantage, so a nonfinite loss names its own source
+            def _mx(t):
+                return torch.nan_to_num(
+                    t.detach().abs(), nan=float("inf"), posinf=float("inf")
+                ).max()
+
+            def _nf(t):
+                return (~torch.isfinite(t.detach())).sum().float()
+
+            chain = torch.stack([
+                _mx(rewards), _nf(rewards), _mx(values), _nf(values),
+                _mx(targets), _nf(targets), _mx(advantages), _nf(advantages),
+            ]).tolist()
 
         metrics = {
+            "reward_absmax": chain[0], "reward_nonfinite": int(chain[1]),
+            "value_absmax": chain[2], "value_nonfinite": int(chain[3]),
+            "target_absmax": chain[4], "target_nonfinite": int(chain[5]),
+            "adv_absmax": chain[6], "adv_nonfinite": int(chain[7]),
             "loss": loss.item(),
             "uev": uev.item(),
             "return_mean": targets.mean().item(),

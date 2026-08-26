@@ -608,3 +608,31 @@ def test_adv_probe_reports_nonfinite_advantages():
         _, metrics = learner._policy_loss(fixed._replace(advantages=adv))
         assert metrics["adv_absmax"] == float("inf"), bad
         assert metrics["adv_nonfinite"] == 1, bad
+
+
+def test_full_chain_probe_localizes_poison():
+    """The value-chain probe (reward/value/target/advantage) and the
+    per-term loss probe must each name their own source, so one skip
+    event is enough to localize without follow-up instrumentation."""
+    torch.manual_seed(0)
+    learner, traj = _make_learner(
+        learning_rate=1e-3, ppo=PPOConfig(max_mean_actor_kl=1e9)
+    )
+    # clean baseline: every chain counter zero
+    fixed, _, vm = learner._fixed_pass(traj, learner.initial_state(3))
+    for k in ("reward_nonfinite", "value_nonfinite", "target_nonfinite",
+              "adv_nonfinite"):
+        assert vm[k] == 0, k
+    assert vm["reward_absmax"] < float("inf")
+    _, clean = learner._policy_loss(fixed)
+    for k in ("nf_surrogate", "nf_actor_kl", "nf_teacher_kl",
+              "nf_reverse_kl", "nf_entropy"):
+        assert clean[k] == 0, k
+
+    # poisoned reward propagates through the chain and is reported
+    bad_traj = traj._replace(rewards=traj.rewards.clone())
+    bad_traj.rewards[0, 0] = float("nan")
+    _, _, vm2 = learner._fixed_pass(bad_traj, learner.initial_state(3))
+    assert vm2["reward_nonfinite"] == 1
+    assert vm2["target_nonfinite"] > 0 and vm2["adv_nonfinite"] > 0
+    assert vm2["value_nonfinite"] == 0  # net itself is healthy

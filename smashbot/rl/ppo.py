@@ -429,6 +429,15 @@ class Learner:
             - cfg.entropy_weight * entropy
         )
         loss = (per_pos * valid).sum() / n_valid
+        # per-term nonfinite counts over VALID positions (one sync): a
+        # nonfinite loss names the term it came from
+        with torch.no_grad():
+            terms = (surrogate, actor_kl, teacher_kl, reverse_teacher_kl,
+                     entropy)
+            bad = torch.stack([
+                ((~torch.isfinite(t)) & valid.bool()).sum().float()
+                for t in terms
+            ]).tolist()
 
         vmean = lambda t: ((t * valid).sum() / n_valid).item()
         metrics = {
@@ -445,6 +454,11 @@ class Learner:
             "logit_absmax_masked": logit_absmax_masked,
             "adv_absmax": adv_absmax,
             "adv_nonfinite": adv_nonfinite,
+            "nf_surrogate": int(bad[0]),
+            "nf_actor_kl": int(bad[1]),
+            "nf_teacher_kl": int(bad[2]),
+            "nf_reverse_kl": int(bad[3]),
+            "nf_entropy": int(bad[4]),
         }
         return loss, metrics
 
@@ -715,7 +729,12 @@ class Learner:
                         f"|logit| valid {metrics['logit_absmax_valid']:.1f} "
                         f"masked {metrics['logit_absmax_masked']:.1f} "
                         f"|adv| {metrics['adv_absmax']:.2f} "
-                        f"adv_nonfinite {metrics['adv_nonfinite']})",
+                        f"adv_nf {metrics['adv_nonfinite']} | terms nf: "
+                        f"surr {metrics['nf_surrogate']} "
+                        f"akl {metrics['nf_actor_kl']} "
+                        f"tkl {metrics['nf_teacher_kl']} "
+                        f"rkl {metrics['nf_reverse_kl']} "
+                        f"ent {metrics['nf_entropy']})",
                         flush=True,
                     )
                     batch_metrics.append(metrics)
@@ -753,7 +772,22 @@ class Learner:
             if not torch.isfinite(grad_norm):
                 # A finite loss can still yield nonfinite gradients;
                 # clip_grad_norm_ does not sanitize NaN. Skip the update.
-                print(f"NONFINITE GRAD NORM ({grad_norm}): skipping update",
+                # inf vs nan discriminates the cause: fp16 OVERFLOW at this
+                # scale produces inf (halving is the right response), bad
+                # math produces nan (halving is useless — scale-independent).
+                n_inf = n_nan = 0
+                first = ""
+                for nm, p_ in self.policy.named_parameters():
+                    if p_.grad is None:
+                        continue
+                    gi = int(torch.isinf(p_.grad).sum().item())
+                    gn = int(torch.isnan(p_.grad).sum().item())
+                    if (gi or gn) and not first:
+                        first = nm
+                    n_inf += gi
+                    n_nan += gn
+                print(f"NONFINITE GRAD NORM ({grad_norm}): skipping update "
+                      f"(inf {n_inf} nan {n_nan} first={first})",
                       flush=True)
                 self.policy_optimizer.zero_grad(set_to_none=True)
                 if use_scaler:
@@ -801,7 +835,9 @@ def _mean_dicts(dicts: tp.Sequence[dict]) -> dict:
                    "logit_absmax_valid", "logit_absmax_masked",
                    "adv_absmax"):
             out[key] = max(vals)
-        elif key in ("anomalous_samples", "adv_nonfinite"):
+        elif key in ("anomalous_samples", "adv_nonfinite", "nf_surrogate",
+                     "nf_actor_kl", "nf_teacher_kl", "nf_reverse_kl",
+                     "nf_entropy"):
             out[key] = sum(vals)
         else:
             out[key] = sum(vals) / len(vals)
