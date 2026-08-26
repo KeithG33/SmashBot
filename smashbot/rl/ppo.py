@@ -745,6 +745,19 @@ class Learner:
                 self._backward(loss * (float(fixed.valid.sum()) / total_valid))
                 any_backward = True
                 batch_metrics.append(metrics)
+            # Stage tag for the grad guard: PPO and imitation backwards
+            # accumulate into the SAME grads, so a NaN born in either
+            # prints the same message. Snapshot finiteness between them
+            # (one sync) to attribute the next event.
+            ppo_grad_nonfinite = None
+            if imit_chunks and lambda_t > 0.0 and any_backward:
+                flags = [
+                    (~torch.isfinite(p_.grad)).any()
+                    for p_ in self.policy.parameters() if p_.grad is not None
+                ]
+                ppo_grad_nonfinite = bool(
+                    torch.stack(flags).any().item()
+                ) if flags else False
             if imit_chunks and lambda_t > 0.0:
                 imit_losses = []
                 for chunk in imit_chunks:
@@ -786,9 +799,13 @@ class Learner:
                         first = nm
                     n_inf += gi
                     n_nan += gn
+                stage = (
+                    "?" if ppo_grad_nonfinite is None
+                    else ("ppo" if ppo_grad_nonfinite else "imitation")
+                )
                 print(f"NONFINITE GRAD NORM ({grad_norm}): skipping update "
-                      f"(inf {n_inf} nan {n_nan} first={first})",
-                      flush=True)
+                      f"(inf {n_inf} nan {n_nan} first={first} "
+                      f"stage={stage})", flush=True)
                 self.policy_optimizer.zero_grad(set_to_none=True)
                 if use_scaler:
                     # unscale_ already recorded found_inf, so update() halves
