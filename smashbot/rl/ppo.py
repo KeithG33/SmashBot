@@ -377,6 +377,13 @@ class Learner:
                 m_maxs.append(torch.where(v, z, a).amax())
             logit_absmax_valid = torch.stack(v_maxs).max().item()
             logit_absmax_masked = torch.stack(m_maxs).max().item()
+            # advantage-path probe: the remaining suspect for rare
+            # NONFINITE LOSS skips with finite logits
+            adv = fixed.advantages.detach()
+            adv_absmax = torch.nan_to_num(
+                adv.abs(), nan=float("inf"), posinf=float("inf")
+            ).max().item()
+            adv_nonfinite = int((~torch.isfinite(adv)).sum().item())
         # Clamp defuses inf logits at masked positions (0-cotangent x
         # inf-jacobian NaNs backward); inert for real logits.
         out = out._replace(logits=tree.map_structure(
@@ -436,6 +443,8 @@ class Learner:
             "anomalous_samples": anomalies,
             "logit_absmax_valid": logit_absmax_valid,
             "logit_absmax_masked": logit_absmax_masked,
+            "adv_absmax": adv_absmax,
+            "adv_nonfinite": adv_nonfinite,
         }
         return loss, metrics
 
@@ -704,7 +713,9 @@ class Learner:
                     print(
                         "NONFINITE LOSS: skipping minibatch (pre-clamp "
                         f"|logit| valid {metrics['logit_absmax_valid']:.1f} "
-                        f"masked {metrics['logit_absmax_masked']:.1f})",
+                        f"masked {metrics['logit_absmax_masked']:.1f} "
+                        f"|adv| {metrics['adv_absmax']:.2f} "
+                        f"adv_nonfinite {metrics['adv_nonfinite']})",
                         flush=True,
                     )
                     batch_metrics.append(metrics)
@@ -787,9 +798,10 @@ def _mean_dicts(dicts: tp.Sequence[dict]) -> dict:
     for key in dicts[0]:
         vals = [d[key] for d in dicts]
         if key in ("actor_kl_max", "log_rho_abs_max",
-                   "logit_absmax_valid", "logit_absmax_masked"):
+                   "logit_absmax_valid", "logit_absmax_masked",
+                   "adv_absmax"):
             out[key] = max(vals)
-        elif key == "anomalous_samples":
+        elif key in ("anomalous_samples", "adv_nonfinite"):
             out[key] = sum(vals)
         else:
             out[key] = sum(vals) / len(vals)

@@ -589,3 +589,22 @@ def test_inf_stored_logits_cannot_make_loss_nonfinite():
         for p_ in learner.policy.parameters():
             if p_.grad is not None:
                 assert torch.isfinite(p_.grad).all(), bad
+
+
+def test_adv_probe_reports_nonfinite_advantages():
+    """An inf/NaN advantage must surface in adv_absmax/adv_nonfinite so
+    the skip-path print localizes the poison."""
+    torch.manual_seed(0)
+    learner, traj = _make_learner(
+        learning_rate=1e-3, ppo=PPOConfig(max_mean_actor_kl=1e9)
+    )
+    fixed, _, _ = learner._fixed_pass(traj, learner.initial_state(3))
+    _, clean = learner._policy_loss(fixed)
+    assert clean["adv_nonfinite"] == 0
+    assert clean["adv_absmax"] < float("inf")
+    for bad in (float("inf"), float("nan")):
+        adv = fixed.advantages.clone()
+        adv[0, 0] = bad
+        _, metrics = learner._policy_loss(fixed._replace(advantages=adv))
+        assert metrics["adv_absmax"] == float("inf"), bad
+        assert metrics["adv_nonfinite"] == 1, bad
