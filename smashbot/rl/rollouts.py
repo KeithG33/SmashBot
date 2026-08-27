@@ -746,9 +746,21 @@ class DolphinRolloutWorker:
                 # (result_serving: carried alongside the result so a
                 # recycle-boundary kind flip can't misattribute it)
                 kind = self._actual_kind(i, p.get("result_serving"))
+                # by_char must only see members that play all 12 characters
+                # with one brain (ghosts, league-teacher): char-locked
+                # members (imports, phillip) tie their character's column
+                # to their own identity/strength, so FOX would measure
+                # "the imports are hard", not the Fox matchup.
+                mem = (
+                    self.league.member_now.get(i)
+                    if self.league is not None else None
+                )
+                locked = mem is not None and (
+                    mem in ("phillip", "cpu") or mem.startswith("import:")
+                )
                 self.trackers[
                     self._TRACKER_KIND.get(kind, kind)
-                ].add_game((a, b), p.get("opp_char"))
+                ].add_game((a, b), None if locked else p.get("opp_char"))
                 if sp.kind == "snapshot":
                     # credit the ended game, take a seat for the drawn
                     # member, draw the one after
