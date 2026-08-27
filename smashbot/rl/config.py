@@ -168,8 +168,10 @@ class RolloutConfig:
     # (bare policy state_dict, snapshot-pool format, same architecture as
     # the student — loaded exactly like a ghost), optionally with a
     # per-import character lock "NAME=PATH@CHAR" (default lock: FOX —
-    # these are trained-fox opponents). An env fighting an import pins the
-    # locked character for that match instead of redrawing.
+    # the original imports are trained-fox opponents). An env fighting an
+    # import pins the locked character for that match instead of
+    # redrawing; "@ANY" imports stay unlocked and redraw their character
+    # per game exactly like snapshots (for 12-char generalist imports).
     # Requires pfsp=True and league_slices > 0.
     league_imports: list[str] = dataclasses.field(default_factory=list)
 
@@ -196,10 +198,13 @@ class RolloutConfig:
             assert path, f"bad league_imports entry {entry!r}: empty path"
             from smashbot.rl.pool import MAIN_12
 
-            assert char in MAIN_12, (
-                f"league import {name!r}: char lock {char!r} not in the "
-                f"policy-opponent roster {MAIN_12}"
-            )
+            if char == "ANY":
+                char = None  # unlocked: redraw per game, like a snapshot
+            else:
+                assert char in MAIN_12, (
+                    f"league import {name!r}: char lock {char!r} not in "
+                    f"the policy-opponent roster {MAIN_12} (or ANY)"
+                )
             assert name not in out, (
                 f"duplicate league_imports name {name!r}"
             )

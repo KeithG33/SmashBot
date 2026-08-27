@@ -1278,3 +1278,23 @@ def test_keep_zero_never_prunes(tmp_path):
         pool.save(policy, step)
     assert len(pool.archive) == 40
     assert all(os.path.exists(p) for p in pool.archive)
+
+
+def test_import_char_lock_any_means_unlocked():
+    """NAME=PATH@ANY imports stay unlocked (char_lock None -> the env
+    redraws per game like a snapshot); default stays FOX; bad chars still
+    fail loudly."""
+    from smashbot.rl.config import RolloutConfig
+
+    cfg = RolloutConfig(league_imports=[
+        "fox1=/tmp/a.pt",              # default lock
+        "gen1=/tmp/b.pt@ANY",          # unlocked 12-char generalist
+        "marth1=/tmp/c.pt@MARTH",      # explicit lock
+    ])
+    m = cfg.import_members()
+    assert m["fox1"] == ("/tmp/a.pt", "FOX")
+    assert m["gen1"] == ("/tmp/b.pt", None)
+    assert m["marth1"] == ("/tmp/c.pt", "MARTH")
+    import pytest as _pytest
+    with _pytest.raises(AssertionError):
+        RolloutConfig(league_imports=["x=/tmp/d.pt@BOWSER"]).import_members()
