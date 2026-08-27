@@ -808,6 +808,7 @@ class Learner:
             # accumulate into the SAME grads, so a NaN born in either
             # prints the same message. Snapshot finiteness between them
             # (one sync) to attribute the next event.
+            ppo_had_backward = any_backward
             ppo_grad_nonfinite = None
             if imit_chunks and lambda_t > 0.0 and any_backward:
                 flags = [
@@ -858,10 +859,13 @@ class Learner:
                         first = nm
                     n_inf += gi
                     n_nan += gn
-                stage = (
-                    "?" if ppo_grad_nonfinite is None
-                    else ("ppo" if ppo_grad_nonfinite else "imitation")
-                )
+                # tri-state: when the between-pass snapshot exists it
+                # decides; otherwise only one backward ran, so the answer
+                # is whichever one that was — never "unknown".
+                if ppo_grad_nonfinite is not None:
+                    stage = "ppo" if ppo_grad_nonfinite else "imitation"
+                else:
+                    stage = "ppo" if ppo_had_backward else "imitation"
                 print(f"NONFINITE GRAD NORM ({grad_norm}): skipping update "
                       f"(inf {n_inf} nan {n_nan} first={first} "
                       f"stage={stage})", flush=True)
@@ -929,11 +933,13 @@ def _mean_dicts(dicts: tp.Sequence[dict]) -> dict:
         vals = [d[key] for d in dicts]
         if key in ("actor_kl_max", "log_rho_abs_max", "log_rho_masked_absmax",
                    "logit_absmax_valid", "logit_absmax_masked",
-                   "adv_absmax"):
+                   "adv_absmax", "reward_absmax", "value_absmax",
+                   "target_absmax"):
             out[key] = max(vals)
         elif key in ("anomalous_samples", "adv_nonfinite", "nf_surrogate",
                      "nf_actor_kl", "nf_teacher_kl", "nf_reverse_kl",
-                     "nf_entropy"):
+                     "nf_entropy", "reward_nonfinite", "value_nonfinite",
+                     "target_nonfinite"):
             out[key] = sum(vals)
         else:
             out[key] = sum(vals) / len(vals)

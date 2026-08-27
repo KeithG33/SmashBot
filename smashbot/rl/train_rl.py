@@ -478,7 +478,11 @@ def main() -> None:
                 # character, so this separates "stronger overall" from
                 # "better at that one matchup"
                 by_char: dict[str, list[int]] = {}
-                for tracker in worker.trackers.values():
+                for kind2, tracker in worker.trackers.items():
+                    if kind2 == "cpu":
+                        # engine AI at ~97% winrate: pooling it would bias
+                        # whichever characters the cpus happen to play
+                        continue
                     for ch, (w, g) in tracker.by_char.items():
                         acc = by_char.setdefault(ch, [0, 0])
                         acc[0] += w
