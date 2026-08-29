@@ -473,25 +473,17 @@ def main() -> None:
                                           "win_rate_recent")):
                             continue
                         log[f"rl/{kname}/{k}"] = v
-                # winrate by OPPONENT CHARACTER, pooled over every tracker:
-                # the imports PFSP weights hardest are all locked to one
-                # character, so this separates "stronger overall" from
-                # "better at that one matchup"
+                # winrate by opponent character, pooled across trackers
                 by_char: dict[str, list[int]] = {}
                 for kind2, tracker in worker.trackers.items():
-                    if kind2 == "cpu":
-                        # engine AI at ~97% winrate: pooling it would bias
-                        # whichever characters the cpus happen to play
+                    if kind2 == "cpu":  # ~97% winrate would bias its chars
                         continue
                     for ch, (w, g) in tracker.by_char.items():
                         acc = by_char.setdefault(ch, [0, 0])
                         acc[0] += w
                         acc[1] += g
-                # One key per character (12), NOT per category per character
-                # (72, and most cells would be too thin to read). These share
-                # a prefix so one report panel globs them onto a single
-                # chart; per-character game counts collapse to one min/total
-                # pair rather than 12 more series.
+                # One key per character; a single report panel globs the
+                # shared prefix onto one chart.
                 thin = 0
                 for ch, (w, g) in sorted(by_char.items()):
                     if g >= 20:  # below that it is noise, not a signal

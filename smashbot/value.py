@@ -76,8 +76,8 @@ class ValueFunction(nn.Module):
             advantages = targets - values
             loss = torch.square(advantages).mean()
             uev = loss / (targets.var() + 1e-8)
-            # full-chain finiteness probe (one sync): reward -> value ->
-            # target -> advantage, so a nonfinite loss names its own source
+            # finiteness probe, reward -> value -> target -> advantage
+            # (one sync): a nonfinite loss names its own source
             def _mx(t):
                 return torch.nan_to_num(
                     t.detach().abs(), nan=float("inf"), posinf=float("inf")

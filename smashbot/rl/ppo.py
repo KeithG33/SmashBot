@@ -214,11 +214,9 @@ class Learner:
         self.precision = precision
         self._amp_enabled = precision == "fp16"
         # One scaler, policy optimizer only (the value path never scales).
-        # growth_interval is in SCALER STEPS: torch's 2000 default assumes
-        # ~10 steps/s (3 min), but we run ~126 steps/HOUR, making a doubling
-        # take ~16h — so a sparse fault rate can hold the scale down forever
-        # (v5 ratcheted 65536->1024 and never recovered). Probe upward more
-        # often; the cost of an over-high probe is one skipped update.
+        # growth_interval is in scaler steps: torch's 2000 default assumes
+        # ~10 steps/s; at our step rate a doubling would take ~16h and any
+        # sparse fault rate would pin the scale down forever.
         self.grad_scaler = (
             torch.amp.GradScaler(
                 self._device_type, init_scale=2.0 ** 16,
@@ -385,8 +383,7 @@ class Learner:
                 m_maxs.append(torch.where(v, z, a).amax())
             logit_absmax_valid = torch.stack(v_maxs).max().item()
             logit_absmax_masked = torch.stack(m_maxs).max().item()
-            # advantage-path probe: the remaining suspect for rare
-            # NONFINITE LOSS skips with finite logits
+            # advantage stream: the one loss input with no clamp of its own
             adv = fixed.advantages.detach()
             adv_absmax = torch.nan_to_num(
                 adv.abs(), nan=float("inf"), posinf=float("inf")
@@ -402,15 +399,12 @@ class Learner:
         vbool = valid.bool()
         n_valid = valid.sum().clamp(min=1.0)
         log_rhos = out.log_probs - fixed.actor_log_probs
-        # Masked positions are the reset-substituted targets the actor never
-        # sampled; their AR teacher-forcing chains diverge, so |log_rho|
-        # there is unbounded. exp() overflows above ~88.7 and the resulting
-        # inf poisons the batch through the mask: inf*0 = NaN (loss), or
-        # min()'s 0-cotangent x inf-jacobian = NaN (grads, finite loss).
-        # where() — not a multiply — so an inf is DISCARDED, not multiplied.
-        # Measure the masked tail BEFORE discarding it: this is the
-        # quantity that has to exceed ~88.7 for the failure above, so
-        # logging it is what confirms the diagnosis in production.
+        # Masked positions have unbounded |log_rho| (diverged AR chains);
+        # exp() overflows past ~88.7 and inf reaches the batch through the
+        # mask (inf*0 or min()'s 0-cotangent x inf-jacobian). where(), not
+        # a multiply: an inf must be discarded, 0*inf is still NaN.
+        # Measure the masked tail before discarding it (the quantity that
+        # must exceed ~88.7 for the failure above).
         with torch.no_grad():
             _m = torch.nan_to_num(
                 log_rhos.detach().abs(), nan=float("inf"), posinf=float("inf")
@@ -418,9 +412,7 @@ class Learner:
             z = torch.zeros((), dtype=_m.dtype, device=_m.device)
             log_rho_masked_absmax = torch.where(vbool, z, _m).max().item()
         log_rhos = torch.where(vbool, log_rhos, torch.zeros_like(log_rhos))
-        # Detect on the post-where tensor but BEFORE clamping, and count
-        # every position (the old code measured |log_rho|*valid, which is
-        # identically 0 at masked positions and so could never see them).
+        # Detect on every position, before clamping.
         raw = log_rhos.detach()
         nonfinite = int((~torch.isfinite(raw)).sum().item())
         raw_abs_max = torch.nan_to_num(
@@ -431,8 +423,7 @@ class Learner:
         )
         if anomalies:
             self._dump_anomaly(log_rhos, fixed)
-        # Bound UNCONDITIONALLY: exp() must never see a value that can
-        # overflow, whether or not the anomaly counter fired.
+        # Bound unconditionally: exp() must never see an overflowable value.
         log_rhos = torch.nan_to_num(
             log_rhos, nan=0.0,
             posinf=cfg.ppo.log_rho_clamp, neginf=-cfg.ppo.log_rho_clamp,
@@ -451,10 +442,8 @@ class Learner:
         actor_kl = self._ops.kl(fixed.actor_logits, out.logits)
         entropy = self._ops.entropy(out.logits)
 
-        # Only weighted terms enter the loss: a zero coefficient must DROP
-        # the term, not multiply it (0.0 * inf = NaN would contaminate the
-        # loss with a term that has no influence on it). actor_kl and
-        # entropy are still computed above for metrics either way.
+        # A zero coefficient must DROP its term, not multiply it:
+        # 0.0 * inf = NaN. (All terms still computed above for metrics.)
         per_pos = -cfg.policy_gradient_weight * surrogate
         for w, term in (
             (cfg.ppo.beta, actor_kl),
@@ -653,17 +642,6 @@ class Learner:
             for j in range(k) if bounds[j + 1] > bounds[j]
         ]
 
-    @staticmethod
-    def _slice_fixed(fixed: _Fixed, rows: tp.Sequence[int]) -> _Fixed:
-        """Row (env-dim) subset of a fixed pass (copy)."""
-        sel = torch.as_tensor(list(rows), dtype=torch.int64)
-
-        def take(t):
-            if isinstance(t, torch.Tensor):
-                return t.index_select(0, sel.to(t.device))
-            return t
-
-        return _Fixed(*(tree.map_structure(take, field) for field in fixed))
 
     def _plan_imitation(
         self, imit_trajs: list[Trajectory]
@@ -765,12 +743,9 @@ class Learner:
         imit_chunks = [c for imf in imit_fixed for c in self._imit_chunks(imf, chunk_rows)]
         total_imit_valid = sum(float(c.valid.sum()) for c in imit_chunks) or 1.0
 
-        # Trust-region snapshot: weights AND optimizer slots. Restoring
-        # weights alone leaves Adam's m/v carrying the rejected update, so
-        # the next step still moves in the direction the trust region just
-        # refused. Held on CPU: this is a full extra copy of the model and
-        # VRAM is the scarce resource here, while the copy costs ~0.1% of
-        # a step's wall clock.
+        # Trust-region snapshot: weights AND optimizer slots (weights
+        # alone leave Adam's m/v carrying the rejected update). On CPU:
+        # a full model copy, and VRAM is the scarce resource.
         snapshot = _to_cpu(self.policy.state_dict())
         opt_snapshot = _to_cpu(self.policy_optimizer.state_dict())
 
@@ -804,10 +779,8 @@ class Learner:
                 self._backward(loss * (float(fixed.valid.sum()) / total_valid))
                 any_backward = True
                 batch_metrics.append(metrics)
-            # Stage tag for the grad guard: PPO and imitation backwards
-            # accumulate into the SAME grads, so a NaN born in either
-            # prints the same message. Snapshot finiteness between them
-            # (one sync) to attribute the next event.
+            # PPO and imitation backwards accumulate into the same grads;
+            # snapshot finiteness between them so the guard can attribute.
             ppo_had_backward = any_backward
             ppo_grad_nonfinite = None
             if imit_chunks and lambda_t > 0.0 and any_backward:
@@ -859,9 +832,8 @@ class Learner:
                         first = nm
                     n_inf += gi
                     n_nan += gn
-                # tri-state: when the between-pass snapshot exists it
-                # decides; otherwise only one backward ran, so the answer
-                # is whichever one that was — never "unknown".
+                # the snapshot decides; with one backward there is no
+                # ambiguity
                 if ppo_grad_nonfinite is not None:
                     stage = "ppo" if ppo_grad_nonfinite else "imitation"
                 else:
@@ -890,8 +862,8 @@ class Learner:
         # Post-update measurement (and trust-region backstop).
         with torch.no_grad():
             post = _mean_dicts([self._policy_loss(f)[1] for f in check_fixed])
-        # FAIL CLOSED: NaN compares False, so a contaminated measurement
-        # would silently keep an update the trust region never cleared.
+        # FAIL CLOSED: NaN > x is False — a contaminated measurement must
+        # revert, not silently keep the update.
         post_kl = post["actor_kl_mean"]
         reverted = (
             not math.isfinite(post_kl) or post_kl > cfg.ppo.max_mean_actor_kl

@@ -123,11 +123,9 @@ def compute_reward(
     """
     own_death = (stocks[:, 0] < prev_stocks[:, 0]).float()
     opp_death = (stocks[:, 1] < prev_stocks[:, 1]).float()
-    # Percent reaches us as a raw libmelee read with no range check, and
-    # unlike the state path (uint16 wrap + embed clamp) nothing downstream
-    # bounds it — a garbage read would become an enormous reward while the
-    # states looked innocent. Nothing legitimately deals 100% in one frame,
-    # so cap the per-frame delta and keep |reward| <= 2 like the vendor.
+    # Percent is a raw libmelee read; the state path wraps+clamps it but
+    # the reward path would pass garbage straight through. Nothing deals
+    # 100% in one frame, so the delta cap keeps |reward| <= 2.
     own_dmg = (percent[:, 0] - prev_percent[:, 0]).clamp(min=0, max=100)
     opp_dmg = (percent[:, 1] - prev_percent[:, 1]).clamp(min=0, max=100)
     reward = (opp_death - own_death) + damage_ratio * (opp_dmg - own_dmg)
@@ -143,11 +141,9 @@ class GameTracker:
     average opponent percent at our kills (low = early kills, strong punish
     game), and average own percent at our deaths (high = hard to kill)."""
 
-    # ema_alpha 0.008 ~ a 250-game horizon (user-dialed): 2-3 full waves of
-    # concurrent games across the fleet, so the ticker EMA reflects several
-    # rounds rather than single-batch luck (~±3pp wobble vs ±5pp at the old
-    # 100-game horizon). Persisted tracker state stores the EMA VALUES
-    # only, so restored checkpoints pick up the new alpha automatically.
+    # ema_alpha 0.008 ~ a 250-game horizon: several full fleet waves, so
+    # the EMA reflects rounds rather than single-batch luck. Restored
+    # checkpoints store EMA values only, so alpha changes apply cleanly.
     def __init__(self, window: int = 100, event_window: int = 200,
                  ema_alpha: float = 0.008):
         import collections
@@ -168,10 +164,8 @@ class GameTracker:
                  opp_char: str | None = None) -> None:
         bot, opp = final_stocks
         diff = bot - opp
-        # Per-opponent-CHARACTER record. The fixed yardsticks that PFSP
-        # weights hardest (the imports) are all locked to one character,
-        # so "are we getting stronger" and "are we getting better at that
-        # one matchup" are otherwise indistinguishable.
+        # Winrate by OPPONENT character (locked members excluded at the
+        # call site: their identity would pollute their char's column).
         if opp_char and diff != 0:
             w, g = self.by_char.get(opp_char, (0, 0))
             self.by_char[opp_char] = (w + (1 if diff > 0 else 0), g + 1)
@@ -465,14 +459,9 @@ class DolphinRolloutWorker:
                 if league.phillip is not None:
                     ph = league.phillip
                     if ph.delay != student.delay:
-                        # Harvested chunks are assembled on the OPPONENT's
-                        # delay and then trained under the student's
-                        # convention, so imitating him teaches a mapping
-                        # whose state->action gap differs by this much.
-                        # Accepted deliberately: delay is baked into the BC
-                        # teacher and ours is the lower (more reactive) of
-                        # the two — but it is an approximation, not an
-                        # equality, so say so out loud.
+                        # Harvested chunks keep the OPPONENT's delay but are
+                        # trained under the student's convention — a known,
+                        # accepted approximation. Announce it.
                         print(
                             f"NOTE: imitation harvest delay mismatch — "
                             f"phillip {ph.delay} vs student {student.delay} "
@@ -746,12 +735,8 @@ class DolphinRolloutWorker:
                 # (result_serving: carried alongside the result so a
                 # recycle-boundary kind flip can't misattribute it)
                 kind = self._actual_kind(i, p.get("result_serving"))
-                # by_char must only see members that can play any character
-                # (ghosts, league-teacher, phillip, @ANY imports, self): a
-                # char-LOCKED member ties its character's column to its own
-                # identity — the fox-locked imports are also the strongest
-                # members, so with them included FOX measures "the imports
-                # are hard", not the Fox matchup.
+                # Char-LOCKED members are excluded from by_char: a locked
+                # member ties its character's column to its own strength.
                 mem = (
                     self.league.member_now.get(i)
                     if self.league is not None else None
@@ -770,9 +755,8 @@ class DolphinRolloutWorker:
                         i, p.get("opp_serving"), p.get("opp_char"),
                         (a > b) if a != b else None,
                     )
-            # envs whose seat starts a new game this frame; resolved to
-            # coordinates HERE, after every boundary (and so every
-            # compaction) has been applied, so the seats cannot be stale
+            # fresh envs resolve to seats AFTER all boundaries/compactions
+            # have applied, so the coordinates cannot be stale
             fresh: set = set()
             if league is not None:
                 fresh, league.fresh_envs = set(league.fresh_envs), []

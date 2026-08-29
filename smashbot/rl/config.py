@@ -78,18 +78,12 @@ class RolloutConfig:
     # and sit wherever that member is loaded (rollouts._Grid). 0 = no
     # league envs.
     league_slices: int = 0
-    # Stacked league weights dtype: "float16" halves VRAM per slice (107 ->
-    # 54 MB) and runs the grid forward under fp16 autocast (measured: 24
-    # fp16 slices cost less VRAM and time than 12 fp32; 94.6% of controller
-    # rows identical to fp32 at saturated sampling — opponents' play, not
-    # the student's, is perturbed). CUDA only.
+    # Stacked league weights dtype: "float16" halves VRAM per slice
+    # (107 -> 54 MB), fp16 autocast on the grid forward. CUDA only.
     league_weights_dtype: str = "float16"
-    # Student (and Phillip) rollout inference precision: "fp16" runs the
-    # networks under fp16 autocast (sampling math stays fp32). Gated by
-    # scripts/precision_probe.py fidelity on a batch captured at that
-    # precision: with the fp16 learner, |ratio_mean - 1| = 9.6e-6 on an
-    # fp16-rollout batch vs 1.8e-5 on an fp32 one (2026-08-23, rl-pool-v4
-    # step 2470 policy) — same precision both sides agrees better.
+    # Student (and Phillip) rollout inference precision: "fp16" = fp16
+    # autocast on the networks (sampling math stays fp32); gated by
+    # scripts/precision_probe.py.
     rollout_precision: str = "fp16"
     # Phillip's agent capacity (his architecture never fits a slice): the
     # max envs fighting him at once; draws beyond it fall back to a
@@ -102,16 +96,10 @@ class RolloutConfig:
     partition_seed: int = 0
     headless: bool = True  # False: rendered window at normal speed (watch mode)
     log_tag: str = ""  # namespaces /tmp/smashbot-env-*.log between runs
-    # Redraw the opponent character at each Dolphin recycle. Flag-gated:
-    # its first production firing correlated with the step-706 NaN crash
-    # (under investigation); off = the proven fixed-char recycle path.
+    # Redraw the opponent character at each Dolphin recycle.
     redraw_chars: bool = True
-    # Boot each Dolphin's replacement in the background during its final game
-    # (recycle hot-swap); the spare parks at intro menus until swapped in.
-    # OFF by default: worth only ~5% at pool-era fps, and its async teardown
-    # caused the 2026-08-12 overnight hang (port race on the misselect-retry
-    # path, since fixed via _drain_old_stops). Opt in for short/tended runs;
-    # re-earn trust before any week-long run relies on it.
+    # Boot each Dolphin's replacement in the background during its final
+    # game (recycle hot-swap). OFF by default: ~5% gain, riskier teardown.
     double_buffer: bool = False
     # (historical: ref_shard_size tuned the retired in-worker TF bridge;
     # kept so old commands don't break. The worker ignores it now.)

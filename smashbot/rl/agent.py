@@ -194,9 +194,8 @@ class BatchedPolicyAgent:
         return to_execute, records, hidden_before
 
     @torch.no_grad()  # rollout stepping is inference: without this the
-    # compiled sample runs its TRAINING graph and every frame's activations
-    # are saved for a backward that never comes (live-caught: 21GB OOM at
-    # 200 rows, and cudagraph trees' "pending, uninvoked backwards" stall)
+    # compiled sample saves every frame's activations for a backward that
+    # never comes
     def infer(
         self, states: tp.Any, resets: torch.Tensor, want_snapshot: bool = True,
     ) -> tuple[list[FrameRecord], tp.Any]:
@@ -342,11 +341,9 @@ class LeagueAgent:
         self.delay = template.delay
         self._embed_controller = template.controller_head.controller_embedding
         # functional_call's skeleton: a THROWAWAY copy (never read back).
-        # The policy has tied parameters (one item MLP shared across item
-        # slots and between the game/state-action embeddings) and
-        # functional_call under vmap leaves a tied template holding an
-        # escaped BatchedTensor — live-caught in the pre-routing design's
-        # first weight-park, and inherent to tied modules under vmap.
+        # The policy has tied parameters, and functional_call under vmap
+        # leaves a tied template holding an escaped BatchedTensor — so the
+        # template must be a throwaway copy.
         self._template = copy.deepcopy(template).to("cpu")
         self._template.__dict__.pop("sample", None)  # any compiled wrapper
         self._template.requires_grad_(False).eval()
