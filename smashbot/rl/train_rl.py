@@ -573,12 +573,12 @@ def main() -> None:
                     log["rl/bychar/_chars_too_thin"] = thin
                 log["rl/frames_per_sec"] = frames / (time.time() - t0)
                 if device == "cuda":
+                    # high-water mark since boot: catches sub-second learner
+                    # peaks that wandb's 10s system sampler misses (reserved/
+                    # current usage is already on the System charts)
                     import torch as _torch
                     log["rl/vram_peak_gib"] = (
                         _torch.cuda.max_memory_allocated() / 2 ** 30
-                    )
-                    log["rl/vram_reserved_gib"] = (
-                        _torch.cuda.memory_reserved() / 2 ** 30
                     )
                 wandb.log(log, step=i)
                 games = sum(
