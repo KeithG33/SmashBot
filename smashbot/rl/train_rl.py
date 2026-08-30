@@ -533,6 +533,8 @@ def main() -> None:
                     log["rl/league/slice_loads"] = lg.seats.loads
                     log["rl/league/compactions"] = lg.seats.compactions
                 for kind, tracker in worker.trackers.items():
+                    if tracker.wins + tracker.losses + tracker.draws == 0:
+                        continue  # sparse: no games yet, no flat-zero panels
                     # tracker kinds share the ledger's category namespace
                     kname = (
                         {"snapshot": "snapshots", "reference": "phillip",
