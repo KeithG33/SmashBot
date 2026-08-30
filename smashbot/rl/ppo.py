@@ -538,8 +538,8 @@ class Learner:
         unchunked fp32 backward over a max-harvest step is what set the
         learner's VRAM high-water mark (micro_batches never touched this
         pass). Chunking is exact: rows are independent through the value
-        net, chunk losses accumulate weighted by their share of valid
-        positions (the full-batch gradient), the optimizer steps ONCE per
+        net, chunk losses accumulate weighted by their ROW share (the
+        loss is a plain mean over all positions), the optimizer steps ONCE per
         trajectory after all chunks, and the MARWIL normalization runs on
         the CONCATENATED advantages — identical weights to the unchunked
         pass."""
