@@ -428,7 +428,15 @@ class DolphinRolloutWorker:
             )
             per = league.import_slices_per
             N = league.agent.N
+            # the merged-row arithmetic mixes seats.S with agent.N: pin
+            # the shape coupling loudly
+            assert league.league.seats.N == N, (
+                f"seats {league.league.seats.N} cells != grid {N} cells"
+            )
             envs_per = config.import_dedicated_envs
+            assert envs_per > 0, (
+                "import specs present but config.import_dedicated_envs=0"
+            )
             n_members, rem = divmod(len(self.import_idx), envs_per)
             assert rem == 0 and envs_per <= per * N, (
                 f"{len(self.import_idx)} import envs not divisible into "

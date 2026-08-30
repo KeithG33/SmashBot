@@ -1389,6 +1389,19 @@ def test_worker_dedicated_imports_route_credit_and_harvest(
     filled = [e for e in worker._import_cells if e is not None]
     assert filled == imp_envs
     assert len(worker._import_cells) == 2 * per * rt.agent.N
+    # weights identity: member slot k's pinned slices hold EXACTLY the
+    # tiny policy _make_runtime loaded for slot k (seed=200+slot) — a
+    # member-order swap or off-by-`per` slice index dies here, not in a
+    # silently-wrong training run
+    S_league = rt.league.seats.S
+    for slot in range(2):
+        sd = _tiny_policy(seed=200 + slot).state_dict()
+        for j in range(per):
+            s = S_league + slot * per + j
+            for k, t in rt.agent._stacked_params.items():
+                assert torch.equal(t[s], sd[k].to(t.dtype)), (
+                    f"slice {s} != member {slot} weights ({k})"
+                )
 
     # opp chars: locked import serves FOX; unlocked serves whatever came up
     for e in imp_envs[:2]:
