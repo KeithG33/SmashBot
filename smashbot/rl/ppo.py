@@ -525,11 +525,24 @@ class Learner:
             1.0 - (1.0 - cfg.imitation_lambda_final_frac) * progress
         )
 
-    def _imitation_fixed(self, traj: Trajectory) -> tp.Optional[_ImitFixed]:
+    def _imitation_fixed(
+        self, traj: Trajectory, row_budget: int = 0,
+    ) -> tp.Optional[_ImitFixed]:
         """Fixed pass for one harvested opponent trajectory: critic update on
         its states (targets = discounted returns G_t along the opponent's
         seat), and detached MARWIL weights w from A = G - V. Returns None
-        (trajectory dropped) on nonfinite inputs — anomaly armor."""
+        (trajectory dropped) on nonfinite inputs — anomaly armor.
+
+        The critic forward+backward runs in row chunks of `row_budget`
+        (<=0: whole trajectory): harvest volume varies per step, and an
+        unchunked fp32 backward over a max-harvest step is what set the
+        learner's VRAM high-water mark (micro_batches never touched this
+        pass). Chunking is exact: rows are independent through the value
+        net, chunk losses accumulate weighted by their share of valid
+        positions (the full-batch gradient), the optimizer steps ONCE per
+        trajectory after all chunks, and the MARWIL normalization runs on
+        the CONCATENATED advantages — identical weights to the unchunked
+        pass."""
         frames = self._frames(traj)
         finite = all(
             bool(torch.isfinite(leaf).all())
@@ -541,16 +554,33 @@ class Learner:
             return None
         batch_size = traj.rewards.shape[0]
         device = traj.rewards.device
+        valid = (~traj.is_resetting[:, 1:]).float()
+        step_rows = (
+            batch_size if row_budget <= 0 else min(row_budget, batch_size)
+        )
         # Our policy/critic never ran over the opponent's stream during the
         # rollout, so there is no carried recurrent state: start from zeros.
-        value_out = self.value_function.outputs(
-            frames, self.value_function.initial_state(batch_size, device),
-            discount=self.config.discount,
-        )
+        self.value_optimizer.zero_grad(set_to_none=True)
+        adv_chunks = []
+        for lo in range(0, batch_size, step_rows):
+            hi = min(lo + step_rows, batch_size)
+            cf = tree.map_structure(
+                lambda t: t[lo:hi] if isinstance(t, torch.Tensor) else t,
+                frames,
+            )
+            value_out = self.value_function.outputs(
+                cf, self.value_function.initial_state(hi - lo, device),
+                discount=self.config.discount,
+            )
+            # chunk share of the full-trajectory mean loss (a plain .mean()
+            # over ALL positions — see value.py — so the share is the ROW
+            # fraction): accumulating these reproduces the unchunked
+            # gradient exactly
+            share = (hi - lo) / batch_size
+            (value_out.loss * share).backward()
+            adv_chunks.append(value_out.advantages)
         # The critic trains on these states with G_t targets (same guard as
         # the on-policy value update).
-        self.value_optimizer.zero_grad(set_to_none=True)
-        value_out.loss.backward()
         value_grad_norm = torch.nn.utils.clip_grad_norm_(
             self.value_function.parameters(), float("inf")
         )
@@ -561,9 +591,8 @@ class Learner:
         else:
             self.value_optimizer.step()
 
-        valid = (~traj.is_resetting[:, 1:]).float()
         weights = imitation_weights(
-            value_out.advantages, valid,
+            torch.cat(adv_chunks, dim=0), valid,
             self.config.imitation_beta, self.config.imitation_w_cap,
         )
         if not torch.isfinite(weights).all():
@@ -644,7 +673,7 @@ class Learner:
 
 
     def _plan_imitation(
-        self, imit_trajs: list[Trajectory]
+        self, imit_trajs: list[Trajectory], row_budget: int = 0,
     ) -> tuple[list[_ImitFixed], dict]:
         """All harvested rows this step (or a uniform sample of
         imitation_rows of them when capped): per harvest group, the critic
@@ -667,7 +696,7 @@ class Learner:
                 continue
             if len(rows) < traj.rewards.shape[0]:
                 traj = slice_trajectory_rows(traj, rows)
-            imf = self._imitation_fixed(traj)
+            imf = self._imitation_fixed(traj, row_budget)
             if imf is not None:
                 imit_fixed.append(imf)
         if not imit_fixed:
@@ -725,7 +754,13 @@ class Learner:
         imit_fixed: list[_ImitFixed] = []
         imit_stats: dict = {}
         if cfg.imitation_rows != 0 and imit_trajs and fixed_list:
-            imit_fixed, imit_stats = self._plan_imitation(imit_trajs)
+            # the imitation critic pass chunks to the PPO micro-batch's row
+            # size, so a max-harvest step can never raise the VRAM peak
+            # above what the PPO batch already sets
+            budget = -(-max(
+                f.valid.shape[0] for f in fixed_list
+            ) // max(1, cfg.micro_batches))
+            imit_fixed, imit_stats = self._plan_imitation(imit_trajs, budget)
         lambda_t = self.lambda_at(progress)
 
         check_fixed = fixed_list  # post-update KL check: full rows, no grad
