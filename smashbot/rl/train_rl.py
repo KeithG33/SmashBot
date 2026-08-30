@@ -303,14 +303,24 @@ def main() -> None:
         assert rcfg.league_slices > 0, (
             f"{league_envs} league envs but league_slices=0"
         )
-        # the grid: S slices x N cells, one slice's worth of slack cells so
-        # free seats can float to where PFSP demand is (see league.py)
+        # the grid: S league slices x N cells (one slice's worth of slack
+        # cells so free seats can float to where PFSP demand is — see
+        # league.py) plus, with dedicated imports, PINNED tail slices —
+        # ceil(import_dedicated_envs / N) per import, loaded once below,
+        # structurally invisible to the allocator (LeagueSeats spans only
+        # the first S slices). One merged forward serves everything.
         S = rcfg.league_slices
         N = -(-(league_envs + S) // S)
+        import_slices_per = (
+            -(-rcfg.import_dedicated_envs // N) if dedicated_imports else 0
+        )
+        S_total = S + import_slices_per * len(
+            import_registry if dedicated_imports else ()
+        )
         template, _, _ = load_policy(args.ckpt, "cpu")
         template.train_value_head = False
         grid = LeagueAgent(
-            template, S, N, name_code=name_code, device=device,
+            template, S_total, N, name_code=name_code, device=device,
             temperature=None,
             weights_dtype=getattr(torch, rcfg.league_weights_dtype),
         )
@@ -344,19 +354,17 @@ def main() -> None:
             print(f"phillip (league member): {rcfg.ref_ckpt} "
                   f"(delay {ph_policy.delay}, name code {ph_code}, "
                   f"capacity {cap})")
-        imports_agent = None
         if dedicated_imports:
-            # one slice per import, cells = its dedicated envs; weights
-            # loaded exactly once — the allocator never touches this agent
-            imports_agent = LeagueAgent(
-                template, len(import_registry), rcfg.import_dedicated_envs,
-                name_code=name_code, device=device, temperature=None,
-                weights_dtype=getattr(torch, rcfg.league_weights_dtype),
-            )
-            for slot, (key, (path, _char)) in enumerate(import_registry.items()):
-                imports_agent.load_slice(slot, torch.load(path, map_location="cpu"))
-            print(f"import agent: {len(import_registry)} slices x "
-                  f"{rcfg.import_dedicated_envs} cells (static)")
+            # pinned import slices: member k owns grid slices
+            # [S + k*per, S + (k+1)*per), loaded exactly once
+            per = import_slices_per
+            for k, (key, (path, _char)) in enumerate(import_registry.items()):
+                sd = torch.load(path, map_location="cpu")
+                for j in range(per):
+                    grid.load_slice(S + k * per + j, sd)
+            print(f"imports: pinned into grid slices {S}..{S_total - 1} "
+                  f"({per} slices x {N} cells per member, "
+                  f"{rcfg.import_dedicated_envs} envs each)")
         seats = LeagueSeats(
             S, N, loader=lambda s, m: grid.load_slice(s, weights.get(m)),
             phillip_capacity=phillip_agent.N if phillip_agent else 0,
@@ -377,10 +385,11 @@ def main() -> None:
         from smashbot.rl.rollouts import LeagueRuntime
 
         runtime = LeagueRuntime(
-            league_proto, grid, phillip_agent, imports_agent=imports_agent,
+            league_proto, grid, phillip_agent,
+            import_slices_per=import_slices_per,
         )
-        print(f"league grid: {S} slices x {N} cells for {league_envs} envs",
-              flush=True)
+        print(f"league grid: {S} seat slices x {N} cells for {league_envs} "
+              f"envs ({S_total} slices total)", flush=True)
     worker = DolphinRolloutWorker(
         args.rollouts, student_agent, opponents=opponents, specs=specs,
         harvest_imitation=args.learner.imitation_rows != 0, league=runtime,
@@ -704,14 +713,24 @@ def main() -> None:
                 ready = torch.cuda.Event()
                 ready.record()  # trajectories fully enqueued on default
 
-                def _run(traj=trajectories, st=state, ev=ready,
+                def _run(traj=trajectories, st=state, ev=ready, step_i=i,
                          prog=i / max(1, args.runtime.steps)):
+                    _t0 = time.perf_counter()
                     overlap_stream.wait_event(ev)
                     with torch.cuda.stream(overlap_stream):
                         out = learner.step(traj, st, progress=prog)
                     # drain before returning: fut.result() must imply the
                     # weights are final (publish reads them next)
                     overlap_stream.synchronize()
+                    if os.environ.get("SMASHBOT_PROFILE"):
+                        # the mb tradeoff gauge: as long as learner-s <
+                        # collect-s the update is fully hidden and a bigger
+                        # micro_batches (lower VRAM peak) is free
+                        print(f"[learner] step {step_i}: "
+                              f"{time.perf_counter() - _t0:.1f}s | "
+                              f"alloc {torch.cuda.memory_allocated() / 2**30:.2f} "
+                              f"reserved {torch.cuda.memory_reserved() / 2**30:.2f} GiB",
+                              flush=True)
                     return out
 
                 fut, fut_i = overlap_pool.submit(_run), i

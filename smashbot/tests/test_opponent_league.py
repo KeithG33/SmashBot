@@ -205,21 +205,11 @@ def _make_worker(monkeypatch, num_envs, seed=0, opp_chars=None,
         )
     runtime = None
     if counts.get("snapshot"):
+        # dedicated imports (import_registry non-empty) get pinned tail
+        # slices inside _make_runtime's grid
         runtime = _make_runtime(
             cfg, counts["snapshot"], pool_dir, members or [], phillip_capacity,
         )
-        if import_registry:
-            from smashbot.rl.agent import LeagueAgent
-
-            imp_agent = LeagueAgent(
-                _tiny_policy(seed=0), len(import_registry),
-                cfg.import_dedicated_envs, name_code=1, device="cpu",
-            )
-            for slot, key in enumerate(import_registry):
-                imp_agent.load_slice(
-                    slot, _tiny_policy(seed=200 + slot).state_dict()
-                )
-            runtime = runtime._replace(imports_agent=imp_agent)
     worker = DolphinRolloutWorker(
         cfg, student, opponents=opponents, specs=specs,
         harvest_imitation=harvest, league=runtime,
@@ -251,13 +241,25 @@ def _make_runtime(cfg, league_envs, pool_dir, ghosts, phillip_capacity):
         pool.save(_tiny_policy(seed=10 + j), step)
     S = cfg.league_slices or 1
     N = -(-(league_envs + S) // S)
-    grid = LeagueAgent(_tiny_policy(seed=0), S, N, name_code=1, device="cpu")
+    dedicated = cfg.import_dedicated_envs > 0
+    imports = cfg.import_members()
+    per = -(-cfg.import_dedicated_envs // N) if dedicated else 0
+    S_total = S + per * len(imports if dedicated else ())
+    grid = LeagueAgent(
+        _tiny_policy(seed=0), S_total, N, name_code=1, device="cpu"
+    )
     fixed = {"teacher": _tiny_policy(seed=1).state_dict()}
     locks = {}
-    for name, (path, char) in cfg.import_members().items():
+    for slot, (name, (path, char)) in enumerate(imports.items()):
         key = f"import:{name}"
-        fixed[key] = _tiny_policy(seed=100 + len(fixed)).state_dict()
-        locks[key] = char
+        if dedicated:
+            # pinned tail slices, one distinct tiny policy per member
+            sd = _tiny_policy(seed=200 + slot).state_dict()
+            for j in range(per):
+                grid.load_slice(S + slot * per + j, sd)
+        else:
+            fixed[key] = _tiny_policy(seed=100 + len(fixed)).state_dict()
+            locks[key] = char
     weights = MemberWeights(fixed)
     phillip = None
     if cfg.league_phillip:
@@ -279,7 +281,7 @@ def _make_runtime(cfg, league_envs, pool_dir, ghosts, phillip_capacity):
         pool, seats, locks=locks, rng=random.Random(0),
         on_result=pool.record_result, cpu_enabled=cfg.league_cpu,
     )
-    return LeagueRuntime(league, grid, phillip)
+    return LeagueRuntime(league, grid, phillip, import_slices_per=per)
 
 
 def _phillip_like_policy(controller_config=None):
@@ -1360,10 +1362,11 @@ def test_partition_emits_dedicated_import_specs():
 def test_worker_dedicated_imports_route_credit_and_harvest(
     monkeypatch, tmp_path
 ):
-    """Static import pool end to end over fake envs: controllers come from
-    the import agent, results credit the 'import' tracker AND the payoff
-    ledger (metrics continuity), locked members stay out of by_char, and
-    the imports harvest group emits imitation trajectories."""
+    """Pinned import slices end to end over fake envs: controllers come
+    from the merged grid's pinned tail, results credit the 'import'
+    tracker AND the payoff ledger (metrics continuity), locked members
+    stay out of by_char, and import rows harvest imitation through the
+    merged 'ours' group."""
     worker, envs = _make_worker(
         monkeypatch, num_envs=12, pool_dir=tmp_path,
         teacher_envs=0, league_slices=2,
@@ -1378,7 +1381,14 @@ def test_worker_dedicated_imports_route_credit_and_harvest(
     imp_envs = worker.import_idx
     assert len(imp_envs) == 4
     rt = worker._runtime
-    assert rt.imports_agent is not None and rt.imports_agent.S == 2
+    per = rt.import_slices_per
+    assert per > 0
+    # merged grid: league seat slices + one pinned block per member
+    assert rt.agent.S == rt.league.seats.S + 2 * per
+    # pinned rows cover every import env, member-major, pads None
+    filled = [e for e in worker._import_cells if e is not None]
+    assert filled == imp_envs
+    assert len(worker._import_cells) == 2 * per * rt.agent.N
 
     # opp chars: locked import serves FOX; unlocked serves whatever came up
     for e in imp_envs[:2]:
@@ -1413,8 +1423,10 @@ def test_worker_dedicated_imports_route_credit_and_harvest(
     assert pool.payoff["import:fx"]["wins"] == 1
     assert pool.payoff["import:free"]["wins"] == 2
 
-    # imitation harvest: the imports group exists and is fed
-    assert "imports" in worker._harvest_groups
+    # imitation harvest: import rows flow through the merged grid group
+    assert "imports" not in worker._harvest_groups
+    assert "ours" in worker._harvest_groups
+    assert len(worker._harvest_groups["ours"].rows) == rt.agent.S * rt.agent.N
 
 
 def test_dedicated_imports_surface_in_category_estimates(tmp_path):

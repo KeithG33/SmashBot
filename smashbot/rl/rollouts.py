@@ -321,10 +321,12 @@ class LeagueRuntime(tp.NamedTuple):
     league: League
     agent: LeagueAgent
     phillip: LeagueAgent | None
-    # Static import agent (v9): one slice per import member, cells
-    # permanently assigned to dedicated envs — weights loaded once at
-    # boot, allocator never involved.
-    imports_agent: LeagueAgent | None = None
+    # Dedicated imports live INSIDE `agent` as pinned tail slices
+    # [seats.S, agent.S): weights loaded once at boot, allocator
+    # structurally blind to them (LeagueSeats only spans seats.S), one
+    # merged forward serves league + imports. import_slices_per = grid
+    # slices per import member (ceil(import_dedicated_envs / N)).
+    import_slices_per: int = 0
 
 
 class DolphinRolloutWorker:
@@ -333,10 +335,11 @@ class DolphinRolloutWorker:
     forward, no second policy copy), plus the opponent side; sync-barrier
     frame loop.
 
-    Opponent side: fixed-kind envs (cpu / teacher / reference / import —
-    imports route to the static imports_agent, not self.opponents) keep their
-    own agents; LEAGUE envs draw an opponent per match and are ROUTED to a
-    cell of the league grid (or a row of Phillip's agent) — see league.py.
+    Opponent side: fixed-kind envs (cpu / teacher / reference) keep their
+    own agents; dedicated IMPORT envs occupy pinned tail slices of the
+    league grid (loaded once, allocator-blind); LEAGUE envs draw an
+    opponent per match and are ROUTED to a seat slice of the same grid (or
+    a row of Phillip's agent) — see league.py.
 
     Learner-row layout: rows 0..D-1 are the D dolphins' primary (student)
     seats; rows D.. are the second seats of self-play dolphins. Row count is
@@ -397,10 +400,8 @@ class DolphinRolloutWorker:
         self.groups: dict = {}
         self.ref_idx: list[int] = []
         self.league_idx: list[int] = []
-        # dedicated import envs, in cell order (partition emits them
-        # member-major, so index k sits at cell (k // N, k % N))
+        # dedicated import envs, member-major (partition order)
         self.import_idx: list[int] = []
-        _imp = league.imports_agent if league is not None else None
         for i, spec in enumerate(self.specs):
             if spec.kind == "teacher":
                 self.groups.setdefault("teacher", []).append(i)
@@ -413,15 +414,33 @@ class DolphinRolloutWorker:
                 # scripts/port_ref_model.py)
                 self.groups.setdefault("reference", []).append(i)
                 self.ref_idx.append(i)
+        # merged import layout: pinned grid rows [seats.S*N, agent.S*N),
+        # member-major, per-member tail cells padded with None. Computed
+        # BEFORE the pairing assert so the assert can describe it.
+        self._import_cells: list[int | None] = []
         if self.import_idx:
-            # LOUD pairing check, unconditional: without the static agent
-            # the import envs' opponent seats would silently idle at
-            # neutral and every game would be a free win
-            assert _imp is not None and len(self.import_idx) == _imp.S * _imp.N, (
-                f"{len(self.import_idx)} dedicated import envs but "
-                + ("no imports agent" if _imp is None else
-                   f"an {_imp.S}x{_imp.N} imports agent")
+            # LOUD pairing check, unconditional: without pinned slices the
+            # import envs' opponent seats would silently idle at neutral
+            # and every game would be a free win
+            assert league is not None and league.import_slices_per > 0, (
+                f"{len(self.import_idx)} dedicated import envs but no "
+                f"pinned import slices in the league grid"
             )
+            per = league.import_slices_per
+            N = league.agent.N
+            envs_per = config.import_dedicated_envs
+            n_members, rem = divmod(len(self.import_idx), envs_per)
+            assert rem == 0 and envs_per <= per * N, (
+                f"{len(self.import_idx)} import envs not divisible into "
+                f"members of {envs_per}, or {envs_per} > {per}x{N} cells"
+            )
+            assert league.agent.S == league.league.seats.S + per * n_members, (
+                f"grid {league.agent.S} slices != {league.league.seats.S} league "
+                f"+ {per}x{n_members} pinned import slices"
+            )
+            for k in range(n_members):
+                block = self.import_idx[k * envs_per:(k + 1) * envs_per]
+                self._import_cells += block + [None] * (per * N - envs_per)
         for name, idx in self.groups.items():
             assert name in self.opponents, f"no agent supplied for group {name}"
             assert self.opponents[name].num_envs == len(idx)
@@ -430,12 +449,14 @@ class DolphinRolloutWorker:
             assert idx == list(range(idx[0], idx[0] + len(idx))), (
                 f"group {name} envs not contiguous: {idx}"
             )
-        if self.league_idx:
+        if self.league_idx or self._import_cells:
             assert league is not None, "league envs need a LeagueRuntime"
             grid = league.agent
+            # total grid rows (league + pinned imports); league capacity
+            # is the SEATS span only — pinned slices never seat draws
             self._grid_cells = grid.S * grid.N
-            assert self._grid_cells >= len(self.league_idx), (
-                f"league grid {grid.S}x{grid.N} cannot seat "
+            assert league.league.seats.S * grid.N >= len(self.league_idx), (
+                f"league seats {league.league.seats.S}x{grid.N} cannot seat "
                 f"{len(self.league_idx)} league envs"
             )
         # dolphin-level seat mask (for the opponent-view mix)
@@ -482,7 +503,11 @@ class DolphinRolloutWorker:
                     config.unroll_length, ref_agent.delay
                 )
                 self._ref_embed = ref_agent._embed_controller
-            if self.league_idx:
+            if self.league_idx or self._import_cells:
+                # ONE group covers the whole merged grid (league cells +
+                # pinned import rows): same delay, same encoding — the
+                # split "imports" group existed only for the retired
+                # separate agent
                 T, dev = config.unroll_length, student.device
                 self._harvest_groups["ours"] = _HarvestGroup(
                     "ours", range(self._grid_cells), T, league.agent.delay, None, dev,
@@ -504,12 +529,6 @@ class DolphinRolloutWorker:
                         "phillip", range(ph.S * ph.N), T, ph.delay,
                         self._traj_reencoder(ph), dev,
                     )
-            imp = league.imports_agent if league is not None else None
-            if imp is not None and self.import_idx:
-                T, dev = config.unroll_length, student.device
-                self._harvest_groups["imports"] = _HarvestGroup(
-                    "imports", range(imp.S * imp.N), T, imp.delay, None, dev,
-                )
         self._procs: list = []
         self._conns: list = []
         import os as _os
@@ -809,12 +828,10 @@ class DolphinRolloutWorker:
         rt = self._runtime
         grid = rt.agent if rt is not None else None
         ph = rt.phillip if rt is not None else None
-        imp = rt.imports_agent if rt is not None else None
-        imp_rows = self.import_idx
-        imp_rows_t = (
-            torch.tensor(imp_rows, dtype=torch.int64,
-                         device=self.student.device)
-            if imp is not None and imp_rows else None
+        # pinned import rows: fixed tail of the merged grid record
+        imp_cells = self._import_cells
+        league_rows = (
+            self.league.seats.S * grid.N if grid is not None else 0
         )
 
         prof = self._prof  # opt-in per-phase timing (SMASHBOT_PROFILE=1)
@@ -891,38 +908,38 @@ class DolphinRolloutWorker:
             # ---- EXECUTE: pop this frame's controllers from every queue
             controllers1 = self.student.execute(reset_rows)
             opp_controllers: dict[int, tp.Any] = {}
-            cells, ph_rows = self._seat_tables() if self.league_idx else ([], [])
-            if self.league_idx:
-                cell_env, cell_reset = self._route(cells, resets_cpu, fresh)
+            cells, ph_rows = (
+                self._seat_tables()
+                if (self.league_idx or imp_cells) else ([], [])
+            )
+            if self.league_idx or imp_cells:
+                # merged row table: dynamic league seats + pinned imports.
+                # `fresh` holds league envs only; import env resets flow
+                # through resets_cpu inside _route.
+                merged = cells + imp_cells
+                cell_env, cell_reset = self._route(merged, resets_cpu, fresh)
                 for e_ in fresh:
                     seat_ = league.seats.seat_of(e_)
-                    if seat_ is not None and seat_[0] < grid.S:
+                    if seat_ is not None and seat_[0] < league.seats.S:
                         grid.reset_cell(*seat_)
+                for p, e_ in enumerate(imp_cells):
+                    if e_ is not None and resets_cpu[e_]:
+                        r = league_rows + p
+                        grid.reset_cell(r // grid.N, r % grid.N)
                 rows = grid.execute()
-                for r, env in enumerate(cells):
+                for r, env in enumerate(merged):
                     if env is not None:
                         opp_controllers[env] = rows[r]
                 if ph is not None:
                     ph_env, ph_reset = self._route(ph_rows, resets_cpu, fresh)
                     for e_ in fresh:
                         seat_ = league.seats.seat_of(e_)
-                        if seat_ is not None and seat_[0] == grid.S:
+                        if seat_ is not None and seat_[0] == league.seats.S:
                             ph.reset_cell(0, seat_[1])
                     ctrls = ph.execute()
                     for r, env in enumerate(ph_rows):
                         if env is not None:
                             opp_controllers[env] = ctrls[r]
-            if imp is not None and imp_rows:
-                imp_reset = torch.tensor(
-                    [resets_cpu[e] for e in imp_rows], dtype=torch.bool,
-                    device=self.student.device,
-                )
-                for r, e_ in enumerate(imp_rows):
-                    if resets_cpu[e_]:
-                        imp.reset_cell(r // imp.N, r % imp.N)
-                ictrls = imp.execute()
-                for r, env in enumerate(imp_rows):
-                    opp_controllers[env] = ictrls[r]
             group_live = {}
             for name, idx in self.groups.items():
                 if cpu_now and all(i in cpu_now for i in idx):
@@ -977,8 +994,7 @@ class DolphinRolloutWorker:
                         ref_rows = torch.tensor(self.ref_idx, device=device)
                         self._imit_assembler.push_reward(-reward[ref_rows])
                     for key, rows_ in (
-                        ("ours", cells), ("phillip", ph_rows),
-                        ("imports", imp_rows),
+                        ("ours", cells + imp_cells), ("phillip", ph_rows),
                     ):
                         g = self._harvest_groups.get(key)
                         if g is not None:
@@ -1031,7 +1047,7 @@ class DolphinRolloutWorker:
             # manual CUDA-graph captures must run single-threaded
             use_par = (
                 self._serve_parallel and self._serve_frames >= 40
-                and (bool(self.league_idx) or (imp is not None and bool(imp_rows)))
+                and bool(self.league_idx or imp_cells)
             )
             self._serve_frames += 1
             ref_records: list[FrameRecord] = []
@@ -1046,14 +1062,15 @@ class DolphinRolloutWorker:
                 prof and prof.lap("student_infer", t0)
                 t0 = prof.t() if prof else None
 
-                if self.league_idx:
-                    # ---- the grid: gather every cell's env view, one forward
+                if self.league_idx or imp_cells:
+                    # ---- the merged grid (league seats + pinned imports):
+                    # gather every row's env view, ONE forward
                     gv = self._flat_view(opp_flats, rows=cell_env, lead=(grid.S, grid.N))
                     prof and prof.lap("grid_gather", t0)
                     t0 = prof.t() if prof else None
                     prof and getattr(grid, "_timer_reset", lambda: None)()
                     record = grid.infer(gv, cell_reset.view(grid.S, grid.N))
-                    harvest["ours"] = (cells, cell_reset, [record])
+                    harvest["ours"] = (cells + imp_cells, cell_reset, [record])
                     prof and prof.lap("grid_infer", t0)
                     t0 = prof.t() if prof else None
                     if ph is not None:
@@ -1061,14 +1078,6 @@ class DolphinRolloutWorker:
                         rec = ph.infer(pv, ph_reset.view(1, ph.N))
                         harvest["phillip"] = (ph_rows, ph_reset, [rec])
                     prof and prof.lap("phillip_infer", t0)
-                if imp is not None and imp_rows:
-                    t0 = prof.t() if prof else None
-                    iv = self._flat_view(
-                        opp_flats, rows=imp_rows_t, lead=(imp.S, imp.N)
-                    )
-                    irec = imp.infer(iv, imp_reset.view(imp.S, imp.N))
-                    harvest["imports"] = (imp_rows, imp_reset, [irec])
-                    prof and prof.lap("imports_infer", t0)
                 t0 = prof.t() if prof else None
                 for name, idx in group_live.items():
                     group_view = self._flat_view(
@@ -1081,22 +1090,22 @@ class DolphinRolloutWorker:
                         ref_records = g_records
                 prof and prof.lap("groups_infer", t0)
             else:
-                # ---- stream-parallel serving: the grid and imports
-                # forwards (manual CUDA graphs, replayable on any stream)
-                # run on their own streams from worker threads while this
-                # thread serves student+groups (torch.compile'd -> default
-                # stream). The serving streams wait on the default stream
-                # (views built there); the default stream waits on them
-                # before the outputs are consumed below.
+                # ---- stream-parallel serving: the merged grid forward
+                # (manual CUDA graph, replayable on any stream) runs on its
+                # own stream from a worker thread while this thread serves
+                # student+groups (torch.compile'd -> default stream). The
+                # serving stream waits on the default stream (views built
+                # there); the default stream waits on it before the outputs
+                # are consumed below.
                 t0 = prof.t() if prof else None
                 futs = []
-                if self.league_idx:
+                if self.league_idx or imp_cells:
                     def _grid_task():
                         gv = self._flat_view(
                             opp_flats, rows=cell_env, lead=(grid.S, grid.N)
                         )
                         record = grid.infer(gv, cell_reset.view(grid.S, grid.N))
-                        harvest["ours"] = (cells, cell_reset, [record])
+                        harvest["ours"] = (cells + imp_cells, cell_reset, [record])
                         if ph is not None:
                             pv = self._flat_view(
                                 opp_flats, rows=ph_env, lead=(1, ph.N)
@@ -1104,14 +1113,6 @@ class DolphinRolloutWorker:
                             rec = ph.infer(pv, ph_reset.view(1, ph.N))
                             harvest["phillip"] = (ph_rows, ph_reset, [rec])
                     futs.append(self._serve_submit("grid", _grid_task))
-                if imp is not None and imp_rows:
-                    def _imports_task():
-                        iv = self._flat_view(
-                            opp_flats, rows=imp_rows_t, lead=(imp.S, imp.N)
-                        )
-                        irec = imp.infer(iv, imp_reset.view(imp.S, imp.N))
-                        harvest["imports"] = (imp_rows, imp_reset, [irec])
-                    futs.append(self._serve_submit("imports", _imports_task))
                 records, hidden_before = self.student.infer(
                     student_view, resets_dev,
                     want_snapshot=(records_pushed % cfg.unroll_length == 0),

@@ -78,7 +78,8 @@ def test_parallel_branch_matches_serial_wiring(monkeypatch, tmp_path):
     torch.manual_seed(7)
     out_b = par.collect(1)
 
-    assert set(submitted) == {"grid", "imports"}
+    # ONE serving lane: imports are pinned slices inside the merged grid
+    assert set(submitted) == {"grid"}
     _assert_same_trajectories(out_a, out_b)
     for ca, cb in zip(serial._conns, par._conns):
         assert len(ca.sent) == len(cb.sent)
