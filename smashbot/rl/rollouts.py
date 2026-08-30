@@ -505,7 +505,7 @@ class DolphinRolloutWorker:
         import os as _os
 
         self._prof = _PhaseProfiler() if _os.environ.get("SMASHBOT_PROFILE") else None
-        # stream-parallel serving state (see _run_serving)
+        # stream-parallel serving state (see _serve_submit)
         self._serve_pool = None
         self._serve_streams: dict[str, tp.Any] = {}
         self._serve_frames = 0
@@ -707,14 +707,26 @@ class DolphinRolloutWorker:
 
     def _serve_submit(self, name: str, fn):
         """Queue one opponent-grid forward on a dedicated CUDA stream in a
-        worker thread. The stream first waits on the default stream (this
-        frame's encoded views are produced there, and the wait is recorded
-        before the caller enqueues its own student forward, so the grids
-        never wait on the student); the caller makes the default stream
-        wait on every serving stream before consuming the outputs. Those
+        worker thread. An event recorded HERE (on the caller's default
+        stream, before the caller enqueues its own student forward) is
+        what the serving stream waits on — this frame's encoded views are
+        already enqueued, the student's kernels are not, so the grids
+        never wait on the student. The caller makes the default stream
+        wait on every serving stream before consuming the outputs, and
+        must not enqueue GPU work between f.result() and that wait. Those
         two ordering edges also make the caching allocator's cross-stream
         memory reuse safe: freed memory is only handed to work enqueued
-        after the corresponding wait."""
+        after the corresponding wait.
+
+        Known limits (reviewed, accepted): concurrent replays of graphs
+        that sample share the default CUDA generator's philox state, so
+        exploration noise across student/grid/imports is neither
+        independent nor reproducible (per-forward logits/action pairs
+        stay self-consistent — trajectories and ratios are unaffected);
+        a mid-run torch.compile recapture inside the parallel window
+        would fail loudly ("Offset increment outside graph capture") —
+        shapes are static here, and --rollouts.no-parallel-serving is
+        the kill switch."""
         if self._serve_pool is None:
             import concurrent.futures
 
@@ -725,11 +737,13 @@ class DolphinRolloutWorker:
         if stream is None:
             stream = self._serve_streams[name] = torch.cuda.Stream()
         prof = self._prof
+        ready = torch.cuda.Event()
+        ready.record()  # main thread: inputs enqueued, student not yet
 
         def run():
             import time as _time
 
-            stream.wait_stream(torch.cuda.default_stream())
+            stream.wait_event(ready)
             t0 = _time.perf_counter() if prof else None
             with torch.cuda.stream(stream):
                 fn()
