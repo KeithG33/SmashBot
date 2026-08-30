@@ -323,7 +323,8 @@ class DolphinRolloutWorker:
     forward, no second policy copy), plus the opponent side; sync-barrier
     frame loop.
 
-    Opponent side: fixed-kind envs (cpu / teacher / reference) keep their
+    Opponent side: fixed-kind envs (cpu / teacher / reference / import —
+    imports route to the static imports_agent, not self.opponents) keep their
     own agents; LEAGUE envs draw an opponent per match and are ROUTED to a
     cell of the league grid (or a row of Phillip's agent) — see league.py.
 
@@ -389,6 +390,7 @@ class DolphinRolloutWorker:
         # dedicated import envs, in cell order (partition emits them
         # member-major, so index k sits at cell (k // N, k % N))
         self.import_idx: list[int] = []
+        _imp = league.imports_agent if league is not None else None
         for i, spec in enumerate(self.specs):
             if spec.kind == "teacher":
                 self.groups.setdefault("teacher", []).append(i)
@@ -402,6 +404,15 @@ class DolphinRolloutWorker:
                 # The TF RefBridge remains available for eval batteries.
                 self.groups.setdefault("reference", []).append(i)
                 self.ref_idx.append(i)
+        if self.import_idx:
+            # LOUD pairing check, unconditional: without the static agent
+            # the import envs' opponent seats would silently idle at
+            # neutral and every game would be a free win
+            assert _imp is not None and len(self.import_idx) == _imp.S * _imp.N, (
+                f"{len(self.import_idx)} dedicated import envs but "
+                + ("no imports agent" if _imp is None else
+                   f"an {_imp.S}x{_imp.N} imports agent")
+            )
         for name, idx in self.groups.items():
             assert name in self.opponents, f"no agent supplied for group {name}"
             assert self.opponents[name].num_envs == len(idx)
@@ -486,11 +497,6 @@ class DolphinRolloutWorker:
                     )
             imp = league.imports_agent if league is not None else None
             if imp is not None and self.import_idx:
-                assert len(self.import_idx) == imp.S * imp.N, (
-                    "dedicated import envs must exactly fill the import "
-                    f"agent: {len(self.import_idx)} envs vs "
-                    f"{imp.S}x{imp.N} cells"
-                )
                 T, dev = config.unroll_length, student.device
                 self._harvest_groups["imports"] = _HarvestGroup(
                     "imports", range(imp.S * imp.N), T, imp.delay, None, dev,
@@ -642,7 +648,9 @@ class DolphinRolloutWorker:
     def _reencode_record(self, rec: FrameRecord, embed=None) -> FrameRecord:
         """Opponent-seat record -> student schema: actions re-encoded through
         the student's controller embedding, name set to the student's
-        code. `embed` = the opponent's embedding (default: reference)."""
+        code. `embed` = the opponent's embedding (default: reference).
+        Only ever called for the ref_envs group (league harvests go
+        through _HarvestGroup.step)."""
         import numpy as np
 
         embed = embed if embed is not None else self._ref_embed
@@ -777,12 +785,14 @@ class DolphinRolloutWorker:
                 self.trackers[
                     self._TRACKER_KIND.get(kind, kind)
                 ].add_game((a, b), None if locked else p.get("opp_char"))
-                if sp.kind == "reference" and self.league is not None:
+                if (sp.kind == "reference" and self.league is not None
+                        and self.league.on_result is not None):
                     # dedicated Phillip (ref_envs mode): keep his ledger row
                     # alive so R:/rl/phillip metrics survive leaving the draw
                     if a != b:
                         self.league.on_result("phillip", a > b)
-                if sp.kind == "import" and self.league is not None:
+                if (sp.kind == "import" and self.league is not None
+                        and self.league.on_result is not None):
                     # dedicated envs are outside the draw, but their games
                     # feed the SAME payoff ledger so rl/imports/* metrics
                     # and the ticker read identically to the league era

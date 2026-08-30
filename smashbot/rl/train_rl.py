@@ -198,9 +198,7 @@ def main() -> None:
         rcfg.log_tag = args.runtime.tag
     # league flags (teacher / lvl-9 CPU as PFSP members): validate up front —
     # loud assert beats 120 Dolphins booting into a mispartitioned run
-    league = rcfg.league_members()
-    if rcfg.import_dedicated_envs > 0:
-        league = [m for m in league if not m.startswith("import:")]
+    league = rcfg.league_members()  # dedicated imports excluded inside
     if league:
         print(f"league members (per-match PFSP draws): {league}")
     # Imported league members (frozen checkpoints from a previous run):
@@ -236,8 +234,14 @@ def main() -> None:
     opponents = {}
     counts = {}
     for spec in specs:
-        if spec.kind in ("teacher", "reference", "snapshot"):
+        if spec.kind in ("teacher", "reference", "snapshot", "import"):
             counts[spec.kind] = counts.get(spec.kind, 0) + 1
+    if counts.get("import"):
+        assert counts.get("snapshot", 0) > 0, (
+            "dedicated imports need league (snapshot) envs: the league "
+            "runtime hosts the static import agent — check teacher_envs "
+            "(default -1 absorbs every spare env)"
+        )
     if "teacher" in counts:
         opponents["teacher"] = BatchedPolicyAgent(
             teacher, counts["teacher"], name_code=name_code, device=device,
@@ -270,6 +274,9 @@ def main() -> None:
         pfsp=rcfg.pfsp, pfsp_p=rcfg.pfsp_p,
         pfsp_hard_frac=rcfg.pfsp_hard_frac, pfsp_explore=rcfg.pfsp_explore,
         league_members=league,
+        metric_imports=(
+            list(import_registry) if rcfg.import_dedicated_envs > 0 else ()
+        ),
     )
     runtime = None
     league_envs = counts.get("snapshot", 0)
@@ -482,6 +489,15 @@ def main() -> None:
                             log[f"rl/imports/{key.split(':', 1)[1]}"] = (
                                 snapshot_pool.win_estimate(key)
                             )
+                    if worker.ref_idx and not rcfg.league_phillip:
+                        # dedicated phillip: his ledger row is fed by the
+                        # reference envs; surface it like a class winrate
+                        ph_row = snapshot_pool.payoff.get("phillip")
+                        if ph_row and ph_row.get("games"):
+                            log["rl/phillip/winrate"] = (
+                                snapshot_pool.win_estimate("phillip")
+                            )
+                            log["rl/phillip/envs"] = len(worker.ref_idx)
                     imp_est = snapshot_pool.category_estimates().get("imports")
                     if imp_est is not None:
                         log["rl/imports/winrate"] = imp_est[0]
@@ -499,7 +515,8 @@ def main() -> None:
                 for kind, tracker in worker.trackers.items():
                     # tracker kinds share the ledger's category namespace
                     kname = (
-                        {"snapshot": "snapshots", "reference": "phillip"}
+                        {"snapshot": "snapshots", "reference": "phillip",
+                         "import": "imports"}
                         .get(kind, kind) if league_envs else kind
                     )
                     for k, v in tracker.stats().items():
@@ -545,7 +562,8 @@ def main() -> None:
                 games = sum(
                     log.get(f"rl/{k}/games_played", 0)
                     for k in (
-                        ("cpu", "teacher", "snapshots", "phillip", "self")
+                        ("cpu", "teacher", "snapshots", "phillip", "self",
+                         "imports")
                         if league_envs
                         else ("cpu", "teacher", "snapshot", "reference", "self")
                     )

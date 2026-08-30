@@ -1030,7 +1030,7 @@ def test_league_imports_parse():
         SnapshotPool("/tmp/never-used", league_members=("imported:v3",))
 
 
-def test_import_auction_singleton_class(tmp_path):
+def test_import_singleton_class_draw_weighting(tmp_path):
     """An import joins the per-match draw as its OWN singleton class:
     weight from its payoff row via f_hard(p=2), and it fades as the
     student starts beating it."""
@@ -1402,3 +1402,24 @@ def test_worker_dedicated_imports_route_credit_and_harvest(
 
     # imitation harvest: the imports group exists and is fed
     assert "imports" in worker._harvest_groups
+
+
+def test_dedicated_imports_surface_in_category_estimates(tmp_path):
+    """metric_imports lets dedicated (non-member) imports appear in
+    category_estimates — per-member rows AND the pooled 'imports' row —
+    while decommissioned payoff rows stay hidden."""
+    from smashbot.rl.pool import SnapshotPool
+
+    pool = SnapshotPool(
+        str(tmp_path), metric_imports=["import:ded"],
+    )
+    for _ in range(4):
+        pool.record_result("import:ded", True)
+    pool.record_result("import:ded", False)
+    pool.record_result("import:old", True)  # decommissioned row
+    cat = pool.category_estimates()
+    assert cat["import:ded"] is not None
+    dec, raw = cat["import:ded"]
+    assert raw == 4 / 5
+    assert cat["imports"] is not None and cat["imports"][1] == 4 / 5
+    assert "import:old" not in cat

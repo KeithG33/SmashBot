@@ -50,7 +50,7 @@ def make_partition(
     self-play env contributes BOTH seats as PPO trajectories, so it costs 2
     budget units while running one Dolphin. The returned list has
     num_envs - self_envs specs (= Dolphins to boot). Order:
-    cpu / teacher / reference / self / league."""
+    cpu / teacher / reference / import / self / league."""
     import_envs = (
         len(import_registry) * import_envs_per if import_registry else 0
     )
@@ -177,6 +177,9 @@ class SnapshotPool:
         # folded into the candidate set for non-latest slots; empty =
         # snapshots only (today's league).
         league_members: tp.Sequence[str] = (),
+        # import keys that should surface in METRICS even when not league
+        # members (dedicated imports, v9): their rows are fed by the worker
+        metric_imports: tp.Sequence[str] = (),
     ):
         self.dir = directory
         self.keep = keep
@@ -199,6 +202,7 @@ class SnapshotPool:
             "sampler has no notion of them)"
         )
         self.league_members = list(league_members)
+        self.metric_imports = tuple(metric_imports)
         os.makedirs(directory, exist_ok=True)
         # Adopt snapshots already on disk (restarts must not amnesia the
         # league: without this, every resume served only its own boot's
@@ -290,11 +294,15 @@ class SnapshotPool:
         for m in LEAGUE_MEMBER_KEYS:
             e = self.payoff.get(m)
             out[m] = pair(e) if e and e.get("games") else None
-        # imported members (cross-generation benchmark rows), when enabled
-        for m in self.league_members:
-            if _is_import_key(m):
-                e = self.payoff.get(m)
-                out[m] = pair(e) if e and e.get("games") else None
+        # imported members (cross-generation benchmark rows): league-drawn
+        # OR dedicated (v9, metric_imports) — but never decommissioned rows
+        imp_keys = sorted(
+            {m for m in self.league_members if _is_import_key(m)}
+            | set(self.metric_imports)
+        )
+        for m in imp_keys:
+            e = self.payoff.get(m)
+            out[m] = pair(e) if e and e.get("games") else None
         wd = gd = 0.0
         rw = rg = 0
         for g in self.archive:
@@ -310,9 +318,7 @@ class SnapshotPool:
         # pooled imports row (ticker "I:"), same math as "ghosts"
         wd = gd = 0.0
         rw = rg = 0
-        for m in self.league_members:
-            if not _is_import_key(m):
-                continue
+        for m in imp_keys:
             e = self.payoff.get(m)
             if not e or not e.get("games"):
                 continue
@@ -340,7 +346,8 @@ class SnapshotPool:
         tmp = path + ".tmp"
         torch.save(policy.state_dict(), tmp)
         os.replace(tmp, path)
-        self.archive.append(path)
+        if path not in self.archive:  # crash-restore can re-save a step
+            self.archive.append(path)
         self._thin()
         return path
 

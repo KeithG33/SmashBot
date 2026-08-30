@@ -76,7 +76,10 @@ class RolloutConfig:
     # simple all-teacher setup; production: everything not cpu/teacher/
     # reference/self is a LEAGUE env (kind "snapshot").
     cpu_envs: int = 0
-    teacher_envs: int = -1  # -1 = all envs not assigned to cpu/league
+    # -1 = teacher absorbs every env not assigned to cpu/ref/import/self/
+    # league — a FOOTGUN with import_dedicated_envs (set teacher_envs 0
+    # explicitly in league configs; train_rl asserts if league envs hit 0)
+    teacher_envs: int = -1
     # The league grid (rl/agent.LeagueAgent): league_slices weight slices,
     # each serving league_envs / league_slices cells. A slice is a weight
     # cache entry — at most league_slices DISTINCT league members are
@@ -91,10 +94,9 @@ class RolloutConfig:
     # autocast on the networks (sampling math stays fp32); gated by
     # scripts/precision_probe.py.
     rollout_precision: str = "fp16"
-    # Phillip's agent capacity (his architecture never fits a slice): the
-    # max envs fighting him at once; draws beyond it fall back to a
-    # resident-member draw. 0 = three slices' worth of cells (he held 2-3
-    # of 12 slots under the auction design).
+    # LEGACY (league_phillip mode only; ignored otherwise): Phillip's
+    # league-agent capacity — max envs fighting him at once. 0 = 3 slices'
+    # worth. v9 serves phillip via dedicated ref_envs instead.
     phillip_capacity: int = 0
     main12_prob: float = 0.6
     snapshot_interval: int = 500  # learner steps between student snapshots
@@ -235,7 +237,9 @@ class RolloutConfig:
             )
             members.append("phillip")
         imports = self.import_members()
-        if imports:
+        if imports and self.import_dedicated_envs <= 0:
+            # dedicated imports (v9) are static envs, NOT league members —
+            # they never enter the draw and need no PFSP
             assert self.league_slices > 0, (
                 f"league_imports serve through the league grid — set "
                 f"league_slices > 0 (got {self.league_slices})"

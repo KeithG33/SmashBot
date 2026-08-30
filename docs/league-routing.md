@@ -71,3 +71,19 @@ Auctions and `apply_assignments`, slot policies (12 live modules),
 `_SlotPool`/spares/parking, outgoing seats and evictions, pending adoption,
 per-slot char locks and cpu wishes, the per-slot loop forward, and the
 post-auction fps trough (parked ghosts stepping un-batched spares).
+
+## v9: static shares
+
+Fixed opponents left the draw entirely. Imports are DEDICATED envs served
+by a static agent (one slice per member, cells permanently assigned at
+boot via `import_dedicated_envs`; char-locked members pin their character,
+`@ANY` members redraw per game). Phillip is dedicated via the classic
+`ref_envs` machinery. The teacher is folded out: snapshot-0000000 (= the
+BC teacher) rides the archive as an ordinary ghost. PFSP's whole world is
+ghosts + cpu on the sampler grid; `league_slices` sizes that grid alone.
+Fixed members keep their payoff rows (the worker credits results under
+the same keys), so `I:`/`R:`/`rl/imports/*`/`rl/phillip/winrate` read
+continuously across the v8->v9 seam (`metric_imports` surfaces dedicated
+imports in `category_estimates`). The legacy league-member flags
+(`league_teacher` / `league_phillip` / league-drawn imports) remain
+supported for older configs.
