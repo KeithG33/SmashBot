@@ -274,6 +274,10 @@ def _env_process_main(
     consecutive_boot_failures = 0
     consecutive_wedges = 0
     first_boot = True
+    if cfg.boot_stagger > 0:
+        # decongest the fleet-wide cold-boot storm: 250+ simultaneous
+        # Dolphin launches blow the port-connect timeout (BOOT FAILURE 3/3)
+        time.sleep(idx * cfg.boot_stagger)
     try:
         while True:
             # Recycle boundary = the ONLY place a desired policy<->cpu flip

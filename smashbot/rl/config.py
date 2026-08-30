@@ -138,6 +138,12 @@ class RolloutConfig:
     # crashing loudly (a supervisor/--runtime.restore auto turns that crash
     # into a ~20min self-heal instead of a silent overnight hang).
     env_timeout: float = 300.0
+    # Seconds between successive envs' FIRST Dolphin boot (env i sleeps
+    # i * boot_stagger). 250+ simultaneous cold boots exceed the port
+    # connect timeout under contention (BOOT FAILURE 3/3 -> run dies);
+    # ~0.15 spreads the storm over ~40s. Recycles are naturally staggered
+    # by game lengths and don't use this.
+    boot_stagger: float = 0.15
     # Slippi replay recording (.slp per game; headless included — run fast,
     # watch later in Slippi at 60fps). Empty replay_dir = Slippi default.
     save_replays: bool = False
