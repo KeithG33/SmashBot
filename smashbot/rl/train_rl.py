@@ -440,12 +440,24 @@ def main() -> None:
                     (i + 1 - start_step) * args.runtime.trajectories_per_step
                     * args.rollouts.num_envs * args.rollouts.unroll_length
                 )
+                # event-counter diagnostics (nf_*, *_nonfinite,
+                # anomalous_samples) log SPARSELY: a healthy run holds them
+                # at 0 forever, and permanently-flat panels are clutter —
+                # the panel materializes the moment an event occurs
+                def _quiet(k, v):
+                    return v == 0 and (
+                        k.startswith("nf_") or k.endswith("_nonfinite")
+                        or k == "anomalous_samples"
+                    )
+
                 log = {
                     "rl/" + k: v
                     for k, v in metrics["post_update"].items()
+                    if not _quiet(k, v)
                 }
                 log.update({
                     "rl/value_" + k: v for k, v in metrics["value"].items()
+                    if not _quiet(k, v)
                 })
                 log["rl/reverted"] = float(metrics["reverted"])
                 log["rl/teacher_swaps"] = teacher_swaps
