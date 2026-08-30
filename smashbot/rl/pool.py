@@ -37,6 +37,10 @@ def make_partition(
     ref_envs: int = 0,
     self_envs: int = 0,
     char_whitelist: tp.Sequence[str] = ("FOX",),
+    # {"import:NAME": (path, char_lock|None)} -> import_envs_per dedicated
+    # envs per member (kind "import": pinned brain, static seat)
+    import_registry: tp.Mapping[str, tuple[str, tp.Optional[str]]] | None = None,
+    import_envs_per: int = 0,
 ) -> list[EnvSpec]:
     """Fixed env partition; seats alternate so each kind is port-balanced.
     Every env not cpu/teacher/reference/self is a LEAGUE env (kind
@@ -47,10 +51,18 @@ def make_partition(
     budget units while running one Dolphin. The returned list has
     num_envs - self_envs specs (= Dolphins to boot). Order:
     cpu / teacher / reference / self / league."""
+    import_envs = (
+        len(import_registry) * import_envs_per if import_registry else 0
+    )
     if teacher_envs < 0:  # default: teacher takes every env not otherwise used
-        teacher_envs = num_envs - cpu_envs - ref_envs - 2 * self_envs
-    league_envs = num_envs - cpu_envs - teacher_envs - ref_envs - 2 * self_envs
-    assert league_envs >= 0, "cpu/teacher/reference/self envs exceed num_envs"
+        teacher_envs = (
+            num_envs - cpu_envs - ref_envs - import_envs - 2 * self_envs
+        )
+    league_envs = (
+        num_envs - cpu_envs - teacher_envs - ref_envs - import_envs
+        - 2 * self_envs
+    )
+    assert league_envs >= 0, "fixed-kind envs exceed num_envs"
     rng = random.Random(seed)
 
     def cpu_char() -> str:
@@ -74,6 +86,16 @@ def make_partition(
     for i, ch in enumerate(stratified(ref_envs)):
         # reference agent (e.g. medium-v2) plays the main 12 (user-verified)
         specs.append(EnvSpec("reference", 1 + (i % 2), ch))
+    if import_registry:
+        for key, (_path, lock) in import_registry.items():
+            chars = (
+                [lock] * import_envs_per if lock
+                else stratified(import_envs_per)
+            )
+            for i, ch in enumerate(chars):
+                specs.append(EnvSpec(
+                    "import", 1 + (i % 2), ch, member=key, char_lock=lock,
+                ))
     # self-play: both seats are the student, so the second seat's boot char
     # draws from the student whitelist (stratified for coverage)
     for i, ch in enumerate(stratified(self_envs, list(char_whitelist))):

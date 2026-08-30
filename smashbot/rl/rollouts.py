@@ -311,6 +311,10 @@ class LeagueRuntime(tp.NamedTuple):
     league: League
     agent: LeagueAgent
     phillip: LeagueAgent | None
+    # Static import agent (v9): one slice per import member, cells
+    # permanently assigned to dedicated envs — weights loaded once at
+    # boot, allocator never involved.
+    imports_agent: LeagueAgent | None = None
 
 
 class DolphinRolloutWorker:
@@ -382,9 +386,14 @@ class DolphinRolloutWorker:
         self.groups: dict = {}
         self.ref_idx: list[int] = []
         self.league_idx: list[int] = []
+        # dedicated import envs, in cell order (partition emits them
+        # member-major, so index k sits at cell (k // N, k % N))
+        self.import_idx: list[int] = []
         for i, spec in enumerate(self.specs):
             if spec.kind == "teacher":
                 self.groups.setdefault("teacher", []).append(i)
+            elif spec.kind == "import":
+                self.import_idx.append(i)
             elif spec.kind == "snapshot":
                 self.league_idx.append(i)
             elif spec.kind == "reference":
@@ -431,13 +440,15 @@ class DolphinRolloutWorker:
         self.assembler = ChunkAssembler(config.unroll_length, student.delay)
         self.trackers = {
             k: GameTracker()
-            for k in ("cpu", "teacher", "snapshot", "reference", "self")
+            for k in ("cpu", "teacher", "snapshot", "reference", "self",
+                      "import")
         }
         # Imitation harvest of opponent seats: the fixed reference group
         # (ref_envs mode) and/or every league seat, grouped by model config
         # ("ours" = the grid, "phillip" = his agent) into _HarvestGroups.
         self.harvest_imitation = harvest_imitation and (
             bool(self.ref_idx) or bool(self.league_idx)
+            or bool(self.import_idx)
         )
         self._harvest_groups: dict[str, _HarvestGroup] = {}
         if self.harvest_imitation:
@@ -473,6 +484,17 @@ class DolphinRolloutWorker:
                         "phillip", range(ph.S * ph.N), T, ph.delay,
                         self._traj_reencoder(ph), dev,
                     )
+            imp = league.imports_agent if league is not None else None
+            if imp is not None and self.import_idx:
+                assert len(self.import_idx) == imp.S * imp.N, (
+                    "dedicated import envs must exactly fill the import "
+                    f"agent: {len(self.import_idx)} envs vs "
+                    f"{imp.S}x{imp.N} cells"
+                )
+                T, dev = config.unroll_length, student.device
+                self._harvest_groups["imports"] = _HarvestGroup(
+                    "imports", range(imp.S * imp.N), T, imp.delay, None, dev,
+                )
         self._procs: list = []
         self._conns: list = []
         import os as _os
@@ -706,6 +728,13 @@ class DolphinRolloutWorker:
         rt = self._runtime
         grid = rt.agent if rt is not None else None
         ph = rt.phillip if rt is not None else None
+        imp = rt.imports_agent if rt is not None else None
+        imp_rows = self.import_idx
+        imp_rows_t = (
+            torch.tensor(imp_rows, dtype=torch.int64,
+                         device=self.student.device)
+            if imp is not None and imp_rows else None
+        )
 
         prof = self._prof  # opt-in per-phase timing (SMASHBOT_PROFILE=1)
         while len(out) < num_trajectories:
@@ -744,10 +773,21 @@ class DolphinRolloutWorker:
                 locked = (
                     mem is not None
                     and self.league.lock_of(mem) is not None
-                )
+                ) or sp.char_lock is not None
                 self.trackers[
                     self._TRACKER_KIND.get(kind, kind)
                 ].add_game((a, b), None if locked else p.get("opp_char"))
+                if sp.kind == "reference" and self.league is not None:
+                    # dedicated Phillip (ref_envs mode): keep his ledger row
+                    # alive so R:/rl/phillip metrics survive leaving the draw
+                    if a != b:
+                        self.league.on_result("phillip", a > b)
+                if sp.kind == "import" and self.league is not None:
+                    # dedicated envs are outside the draw, but their games
+                    # feed the SAME payoff ledger so rl/imports/* metrics
+                    # and the ticker read identically to the league era
+                    if a != b:
+                        self.league.on_result(sp.member, a > b)
                 if sp.kind == "snapshot":
                     # credit the ended game, take a seat for the drawn
                     # member, draw the one after
@@ -789,6 +829,17 @@ class DolphinRolloutWorker:
                     for r, env in enumerate(ph_rows):
                         if env is not None:
                             opp_controllers[env] = ctrls[r]
+            if imp is not None and imp_rows:
+                imp_reset = torch.tensor(
+                    [resets_cpu[e] for e in imp_rows], dtype=torch.bool,
+                    device=self.student.device,
+                )
+                for r, e_ in enumerate(imp_rows):
+                    if resets_cpu[e_]:
+                        imp.reset_cell(r // imp.N, r % imp.N)
+                ictrls = imp.execute()
+                for r, env in enumerate(imp_rows):
+                    opp_controllers[env] = ictrls[r]
             group_live = {}
             for name, idx in self.groups.items():
                 if cpu_now and all(i in cpu_now for i in idx):
@@ -842,7 +893,10 @@ class DolphinRolloutWorker:
                     if self.ref_idx:
                         ref_rows = torch.tensor(self.ref_idx, device=device)
                         self._imit_assembler.push_reward(-reward[ref_rows])
-                    for key, rows_ in (("ours", cells), ("phillip", ph_rows)):
+                    for key, rows_ in (
+                        ("ours", cells), ("phillip", ph_rows),
+                        ("imports", imp_rows),
+                    ):
                         g = self._harvest_groups.get(key)
                         if g is not None:
                             g.push_reward(self._rows_of(-reward, rows_))
@@ -915,7 +969,15 @@ class DolphinRolloutWorker:
                     rec = ph.infer(pv, ph_reset.view(1, ph.N))
                     harvest["phillip"] = (ph_rows, ph_reset, [rec])
                 prof and prof.lap("phillip_infer", t0)
+            if imp is not None and imp_rows:
                 t0 = prof.t() if prof else None
+                iv = self._flat_view(
+                    opp_flats, rows=imp_rows_t, lead=(imp.S, imp.N)
+                )
+                irec = imp.infer(iv, imp_reset.view(imp.S, imp.N))
+                harvest["imports"] = (imp_rows, imp_reset, [irec])
+                prof and prof.lap("imports_infer", t0)
+            t0 = prof.t() if prof else None
             for name, idx in group_live.items():
                 group_view = self._flat_view(
                     tuple(t[idx[0]:idx[-1] + 1] for t in opp_flats)

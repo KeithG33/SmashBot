@@ -178,11 +178,17 @@ def _make_worker(monkeypatch, num_envs, seed=0, opp_chars=None,
     student = BatchedPolicyAgent(_tiny_policy(seed=0), num_envs, name_code=1)
     from smashbot.rl.pool import make_partition, student_whitelist
 
+    import_registry = {
+        f"import:{name}": (path, char)
+        for name, (path, char) in cfg.import_members().items()
+    } if cfg.import_dedicated_envs > 0 else None
     specs = make_partition(
         cfg.num_envs, cfg.cpu_envs, cfg.teacher_envs,
         cfg.main12_prob, cfg.partition_seed, ref_envs=cfg.ref_envs,
         self_envs=cfg.self_envs,
         char_whitelist=student_whitelist(cfg.char_whitelist, cfg.bot_char),
+        import_registry=import_registry,
+        import_envs_per=cfg.import_dedicated_envs,
     )
     opponents = {}
     counts = {}
@@ -202,6 +208,18 @@ def _make_worker(monkeypatch, num_envs, seed=0, opp_chars=None,
         runtime = _make_runtime(
             cfg, counts["snapshot"], pool_dir, members or [], phillip_capacity,
         )
+        if import_registry:
+            from smashbot.rl.agent import LeagueAgent
+
+            imp_agent = LeagueAgent(
+                _tiny_policy(seed=0), len(import_registry),
+                cfg.import_dedicated_envs, name_code=1, device="cpu",
+            )
+            for slot, key in enumerate(import_registry):
+                imp_agent.load_slice(
+                    slot, _tiny_policy(seed=200 + slot).state_dict()
+                )
+            runtime = runtime._replace(imports_agent=imp_agent)
     worker = DolphinRolloutWorker(
         cfg, student, opponents=opponents, specs=specs,
         harvest_imitation=harvest, league=runtime,
@@ -1298,3 +1316,89 @@ def test_import_char_lock_any_means_unlocked():
     import pytest as _pytest
     with _pytest.raises(AssertionError):
         RolloutConfig(league_imports=["x=/tmp/d.pt@BOWSER"]).import_members()
+
+
+# ------------------------------------------------- dedicated imports (v9)
+
+
+def test_partition_emits_dedicated_import_specs():
+    from smashbot.rl.pool import make_partition
+
+    reg = {
+        "import:fx": ("/tmp/a.pt", "FOX"),
+        "import:free": ("/tmp/b.pt", None),
+    }
+    specs = make_partition(
+        num_envs=20, cpu_envs=0, teacher_envs=2, seed=0,
+        import_registry=reg, import_envs_per=3,
+    )
+    imp = [sp for sp in specs if sp.kind == "import"]
+    assert len(imp) == 6
+    # member-major order matches the static agent's cell layout
+    assert [sp.member for sp in imp] == ["import:fx"] * 3 + ["import:free"] * 3
+    # locked member pins its char on every env; unlocked draws from roster
+    assert all(sp.opponent_char == "FOX" and sp.char_lock == "FOX"
+               for sp in imp[:3])
+    assert all(sp.char_lock is None for sp in imp[3:])
+    # budget: league envs shrink by the import envs
+    assert sum(1 for sp in specs if sp.kind == "snapshot") == 20 - 2 - 6
+
+
+def test_worker_dedicated_imports_route_credit_and_harvest(
+    monkeypatch, tmp_path
+):
+    """Static import pool end to end over fake envs: controllers come from
+    the import agent, results credit the 'import' tracker AND the payoff
+    ledger (metrics continuity), locked members stay out of by_char, and
+    the imports harvest group emits imitation trajectories."""
+    worker, envs = _make_worker(
+        monkeypatch, num_envs=12, pool_dir=tmp_path,
+        teacher_envs=0, league_slices=2,
+        members=[0], harvest=True, pfsp_explore=1.0,
+        import_dedicated_envs=2,
+        league_imports=[
+            "fx=/tmp/does-not-matter.pt@FOX",
+            "free=/tmp/does-not-matter2.pt@ANY",
+        ],
+        char_whitelist=["FOX", "MARTH", "FALCO", "PEACH"],
+    )
+    imp_envs = worker.import_idx
+    assert len(imp_envs) == 4
+    rt = worker._runtime
+    assert rt.imports_agent is not None and rt.imports_agent.S == 2
+
+    # opp chars: locked import serves FOX; unlocked serves whatever came up
+    for e in imp_envs[:2]:
+        envs.opp_chars[e] = "FOX"
+    for e in imp_envs[2:]:
+        envs.opp_chars[e] = "MARTH"
+
+    worker.collect(1)
+    # every import env received a controller each frame (validated decode
+    # happens inside _FakeConn.send); check a command actually landed
+    for e in imp_envs:
+        sent = worker._conns[e].sent
+        assert any(any(isinstance(k, int) for k in cmd) for cmd in sent)
+
+    # deliver decided results on all four import envs
+    for e in imp_envs[:3]:
+        envs.final_stocks[e] = (4, 0)   # student wins
+    envs.final_stocks[imp_envs[3]] = (0, 4)  # student loses
+    worker.collect(1)
+
+    t = worker.trackers["import"]
+    assert t.wins == 3 and t.losses == 1
+    # locked (FOX) games excluded from by_char; unlocked (MARTH) included
+    assert "FOX" not in t.by_char
+    assert t.by_char.get("MARTH", (0, 0))[1] == 2
+    # ledger rows fed for both members (metrics continuity)
+    pool = worker.league.pool
+    assert pool.payoff["import:fx"]["games"] == 2
+    assert pool.payoff["import:free"]["games"] == 2
+    # ports alternate within each member's envs, so (4,0) on the port-2
+    # env is a student LOSS after the swap: fx = 1 win 1 loss
+    assert pool.payoff["import:fx"]["wins"] == 1
+    assert pool.payoff["import:free"]["wins"] == 2
+
+    # imitation harvest: the imports group exists and is fed
+    assert "imports" in worker._harvest_groups

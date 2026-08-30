@@ -199,6 +199,8 @@ def main() -> None:
     # league flags (teacher / lvl-9 CPU as PFSP members): validate up front —
     # loud assert beats 120 Dolphins booting into a mispartitioned run
     league = rcfg.league_members()
+    if rcfg.import_dedicated_envs > 0:
+        league = [m for m in league if not m.startswith("import:")]
     if league:
         print(f"league members (per-match PFSP draws): {league}")
     # Imported league members (frozen checkpoints from a previous run):
@@ -214,11 +216,22 @@ def main() -> None:
             f"league import {key}: state_dict not found at {path}"
         )
         print(f"league import: {key} <- {path} @ {char} (char lock)")
+    dedicated_imports = rcfg.import_dedicated_envs > 0 and bool(import_registry)
+    if dedicated_imports:
+        # the static agent + ledger both live inside the league runtime
+        assert rcfg.league_slices > 0, (
+            "import_dedicated_envs requires league envs (the ghost league "
+            "hosts the runtime and the payoff ledger)"
+        )
+        print(f"imports: DEDICATED, {rcfg.import_dedicated_envs} envs each "
+              f"x {len(import_registry)} members (static agent, no draw)")
     specs = make_partition(
         rcfg.num_envs, rcfg.cpu_envs, rcfg.teacher_envs,
         rcfg.main12_prob, rcfg.partition_seed,
         ref_envs=rcfg.ref_envs, self_envs=rcfg.self_envs,
         char_whitelist=student_whitelist(rcfg.char_whitelist, rcfg.bot_char),
+        import_registry=import_registry if dedicated_imports else None,
+        import_envs_per=rcfg.import_dedicated_envs,
     )
     opponents = {}
     counts = {}
@@ -280,8 +293,9 @@ def main() -> None:
         )
         # member weights: teacher (frozen copy), imports, snapshots (LRU)
         fixed = {"teacher": {k: v.detach().cpu() for k, v in teacher.state_dict().items()}}
-        for key, (path, _char) in import_registry.items():
-            fixed[key] = torch.load(path, map_location="cpu")
+        if not dedicated_imports:
+            for key, (path, _char) in import_registry.items():
+                fixed[key] = torch.load(path, map_location="cpu")
         # cache every ghost the archive can hold (fixed members live
         # outside the LRU); effectively unbounded when pruning is off
         weights = MemberWeights(fixed, lru=(
@@ -303,6 +317,19 @@ def main() -> None:
             print(f"phillip (league member): {rcfg.ref_ckpt} "
                   f"(delay {ph_policy.delay}, name code {ph_code}, "
                   f"capacity {cap})")
+        imports_agent = None
+        if dedicated_imports:
+            # one slice per import, cells = its dedicated envs; weights
+            # loaded exactly once — the allocator never touches this agent
+            imports_agent = LeagueAgent(
+                template, len(import_registry), rcfg.import_dedicated_envs,
+                name_code=name_code, device=device, temperature=None,
+                weights_dtype=getattr(torch, rcfg.league_weights_dtype),
+            )
+            for slot, (key, (path, _char)) in enumerate(import_registry.items()):
+                imports_agent.load_slice(slot, torch.load(path, map_location="cpu"))
+            print(f"import agent: {len(import_registry)} slices x "
+                  f"{rcfg.import_dedicated_envs} cells (static)")
         seats = LeagueSeats(
             S, N, loader=lambda s, m: grid.load_slice(s, weights.get(m)),
             phillip_capacity=phillip_agent.N if phillip_agent else 0,
@@ -312,14 +339,19 @@ def main() -> None:
 
         league_proto = League(
             snapshot_pool, seats,
-            locks={k: char for k, (_p, char) in import_registry.items()},
+            locks=(
+                {} if dedicated_imports
+                else {k: c for k, (_p, c) in import_registry.items()}
+            ),
             rng=_random.Random(rcfg.partition_seed ^ 0xA11A),
             on_result=snapshot_pool.record_result,
             cpu_enabled=rcfg.league_cpu, warm=weights.warm,
         )
         from smashbot.rl.rollouts import LeagueRuntime
 
-        runtime = LeagueRuntime(league_proto, grid, phillip_agent)
+        runtime = LeagueRuntime(
+            league_proto, grid, phillip_agent, imports_agent=imports_agent,
+        )
         print(f"league grid: {S} slices x {N} cells for {league_envs} envs",
               flush=True)
     worker = DolphinRolloutWorker(
@@ -445,6 +477,11 @@ def main() -> None:
                         log[f"rl/snapshots/s{g_step:07d}"] = (
                             snapshot_pool.win_estimate(g_path)
                         )
+                    if rcfg.import_dedicated_envs > 0:
+                        for key in import_registry:
+                            log[f"rl/imports/{key.split(':', 1)[1]}"] = (
+                                snapshot_pool.win_estimate(key)
+                            )
                     imp_est = snapshot_pool.category_estimates().get("imports")
                     if imp_est is not None:
                         log["rl/imports/winrate"] = imp_est[0]
@@ -496,6 +533,14 @@ def main() -> None:
                     )
                     log["rl/bychar/_chars_too_thin"] = thin
                 log["rl/frames_per_sec"] = frames / (time.time() - t0)
+                if device == "cuda":
+                    import torch as _torch
+                    log["rl/vram_peak_gib"] = (
+                        _torch.cuda.max_memory_allocated() / 2 ** 30
+                    )
+                    log["rl/vram_reserved_gib"] = (
+                        _torch.cuda.memory_reserved() / 2 ** 30
+                    )
                 wandb.log(log, step=i)
                 games = sum(
                     log.get(f"rl/{k}/games_played", 0)
@@ -520,7 +565,8 @@ def main() -> None:
 
                 ref_bit = (
                     f"R:{_pct(cat.get('phillip'))} "
-                    if rcfg.league_phillip else (
+                    if rcfg.league_phillip
+                    or (league_envs and worker.ref_idx) else (
                         f"R:{log.get('rl/reference/win_rate_ema', 0.5):.0%} "
                         if worker.ref_idx else ""
                     )

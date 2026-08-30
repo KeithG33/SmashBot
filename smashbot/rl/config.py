@@ -49,10 +49,16 @@ def student_whitelist(
 class EnvSpec:
     """Per-env assignment, fixed for the run."""
 
-    kind: str  # "cpu" | "teacher" | "reference" | "self" | "snapshot" (league)
+    # "cpu" | "teacher" | "reference" | "import" | "self" | "snapshot"
+    # (snapshot = league env: opponent drawn per match)
+    kind: str
     student_port: int  # 1 or 2
     opponent_char: str
     cpu_level: int = 9
+    # "import" envs: which fixed brain this env is pinned to ("import:NAME")
+    member: str = ""
+    # pinned opponent character ("FOX" imports); None = redraw per game
+    char_lock: tp.Optional[str] = None
 
 
 @dataclasses.dataclass
@@ -93,6 +99,10 @@ class RolloutConfig:
     main12_prob: float = 0.6
     snapshot_interval: int = 500  # learner steps between student snapshots
     snapshot_keep: int = 30  # ghost archive cap; <=0 = never prune
+    # Dedicated envs PER import member (static: pinned brain, no league
+    # draw, per-game char redraw unless the import is char-locked).
+    # 0 = legacy behavior: imports are league members drawn by PFSP.
+    import_dedicated_envs: int = 0
     partition_seed: int = 0
     headless: bool = True  # False: rendered window at normal speed (watch mode)
     log_tag: str = ""  # namespaces /tmp/smashbot-env-*.log between runs

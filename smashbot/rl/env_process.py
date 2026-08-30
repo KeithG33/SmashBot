@@ -111,7 +111,9 @@ def _env_process_main(
     # next game's character (see next_opponent_char); a kind change turns
     # the current game into this Dolphin's last (spare pre-booted now,
     # recycle at the boundary). Never sent outside league mode.
-    char_lock = None
+    # Static import envs carry their lock in the spec (league envs get
+    # theirs from opp_next commands); None = per-game redraw.
+    char_lock = spec.char_lock
     opp_next = None
     # SMASHBOT_PROFILE=1: per-frame phase timing for THIS env (printed every
     # 600 frames): dolphin = waiting for the emulator's next frame, parse =
