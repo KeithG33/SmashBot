@@ -31,6 +31,9 @@ class RuntimeConfig:
     checkpoint_interval: int = 50
     log_interval: int = 1
     wandb_mode: str = "online"
+    # wandb run id override (default: the tag). Needed when a tag's id was
+    # deleted on the server — deleted ids are tombstoned and unreusable.
+    wandb_id: str = ""
     name: str = "Master Player"
     compile: bool = True  # compile sample_n (the batched flush)
     # Hot-swappable teacher: poll this path (default: the --ckpt file) every
@@ -407,7 +410,8 @@ def main() -> None:
     import wandb
 
     wandb.init(
-        project="shinebot", id=args.runtime.tag, name=args.runtime.tag,
+        project="shinebot", id=args.runtime.wandb_id or args.runtime.tag,
+        name=args.runtime.tag,
         mode=args.runtime.wandb_mode, config=dataclasses.asdict(args),
     )
 
