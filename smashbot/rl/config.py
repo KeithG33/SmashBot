@@ -66,6 +66,12 @@ class RolloutConfig:
     num_envs: int = 8
     unroll_length: int = 240  # 4s, slippi-ai's RL rollout length
     batch_steps: int = 1  # frames per inference flush; measured best on this rig (see docs)
+    # overlap the per-frame opponent grid forwards (league + imports) on
+    # their own CUDA streams while the student/groups run on the default
+    # stream; the calls are independent and their small latency-bound
+    # kernels coexist on the GPU. Serial on CPU and for the first frames
+    # of a boot (compile/graph capture must be single-threaded).
+    parallel_serving: bool = True
     bot_char: str = "FOX"
     stage: str = "FINAL_DESTINATION"
     games_per_dolphin: int = 20

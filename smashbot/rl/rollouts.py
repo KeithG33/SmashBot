@@ -505,7 +505,18 @@ class DolphinRolloutWorker:
         import os as _os
 
         self._prof = _PhaseProfiler() if _os.environ.get("SMASHBOT_PROFILE") else None
-        if self._prof is not None and league is not None:
+        # stream-parallel serving state (see _run_serving)
+        self._serve_pool = None
+        self._serve_streams: dict[str, tp.Any] = {}
+        self._serve_frames = 0
+        self._serve_parallel = (
+            self.config.parallel_serving
+            and torch.device(self.student.device).type == "cuda"
+        )
+        # the grid sub-timers device-sync between laps, which would
+        # serialize the streams — serial mode only
+        if (self._prof is not None and league is not None
+                and not self._serve_parallel):
             # grid sub-phases (forward / record+to_cpu / decode+queues)
             t = {"t0": None}
 
@@ -693,6 +704,45 @@ class DolphinRolloutWorker:
         if serving == "cpu":
             return "cpu"
         return self.member_kind(self.league.member_now.get(i))
+
+    def _serve_submit(self, name: str, fn):
+        """Queue one opponent-grid forward on a dedicated CUDA stream in a
+        worker thread. The stream first waits on the default stream (this
+        frame's encoded views are produced there, and the wait is recorded
+        before the caller enqueues its own student forward, so the grids
+        never wait on the student); the caller makes the default stream
+        wait on every serving stream before consuming the outputs. Those
+        two ordering edges also make the caching allocator's cross-stream
+        memory reuse safe: freed memory is only handed to work enqueued
+        after the corresponding wait."""
+        if self._serve_pool is None:
+            import concurrent.futures
+
+            self._serve_pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="serve"
+            )
+        stream = self._serve_streams.get(name)
+        if stream is None:
+            stream = self._serve_streams[name] = torch.cuda.Stream()
+        prof = self._prof
+
+        def run():
+            import time as _time
+
+            stream.wait_stream(torch.cuda.default_stream())
+            t0 = _time.perf_counter() if prof else None
+            with torch.cuda.stream(stream):
+                fn()
+            if prof is not None:
+                # wall time without a device sync (a sync here would
+                # serialize the streams); the .cpu() inside fn makes this
+                # track the real latency closely
+                key = f"{name}_wall"
+                prof.acc[key] = prof.acc.get(key, 0.0) + (
+                    _time.perf_counter() - t0
+                ) * 1e3
+
+        return self._serve_pool.submit(run)
 
     def _seat_tables(self):
         """Row -> env maps for the grid cells and Phillip's rows (None =
@@ -952,51 +1002,113 @@ class DolphinRolloutWorker:
             ))
             resets_dev = resets.to(device)
             pending_resets.append(resets_dev)
-            t0 = prof.t() if prof else None
-            records, hidden_before = self.student.infer(
-                student_view, resets_dev,
-                # the snapshot is only consumed at a chunk boundary
-                want_snapshot=(records_pushed % cfg.unroll_length == 0),
-            )
-            prof and prof.lap("student_infer", t0)
-            t0 = prof.t() if prof else None
 
+            # first frames of a boot stay serial: torch.compile and the
+            # manual CUDA-graph captures must run single-threaded
+            use_par = (
+                self._serve_parallel and self._serve_frames >= 40
+                and (bool(self.league_idx) or (imp is not None and bool(imp_rows)))
+            )
+            self._serve_frames += 1
             ref_records: list[FrameRecord] = []
             harvest: dict[str, tuple] = {}  # key -> (rows, resets, records)
-            if self.league_idx:
-                # ---- the grid: gather every cell's env view, one forward
-                gv = self._flat_view(opp_flats, rows=cell_env, lead=(grid.S, grid.N))
-                prof and prof.lap("grid_gather", t0)
+            if not use_par:
                 t0 = prof.t() if prof else None
-                prof and grid._timer_reset()
-                record = grid.infer(gv, cell_reset.view(grid.S, grid.N))
-                harvest["ours"] = (cells, cell_reset, [record])
-                prof and prof.lap("grid_infer", t0)
+                records, hidden_before = self.student.infer(
+                    student_view, resets_dev,
+                    # the snapshot is only consumed at a chunk boundary
+                    want_snapshot=(records_pushed % cfg.unroll_length == 0),
+                )
+                prof and prof.lap("student_infer", t0)
                 t0 = prof.t() if prof else None
-                if ph is not None:
-                    pv = self._flat_view(opp_flats, rows=ph_env, lead=(1, ph.N))
-                    rec = ph.infer(pv, ph_reset.view(1, ph.N))
-                    harvest["phillip"] = (ph_rows, ph_reset, [rec])
-                prof and prof.lap("phillip_infer", t0)
-            if imp is not None and imp_rows:
+
+                if self.league_idx:
+                    # ---- the grid: gather every cell's env view, one forward
+                    gv = self._flat_view(opp_flats, rows=cell_env, lead=(grid.S, grid.N))
+                    prof and prof.lap("grid_gather", t0)
+                    t0 = prof.t() if prof else None
+                    prof and getattr(grid, "_timer_reset", lambda: None)()
+                    record = grid.infer(gv, cell_reset.view(grid.S, grid.N))
+                    harvest["ours"] = (cells, cell_reset, [record])
+                    prof and prof.lap("grid_infer", t0)
+                    t0 = prof.t() if prof else None
+                    if ph is not None:
+                        pv = self._flat_view(opp_flats, rows=ph_env, lead=(1, ph.N))
+                        rec = ph.infer(pv, ph_reset.view(1, ph.N))
+                        harvest["phillip"] = (ph_rows, ph_reset, [rec])
+                    prof and prof.lap("phillip_infer", t0)
+                if imp is not None and imp_rows:
+                    t0 = prof.t() if prof else None
+                    iv = self._flat_view(
+                        opp_flats, rows=imp_rows_t, lead=(imp.S, imp.N)
+                    )
+                    irec = imp.infer(iv, imp_reset.view(imp.S, imp.N))
+                    harvest["imports"] = (imp_rows, imp_reset, [irec])
+                    prof and prof.lap("imports_infer", t0)
                 t0 = prof.t() if prof else None
-                iv = self._flat_view(
-                    opp_flats, rows=imp_rows_t, lead=(imp.S, imp.N)
+                for name, idx in group_live.items():
+                    group_view = self._flat_view(
+                        tuple(t[idx[0]:idx[-1] + 1] for t in opp_flats)
+                    )
+                    g_records, _ = self.opponents[name].infer(
+                        group_view, resets_dev[idx[0]:idx[-1] + 1], want_snapshot=False,
+                    )
+                    if name == "reference" and self.harvest_imitation:
+                        ref_records = g_records
+                prof and prof.lap("groups_infer", t0)
+            else:
+                # ---- stream-parallel serving: the grid and imports
+                # forwards (manual CUDA graphs, replayable on any stream)
+                # run on their own streams from worker threads while this
+                # thread serves student+groups (torch.compile'd -> default
+                # stream). The serving streams wait on the default stream
+                # (views built there); the default stream waits on them
+                # before the outputs are consumed below.
+                t0 = prof.t() if prof else None
+                futs = []
+                if self.league_idx:
+                    def _grid_task():
+                        gv = self._flat_view(
+                            opp_flats, rows=cell_env, lead=(grid.S, grid.N)
+                        )
+                        record = grid.infer(gv, cell_reset.view(grid.S, grid.N))
+                        harvest["ours"] = (cells, cell_reset, [record])
+                        if ph is not None:
+                            pv = self._flat_view(
+                                opp_flats, rows=ph_env, lead=(1, ph.N)
+                            )
+                            rec = ph.infer(pv, ph_reset.view(1, ph.N))
+                            harvest["phillip"] = (ph_rows, ph_reset, [rec])
+                    futs.append(self._serve_submit("grid", _grid_task))
+                if imp is not None and imp_rows:
+                    def _imports_task():
+                        iv = self._flat_view(
+                            opp_flats, rows=imp_rows_t, lead=(imp.S, imp.N)
+                        )
+                        irec = imp.infer(iv, imp_reset.view(imp.S, imp.N))
+                        harvest["imports"] = (imp_rows, imp_reset, [irec])
+                    futs.append(self._serve_submit("imports", _imports_task))
+                records, hidden_before = self.student.infer(
+                    student_view, resets_dev,
+                    want_snapshot=(records_pushed % cfg.unroll_length == 0),
                 )
-                irec = imp.infer(iv, imp_reset.view(imp.S, imp.N))
-                harvest["imports"] = (imp_rows, imp_reset, [irec])
-                prof and prof.lap("imports_infer", t0)
-            t0 = prof.t() if prof else None
-            for name, idx in group_live.items():
-                group_view = self._flat_view(
-                    tuple(t[idx[0]:idx[-1] + 1] for t in opp_flats)
-                )
-                g_records, _ = self.opponents[name].infer(
-                    group_view, resets_dev[idx[0]:idx[-1] + 1], want_snapshot=False,
-                )
-                if name == "reference" and self.harvest_imitation:
-                    ref_records = g_records
-            prof and prof.lap("groups_infer", t0)
+                for name, idx in group_live.items():
+                    group_view = self._flat_view(
+                        tuple(t[idx[0]:idx[-1] + 1] for t in opp_flats)
+                    )
+                    g_records, _ = self.opponents[name].infer(
+                        group_view, resets_dev[idx[0]:idx[-1] + 1],
+                        want_snapshot=False,
+                    )
+                    if name == "reference" and self.harvest_imitation:
+                        ref_records = g_records
+                for f in futs:
+                    f.result()  # re-raises worker-thread errors
+                if self._serve_streams:
+                    cur = torch.cuda.current_stream()
+                    for s in self._serve_streams.values():
+                        cur.wait_stream(s)
+                prof and prof.lap("serve(par)", t0)
             t0 = prof.t() if prof else None
 
             # ---- assemble / harvest
