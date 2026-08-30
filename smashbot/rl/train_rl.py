@@ -563,14 +563,14 @@ def main() -> None:
                 thin = 0
                 for ch, (w, g) in sorted(by_char.items()):
                     if g >= 20:  # below that it is noise, not a signal
-                        log[f"rl/bychar/{ch}"] = w / g
+                        log[f"bychar/{ch}"] = w / g
                     else:
                         thin += 1
                 if by_char:
-                    log["rl/bychar/_games_total"] = sum(
+                    log["bychar/_games_total"] = sum(
                         g for _, g in by_char.values()
                     )
-                    log["rl/bychar/_chars_too_thin"] = thin
+                    log["bychar/_chars_too_thin"] = thin
                 log["rl/frames_per_sec"] = frames / (time.time() - t0)
 
                 wandb.log(log, step=i)
