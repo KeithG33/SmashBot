@@ -299,7 +299,11 @@ def main() -> None:
             weights_dtype=getattr(torch, rcfg.league_weights_dtype),
         )
         # member weights: teacher (frozen copy), imports, snapshots (LRU)
-        fixed = {"teacher": {k: v.detach().cpu() for k, v in teacher.state_dict().items()}}
+        fixed = {}
+        if "teacher" in league:  # league-drawn teacher only (legacy mode)
+            fixed["teacher"] = {
+                k: v.detach().cpu() for k, v in teacher.state_dict().items()
+            }
         if not dedicated_imports:
             for key, (path, _char) in import_registry.items():
                 fixed[key] = torch.load(path, map_location="cpu")
@@ -404,7 +408,9 @@ def main() -> None:
                 new_teacher = watcher.poll()
                 if new_teacher is not None:
                     teacher.load_state_dict(new_teacher)  # in-place copy
-                    if runtime is not None:
+                    if runtime is not None and "teacher" in league:
+                        # refresh the league-served copy (legacy mode only;
+                        # in v9 the teacher exists only as the KL anchor)
                         weights.set("teacher", {
                             k: v.detach().cpu() for k, v in teacher.state_dict().items()
                         })
@@ -513,9 +519,11 @@ def main() -> None:
                     imp_est = snapshot_pool.category_estimates().get("imports")
                     if imp_est is not None:
                         log["rl/imports/winrate"] = imp_est[0]
-                        log["rl/imports/envs"] = sum(
-                            v for c, v in held.items()
-                            if c.startswith("import:")
+                        log["rl/imports/envs"] = (
+                            len(worker.import_idx)
+                            if rcfg.import_dedicated_envs > 0 else
+                            sum(v for c, v in held.items()
+                                if c.startswith("import:"))
                         )
                     lg = worker.league
                     log["rl/league/fallback_rate"] = lg.fallback_rate

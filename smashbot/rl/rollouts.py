@@ -400,8 +400,7 @@ class DolphinRolloutWorker:
                 self.league_idx.append(i)
             elif spec.kind == "reference":
                 # served in-process by the ported torch checkpoint (see
-                # scripts/port_ref_model.py) — same path as teacher/slots.
-                # The TF RefBridge remains available for eval batteries.
+                # scripts/port_ref_model.py)
                 self.groups.setdefault("reference", []).append(i)
                 self.ref_idx.append(i)
         if self.import_idx:
