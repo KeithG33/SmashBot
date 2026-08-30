@@ -336,7 +336,8 @@ def main() -> None:
         # cache every ghost the archive can hold (fixed members live
         # outside the LRU); effectively unbounded when pruning is off
         weights = MemberWeights(fixed, lru=(
-            10 ** 6 if rcfg.snapshot_keep <= 0 else max(16, rcfg.snapshot_keep)
+            max(16, rcfg.ghost_cache) if rcfg.snapshot_keep <= 0
+            else max(16, rcfg.snapshot_keep)
         ))
         phillip_agent = None
         if rcfg.league_phillip:

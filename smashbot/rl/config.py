@@ -107,6 +107,11 @@ class RolloutConfig:
     main12_prob: float = 0.6
     snapshot_interval: int = 500  # learner steps between student snapshots
     snapshot_keep: int = 30  # ghost archive cap; <=0 = never prune
+    # Host-RAM cap on RESIDENT ghost weights when the archive is immortal
+    # (snapshot_keep <= 0): ~107MB each, so an unbounded cache grows
+    # ~8.6GB by step 40k. Evicted ghosts reload from disk on demand (the
+    # league's warm() prefetch hides the latency).
+    ghost_cache: int = 40
     # Dedicated envs PER import member (static: pinned brain, no league
     # draw, per-game char redraw unless the import is char-locked).
     # 0 = legacy behavior: imports are league members drawn by PFSP.
