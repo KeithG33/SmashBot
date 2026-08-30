@@ -240,7 +240,13 @@ class _PhaseProfiler:
         self.n = 0
 
     def t(self) -> float:
-        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        # current-stream sync, NOT device-wide: a device sync would block
+        # on the overlapped learner stream (learner_overlap) and on the
+        # serving streams, serializing exactly what we overlap. The wait
+        # edges already order the default stream after the serving work
+        # this timer means to measure.
+        if torch.cuda.is_available():
+            torch.cuda.current_stream().synchronize()
         return self._time.perf_counter()
 
     def lap(self, key: str, t0: float) -> None:
@@ -252,7 +258,11 @@ class _PhaseProfiler:
             return
         self.n += 1
         if self.n % self.every == 0:
-            total = sum(self.acc.values())
+            # *_wall keys are per-thread wall times INSIDE serve(par) —
+            # counting them in the total would double-book the overlap
+            total = sum(
+                v for k, v in self.acc.items() if not k.endswith("_wall")
+            )
             parts = "  ".join(f"{k} {v / self.n:6.1f}" for k, v in self.acc.items())
             print(f"[profile] ms/frame total {total / self.n:6.1f} | {parts}",
                   flush=True)

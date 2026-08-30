@@ -177,14 +177,30 @@ def main() -> None:
     _save_rl_checkpoint.policy_opt = learner.policy_optimizer
     _save_rl_checkpoint.value_opt = learner.value_optimizer
 
+    overlap = args.rollouts.learner_overlap and device == "cuda"
+    serving_policy = policy
+    if overlap:
+        # the worker serves a dedicated copy so the concurrently-running
+        # optimizer.step can never tear a forward mid-frame; the pipeline
+        # loop publishes learner weights into it at step boundaries
+        import copy as _copy
+
+        serving_policy = _copy.deepcopy(policy)
+        serving_policy.requires_grad_(False).eval()
+        serving_policy.train_value_head = False
+        print("learner overlap: ON — student serves a published weight "
+              "copy; rollouts are one update stale", flush=True)
     if args.runtime.compile:
         mode = "reduce-overhead" if device == "cuda" else "default"
-        policy.sample = torch.compile(policy.sample, mode=mode)
+        # the SERVING policy's sample paths are what rollouts call (they
+        # are policy's own when overlap is off); the learner never samples
+        serving_policy.sample = torch.compile(serving_policy.sample, mode=mode)
         teacher.sample = torch.compile(teacher.sample, mode=mode)
-        policy.sample_n = torch.compile(policy.sample_n, mode=mode)
+        serving_policy.sample_n = torch.compile(serving_policy.sample_n, mode=mode)
         teacher.sample_n = torch.compile(teacher.sample_n, mode=mode)
     student_agent = BatchedPolicyAgent(
-        policy, args.rollouts.num_envs, name_code=name_code, device=device,
+        serving_policy, args.rollouts.num_envs, name_code=name_code,
+        device=device,
         batch_steps=args.rollouts.batch_steps,
         precision=args.rollouts.rollout_precision,
     )
@@ -396,8 +412,9 @@ def main() -> None:
     watcher = TeacherWatcher(args.runtime.teacher_watch or args.ckpt)
     teacher_swaps = 0
     t0 = time.time()
-    try:
-        for i in range(start_step, args.runtime.steps):
+
+    def _pre_step(i):
+            nonlocal state, teacher_swaps
             if league_envs and i > 0 and i % rcfg.snapshot_interval == 0:
                 # a new ghost joins the league; envs draw it per match
                 # from now on (no auction, no swaps)
@@ -421,23 +438,8 @@ def main() -> None:
                     )
                     teacher_swaps += 1
                     print(f"[{i}] TEACHER SWAPPED (#{teacher_swaps})")
-            trajectories = worker.collect(args.runtime.trajectories_per_step)
-            if os.environ.get("SMASHBOT_PROFILE") and device == "cuda":
-                torch.cuda.synchronize()
-                _base = torch.cuda.memory_allocated()
-                torch.cuda.reset_peak_memory_stats()
-            state, metrics = learner.step(
-                trajectories, state,
-                progress=i / max(1, args.runtime.steps),
-            )
-            if os.environ.get("SMASHBOT_PROFILE") and device == "cuda":
-                torch.cuda.synchronize()
-                peak = torch.cuda.max_memory_allocated()
-                print(f"[vram] step {i}: baseline {_base / 2**30:.2f} GiB "
-                      f"(inference residency: weights + graph pools) | learner peak "
-                      f"{peak / 2**30:.2f} GiB | activations {(peak - _base) / 2**30:.2f} GiB | "
-                      f"reserved {torch.cuda.memory_reserved() / 2**30:.2f} GiB", flush=True)
 
+    def _post_step(i, metrics):
             if i % args.runtime.log_interval == 0:
                 # frames THIS BOOT only: after a restore, i includes the
                 # restored steps but t0 is boot time — crediting them made
@@ -636,8 +638,90 @@ def main() -> None:
                     f"{run_dir}/latest.pt", ckpt["config"], policy, value_fn,
                     name_map, i, args.ckpt,
                 )
+
+    overlap_pool = None
+    overlap_stream = None
+    if overlap:
+        import concurrent.futures
+
+        overlap_pool = concurrent.futures.ThreadPoolExecutor(
+            1, thread_name_prefix="learner"
+        )
+        overlap_stream = torch.cuda.Stream()
+        _s_sd = serving_policy.state_dict()
+        _p_sd = policy.state_dict()
+        _pub_pairs = [(_s_sd[k], _p_sd[k]) for k in _s_sd]
+
+        def _publish():
+            # boundary-only: the learner is joined, the next collect has
+            # not started — the serving copy can never see a torn update
+            with torch.no_grad():
+                for dst, src in _pub_pairs:
+                    dst.copy_(src)
+
+    try:
+        # learner_overlap pipeline: collect batch i while learner.step on
+        # batch i-1 runs on its own stream in the background thread. Join,
+        # THEN pre-ops/publish (they read final θ), then submit batch i.
+        # Rollouts act one gradient update behind the learner — PPO's
+        # importance ratios absorb it (see rl/actor_kl_mean).
+        fut = None
+        fut_i = None
+        for i in range(start_step, args.runtime.steps):
+            if not overlap:
+                _pre_step(i)
+                trajectories = worker.collect(
+                    args.runtime.trajectories_per_step
+                )
+                prof_vram = (
+                    os.environ.get("SMASHBOT_PROFILE") and device == "cuda"
+                )
+                if prof_vram:
+                    torch.cuda.synchronize()
+                    _base = torch.cuda.memory_allocated()
+                    torch.cuda.reset_peak_memory_stats()
+                state, metrics = learner.step(
+                    trajectories, state,
+                    progress=i / max(1, args.runtime.steps),
+                )
+                if prof_vram:
+                    torch.cuda.synchronize()
+                    peak = torch.cuda.max_memory_allocated()
+                    print(f"[vram] step {i}: baseline {_base / 2**30:.2f} GiB "
+                          f"(inference residency: weights + graph pools) | learner peak "
+                          f"{peak / 2**30:.2f} GiB | activations {(peak - _base) / 2**30:.2f} GiB | "
+                          f"reserved {torch.cuda.memory_reserved() / 2**30:.2f} GiB", flush=True)
+                _post_step(i, metrics)
+            else:
+                trajectories = worker.collect(
+                    args.runtime.trajectories_per_step
+                )
+                if fut is not None:
+                    state, metrics = fut.result()
+                    _post_step(fut_i, metrics)
+                _pre_step(i)  # θ is final: the previous update was joined
+                _publish()
+                ready = torch.cuda.Event()
+                ready.record()  # trajectories fully enqueued on default
+
+                def _run(traj=trajectories, st=state, ev=ready,
+                         prog=i / max(1, args.runtime.steps)):
+                    overlap_stream.wait_event(ev)
+                    with torch.cuda.stream(overlap_stream):
+                        out = learner.step(traj, st, progress=prog)
+                    # drain before returning: fut.result() must imply the
+                    # weights are final (publish reads them next)
+                    overlap_stream.synchronize()
+                    return out
+
+                fut, fut_i = overlap_pool.submit(_run), i
+        if overlap and fut is not None:
+            state, metrics = fut.result()
+            _post_step(fut_i, metrics)
     finally:
         worker.stop()
+        if overlap_pool is not None:
+            overlap_pool.shutdown(wait=True)
 
 
 if __name__ == "__main__":

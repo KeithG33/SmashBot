@@ -119,6 +119,13 @@ class RolloutConfig:
     # Boot each Dolphin's replacement in the background during its final
     # game (recycle hot-swap). OFF by default: ~5% gain, riskier teardown.
     double_buffer: bool = False
+    # Double-buffer the LEARNER: run learner.step(batch k) on its own CUDA
+    # stream in a background thread while the worker collects batch k+1.
+    # Rollouts become one gradient-update stale (PPO's importance ratios
+    # absorb it; watch rl/actor_kl_mean); the student serves a dedicated
+    # weight copy published at step boundaries so optimizer.step can never
+    # tear a forward. CUDA only; serial on CPU.
+    learner_overlap: bool = False
     # (historical: ref_shard_size tuned the retired in-worker TF bridge;
     # kept so old commands don't break. The worker ignores it now.)
     ref_shard_size: int = 16
@@ -221,6 +228,13 @@ class RolloutConfig:
         """Special league member keys enabled by the flags; validates the
         config (loud asserts — a silently ignored flag would strand envs)."""
         members = []
+        if self.learner_overlap:
+            assert self.teacher_envs == 0, (
+                "learner_overlap runs the learner concurrently with the "
+                "worker; teacher_envs>0 would serve the SAME live teacher "
+                "module from both threads (compiled-cudagraph state is not "
+                "thread-safe) — fold the teacher into the league instead"
+            )
         if self.league_teacher:
             assert self.teacher_envs == 0, (
                 f"league_teacher folds the teacher into the PFSP league — "

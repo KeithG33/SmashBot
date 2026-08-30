@@ -858,6 +858,19 @@ def test_league_flags_default_off_golden(tmp_path):
         assert os.path.basename(a) == os.path.basename(b)
 
 
+def test_learner_overlap_rejects_live_teacher_envs():
+    """learner_overlap serves the live teacher module from the worker
+    thread while the learner uses it concurrently — forbidden; teacher
+    envs must be zero (folded into the league or absent)."""
+    with pytest.raises(AssertionError, match="learner_overlap"):
+        RolloutConfig(learner_overlap=True, teacher_envs=4).league_members()
+    with pytest.raises(AssertionError, match="learner_overlap"):
+        RolloutConfig(learner_overlap=True).league_members()  # default -1
+    assert RolloutConfig(
+        learner_overlap=True, teacher_envs=0
+    ).league_members() == []
+
+
 def test_league_flag_asserts():
     """Loud config validation: league flag with a nonzero fixed partition,
     or without pfsp, must fail with an actionable message."""
