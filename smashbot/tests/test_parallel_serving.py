@@ -88,9 +88,14 @@ def test_parallel_branch_matches_serial_wiring(monkeypatch, tmp_path):
 
 
 def _cuda_ready(need_bytes=1_500_000_000):
-    if not torch.cuda.is_available():
+    try:
+        if not torch.cuda.is_available():
+            return False
+        free, _ = torch.cuda.mem_get_info()
+    except Exception:
+        # a saturated device can refuse even context creation
+        # (cudaErrorDevicesUnavailable) — that's a skip, not a crash
         return False
-    free, _ = torch.cuda.mem_get_info()
     return free >= need_bytes
 
 
