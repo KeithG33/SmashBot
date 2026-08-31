@@ -274,6 +274,12 @@ def _env_process_main(
     consecutive_boot_failures = 0
     consecutive_wedges = 0
     first_boot = True
+    # Desync the fleet's recycle waves: env idx's FIRST Dolphin life ends
+    # after a deterministic 1..games_per_dolphin games (Knuth multiplicative
+    # hash of idx) instead of the full count. A cohort that boots together
+    # otherwise bloats and recycles in lockstep — 250 Dolphins' leak peaks
+    # simultaneously right before the first synchronized wave.
+    next_recycle_at = 1 + (idx * 2654435761) % max(1, cfg.games_per_dolphin)
     if cfg.boot_stagger > 0:
         # decongest the fleet-wide cold-boot storm: 250+ simultaneous
         # Dolphin launches blow the port-connect timeout (BOOT FAILURE 3/3)
@@ -323,6 +329,8 @@ def _env_process_main(
                 continue
             parser = Parser(ports=[1, 2])
             games = 0
+            recycle_at = next_recycle_at
+            next_recycle_at = cfg.games_per_dolphin
             last_frame = None
             last_stocks = None
             # New-game gate: a pre-booted spare idles at the title screen,
@@ -405,12 +413,12 @@ def _env_process_main(
                         result_kind = serving  # kind is fixed within a dolphin
                         # the game starting NOW plays the previously armed char
                         cur_opp_char = armed_opp_char
-                        if games >= cfg.games_per_dolphin:
+                        if games >= recycle_at:
                             pending_reset, pending_result = True, result
                             pending_result_kind = serving
                             break
                         parser = Parser(ports=[1, 2])
-                    if games >= cfg.games_per_dolphin - 1:
+                    if games >= recycle_at - 1:
                         _start_spare()  # entering this Dolphin's final game
                     if _prof:
                         _t1 = time.perf_counter(); _acc["dolphin"] += _t1 - _t0
@@ -480,7 +488,7 @@ def _env_process_main(
                             want = "cpu" if want == "cpu" else spec.kind
                             if want != cur_kind:
                                 desired_kind = want
-                                games = max(games, cfg.games_per_dolphin - 1)
+                                games = max(games, recycle_at - 1)
                         # per-GAME character rotation: the vendor's menu
                         # helper and misselect guard both read
                         # player.character LIVE each menu pass, so
