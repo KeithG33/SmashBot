@@ -272,12 +272,64 @@ class Learner:
             reward=traj.rewards,
         )
 
+    @staticmethod
+    def _rows_take(struct, lo, hi, n):
+        """Row-range VIEWS of a per-row struct: batch is dim 0 everywhere
+        EXCEPT torch RNN states ([layers, B, H]) — the same disambiguation
+        _mask_state/_row_chunks use."""
+        def take(t):
+            if not isinstance(t, torch.Tensor):
+                return t
+            if t.dim() >= 1 and t.shape[0] == n:
+                return t[lo:hi]
+            if t.dim() >= 2 and t.shape[1] == n:
+                return t[:, lo:hi]
+            return t
+        return tree.map_structure(take, struct)
+
+    @staticmethod
+    def _rows_cat(structs, ref, n):
+        """Stitch per-chunk structs back to full rows: each leaf concats
+        along the batch dim of its FULL-BATCH reference leaf (chunk shapes
+        alone are ambiguous — a 1-row chunk of a [layers, B, H] RNN state
+        looks batch-first). Leaves whose reference has no batch dim must
+        agree across chunks and pass through. Single chunk passes through
+        untouched (keeps views)."""
+        if len(structs) == 1:
+            return structs[0]
+
+        def cat(rf, *leaves):
+            if not isinstance(leaves[0], torch.Tensor):
+                return leaves[0]
+            if rf.dim() >= 1 and rf.shape[0] == n:
+                return torch.cat(leaves, dim=0)
+            if rf.dim() >= 2 and rf.shape[1] == n:
+                return torch.cat(leaves, dim=1)
+            for lf in leaves[1:]:
+                assert torch.equal(lf, leaves[0]), (
+                    "batchless state leaf differs across row chunks"
+                )
+            return leaves[0]
+        return tree.map_structure(cat, ref, *structs)
+
     def _fixed_pass(
         self, traj: Trajectory, state: LearnerState
     ) -> tuple[_Fixed, LearnerState, dict]:
         """Everything reusable across epochs: teacher logits, advantages (with
         a value-net update), and the actor's own log-probs — plus carried
-        recurrent states."""
+        recurrent states.
+
+        The expensive forwards (teacher unroll, value fwd+bwd, log-probs)
+        run in row chunks of ceil(B / micro_batches): the unchunked fp32
+        value backward over the full batch was the learner's largest
+        constant VRAM block (micro_batches never touched it). Chunking is
+        exact — rows are independent through every core, value-loss chunks
+        accumulate weighted by their ROW share (the loss is a plain mean
+        and T is constant across row chunks), the value optimizer steps
+        ONCE per trajectory after all chunks, and per-row outputs/carried
+        states are stitched back in row order. Merged metrics: counts sum,
+        absmax takes max, means are row-weighted (uev approximately — its
+        variance denominator is per-chunk; diagnostics only)."""
         frames = self._frames(traj)
         batch_size = traj.rewards.shape[0]
 
@@ -289,23 +341,62 @@ class Learner:
             traj.initial_state,
         )
 
-        # Frozen-teacher forward follows the policy autocast (fp16 mode):
-        # its logits only feed KL terms whose log_softmax autocast pins to
-        # fp32 — the probe measured this exact path.
-        with self._autocast(), torch.no_grad():
-            teacher_out = self.teacher.unroll(
-                frames, state.teacher, discount=self.config.discount
-            )
-
-        # VALUE island: everything from here through the value optimizer
-        # step stays entirely fp32 — deliberately OUTSIDE any autocast scope
-        # (fp16's weakest probe arm; small compute share). No scaler either:
-        # fp32 gradients don't underflow.
-        value_out = self.value_function.outputs(
-            frames, state.value, discount=self.config.discount
-        )
+        budget = -(-batch_size // max(1, self.config.micro_batches))
+        bounds = list(range(0, batch_size, budget)) + [batch_size]
+        chunk_rows = [
+            bounds[j + 1] - bounds[j] for j in range(len(bounds) - 1)
+        ]
         self.value_optimizer.zero_grad(set_to_none=True)
-        value_out.loss.backward()
+        t_logits, t_states = [], []
+        advantages, v_states, v_metrics = [], [], []
+        a_logits, a_logps = [], []
+        for lo, hi in zip(bounds[:-1], bounds[1:]):
+            ctraj = self._rows_take(traj, lo, hi, batch_size)
+            cframes = self._frames(ctraj)
+            # Frozen-teacher forward follows the policy autocast (fp16
+            # mode): its logits only feed KL terms whose log_softmax
+            # autocast pins to fp32 — the probe measured this exact path.
+            with self._autocast(), torch.no_grad():
+                teacher_out = self.teacher.unroll(
+                    cframes,
+                    self._rows_take(state.teacher, lo, hi, batch_size),
+                    discount=self.config.discount,
+                )
+            # VALUE island: everything from here through the value
+            # optimizer step stays entirely fp32 — deliberately OUTSIDE
+            # any autocast scope (fp16's weakest probe arm; small compute
+            # share). No scaler either: fp32 gradients don't underflow.
+            value_out = self.value_function.outputs(
+                cframes,
+                self._rows_take(state.value, lo, hi, batch_size),
+                discount=self.config.discount,
+            )
+            (value_out.loss * ((hi - lo) / batch_size)).backward()
+
+            # Unroll position t (t = 0..T-1) predicts the action sampled
+            # at frame t: its actor logits are logits[t], and the sampled
+            # action itself is the NEXT entry of the prev-action stream,
+            # controller_state[t+1]. Stored fp16 logits (sample-time +
+            # teacher) feed the KLs as constants; sanitize rare inf/NaN so
+            # the loss stays finite.
+            san = lambda t: torch.nan_to_num(
+                t, nan=0.0, posinf=self.LOGIT_CLAMP, neginf=-self.LOGIT_CLAMP
+            )
+            ca_logits = tree.map_structure(
+                lambda t: san(t[:, :-1]), ctraj.actions.logits
+            )
+            ca_actions = tree.map_structure(
+                lambda t: t[:, 1:], ctraj.actions.controller_state
+            )
+            with self._autocast(), torch.no_grad():
+                a_logps.append(self._ops.log_prob(ca_logits, ca_actions))
+            a_logits.append(ca_logits)
+            t_logits.append(tree.map_structure(san, teacher_out.logits))
+            t_states.append(teacher_out.final_state)
+            advantages.append(value_out.advantages)
+            v_states.append(value_out.final_state)
+            v_metrics.append(value_out.metrics)
+
         value_grad_norm = torch.nn.utils.clip_grad_norm_(
             self.value_function.parameters(), float("inf")
         )
@@ -316,40 +407,49 @@ class Learner:
         else:
             self.value_optimizer.step()
 
-        # Unroll position t (t = 0..T-1) predicts the action sampled at frame
-        # t: its actor logits are logits[t], and the sampled action itself is
-        # the NEXT entry of the prev-action stream, controller_state[t+1].
-        actor_logits = tree.map_structure(lambda t: t[:, :-1], traj.actions.logits)
-        actor_actions = tree.map_structure(
-            lambda t: t[:, 1:], traj.actions.controller_state
-        )
-        # Stored fp16 logits (sample-time + teacher) feed the KLs as
-        # constants; sanitize rare inf/NaN so the loss stays finite.
-        san = lambda t: torch.nan_to_num(
-            t, nan=0.0, posinf=self.LOGIT_CLAMP, neginf=-self.LOGIT_CLAMP
-        )
-        actor_logits = tree.map_structure(san, actor_logits)
-        teacher_logits = tree.map_structure(san, teacher_out.logits)
-        with self._autocast(), torch.no_grad():
-            actor_log_probs = self._ops.log_prob(actor_logits, actor_actions)
+        metrics = dict(v_metrics[0])
+        if len(v_metrics) > 1:
+            for k in metrics:
+                vals = [m[k] for m in v_metrics]
+                if k.endswith("_nonfinite"):
+                    metrics[k] = sum(vals)
+                elif k.endswith("_absmax"):
+                    metrics[k] = max(vals)
+                else:  # loss / uev / return_mean / reward_mean
+                    metrics[k] = sum(
+                        v * r for v, r in zip(vals, chunk_rows)
+                    ) / batch_size
 
+        # logits/log-probs/advantages are [B, T, ...] slices of batch-first
+        # trees: plain dim-0 concat. Only the recurrent STATES need the
+        # reference-based batch-dim disambiguation.
+        cat0 = (
+            (lambda seq: seq[0]) if len(chunk_rows) == 1
+            else (lambda seq: tree.map_structure(
+                lambda *xs: torch.cat(xs, dim=0), *seq
+            ))
+        )
         fixed = _Fixed(
             frames=frames,
             initial_policy_state=initial_policy_state,
-            advantages=value_out.advantages,
-            teacher_logits=teacher_logits,
-            actor_logits=actor_logits,
-            actor_log_probs=actor_log_probs,
+            advantages=cat0(advantages),
+            teacher_logits=cat0(t_logits),
+            actor_logits=cat0(a_logits),
+            actor_log_probs=cat0(a_logps),
             valid=(~traj.is_resetting[:, 1:]).float(),
         )
         # Detach carried recurrent states: the next chunk's backward must not
         # reach into this chunk's (already-freed) graph.
         detach = lambda t: t.detach() if isinstance(t, torch.Tensor) else t
         new_state = LearnerState(
-            teacher=tree.map_structure(detach, teacher_out.final_state),
-            value=tree.map_structure(detach, value_out.final_state),
+            teacher=tree.map_structure(
+                detach, self._rows_cat(t_states, state.teacher, batch_size)
+            ),
+            value=tree.map_structure(
+                detach, self._rows_cat(v_states, state.value, batch_size)
+            ),
         )
-        return fixed, new_state, value_out.metrics
+        return fixed, new_state, metrics
 
     def _policy_loss(self, fixed: _Fixed) -> tuple[torch.Tensor, dict]:
         # The whole loss runs under the policy autocast (fp16 mode), exactly
