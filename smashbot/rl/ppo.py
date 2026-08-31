@@ -394,7 +394,14 @@ class Learner:
             t_logits.append(tree.map_structure(san, teacher_out.logits))
             t_states.append(teacher_out.final_state)
             advantages.append(value_out.advantages)
-            v_states.append(value_out.final_state)
+            # detach HERE, not after the loop: a graph-attached final_state
+            # would keep parts of this chunk's backward graph alive across
+            # the remaining chunks — the exact pinning this pass exists to
+            # prevent
+            v_states.append(tree.map_structure(
+                lambda t: t.detach() if isinstance(t, torch.Tensor) else t,
+                value_out.final_state,
+            ))
             v_metrics.append(value_out.metrics)
 
         value_grad_norm = torch.nn.utils.clip_grad_norm_(
