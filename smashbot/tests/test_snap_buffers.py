@@ -4,7 +4,6 @@ and the revert path restores the CURRENT step's start (a stale-buffer bug
 would restore an older step)."""
 
 import torch
-import tree
 
 from smashbot.rl.config import RLConfig, PPOConfig
 from smashbot.rl.ppo import Learner, _to_cpu
@@ -93,3 +92,33 @@ def test_revert_restores_current_step_not_stale_buffer():
     _, m2 = learner.step([traj2], state, progress=0.0)
     assert m2["reverted"]
     _assert_same(start2, _to_cpu(learner.policy.state_dict()))
+
+
+def test_double_revert_restores_optimizer_exactly():
+    """Optimizer.load_state_dict keeps matching tensors by REFERENCE, so
+    without the buffer surrender on the revert path, revert #2 restores
+    post-update Adam state (on CPU, dtype+device always match — this test
+    fails loudly against the unfixed code: ~205/207 leaves wrong)."""
+    learner = _learner(
+        ppo=PPOConfig(max_mean_actor_kl=1e9, num_epochs=1),
+        imitation_rows=0,
+    )
+    state = learner.initial_state(4)
+    # one clean step so Adam state is populated
+    state, m0 = learner.step(
+        [_rollout(learner.policy, B=4, T=8, seed=0)], state, progress=0.0
+    )
+    assert not m0["reverted"]
+    learner.config.ppo.max_mean_actor_kl = 0.0
+    # revert #1 (live optimizer may now alias the buffer without the fix)
+    state, m1 = learner.step(
+        [_rollout(learner.policy, B=4, T=8, seed=1)], state, progress=0.0
+    )
+    assert m1["reverted"]
+    opt_start = _to_cpu(learner.policy_optimizer.state_dict())
+    # revert #2 must restore EXACTLY this step's starting optimizer state
+    _, m2 = learner.step(
+        [_rollout(learner.policy, B=4, T=8, seed=2)], state, progress=0.0
+    )
+    assert m2["reverted"]
+    _assert_same(opt_start, _to_cpu(learner.policy_optimizer.state_dict()))

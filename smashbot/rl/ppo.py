@@ -248,9 +248,11 @@ class Learner:
         and non-tensor leaves (param_groups scalars) are rebuilt fresh
         each step (tiny). Structure changes (e.g. Adam state populating
         after the first optimizer step) fall back to fresh allocation for
-        the changed leaves only. Aliasing is safe: the buffers are only
-        read by the same step's revert (policy/optimizer load_state_dict
-        both copy out of them), never retained across steps."""
+        the changed leaves only. Aliasing: policy.load_state_dict copies
+        out of the buffer, but Optimizer.load_state_dict keeps matching
+        tensors by REFERENCE — the revert path therefore surrenders the
+        opt buffer after restoring from it. Nothing else retains a
+        snapshot across steps."""
 
         def into(dst, s):
             if isinstance(s, torch.Tensor):
@@ -1061,6 +1063,13 @@ class Learner:
         if reverted:
             self.policy.load_state_dict(snapshot)
             self.policy_optimizer.load_state_dict(opt_snapshot)
+            # Optimizer.load_state_dict does NOT copy tensors whose
+            # dtype+device already match — the live Adam state now ALIASES
+            # the buffer. Surrender it (next step fresh-allocates); keeping
+            # it would make the next snapshot a no-op self-copy that then
+            # tracks the live update, so a second revert would restore
+            # post-update state (reviewer-proven on CPU: 205/207 leaves).
+            self._snap_buffers.pop("opt", None)
 
         metrics = {
             "epochs": epoch_metrics,
