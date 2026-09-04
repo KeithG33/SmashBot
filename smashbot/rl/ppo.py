@@ -236,6 +236,45 @@ class Learner:
         # Imitation row-cap sampling RNG; seeded for reproducibility,
         # reseedable in tests.
         self._imit_rng = random.Random(0)
+        # Persistent trust-region snapshot buffers (see step): tensor
+        # storages allocated once and copied into per step.
+        self._snap_buffers: dict = {}
+
+    def _snap_into(self, key: str, src):
+        """Deep-copy `src` (a state dict) to CPU, REUSING the tensor
+        storages from this key's previous snapshot wherever shapes/dtypes
+        still match — the content is identical to a fresh _to_cpu, but
+        ~1.3GB/step of host tensor churn becomes zero. Dict/list shells
+        and non-tensor leaves (param_groups scalars) are rebuilt fresh
+        each step (tiny). Structure changes (e.g. Adam state populating
+        after the first optimizer step) fall back to fresh allocation for
+        the changed leaves only. Aliasing is safe: the buffers are only
+        read by the same step's revert (policy/optimizer load_state_dict
+        both copy out of them), never retained across steps."""
+
+        def into(dst, s):
+            if isinstance(s, torch.Tensor):
+                s = s.detach()
+                if (isinstance(dst, torch.Tensor) and dst.shape == s.shape
+                        and dst.dtype == s.dtype):
+                    dst.copy_(s)
+                    return dst
+                return s.to("cpu", copy=True)
+            if isinstance(s, dict):
+                d = dst if isinstance(dst, dict) else {}
+                return {k: into(d.get(k), v) for k, v in s.items()}
+            if isinstance(s, (list, tuple)):
+                d = (
+                    list(dst)
+                    if isinstance(dst, (list, tuple)) and len(dst) == len(s)
+                    else [None] * len(s)
+                )
+                return type(s)(into(a, b) for a, b in zip(d, s))
+            return copy.deepcopy(s)
+
+        out = into(self._snap_buffers.get(key), src)
+        self._snap_buffers[key] = out
+        return out
 
     def _autocast(self):
         """fp16-mode autocast for POLICY forward regions; a plain null
@@ -887,9 +926,15 @@ class Learner:
 
         # Trust-region snapshot: weights AND optimizer slots (weights
         # alone leave Adam's m/v carrying the rejected update). On CPU:
-        # a full model copy, and VRAM is the scarce resource.
-        snapshot = _to_cpu(self.policy.state_dict())
-        opt_snapshot = _to_cpu(self.policy_optimizer.state_dict())
+        # a full model copy, and VRAM is the scarce resource. Copied into
+        # PERSISTENT reusable buffers — allocating ~1.3GB of fresh host
+        # tensors every step ground glibc's heap into gigabytes of
+        # retained dirty pages (~0.3-0.7G/hr trainer RSS drift, measured
+        # via smaps: 35G heap at 28h uptime vs ~12G live).
+        snapshot = self._snap_into("policy", self.policy.state_dict())
+        opt_snapshot = self._snap_into(
+            "opt", self.policy_optimizer.state_dict()
+        )
 
         epoch_metrics: list[dict] = []
         imit_loss_val = 0.0
