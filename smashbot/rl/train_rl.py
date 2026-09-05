@@ -115,6 +115,29 @@ def _save_rl_checkpoint(
     os.replace(tmp, path)
 
 
+def _malloc_trim_report(step: int) -> None:
+    """glibc malloc_trim(0) + RSS-delta telemetry (see call site). Safe:
+    trim only releases free heap pages back to the OS — allocated memory
+    is untouched; a no-op on non-glibc. Costs ~ms."""
+    import ctypes
+
+    try:
+        rss_kb = lambda: int(
+            next(
+                line for line in open("/proc/self/status")
+                if line.startswith("VmRSS")
+            ).split()[1]
+        )
+        before = rss_kb()
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+        after = rss_kb()
+        print(f"[trim] step {step}: rss {before / 2**20:.2f} -> "
+              f"{after / 2**20:.2f} GiB (released {(before - after) / 2**20:.2f})",
+              flush=True)
+    except Exception as e:  # diagnostic must never kill training
+        print(f"[trim] step {step}: unavailable ({e})", flush=True)
+
+
 def main() -> None:
     import torch
 
@@ -652,6 +675,12 @@ def main() -> None:
                     f"{run_dir}/latest.pt", ckpt["config"], policy, value_fn,
                     name_map, i, args.ckpt,
                 )
+                # glibc heap trim + telemetry: the trainer's RSS grows
+                # ~1G/hr from heap the allocator retains after free. Trim
+                # returns releasable pages to the OS; the printed delta is
+                # the DIAGNOSTIC — big recovery = retention (trim is the
+                # cure), no recovery = live growth (a real leak to hunt).
+                _malloc_trim_report(i)
 
     overlap_pool = None
     overlap_stream = None
