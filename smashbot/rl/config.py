@@ -302,6 +302,13 @@ class RLConfig:
     learning_rate: float = 1e-4
     policy_gradient_weight: float = 1.0
     kl_teacher_weight: float = 1e-1
+    # Teacher-KL leash decay: linear from kl_teacher_weight (progress 0)
+    # to this value (progress 1). Negative = disabled (constant leash,
+    # the historical behavior). ONE schedule, no resume special-casing:
+    # a mid-run change extrapolates the line backward so the current
+    # step sits on it (v10 @17k: start 0.1206522 -> 0.08 now -> 0.025
+    # at 40k).
+    kl_teacher_weight_final: float = -1.0
     reverse_kl_teacher_weight: float = 0.0
     entropy_weight: float = 0.0
     reward_halflife: float = 4.0  # seconds

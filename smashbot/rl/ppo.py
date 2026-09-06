@@ -236,6 +236,10 @@ class Learner:
         # Imitation row-cap sampling RNG; seeded for reproducibility,
         # reseedable in tests.
         self._imit_rng = random.Random(0)
+        # Current teacher-KL leash weight; refreshed from the decay
+        # schedule at each step() (constant when decay is disabled).
+        # Initialized here so direct _policy_loss calls (tests) work.
+        self._kl_teacher_w = config.kl_teacher_weight
         # Persistent trust-region snapshot buffers (see step): tensor
         # storages allocated once and copied into per step.
         self._snap_buffers: dict = {}
@@ -595,7 +599,7 @@ class Learner:
         per_pos = -cfg.policy_gradient_weight * surrogate
         for w, term in (
             (cfg.ppo.beta, actor_kl),
-            (cfg.kl_teacher_weight, teacher_kl),
+            (self._kl_teacher_w, teacher_kl),
             (cfg.reverse_kl_teacher_weight, reverse_teacher_kl),
             (-cfg.entropy_weight, entropy),
         ):
@@ -660,6 +664,19 @@ class Learner:
                 path,
             )
             print(f"ANOMALY: dumped {path}")
+
+    def kl_teacher_weight_at(self, progress: float) -> float:
+        """Teacher-KL leash coefficient at run fraction `progress`: linear
+        from kl_teacher_weight to kl_teacher_weight_final; constant (the
+        historical behavior) while the final is negative."""
+        cfg = self.config
+        if cfg.kl_teacher_weight_final < 0:
+            return cfg.kl_teacher_weight
+        p = min(max(progress, 0.0), 1.0)
+        return (
+            cfg.kl_teacher_weight
+            + (cfg.kl_teacher_weight_final - cfg.kl_teacher_weight) * p
+        )
 
     # ------------------------------------------------ opponent imitation
 
@@ -910,6 +927,7 @@ class Learner:
             ) // max(1, cfg.micro_batches))
             imit_fixed, imit_stats = self._plan_imitation(imit_trajs, budget)
         lambda_t = self.lambda_at(progress)
+        self._kl_teacher_w = self.kl_teacher_weight_at(progress)
 
         check_fixed = fixed_list  # post-update KL check: full rows, no grad
         train_fixed = fixed_list
@@ -1077,6 +1095,8 @@ class Learner:
             "value": _mean_dicts(value_metrics),
             "reverted": reverted,
         }
+        # surface the (possibly decaying) leash weight beside teacher_kl
+        post["kl_teacher_w"] = float(self._kl_teacher_w)
         if imit_stats:
             metrics["imitation"] = dict(
                 imit_stats, loss=imit_loss_val, **{"lambda": lambda_t}
