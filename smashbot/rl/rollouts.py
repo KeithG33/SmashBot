@@ -588,15 +588,6 @@ class DolphinRolloutWorker:
         # ~100MB+ each-child private without this — x253 envs. torch stays
         # deliberately absent (its ~0.26GB and CUDA must never enter the
         # env processes).
-        # jemalloc (LD_PRELOAD, for the trainer's heap-churn pinning) must
-        # NOT inherit to the fleet: under it, Dolphin boot ConnectFailed
-        # rates tripled (3 consecutive boot failures vs ~30% base). The
-        # trainer's own jemalloc resolved at exec and is unaffected;
-        # stripping here scopes env processes + Dolphins back to glibc.
-        import os as _os_env
-
-        _os_env.environ.pop("LD_PRELOAD", None)
-        _os_env.environ.pop("MALLOC_CONF", None)
         ctx = mp.get_context("forkserver")
         ctx.set_forkserver_preload([
             "smashbot.rl.env_process",
