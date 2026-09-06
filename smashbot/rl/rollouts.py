@@ -590,14 +590,15 @@ class DolphinRolloutWorker:
         # env processes).
         ctx = mp.get_context("forkserver")
         ctx.set_forkserver_preload([
+            # numpy + the pure-numpy encoder only. melee (and everything
+            # importing it: slippi_ai.dolphin, parse_libmelee,
+            # dolphin_setup) must NOT preload: its networking stack (enet)
+            # initializes at import time, and forkserver children cloning
+            # that parent-initialized state fail their Dolphin CONNECT
+            # handshake — 5 consecutive boot failures until removed.
             "smashbot.rl.env_process",
             "numpy",
-            "melee",
-            "slippi_ai.controller_lib",
-            "slippi_ai.dolphin",
-            "slippi_db.parse_libmelee",
             "smashbot.encode",
-            "smashbot.eval.dolphin_setup",
         ])
         # env processes encode frames with a torch-free numpy encoder rebuilt
         # from this spec (pure data; see smashbot.encode)
