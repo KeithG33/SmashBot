@@ -581,11 +581,24 @@ class DolphinRolloutWorker:
             for i, lock in locks.items():
                 if lock is not None:
                     self.specs[i].opponent_char = lock
-        # forkserver, preloading ONLY the torch-free env module: a spawned
-        # child would re-import __main__ (train_rl -> torch, ~0.26 GB private
-        # per env); forked-from-server envs stay ~10 MB and share its pages
+        # forkserver, preloading the torch-free env module AND its heavy
+        # deps: anything imported by the forkserver parent is COW-shared
+        # by every env child; anything imported inside _env_process_main
+        # after the fork is PRIVATE per child. numpy+melee+parser are
+        # ~100MB+ each-child private without this — x253 envs. torch stays
+        # deliberately absent (its ~0.26GB and CUDA must never enter the
+        # env processes).
         ctx = mp.get_context("forkserver")
-        ctx.set_forkserver_preload(["smashbot.rl.env_process"])
+        ctx.set_forkserver_preload([
+            "smashbot.rl.env_process",
+            "numpy",
+            "melee",
+            "slippi_ai.controller_lib",
+            "slippi_ai.dolphin",
+            "slippi_db.parse_libmelee",
+            "smashbot.encode",
+            "smashbot.eval.dolphin_setup",
+        ])
         # env processes encode frames with a torch-free numpy encoder rebuilt
         # from this spec (pure data; see smashbot.encode)
         from smashbot import embed as embed_lib
