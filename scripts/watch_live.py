@@ -271,9 +271,13 @@ def parse_args(argv=None):
                          "policy's own name_map)")
     ap.add_argument("--fullscreen", action="store_true")
     ap.add_argument("--gfx-backend", default="OGL", help="OGL | Vulkan | ''")
+    ap.add_argument("--device", default="cuda", choices=("cpu", "cuda"),
+                    help="inference device (default cuda: batch-1 CPU forwards "
+                         "can't sustain 60fps for two bots; falls back to cpu "
+                         "if no GPU)")
     ap.add_argument("--threads", type=int, default=8,
-                    help="torch intra-op threads (batch-1 CPU inference is "
-                         "fastest around 8)")
+                    help="torch intra-op threads for --device cpu (batch-1 "
+                         "CPU inference is fastest around 8)")
     ap.add_argument("--pin-cores", type=int, default=0,
                     help="pin inference to the first N cores and Dolphin to "
                          "the rest, as in play.py; 0 = off (default -- the "
@@ -304,6 +308,10 @@ def _describe(record, index: int) -> str:
 def main(argv=None) -> None:
     args = parse_args(argv)
     torch.set_num_threads(args.threads)
+    device = args.device
+    if device == "cuda" and not torch.cuda.is_available():
+        print("CUDA not available; falling back to CPU", flush=True)
+        device = "cpu"
 
     try:
         specs = resolve_specs(args)
@@ -313,7 +321,7 @@ def main(argv=None) -> None:
 
     agents, infos = build_agents(
         specs,
-        device="cpu",
+        device=device,
         compile_policies=args.compile,
         name=args.name,
         temperature=args.temperature,
@@ -326,7 +334,8 @@ def main(argv=None) -> None:
         print(f"    char {chars[port]} | delay {info.delay} | "
               f"{args.name!r} -> code {info.name_code}")
     print(f"stage {args.stage} | games {args.games or 'forever'} | "
-          f"compile {'on (cpu inductor, warmed)' if args.compile else 'off'} | "
+          f"device {device} | "
+          f"compile {'on (warmed)' if args.compile else 'off'} | "
           f"mute {'on' if args.mute else 'off'} | "
           f"replays {'-> ' + args.replay_dir if args.save_replays else 'off'}")
 

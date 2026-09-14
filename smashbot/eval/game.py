@@ -54,8 +54,12 @@ def maybe_compile(policy, device: str, verbose: bool = True) -> None:
 
     from slippi_ai.types import StateAction
 
-    mode = "reduce-overhead" if device == "cuda" else "default"
-    policy.sample = torch.compile(policy.sample, mode=mode)
+    # "default" (inductor fusion, no cudagraphs) on both devices. cudagraphs
+    # (mode="reduce-overhead") reuse output-tensor storage across runs, which
+    # collides with the async agent holding the previous frame's action while
+    # the next forward runs ("accessing tensor output of CUDAGraphs that has
+    # been overwritten"). Fusion alone is enough for batch-1 live inference.
+    policy.sample = torch.compile(policy.sample, mode="default")
     torch._dynamo.config.recompile_limit = 128
     if verbose:
         print("torch.compile enabled; warming up...")
