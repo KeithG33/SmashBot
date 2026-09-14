@@ -35,6 +35,8 @@ def main() -> None:
         "--ckpt", default="/home/kage/drive2/ShineBot/runs/debug-fox-v0/best.pt"
     )
     ap.add_argument("--opponent", choices=["cpu", "human"], default="cpu")
+    ap.add_argument("--bot_char", default="FOX",
+                    help="character the bot plays (default FOX)")
     ap.add_argument("--cpu_level", type=int, default=9)
     ap.add_argument("--opponent_char", default="MARTH")
     ap.add_argument("--stage", default="FINAL_DESTINATION")
@@ -94,7 +96,7 @@ def main() -> None:
         spec = "human"
     opponent = game_lib.Opponent.parse(spec)
     players = {
-        1: dolphin_lib.AI(character=melee.Character.FOX),
+        1: dolphin_lib.AI(character=melee.Character[args.bot_char.upper()]),
         2: opponent.make_player(),
     }
     dolphin = game_lib.make_dolphin(
