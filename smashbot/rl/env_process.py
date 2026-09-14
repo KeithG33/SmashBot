@@ -109,8 +109,8 @@ def _env_process_main(
     # CHAR|None}. Read at game boundaries AFTER that frame's command, so a
     # draw made when game g starts shapes game g+1: the lock pins the
     # next game's character (see next_opponent_char); a kind change turns
-    # the current game into this Dolphin's last (spare pre-booted now,
-    # recycle at the boundary). Never sent outside league mode.
+    # the current game into this Dolphin's last (recycle at the boundary).
+    # Never sent outside league mode.
     # Static import envs carry their lock in the spec (league envs get
     # theirs from opp_next commands); None = per-game redraw.
     char_lock = spec.char_lock
@@ -183,16 +183,9 @@ def _env_process_main(
     pending_result_kind = None
     consecutive_misselects = 0
 
-    # Double buffering: during a Dolphin's LAST game, boot its replacement in
-    # a background thread. The spare is only CONSTRUCTED (process up, ISO
-    # loaded, idle at intro menus — menus don't advance without inputs, so
-    # nothing progresses unattended); menu navigation still happens at swap,
-    # via the normal iter_gamestates path with its misselect guard. Hides the
-    # 10-15s boot that otherwise stalls the whole worker barrier per recycle.
     import signal
     import threading
 
-    spare = {"dolphin": None, "thread": None}
     old_stops: list = []  # (thread, dolphin_pid) pairs
 
     def _dolphin_pid(d) -> int | None:
@@ -200,37 +193,6 @@ def _env_process_main(
             return d.console._process.pid
         except AttributeError:
             return None
-
-    def _boot_spare() -> None:
-        try:
-            spare["dolphin"] = make_dolphin(
-                players, headless=cfg.headless, stage=cfg.stage,
-                save_replays=cfg.save_replays, replay_dir=_replay_dir,
-                dual_core=cfg.dolphin_dual_core,
-            )
-        except Exception as e:  # fall back to a cold boot at swap time
-            print(f"spare boot failed (cold boot at swap): {e}", flush=True)
-            spare["dolphin"] = None
-
-    def _start_spare() -> None:
-        if cfg.double_buffer and spare["thread"] is None:
-            spare["thread"] = threading.Thread(target=_boot_spare, daemon=True)
-            spare["thread"].start()
-
-    def _take_spare():
-        if spare["thread"] is None:
-            return None
-        spare["thread"].join(timeout=120)
-        if spare["thread"].is_alive():
-            # wedged spare boot: abandon it (daemon thread) and cold-boot
-            print("WARNING: spare boot wedged; abandoning it", flush=True)
-            spare["thread"] = None
-            spare["dolphin"] = None
-            return None
-        d, spare["dolphin"], spare["thread"] = spare["dolphin"], None, None
-        if d is not None:
-            print("recycle: swapped to pre-booted spare", flush=True)
-        return d
 
     def _drain_old_stops(timeout: float = 20.0) -> None:
         """Cold boots must not overlap a dying Dolphin: the previous instance
@@ -312,7 +274,7 @@ def _env_process_main(
                 print(f"recycle: opponent redrawn -> {new_char}", flush=True)
             first_boot = False
             try:
-                dolphin = _take_spare() or _cold_boot()
+                dolphin = _cold_boot()
                 consecutive_boot_failures = 0
                 # the first command after a boot carries the NEXT game's
                 # seat (drawn while this game's players were being built):
@@ -333,7 +295,7 @@ def _env_process_main(
             next_recycle_at = cfg.games_per_dolphin
             last_frame = None
             last_stocks = None
-            # New-game gate: a pre-booted spare idles at the title screen,
+            # New-game gate: a booting Dolphin idles at the title screen,
             # where Melee's ATTRACT-MODE DEMO auto-plays after a timeout —
             # demo frames are "in-game" frames with garbage ports/fields
             # (live-caught: NaN states -> multinomial assert at the first
@@ -418,8 +380,6 @@ def _env_process_main(
                             pending_result_kind = serving
                             break
                         parser = Parser(ports=[1, 2])
-                    if games >= recycle_at - 1:
-                        _start_spare()  # entering this Dolphin's final game
                     if _prof:
                         _t1 = time.perf_counter(); _acc["dolphin"] += _t1 - _t0
                     last_frame = gs.frame
@@ -538,8 +498,7 @@ def _env_process_main(
                 # menu cursor race under fast-forward (notably the Sheik/
                 # Zelda slot): scrap this Dolphin and retry with a fresh one.
                 # BOUNDED: persistent misselection means the character is
-                # mechanically unpickable — die loudly, not loop forever
-                # (learned via 362 consecutive CPU-Sheik retries).
+                # mechanically unpickable — die loudly, not loop forever.
                 consecutive_misselects += 1
                 if consecutive_misselects >= 3:
                     raise
@@ -547,11 +506,10 @@ def _env_process_main(
               else:
                 consecutive_misselects = 0
             finally:
-                # Recycle path: stop the old Dolphin off-thread so a SPARE
-                # swap isn't gated on teardown. Cold boots drain these first
-                # (_drain_old_stops), so teardown/boot never overlap except
-                # in the validated healthy-spare case. Non-daemon: shutdown
-                # waits for the kills (no zombie Dolphins).
+                # Recycle path: stop the old Dolphin off-thread so the next
+                # boot isn't gated on teardown. Cold boots drain these first
+                # (_drain_old_stops), so teardown and boot never overlap.
+                # Non-daemon: shutdown waits for the kills (no zombie Dolphins).
                 pid = _dolphin_pid(dolphin)
                 t = threading.Thread(target=dolphin.stop)
                 t.start()
@@ -559,8 +517,4 @@ def _env_process_main(
     except (EOFError, BrokenPipeError, KeyboardInterrupt):
         pass
     finally:
-        if spare["thread"] is not None:
-            spare["thread"].join(timeout=60)
-            if spare["dolphin"] is not None:
-                spare["dolphin"].stop()
         _drain_old_stops()

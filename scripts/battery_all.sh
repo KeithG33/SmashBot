@@ -22,7 +22,7 @@ set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="$ROOT/.venv/bin/python"
-RUN_DIR="${RUN_DIR:-/home/kage/drive2/ShineBot/runs/rl-pool-v3}"
+RUN_DIR="${RUN_DIR:-/home/kage/drive2/ShineBot/runs/rl-pool-v10}"
 RESULTS="$ROOT/scripts/battery_results"
 
 mkdir -p "$RESULTS"

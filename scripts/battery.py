@@ -21,7 +21,7 @@ exceeding --envs Dolphins at once. Everything is deterministic: no RNG in
 spec construction, phase order fixed, seats alternating.
 
 Reproducibility choices (do not change casually -- they ARE the yardstick):
-  - redraw_chars=False, double_buffer=False: fixed matchups, proven env path.
+  - redraw_chars=False: fixed matchups (the yardstick must not drift).
   - PHASES: hardcoded 4-char slates; env i of each yardstick group plays
     slate[i % 4], student_port alternating 1/2. Same slates every run.
   - games_per_dolphin high (200) so Dolphin recycles never interfere.
@@ -72,7 +72,7 @@ BATTERY_SLATE = [c for _, slate in PHASES for c in slate]
 
 YARDSTICK_TEACHER = "/home/kage/drive2/ShineBot/models/yardstick-teacher-887500.pt"
 YARDSTICK_PHILLIP = "/home/kage/drive2/ShineBot/models/medium-v2-torch.pt"
-DEFAULT_CONFIG_FROM = "/home/kage/drive2/ShineBot/runs/rl-pool-v3/latest.pt"
+DEFAULT_CONFIG_FROM = "/home/kage/drive2/ShineBot/runs/rl-pool-v10/latest.pt"
 RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "battery_results")
 
 # JSON report keys per yardstick block (schema pinned by test_battery.py).
@@ -473,7 +473,6 @@ def main() -> None:
         league_slices=0,
         games_per_dolphin=args.games_per_dolphin,
         redraw_chars=False,     # fixed matchups: the yardstick must not drift
-        double_buffer=False,    # proven recycle path only
         log_tag="battery",      # env logs: /tmp/smashbot-env-battery-*.log
         env_timeout=args.env_timeout,
         ref_ckpt=args.yardstick_phillip,

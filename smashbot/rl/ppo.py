@@ -945,12 +945,9 @@ class Learner:
         total_imit_valid = sum(float(c.valid.sum()) for c in imit_chunks) or 1.0
 
         # Trust-region snapshot: weights AND optimizer slots (weights
-        # alone leave Adam's m/v carrying the rejected update). On CPU:
-        # a full model copy, and VRAM is the scarce resource. Copied into
-        # PERSISTENT reusable buffers — allocating ~1.3GB of fresh host
-        # tensors every step ground glibc's heap into gigabytes of
-        # retained dirty pages (~0.3-0.7G/hr trainer RSS drift, measured
-        # via smaps: 35G heap at 28h uptime vs ~12G live).
+        # alone leave Adam's m/v carrying the rejected update). Copied into
+        # PERSISTENT reusable buffers — allocating fresh host tensors every
+        # step churns the allocator's heap unboundedly.
         snapshot = self._snap_into("policy", self.policy.state_dict())
         opt_snapshot = self._snap_into(
             "opt", self.policy_optimizer.state_dict()
@@ -1082,11 +1079,9 @@ class Learner:
             self.policy.load_state_dict(snapshot)
             self.policy_optimizer.load_state_dict(opt_snapshot)
             # Optimizer.load_state_dict does NOT copy tensors whose
-            # dtype+device already match — the live Adam state now ALIASES
-            # the buffer. Surrender it (next step fresh-allocates); keeping
-            # it would make the next snapshot a no-op self-copy that then
-            # tracks the live update, so a second revert would restore
-            # post-update state (reviewer-proven on CPU: 205/207 leaves).
+            # dtype+device already match — the live Adam state would then
+            # ALIAS the reused buffer. Surrender it so the next step
+            # fresh-allocates and a later revert restores the correct state.
             self._snap_buffers.pop("opt", None)
 
         metrics = {

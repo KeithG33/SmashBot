@@ -107,7 +107,6 @@ def build_rollout_config(args) -> RolloutConfig:
         league_slices=0,
         games_per_dolphin=200,   # high: recycles never interfere
         redraw_chars=False,      # fixed matchups
-        double_buffer=False,     # proven env path
         log_tag="capture",       # env logs: /tmp/smashbot-env-capture-*.log
         env_timeout=args.env_timeout,
         ref_ckpt=args.yardstick_phillip,

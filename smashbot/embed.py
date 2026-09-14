@@ -389,7 +389,7 @@ def make_embed_char():
     return OneHotEmbedding("Character", size=0x21, dtype=np.uint8)
 
 
-# puff and kirby have 6 jumps; one-hot of 7 (the +1 was fixed upstream Sep 2025)
+# puff and kirby have 6 jumps; one-hot of 7
 def make_embed_jumps_left():
     return OneHotEmbedding("jumps_left", 7, dtype=np.uint8)
 

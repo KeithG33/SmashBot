@@ -180,8 +180,7 @@ class GameTracker:
             outcome = 1.0 if diff > 0 else 0.0
             a = self.ema_alpha
             # seed at the 0.5 prior, not the first outcome: an extreme seed
-            # takes ~200 games to wash out at this alpha (live-caught: SP:
-            # read 0% for hours after its first game happened to be a loss)
+            # takes ~200 games to wash out at this alpha
             prev = 0.5 if self.win_ema is None else self.win_ema
             self.win_ema = (1 - a) * prev + a * outcome
         a = self.ema_alpha
@@ -622,9 +621,9 @@ class DolphinRolloutWorker:
 
     def _gather_all(self) -> list[dict]:
         """Barrier recv with a watchdog: one silent env must crash the run
-        loudly (env index + spec + log path), never hang it. Learned the hard
-        way — a wedged Dolphin boot froze a 128-env run overnight at step 36
-        with zero symptoms beyond a stopped ticker."""
+        loudly (env index + spec + log path), never hang it — a wedged
+        Dolphin boot otherwise stalls the whole run with no symptom but a
+        stopped ticker."""
         import time as time_lib
 
         deadline = time_lib.monotonic() + self.config.env_timeout
@@ -1022,8 +1021,7 @@ class DolphinRolloutWorker:
                         if g is not None:
                             g.push_reward(self._rows_of(-reward, rows_))
                 # stock events are rare: find them with tensor ops and only
-                # loop over the hits (a per-dolphin Python loop with element
-                # indexing cost ~10 ms/frame at 176 Dolphins)
+                # loop over the hits (a per-dolphin Python loop is far slower)
                 D = self.num_dolphins
                 live = ~resets[:D]
                 lost = (stocks[:D] < self._prev_stocks[:D]) & live[:, None]

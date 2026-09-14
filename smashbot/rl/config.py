@@ -121,9 +121,6 @@ class RolloutConfig:
     log_tag: str = ""  # namespaces /tmp/smashbot-env-*.log between runs
     # Redraw the opponent character at each Dolphin recycle.
     redraw_chars: bool = True
-    # Boot each Dolphin's replacement in the background during its final
-    # game (recycle hot-swap). OFF by default: ~5% gain, riskier teardown.
-    double_buffer: bool = False
     # Double-buffer the LEARNER: run learner.step(batch k) on its own CUDA
     # stream in a background thread while the worker collects batch k+1.
     # Rollouts become one gradient-update stale (PPO's importance ratios

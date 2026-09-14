@@ -9,3 +9,4 @@ runs/
 *.pkl
 .ruff_cache/
 scripts/tournament_results/
+scripts/battery_results/

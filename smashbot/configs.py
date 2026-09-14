@@ -72,11 +72,11 @@ class ValueConfig:
 class LearnerConfig:
     learning_rate: float = 1e-4
     value_cost: float = 0.5
-    # Faithful slippi-ai defaults: fp32, no clipping. The bf16+clip experiment
-    # (debug-fox-v0-bf16) tracked slightly worse on eval and value loss; revisit
-    # with seeded A/Bs if the +35% throughput is ever needed.
+    # Faithful slippi-ai defaults: fp32, no clipping. (bf16+clip tracked
+    # slightly worse on eval/value loss; revisit with seeded A/Bs if the
+    # throughput is ever needed.)
     max_grad_norm: float = 0.0
     precision: str = "fp32"  # bf16 | fp32
-    # Measured SLOWER than eager (125k vs 152k frames/s): dynamo graph-breaks
-    # on tree-structured code + cuDNN LSTM boundary. Left as opt-in.
+    # Off: measured slower than eager (dynamo graph-breaks on tree-structured
+    # code + the cuDNN LSTM boundary). Opt-in.
     compile: bool = False

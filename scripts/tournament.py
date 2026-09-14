@@ -495,7 +495,6 @@ def _run_pair(
         stage=resolve_stage(args.stage),
         games_per_dolphin=args.games_per_dolphin,
         redraw_chars=(args.char_mode == "main12"),
-        double_buffer=False,  # proven recycle path only
         log_tag=f"tourney-{plan.a}-vs-{plan.b}",
         env_timeout=args.env_timeout,
         char_whitelist=(list(MAIN_12) if args.char_mode == "main12"
