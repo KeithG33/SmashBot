@@ -254,7 +254,7 @@ def test_report_json_roundtrip(tmp_path):
         _pair("s1", "s2", 5, 3),
         _pair("s1", "phillip", 4, 4),
         tourn.empty_pair_result(
-            tourn.PairPlan("s2", "phillip", 8), "budget reached"
+            tourn.PairPlan("s2", "phillip", 8), "env 3 died"
         ),
     ]
     report = tourn.make_report(

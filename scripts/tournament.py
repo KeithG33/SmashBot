@@ -425,9 +425,6 @@ def parse_args(argv=None) -> argparse.Namespace:
                          "specialists); main12: per-game character redraws")
     ap.add_argument("--stage", default="FD",
                     help="FD/BF/DL/YS/FOD/PS alias or full melee.Stage name")
-    ap.add_argument("--max-minutes", type=float, default=90.0,
-                    help="total wall-clock budget; partial results are still "
-                         "reported")
     ap.add_argument("--out", default="",
                     help=f"JSON report path (default "
                          f"{RESULTS_DIR}/<timestamp>.json)")
@@ -470,7 +467,6 @@ def _load_contestant_policies(
 def _run_pair(
     plan: PairPlan,
     games_target: int,
-    deadline: float,
     policies: dict,
     args: argparse.Namespace,
     results: dict,
@@ -478,8 +474,9 @@ def _run_pair(
 ) -> None:
     """One pairing, one worker, one thread: contestant A on the student seat
     of every env, contestant B serving the whole "teacher" opponent group.
-    Collect until the pair's game target or the shared deadline; any crash
-    keeps the tracker's partial results (battery-style honesty)."""
+    Collect until the pair's game target; a crash (including the worker's
+    env_timeout watchdog on a silent env) keeps the tracker's partial
+    results (battery-style honesty)."""
     from smashbot.rl.agent import BatchedPolicyAgent
     from smashbot.rl.rollouts import DolphinRolloutWorker
 
@@ -521,9 +518,6 @@ def _run_pair(
             progress[key] = done
             if done >= games_target:
                 break
-            if time.monotonic() > deadline:
-                error = "budget reached; partial results kept"
-                break
     except Exception as e:  # env death/timeout: keep partials, report why
         error = f"{type(e).__name__}: {e}"
     finally:
@@ -550,7 +544,6 @@ def _run_wave(
     num_waves: int,
     wave: list[PairPlan],
     games_target: int,
-    deadline: float,
     policies: dict,
     args: argparse.Namespace,
 ) -> list[dict]:
@@ -561,7 +554,7 @@ def _run_wave(
     threads = [
         threading.Thread(
             target=_run_pair,
-            args=(p, games_target, deadline, policies, args, results, progress),
+            args=(p, games_target, policies, args, results, progress),
             name=f"pair-{p.a}-vs-{p.b}",
         )
         for p in wave
@@ -624,22 +617,11 @@ def main() -> None:
         return
 
     t0 = time.monotonic()
-    deadline = t0 + args.max_minutes * 60
     pair_results: list[dict] = []
     for wi, wave in enumerate(waves):
-        if time.monotonic() > deadline - 60:
-            print(
-                f"[wave {wi + 1}/{len(waves)}] skipped: budget exhausted",
-                flush=True,
-            )
-            pair_results.extend(
-                empty_pair_result(p, "skipped: budget exhausted") for p in wave
-            )
-            continue
         pair_results.extend(
             _run_wave(
-                wi, len(waves), wave, args.games_per_pair, deadline,
-                policies, args,
+                wi, len(waves), wave, args.games_per_pair, policies, args,
             )
         )
 
@@ -653,7 +635,6 @@ def main() -> None:
         device=args.device,
         char_mode=args.char_mode,
         stage=resolve_stage(args.stage),
-        max_minutes=args.max_minutes,
         games_per_dolphin=args.games_per_dolphin,
         env_timeout=args.env_timeout,
         num_pairs=len(pairs),
