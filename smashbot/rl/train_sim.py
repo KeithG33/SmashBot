@@ -260,6 +260,10 @@ def run(args) -> None:
     scfg: SimRolloutConfig = args.sim
     device = args.runtime.device
     assert device == "cuda", "sim backend is a GPU training path"
+    if os.environ.get("SMASHBOT_MEMDEBUG"):
+        # allocator history with python stacks; dumped on OOM (below) for
+        # torch.cuda.memory._snapshot analysis
+        torch.cuda.memory._record_memory_history(max_entries=200000)
 
     policy, name_map, step = load_policy(args.ckpt, device)
     policy.train_value_head = False
@@ -545,6 +549,12 @@ def run(args) -> None:
         if fut is not None:
             state, metrics = fut.result()
             _post_step(fut_i, metrics)
+    except torch.OutOfMemoryError:
+        if os.environ.get("SMASHBOT_MEMDEBUG"):
+            snap = f"{run_dir}/oom_snapshot.pickle"
+            torch.cuda.memory._dump_snapshot(snap)
+            print(f"[memdebug] OOM snapshot dumped to {snap}", flush=True)
+        raise
     finally:
         worker.close()
         overlap_pool.shutdown(wait=False)
