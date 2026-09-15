@@ -116,6 +116,7 @@ class SimLeagueWorker:
         self.device = device
         self.rng = random.Random(cfg.partition_seed)
         self._worker = None
+        self._grid = None                # persistent PfspGrid (captured graph)
         self._env_char = None            # per-env opponent char name (for trackers)
         self.part: dict = {}
         from smashbot.rl.rollouts import GameTracker
@@ -153,14 +154,31 @@ class SimLeagueWorker:
         self.part = self.lg.partition(N, self.rng,
                                       max_pfsp_members=cfg.max_pfsp_members)
         opponents = []
-        slot = 0
+        pfsp = []                        # [(key, env_rows)] for the grid
         for key, idx in self.part.items():
             if key == "self" or key.startswith("phillip:"):
                 pol, nc = self.lg.get(key)
-            else:  # PFSP member -> persistent slot skeleton (in-place load)
+                opponents.append((key, pol, idx, key != "self", nc))
+            else:
+                pfsp.append((key, idx))
+        grid = None
+        K = cfg.max_pfsp_members
+        if len(pfsp) == K and len({len(r) for _, r in pfsp}) == 1:
+            # full house of equal slots -> ONE captured vmap forward for all
+            # PFSP members (member swaps are in-place load_slice)
+            from smashbot.rl.sim_league import PfspGrid
+            if self._grid is None:
+                self._grid = PfspGrid(
+                    self.lg.make_grid_template(), K, len(pfsp[0][1]),
+                    self.name_code, cfg.unroll_length, self.device)
+            self._grid.assign(pfsp, self.lg.get_state)
+            grid = self._grid
+        else:
+            # league too small to fill the slots (fresh run boot): fall back
+            # to per-slot compiled skeletons until it grows
+            for slot, (key, idx) in enumerate(pfsp):
                 pol, nc = self.lg.get(key, slot=slot)
-                slot += 1
-            opponents.append((key, pol, idx, key != "self", nc))
+                opponents.append((key, pol, idx, True, nc))
         # per-env characters: student uniform MAIN_12; opponent uniform
         # MAIN_12 except fox imports (char-locked FOX, as in v10)
         chars = [getattr(msl.Character, _MSL_CHAR[c.upper()])
@@ -184,6 +202,7 @@ class SimLeagueWorker:
             self.policy, opponents, N, cfg.unroll_length, cfg.data_dir,
             stages, char_pairs, name_code=self.name_code, device=self.device,
             record_fn=self._on_game, precision=cfg.rollout_precision,
+            grid=grid,
         )
 
     def maybe_repartition(self, step: int) -> bool:

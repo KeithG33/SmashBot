@@ -62,6 +62,55 @@ def make_reencoder(opp_embed, stu_embed, student_name_code, device):
     return reencode
 
 
+class PfspGrid:
+    """The PFSP slots on ONE LeagueAgent: S slices (one member each) x Nc
+    cells, stepped as a single captured vmap forward per frame — dolphin's
+    league serving transplanted to the sim. fp16 stacked weights; a member
+    swap is an in-place load_slice (visible to the captured graph), never a
+    rebuild. Persists across re-partition periods: assign() reloads changed
+    members and remaps cells to this period's env rows.
+
+    Harvest: one ChunkAssembler over all S*Nc cells; sgu-family members share
+    the student's schema, so no reencode; initial_state=None (the dolphin
+    grid harvest convention — the learner's imitation path never unrolls
+    from a carried state)."""
+
+    def __init__(self, template, slices, cells, name_code, unroll, device):
+        from smashbot.rl.agent import LeagueAgent
+        self.S, self.Nc = slices, cells
+        self.agent = LeagueAgent(template, slices, cells, name_code, device,
+                                 weights_dtype=torch.float16,
+                                 state_dtype=torch.float16)
+        self.assembler = ChunkAssembler(unroll, template.delay)
+        self.members = [None] * slices        # member key per slice
+        self.env_idx = None                   # [S, Nc] env rows (per period)
+        self.flat_env = None                  # [S*Nc] env rows, cell order
+        self.idx_t = None                     # gather index on device
+        self.device = device
+
+    def assign(self, assignments, get_state):
+        """assignments: [(key, env_rows)] one per slice, this period's map.
+        Loads changed members in place and resets every cell (a re-partition
+        resets all envs)."""
+        assert len(assignments) == self.S, (len(assignments), self.S)
+        idx = []
+        for s, (key, rows) in enumerate(assignments):
+            assert len(rows) == self.Nc, (key, len(rows), self.Nc)
+            if self.members[s] != key:
+                self.agent.load_slice(s, get_state(key))
+                self.members[s] = key
+            idx.append(np.asarray(rows, dtype=np.int64))
+        self.env_idx = np.stack(idx)
+        self.flat_env = self.env_idx.reshape(-1)
+        self.idx_t = torch.as_tensor(self.flat_env, device=self.device)
+        for s in range(self.S):
+            for n in range(self.Nc):
+                self.agent.reset_cell(s, n)
+
+    def gid_of_cell(self, cell: int) -> str:
+        return self.members[cell // self.Nc]
+
+
 class _Group:
     """One opponent identity serving a fixed subset of env rows."""
 
@@ -83,8 +132,10 @@ class _Group:
 class MultiOpponentSimWorker:
     def __init__(self, student_policy, opponents, batch_size, unroll_length, data_dir,
                  stage, char_pairs, name_code=1, device="cpu", record_fn=None,
-                 precision="fp32"):
-        """opponents: list of (gid, policy, env_idx, harvest, name_code).
+                 precision="fp32", grid: PfspGrid | None = None):
+        """opponents: list of (gid, policy, env_idx, harvest, name_code) —
+        the per-policy groups (self + phillips). PFSP members ride in `grid`
+        (a PfspGrid already assign()ed for this period) as one merged forward.
         char_pairs: [(p0_char, p1_char)] per env (len == batch_size).
         stage: one msl.Stage for all envs, or a per-env list (len == batch_size).
         record_fn(env_i, opponent_gid, student_stocks, opp_stocks): called on
@@ -97,8 +148,10 @@ class MultiOpponentSimWorker:
         self.unroll = unroll_length
         self.device = device
         self.record_fn = record_fn
+        self.grid = grid
         self.student = BatchedPolicyAgent(student_policy, batch_size, name_code=name_code,
                                           device=device, precision=precision)
+        self.student.set_flat_controllers(True)
         self.assembler = ChunkAssembler(unroll_length, student_policy.delay)
         self._pushed = 0
         self._prev = None
@@ -122,12 +175,20 @@ class MultiOpponentSimWorker:
             self.groups.append(
                 _Group(gid, pol, idx, harv, unroll_length, device, nc, re,
                        precision=precision))
+        for g in self.groups:
+            g.agent.set_flat_controllers(True)
         # env -> opponent gid, for outcome recording
         self.env_opp = np.empty(batch_size, dtype=object)
         for g in self.groups:
             self.env_opp[g.env_idx] = g.gid
-        # env_idx must partition [0, N)
-        covered = np.concatenate([g.env_idx for g in self.groups]) if self.groups else np.array([], int)
+        if grid is not None:
+            for s in range(grid.S):
+                self.env_opp[grid.env_idx[s]] = grid.members[s]
+        # groups + grid must partition [0, N)
+        covered = [g.env_idx for g in self.groups]
+        if grid is not None:
+            covered.append(grid.flat_env)
+        covered = np.concatenate(covered) if covered else np.array([], int)
         assert sorted(covered.tolist()) == list(range(batch_size)), "opponent env_idx must partition all envs"
         self.env = msl.EnvBatch(batch_size=batch_size, length=max(64, unroll_length + 1), data_dir=data_dir)
         stages = stage if isinstance(stage, (list, tuple)) else [stage] * batch_size
@@ -150,30 +211,43 @@ class MultiOpponentSimWorker:
             states = _states_to_torch(sim_env.encode_obs(obs), dev)
             want = (self._pushed % T == 0)
             records, hidden_before = self.student.infer(states, reset_t, want_snapshot=want)
-            to_exec = self.student.execute(np.nonzero(reset_np)[0].tolist())
-            sim_env.write_controllers(env, to_exec, player=0)
+            p0_rows = np.stack(self.student.execute(np.nonzero(reset_np)[0].tolist()))
+            sim_env.write_controller_rows(env, p0_rows, player=0)
 
-            # ---- opponents (player 1), grouped ----
-            # ONE swapped-view encode + H2D for all envs; groups take GPU
-            # slices (14 per-group numpy encodes measured 46ms/frame vs 4ms
-            # for one full-width encode)
+            # ---- opponents (player 1) ----
+            # ONE swapped-view encode + H2D for all envs; groups and the
+            # grid take GPU slices (14 per-group numpy encodes measured
+            # 46ms/frame vs 4ms for one full-width encode)
             opp_states = _states_to_torch(
                 sim_env.encode_obs(obs, self_slot=1, opp_slot=0), dev)
-            p1 = [None] * self.N
+            p1_rows = np.empty((self.N, 13), dtype=np.float32)
             for g in self.groups:
                 gstates = tree.map_structure(lambda t: t[g.idx_t], opp_states)
                 greset = torch.as_tensor(g._reset, device=dev)
                 gwant = (g._pushed % T == 0)
                 grecords, ghidden = g.agent.infer(gstates, greset, want_snapshot=gwant)
-                gexec = g.agent.execute(np.nonzero(g._reset)[0].tolist())
-                for k, i in enumerate(g.env_idx):
-                    p1[i] = gexec[k]
+                p1_rows[g.env_idx] = np.stack(
+                    g.agent.execute(np.nonzero(g._reset)[0].tolist()))
                 if g.harvest:
                     for rec in grecords:
                         snap = ghidden if g._pushed % T == 0 else None
                         g.assembler.push_frame(rec, greset, snap)
                         g._pushed += 1
-            sim_env.write_controllers(env, p1, player=1)
+            if self.grid is not None:            # PFSP slots: ONE forward
+                gr = self.grid
+                gr_reset = reset_np[gr.flat_env]                  # [S*Nc]
+                for cell in np.nonzero(gr_reset)[0]:
+                    gr.agent.reset_cell(cell // gr.Nc, cell % gr.Nc)
+                p1_rows[gr.flat_env] = gr.agent.execute()
+                gviews = tree.map_structure(
+                    lambda t: t[gr.idx_t].view(gr.S, gr.Nc, *t.shape[1:]),
+                    opp_states)
+                grec = gr.agent.infer(
+                    gviews, torch.as_tensor(
+                        gr_reset.reshape(gr.S, gr.Nc), device=dev))
+                gr.assembler.push_frame(
+                    grec, torch.as_tensor(gr_reset, device=dev), None)
+            sim_env.write_controller_rows(env, p1_rows, player=1)
 
             # ---- rewards ----
             stocks, percent = _seat_stats(obs)         # [N,2] self,opp (player-0 view)
@@ -185,6 +259,8 @@ class MultiOpponentSimWorker:
                 for g in self.groups:
                     if g.harvest:  # opponent seat reward = zero-sum mirror
                         g.assembler.push_reward((-reward[g.env_idx]).clone())
+                if self.grid is not None:
+                    self.grid.assembler.push_reward((-reward[self.grid.idx_t]).clone())
             self._prev = (stocks, percent)
 
             # ---- student records ----
@@ -213,6 +289,9 @@ class MultiOpponentSimWorker:
                     if g.reencode is not None:
                         traj = g.reencode(traj)
                     imit_out.append(traj)
+            if self.grid is not None and self.grid.assembler.ready():
+                # student schema (sgu family) -> no reencode
+                imit_out.append(self.grid.assembler.emit()._replace(kind="imitation"))
         return ppo_out, imit_out
 
     def close(self):
@@ -336,6 +415,21 @@ class SimLeague:
         with _torch.no_grad():
             res = skeleton.load_state_dict(state, strict=True)
         return res
+
+    def get_state(self, key):
+        """A PFSP member's raw state_dict (for PfspGrid.load_slice)."""
+        import torch as _torch
+        path = self.fox_paths[key] if key.startswith("import:") else key
+        return _torch.load(path, map_location=self.device, weights_only=True)
+
+    def make_grid_template(self):
+        """Uncompiled skeleton for PfspGrid/LeagueAgent (it deep-copies the
+        template and builds its own captured vmap forward)."""
+        fn, self.compile_fn = self.compile_fn, None
+        try:
+            return self._make_skeleton()
+        finally:
+            self.compile_fn = fn
 
     # ---- per-env assignment ----
     def partition(self, N, rng=None, max_pfsp_members=None):

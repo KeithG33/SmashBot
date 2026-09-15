@@ -62,6 +62,9 @@ def main():
     ap.add_argument("--unroll", type=int, default=240)
     ap.add_argument("--max-pfsp", type=int, default=8)
     ap.add_argument("--micro-batches", type=int, default=4)
+    ap.add_argument("--overlap", action="store_true",
+                    help="pipeline learner on a second stream (train_sim's "
+                         "real loop): true co-peak VRAM + wall-clock fps")
     ap.add_argument("--data-dir", default=os.environ.get("MSL_DATA_DIR"))
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
@@ -93,51 +96,41 @@ def main():
         phillips[tier] = (pol, frac, resolve_name_code(pnm, "Master Player"))
     fox = {k: v for k, v in FOX.items() if os.path.exists(v)}
 
-    self_frac = 1.0 - sum(f for _, _, f in phillips.values()) - 0.35  # phillips + 35% pfsp
+    # tuple is (policy, frac, name_code) — frac is the MIDDLE element (a
+    # prior version summed the name codes here, silently collapsing the
+    # partition to pfsp-only and invalidating those measurements)
+    self_frac = 1.0 - sum(frac for _, frac, _ in phillips.values()) - 0.35
     lg = SimLeague(policy, args.snapshot_dir, phillips=phillips, fox_imports=fox,
                    self_frac=self_frac, device=dev,
                    config_from=args.ckpt, self_name_code=sc,
                    compile_fn=lambda s: torch.compile(s, mode="reduce-overhead"))
 
-    rng = random.Random(0)
-    part = lg.partition(N, rng, max_pfsp_members=args.max_pfsp)
-    print(f"num_envs={N} unroll={T} | groups={len(part)} "
-          f"(self+{len(phillips)}phil+{len(part)-1-len(phillips)}pfsp)")
-    opponents = []
-    slot = 0
-    for key, idx in part.items():
-        if key == "self" or key.startswith("phillip:"):
-            pol, nc = lg.get(key)
-        else:
-            pol, nc = lg.get(key, slot=slot)
-            slot += 1
-        opponents.append((key, pol, idx, key != "self", nc))
-
-    chars = [msl.Character.FOX, msl.Character.FALCO, msl.Character.MARTH,
-             msl.Character.FALCON, msl.Character.JIGGLYPUFF, msl.Character.PEACH]
-    char_pairs = [(rng.choice(chars), rng.choice(chars)) for _ in range(N)]
-
-    w = MultiOpponentSimWorker(policy, opponents, N, T, args.data_dir,
-                               msl.Stage.FINAL_DESTINATION, char_pairs,
-                               name_code=sc, device=dev, precision="fp16",
-                               record_fn=lambda i, gid, s0, s1: lg.record(gid, s0 > s1))
+    # the REAL training worker (grid + groups + trackers), so the harness
+    # measures exactly the launch path
+    from smashbot.rl.train_sim import SimRolloutConfig, SimLeagueWorker
+    scfg = SimRolloutConfig(num_envs=N, unroll_length=T, data_dir=args.data_dir,
+                            max_pfsp_members=args.max_pfsp)
+    w = SimLeagueWorker(scfg, lg, policy, sc, dev)
+    share = {k.split("/")[-1]: len(v) for k, v in w.part.items()}
+    print(f"num_envs={N} unroll={T} | groups={len(w.part)} "
+          f"(grid={'ON' if w._grid is not None else 'off'})")
+    print(f"pool: {share}")
+    assert "self" in share and any(k.startswith("phillip:") for k in share), (
+        "partition lost self/phillips — measuring the wrong pool")
     state = learner.initial_state(N, dev)
 
     # warmup: trigger compile / cudagraph capture, fill one chunk
-    ppo, imit = [], []
-    while len(ppo) < 1:
-        p, i = w.collect(30); ppo += p; imit += i
+    trajs = w.collect(1)
     torch.cuda.synchronize()
 
     # ---- measure: baseline (resident) -> collect -> learner.step (peak) ----
     torch.cuda.synchronize()
     base = torch.cuda.memory_allocated()
     torch.cuda.reset_peak_memory_stats()
-    ppo, imit = [], []
-    while len(ppo) < 1:
-        p, i = w.collect(30); ppo += p; imit += i
+    trajs = w.collect(1)
     roll_peak = torch.cuda.max_memory_allocated()
-    trajs = ppo + imit
+    ppo = [t for t in trajs if t.kind != "imitation"]
+    imit = [t for t in trajs if t.kind == "imitation"]
     state, metrics = learner.step(trajs, state, progress=step / 40000)
     torch.cuda.synchronize()
     peak = torch.cuda.max_memory_allocated()
@@ -149,21 +142,56 @@ def main():
     print(f"        ppo_trajs={len(ppo)} imit_trajs={len(imit)} "
           f"| metrics finite={all(np.isfinite(v) for v in metrics.values() if isinstance(v,(int,float)))}")
 
-    # ---- throughput: timed steady-state cycles (sequential = the floor;
-    # learner_overlap in training hides the shorter of the two phases) ----
+    # ---- throughput: timed steady-state cycles.
+    # Sequential mode = the floor + the components. --overlap mirrors
+    # train_sim's real pipeline (learner.step(i) on its own stream in a
+    # background thread WHILE collect(i+1) runs) and reports the TRUE
+    # co-peak VRAM + wall-clock fps of the training loop.
     import time
-    for cyc in range(3):
-        torch.cuda.synchronize(); t0 = time.perf_counter()
-        ppo, imit = [], []
-        while len(ppo) < 1:
-            p, i = w.collect(30); ppo += p; imit += i
-        torch.cuda.synchronize(); t1 = time.perf_counter()
-        state, _m = learner.step(ppo + imit, state, progress=step / 40000)
-        torch.cuda.synchronize(); t2 = time.perf_counter()
-        frames = N * T
-        print(f"[cycle {cyc}] collect {t1-t0:.1f}s ({frames/(t1-t0):,.0f} fps) | "
-              f"learner {t2-t1:.1f}s | sequential {frames/(t2-t0):,.0f} fps | "
-              f"overlapped-> {frames/max(t1-t0, t2-t1):,.0f} fps", flush=True)
+    if not args.overlap:
+        for cyc in range(3):
+            torch.cuda.synchronize(); t0 = time.perf_counter()
+            trajs = w.collect(1)
+            torch.cuda.synchronize(); t1 = time.perf_counter()
+            state, _m = learner.step(trajs, state, progress=step / 40000)
+            torch.cuda.synchronize(); t2 = time.perf_counter()
+            frames = N * T
+            print(f"[cycle {cyc}] collect {t1-t0:.1f}s ({frames/(t1-t0):,.0f} fps) | "
+                  f"learner {t2-t1:.1f}s | sequential {frames/(t2-t0):,.0f} fps | "
+                  f"overlapped-> {frames/max(t1-t0, t2-t1):,.0f} fps", flush=True)
+    else:
+        import concurrent.futures
+        pool = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="learner")
+        stream = torch.cuda.Stream()
+
+        def collect_one():
+            return w.collect(1)
+
+        def run_learner(traj, st):
+            def _r():
+                ev = torch.cuda.Event(); ev.record()
+                stream.wait_event(ev)
+                with torch.cuda.stream(stream):
+                    out = learner.step(traj, st, progress=step / 40000)
+                stream.synchronize()
+                return out
+            return pool.submit(_r)
+
+        torch.cuda.reset_peak_memory_stats()
+        trajs = collect_one()                       # prime the pipeline
+        fut = run_learner(trajs, state)
+        for cyc in range(4):
+            torch.cuda.synchronize(); t0 = time.perf_counter()
+            trajs = collect_one()                   # overlaps learner(i-1)
+            state, _m = fut.result()
+            fut = run_learner(trajs, state)
+            torch.cuda.synchronize(); t1 = time.perf_counter()
+            peak = torch.cuda.max_memory_allocated() / 2**30
+            resv = torch.cuda.memory_reserved() / 2**30
+            print(f"[ovl {cyc}] step {t1-t0:.1f}s = {N*T/(t1-t0):,.0f} fps | "
+                  f"co-peak {peak:.2f} GiB | reserved {resv:.2f} GiB", flush=True)
+        state, _m = fut.result()
+        pool.shutdown(wait=False)
     w.close()
 
 

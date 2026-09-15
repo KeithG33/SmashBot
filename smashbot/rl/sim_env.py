@@ -140,3 +140,23 @@ def write_controllers(env, controllers, player: int) -> None:
             getattr(ctrl.buttons, name)[t] = np.fromiter(
                 (bool(getattr(c.buttons, name)) for c in controllers), bool, N)
     msl.write_controller(env.controller_action_view, ctrl, player=player)
+
+
+# controller_rows column order = tree.flatten(Controller):
+#   0 main_x  1 main_y  2 c_x  3 c_y  4 shoulder  5..12 buttons A B X Y Z L R D_UP
+def write_controller_rows(env, rows: np.ndarray, player: int) -> None:
+    """Vectorized twin of write_controllers for the flat [N, 13] row format
+    (encode.controller_rows / BatchedPolicyAgent flat_controllers /
+    LeagueAgent.execute) -- column assignments, no per-controller Python."""
+    import melee_sim as msl
+
+    ctrl = msl.neutral_controller((env.length, env.batch_size))
+    t = env.t
+    ctrl.main_stick.x[t] = rows[:, 0]
+    ctrl.main_stick.y[t] = rows[:, 1]
+    ctrl.c_stick.x[t] = rows[:, 2]
+    ctrl.c_stick.y[t] = rows[:, 3]
+    ctrl.shoulder[t] = rows[:, 4]
+    for j, name in enumerate(_BUTTONS):
+        getattr(ctrl.buttons, name)[t] = rows[:, 5 + j] > 0.5
+    msl.write_controller(env.controller_action_view, ctrl, player=player)

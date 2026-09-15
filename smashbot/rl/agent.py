@@ -326,6 +326,7 @@ class LeagueAgent:
         self, template: Policy, slices: int, cells: int, name_code: int,
         device, temperature=None, capture: bool | None = None,
         weights_dtype: torch.dtype = torch.float32,
+        state_dtype: torch.dtype | None = None,
     ):
         import copy
 
@@ -335,6 +336,12 @@ class LeagueAgent:
         # fp16 stacked weights halve the per-slice VRAM (107 -> 54 MB); the
         # forward then runs under fp16 autocast (norms stay fp32)
         self.weights_dtype = weights_dtype
+        # optional recurrent-state storage dtype (see _initial_hidden); only
+        # meaningful with the fp16-autocast forward
+        self.state_dtype = state_dtype
+        assert state_dtype is None or weights_dtype == torch.float16, (
+            "state_dtype override is for the fp16 forward"
+        )
         assert weights_dtype == torch.float32 or self.device.type == "cuda", (
             "fp16 league weights need CUDA (fp16 autocast)"
         )
@@ -500,10 +507,21 @@ class LeagueAgent:
 
     def _initial_hidden(self):
         h0 = [self._template.initial_state(self.N, self.device) for _ in range(self.S)]
-        return tree.map_structure(
+        stacked = tree.map_structure(
             lambda *xs: torch.stack(xs) if isinstance(xs[0], torch.Tensor) else xs[0],
             *h0,
         )
+        if self.state_dtype is not None:
+            # fp16 recurrent state (the KV caches dominate): the fp16-weights
+            # forward computes under fp16 autocast anyway, so storing the
+            # carried state fp16 loses nothing — and at window-256 x 6 layers
+            # the in+out static buffers are the grid's biggest resident term.
+            stacked = tree.map_structure(
+                lambda t: t.to(self.state_dtype)
+                if isinstance(t, torch.Tensor) and t.is_floating_point() else t,
+                stacked,
+            )
+        return stacked
 
     def _make_vmap(self):
         from torch.func import functional_call, vmap
