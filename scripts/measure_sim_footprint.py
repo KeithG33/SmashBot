@@ -113,7 +113,8 @@ def main():
 
     w = MultiOpponentSimWorker(policy, opponents, N, T, args.data_dir,
                                msl.Stage.FINAL_DESTINATION, char_pairs,
-                               name_code=sc, device=dev, record_fn=lg.record)
+                               name_code=sc, device=dev,
+                               record_fn=lambda i, gid, s0, s1: lg.record(gid, s0 > s1))
     state = learner.initial_state(N, dev)
 
     # warmup: trigger compile / cudagraph capture, fill one chunk

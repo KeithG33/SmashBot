@@ -25,16 +25,51 @@ from smashbot.rl import sim_env
 from smashbot.rl.sim_rollout import _states_to_torch, _seat_stats
 
 
+def make_reencoder(opp_embed, stu_embed, student_name_code, device):
+    """Harvested-chunk fixup for an opponent with its OWN config (the
+    phillips): re-encode the controller stream through the student's
+    embedding and recondition the name — the sim twin of
+    DolphinRolloutWorker._traj_reencoder. Logits stay opponent-schema
+    (unused by the imitation loss)."""
+    import tree as _tree
+
+    def reencode(traj):
+        encoded_np = opp_embed.map(
+            lambda e, x: x.astype(getattr(e, "dtype", x.dtype)),
+            _tree.map_structure(
+                lambda x: x.cpu().numpy(), traj.actions.controller_state
+            ),
+        )
+        raw = opp_embed.decode(encoded_np)
+        prev = _tree.map_structure(
+            lambda x: torch.from_numpy(
+                np.ascontiguousarray(
+                    x.astype(np.int64) if x.dtype.kind in "iu" else x
+                )
+            ).to(device),
+            stu_embed.from_state(raw),
+        )
+        return traj._replace(
+            actions=traj.actions._replace(controller_state=prev),
+            name=torch.full_like(traj.name, student_name_code),
+        )
+
+    return reencode
+
+
 class _Group:
     """One opponent identity serving a fixed subset of env rows."""
 
-    def __init__(self, gid, policy, env_idx, harvest, unroll, device, name_code):
+    def __init__(self, gid, policy, env_idx, harvest, unroll, device, name_code,
+                 reencode=None, precision="fp32"):
         self.gid = gid
         self.env_idx = np.asarray(env_idx, dtype=np.int64)   # env rows this opp plays
         self.harvest = harvest
         self.n = len(self.env_idx)
-        self.agent = BatchedPolicyAgent(policy, self.n, name_code=name_code, device=device)
+        self.agent = BatchedPolicyAgent(policy, self.n, name_code=name_code,
+                                        device=device, precision=precision)
         self.assembler = ChunkAssembler(unroll, policy.delay) if harvest else None
+        self.reencode = reencode
         self._pushed = 0
         self._prev = None
         self._reset = np.ones(self.n, dtype=bool)   # its envs start fresh
@@ -42,25 +77,46 @@ class _Group:
 
 class MultiOpponentSimWorker:
     def __init__(self, student_policy, opponents, batch_size, unroll_length, data_dir,
-                 stage, char_pairs, name_code=1, device="cpu", record_fn=None):
+                 stage, char_pairs, name_code=1, device="cpu", record_fn=None,
+                 precision="fp32"):
         """opponents: list of (gid, policy, env_idx, harvest, name_code).
         char_pairs: [(p0_char, p1_char)] per env (len == batch_size).
-        record_fn(opponent_gid, student_won): called on each decided game."""
+        stage: one msl.Stage for all envs, or a per-env list (len == batch_size).
+        record_fn(env_i, opponent_gid, student_stocks, opp_stocks): called on
+        each decided game (terminal-frame stocks, student = player 0).
+        precision: BatchedPolicyAgent precision for every seat ("fp16" is the
+        probe-validated rollout setting from v10)."""
         import melee_sim as msl
         self.msl = msl
         self.N = batch_size
         self.unroll = unroll_length
         self.device = device
         self.record_fn = record_fn
-        self.student = BatchedPolicyAgent(student_policy, batch_size, name_code=name_code, device=device)
+        self.student = BatchedPolicyAgent(student_policy, batch_size, name_code=name_code,
+                                          device=device, precision=precision)
         self.assembler = ChunkAssembler(unroll_length, student_policy.delay)
         self._pushed = 0
         self._prev = None
         self._reset_mask = np.ones(batch_size, dtype=bool)
-        self.groups = [
-            _Group(gid, pol, idx, harv, unroll_length, device, nc)
-            for (gid, pol, idx, harv, nc) in opponents
-        ]
+        stu_embed = student_policy.controller_head.controller_embedding
+        self.groups = []
+        for (gid, pol, idx, harv, nc) in opponents:
+            re = None
+            if harv:
+                # student-schema fixup (see make_reencoder): identity for
+                # matching configs (snapshots/imports), a real re-encode +
+                # name recondition for the phillips
+                re = make_reencoder(
+                    pol.controller_head.controller_embedding, stu_embed,
+                    name_code, device)
+                if pol.delay != student_policy.delay:
+                    print(f"NOTE: imitation harvest delay mismatch — {gid} "
+                          f"{pol.delay} vs student {student_policy.delay} "
+                          f"({pol.delay - student_policy.delay:+d} frames)",
+                          flush=True)
+            self.groups.append(
+                _Group(gid, pol, idx, harv, unroll_length, device, nc, re,
+                       precision=precision))
         # env -> opponent gid, for outcome recording
         self.env_opp = np.empty(batch_size, dtype=object)
         for g in self.groups:
@@ -69,8 +125,9 @@ class MultiOpponentSimWorker:
         covered = np.concatenate([g.env_idx for g in self.groups]) if self.groups else np.array([], int)
         assert sorted(covered.tolist()) == list(range(batch_size)), "opponent env_idx must partition all envs"
         self.env = msl.EnvBatch(batch_size=batch_size, length=max(64, unroll_length + 1), data_dir=data_dir)
-        cfgs = [msl.MatchConfig(stage=stage, players=(msl.PlayerConfig(a), msl.PlayerConfig(b)))
-                for (a, b) in char_pairs]
+        stages = stage if isinstance(stage, (list, tuple)) else [stage] * batch_size
+        cfgs = [msl.MatchConfig(stage=s, players=(msl.PlayerConfig(a), msl.PlayerConfig(b)))
+                for s, (a, b) in zip(stages, char_pairs)]
         self.env.configure_matches(cfgs)
         self.env.reset_all()
 
@@ -134,7 +191,8 @@ class MultiOpponentSimWorker:
                 if done.any():
                     fs, _ = _seat_stats(env.current_frame)  # terminal frame stocks
                     for i in np.nonzero(done)[0]:
-                        self.record_fn(self.env_opp[i], bool(fs[i, 0] > fs[i, 1]))
+                        self.record_fn(int(i), self.env_opp[i],
+                                       int(fs[i, 0]), int(fs[i, 1]))
             for g in self.groups:
                 g._reset = self._reset_mask[g.env_idx]
 
@@ -142,7 +200,10 @@ class MultiOpponentSimWorker:
                 ppo_out.append(self.assembler.emit())
             for g in self.groups:
                 if g.harvest and g.assembler.ready():
-                    imit_out.append(g.assembler.emit()._replace(kind="imitation"))
+                    traj = g.assembler.emit()._replace(kind="imitation")
+                    if g.reencode is not None:
+                        traj = g.reencode(traj)
+                    imit_out.append(traj)
         return ppo_out, imit_out
 
     def close(self):

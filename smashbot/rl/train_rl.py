@@ -20,6 +20,7 @@ import tyro
 # this __main__ module (multiprocessing prepare()), and torch would cost
 # each of them ~0.26 GB. Heavy imports live inside the functions below.
 from smashbot.rl.config import RLConfig, RolloutConfig
+from smashbot.rl.train_sim import SimRolloutConfig
 
 
 @dataclasses.dataclass
@@ -51,6 +52,10 @@ class Config:
     learner: RLConfig = dataclasses.field(default_factory=RLConfig)
     rollouts: RolloutConfig = dataclasses.field(default_factory=RolloutConfig)
     runtime: RuntimeConfig = dataclasses.field(default_factory=RuntimeConfig)
+    # "dolphin" (the fleet below) or "sim" (melee-sim-light batched sim;
+    # rollout options under --sim, see rl/train_sim.py)
+    backend: str = "dolphin"
+    sim: SimRolloutConfig = dataclasses.field(default_factory=SimRolloutConfig)
 
 
 def build_value_function(cfg: dict, device: str):
@@ -126,6 +131,10 @@ def main() -> None:
     from smashbot.rl.teacher_watch import TeacherWatcher
 
     args = tyro.cli(Config)
+    if args.backend == "sim":
+        from smashbot.rl import train_sim
+        return train_sim.run(args)
+    assert args.backend == "dolphin", args.backend
     device = args.runtime.device
 
     policy, name_map, step = load_policy(args.ckpt, device)
