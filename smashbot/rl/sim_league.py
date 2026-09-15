@@ -135,3 +135,99 @@ class MultiOpponentSimWorker:
 
     def close(self):
         self.env.close()
+
+
+# ---------------------------------------------------------------- opponent pool
+
+import random as _random
+
+from smashbot.rl.pool import SnapshotPool
+
+
+class SimLeague:
+    """Opponent pool + per-env assignment for the sim league.
+
+    Three fixed shares (self / phillips / PFSP pool) per the design:
+      * self       -- the current policy (mirror), no harvest.
+      * phillips    -- 5 fixed tiers, per-tier env fraction, harvested.
+      * PFSP pool   -- snapshots (League.archive) + fox imports (import:NAME),
+                       drawn by League.draw_member, harvested.
+    Reuses League for the PFSP draw + payoff ledger (pfsp.json), so a resume
+    loads v10's archive + payoff table straight from the snapshot dir.
+
+    Assignment is coarse (re-partitioned every `repartition_every` frames), so
+    within a period an env keeps its opponent and a game reset just resets
+    hidden -- no cross-group state migration.
+    """
+
+    def __init__(self, current_policy, snapshot_dir, phillips, fox_imports,
+                 self_frac=0.30, device="cpu", pfsp_hard_frac=0.25, pfsp_explore=0.15,
+                 name_resolver=None):
+        # phillips: {tier_id: (policy, frac, name_code)}; fox_imports: {"import:NAME": path}
+        self.current = current_policy
+        self.device = device
+        self.self_frac = self_frac
+        self.phillips = phillips
+        self.fox_paths = dict(fox_imports)
+        self.league = SnapshotPool(
+            snapshot_dir, keep=0, pfsp=True,
+            pfsp_hard_frac=pfsp_hard_frac, pfsp_explore=pfsp_explore,
+            league_members=list(fox_imports.keys()),
+        )
+        self._cache = {}          # member_key -> (policy, name_code)
+        self._resolve = name_resolver or (lambda nm: 1)
+
+    # ---- policy resolution (lazy load + cache) ----
+    def get(self, key):
+        """(policy, name_code) for an assignment key: 'self', 'phillip:<id>',
+        a snapshot path, or 'import:<name>'."""
+        if key == "self":
+            return self.current, self._sc
+        if key.startswith("phillip:"):
+            pol, _frac, nc = self.phillips[key.split(":", 1)[1]]
+            return pol, nc
+        if key in self._cache:
+            return self._cache[key]
+        from smashbot.eval.game import load_policy, resolve_name_code
+        path = self.fox_paths[key] if key.startswith("import:") else key
+        pol, nm, _ = load_policy(path, self.device)
+        pol.train_value_head = False
+        pol.requires_grad_(False)
+        pol.eval()
+        val = (pol, resolve_name_code(nm, "Master Player"))
+        self._cache[key] = val
+        return val
+
+    def set_self_name_code(self, nc):
+        self._sc = nc
+
+    # ---- per-env assignment ----
+    def partition(self, N, rng=None):
+        """{member_key: np.ndarray(env indices)} covering all N envs."""
+        rng = rng or _random.Random()
+        idx = list(range(N))
+        rng.shuffle(idx)
+        cur = 0
+        groups: dict[str, list] = {}
+
+        def take(n):
+            nonlocal cur
+            g = idx[cur:cur + n]
+            cur += n
+            return g
+
+        groups["self"] = take(round(self.self_frac * N))
+        for tier, (_pol, frac, _nc) in self.phillips.items():
+            groups[f"phillip:{tier}"] = take(round(frac * N))
+        # everything left is the PFSP pool
+        for i in idx[cur:]:
+            m = self.league.draw_member(rng) or "self"
+            groups.setdefault(m, []).append(i)
+        return {k: np.asarray(v, dtype=np.int64) for k, v in groups.items() if len(v)}
+
+    def record(self, key, won: bool):
+        """Record a decided game outcome for a PFSP-pool member (snapshots +
+        fox imports). Phillips/self aren't in the PFSP ledger."""
+        if key == "self" or key.startswith("phillip:"):
+            return
+        self.league.record_result(key, won)
