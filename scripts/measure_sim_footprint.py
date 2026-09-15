@@ -89,22 +89,28 @@ def main():
         if not os.path.exists(path):
             print(f"  (skip phillip {tier}: {path} missing)"); continue
         pol, pnm, _ = load_policy(path, dev); pol.eval(); pol.requires_grad_(False)
-        pol.sample = torch.compile(pol.sample, mode="default")
+        pol.sample = torch.compile(pol.sample, mode="reduce-overhead")
         phillips[tier] = (pol, frac, resolve_name_code(pnm, "Master Player"))
     fox = {k: v for k, v in FOX.items() if os.path.exists(v)}
 
     self_frac = 1.0 - sum(f for _, _, f in phillips.values()) - 0.35  # phillips + 35% pfsp
     lg = SimLeague(policy, args.snapshot_dir, phillips=phillips, fox_imports=fox,
                    self_frac=self_frac, device=dev,
-                   config_from=args.ckpt, self_name_code=sc)
+                   config_from=args.ckpt, self_name_code=sc,
+                   compile_fn=lambda s: torch.compile(s, mode="reduce-overhead"))
 
     rng = random.Random(0)
     part = lg.partition(N, rng, max_pfsp_members=args.max_pfsp)
     print(f"num_envs={N} unroll={T} | groups={len(part)} "
           f"(self+{len(phillips)}phil+{len(part)-1-len(phillips)}pfsp)")
     opponents = []
+    slot = 0
     for key, idx in part.items():
-        pol, nc = lg.get(key)
+        if key == "self" or key.startswith("phillip:"):
+            pol, nc = lg.get(key)
+        else:
+            pol, nc = lg.get(key, slot=slot)
+            slot += 1
         opponents.append((key, pol, idx, key != "self", nc))
 
     chars = [msl.Character.FOX, msl.Character.FALCO, msl.Character.MARTH,
@@ -113,7 +119,7 @@ def main():
 
     w = MultiOpponentSimWorker(policy, opponents, N, T, args.data_dir,
                                msl.Stage.FINAL_DESTINATION, char_pairs,
-                               name_code=sc, device=dev,
+                               name_code=sc, device=dev, precision="fp16",
                                record_fn=lambda i, gid, s0, s1: lg.record(gid, s0 > s1))
     state = learner.initial_state(N, dev)
 

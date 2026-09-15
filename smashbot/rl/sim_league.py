@@ -21,6 +21,7 @@ import random as _random
 
 import numpy as np
 import torch
+import tree
 
 from smashbot.rl.agent import BatchedPolicyAgent
 from smashbot.rl.pool import SnapshotPool
@@ -68,6 +69,7 @@ class _Group:
                  reencode=None, precision="fp32"):
         self.gid = gid
         self.env_idx = np.asarray(env_idx, dtype=np.int64)   # env rows this opp plays
+        self.idx_t = torch.as_tensor(self.env_idx, device=device)  # GPU gather index
         self.harvest = harvest
         self.n = len(self.env_idx)
         self.agent = BatchedPolicyAgent(policy, self.n, name_code=name_code,
@@ -152,10 +154,14 @@ class MultiOpponentSimWorker:
             sim_env.write_controllers(env, to_exec, player=0)
 
             # ---- opponents (player 1), grouped ----
+            # ONE swapped-view encode + H2D for all envs; groups take GPU
+            # slices (14 per-group numpy encodes measured 46ms/frame vs 4ms
+            # for one full-width encode)
+            opp_states = _states_to_torch(
+                sim_env.encode_obs(obs, self_slot=1, opp_slot=0), dev)
             p1 = [None] * self.N
             for g in self.groups:
-                gobs = obs[g.env_idx]
-                gstates = _states_to_torch(sim_env.encode_obs(gobs, self_slot=1, opp_slot=0), dev)
+                gstates = tree.map_structure(lambda t: t[g.idx_t], opp_states)
                 greset = torch.as_tensor(g._reset, device=dev)
                 gwant = (g._pushed % T == 0)
                 grecords, ghidden = g.agent.infer(gstates, greset, want_snapshot=gwant)
@@ -234,7 +240,7 @@ class SimLeague:
 
     def __init__(self, current_policy, snapshot_dir, phillips, fox_imports,
                  self_frac=0.30, device="cpu", pfsp_hard_frac=0.25, pfsp_explore=0.075,
-                 config_from=None, self_name_code=1):
+                 config_from=None, self_name_code=1, compile_fn=None):
         # phillips: {tier_id: (policy, frac, name_code)}; fox_imports: {"import:NAME": path}
         # config_from: full checkpoint whose config builds the bare-state members
         #   (snapshots + fox imports are saved as bare state_dicts, no config).
@@ -250,39 +256,55 @@ class SimLeague:
             pfsp_hard_frac=pfsp_hard_frac, pfsp_explore=pfsp_explore,
             league_members=list(fox_imports.keys()),
         )
-        self._cache = {}          # member_key -> (policy, name_code)
+        self._cache = {}          # member_key -> dedicated skeleton (slotless path)
+        self._slots = []          # [skeleton, loaded_key] per PFSP slot
+        self.compile_fn = compile_fn  # sample -> compiled sample, for skeletons
         self._sc = self_name_code
         self._cfg = None
         if config_from is not None:
             from smashbot import saving
             self._cfg = saving.load_checkpoint(config_from)["config"]
 
-    # ---- policy resolution (lazy load + cache) ----
-    def get(self, key):
+    # ---- policy resolution ----
+    def get(self, key, slot=None):
         """(policy, name_code) for an assignment key: 'self', 'phillip:<id>',
-        a snapshot path, or 'import:<name>'."""
+        a snapshot path, or 'import:<name>'.
+
+        PFSP members (snapshots + imports) are served from persistent SLOT
+        skeletons: pass `slot` (0..K-1) and the member's weights are copied
+        in place into that slot's policy. The skeleton object — and its
+        compiled sample graph — persists across periods, so a member swap is
+        a weight copy, never a recompile (cudagraph replays read weights by
+        pointer)."""
         if key == "self":
             return self.current, self._sc
         if key.startswith("phillip:"):
             pol, _frac, nc = self.phillips[key.split(":", 1)[1]]
             return pol, nc
-        if key in self._cache:
-            return self._cache[key]
-        path = self.fox_paths[key] if key.startswith("import:") else key
-        pol = self._load_bare(path)
-        pol.train_value_head = False
-        pol.requires_grad_(False)
-        pol.eval()
-        # snapshots share the student's name_map exactly; fox imports lack their
-        # own map -> self name_code is the correct/defensible conditioning.
-        val = (pol, self._sc)
-        self._cache[key] = val
-        return val
-
-    def _load_bare(self, path):
-        """Build a policy skeleton from config_from and load a bare state_dict
-        (snapshots + fox imports carry no config of their own)."""
         import torch as _torch
+        path = self.fox_paths[key] if key.startswith("import:") else key
+        if slot is None:                      # legacy: dedicated instance
+            if key not in self._cache:
+                self._cache[key] = self._make_skeleton()
+                self._load_into(self._cache[key], path)
+            return self._cache[key], self._sc
+        while len(self._slots) <= slot:
+            self._slots.append([None, None])  # [skeleton, loaded_key]
+        sk = self._slots[slot]
+        if sk[0] is None:
+            sk[0] = self._make_skeleton()
+        if sk[1] != key:
+            self._load_into(sk[0], path)
+            sk[1] = key
+        # snapshots share the student's name_map exactly; fox imports lack
+        # their own map -> self name_code is the correct conditioning.
+        return sk[0], self._sc
+
+    def _make_skeleton(self):
+        """Empty policy built from config_from (snapshots + fox imports are
+        bare state_dicts, no config of their own). compile_fn, if set, wraps
+        .sample once at construction — the wrapper then serves every member
+        loaded into this skeleton."""
         from smashbot import configs, embed as embed_lib
         from smashbot.policy import build_policy
         if self._cfg is None:
@@ -299,10 +321,21 @@ class SimLeague:
             policy_config=configs.PolicyConfig(**cfg["policy"]),
             num_names=cfg["data"]["max_names"],
         ).to(self.device)
-        state = _torch.load(path, map_location=self.device, weights_only=True)
-        pol.load_state_dict(state)
+        pol.train_value_head = False
+        pol.requires_grad_(False)
         pol.eval()
+        if self.compile_fn is not None:
+            pol.sample = self.compile_fn(pol.sample)
         return pol
+
+    def _load_into(self, skeleton, path):
+        """Copy a member's weights into a skeleton IN PLACE (compiled graphs
+        read parameters by pointer, so replays see the new member)."""
+        import torch as _torch
+        state = _torch.load(path, map_location=self.device, weights_only=True)
+        with _torch.no_grad():
+            res = skeleton.load_state_dict(state, strict=True)
+        return res
 
     # ---- per-env assignment ----
     def partition(self, N, rng=None, max_pfsp_members=None):
@@ -333,19 +366,24 @@ class SimLeague:
                 m = self.league.draw_member(rng) or "self"
                 groups.setdefault(m, []).append(i)
         elif pfsp_envs:
-            # draw up to K distinct members, spread the pfsp envs across them
+            # K distinct members, EQUAL-size slots (remainder envs fold into
+            # self): every group's row count is then constant across periods,
+            # so per-slot compiled graphs never see a new shape.
             members, seen = [], set()
             for _ in range(max_pfsp_members * 8):
                 if len(members) >= max_pfsp_members:
                     break
                 m = self.league.draw_member(rng) or "self"
-                if m not in seen:
+                if m not in seen and m != "self":
                     seen.add(m)
                     members.append(m)
-            if not members:
-                members = ["self"]
-            for j, i in enumerate(pfsp_envs):
-                groups.setdefault(members[j % len(members)], []).append(i)
+            per = len(pfsp_envs) // len(members) if members else 0
+            if per == 0:
+                groups["self"] += pfsp_envs
+            else:
+                for j, m in enumerate(members):
+                    groups[m] = pfsp_envs[j * per:(j + 1) * per]
+                groups["self"] += pfsp_envs[len(members) * per:]
         return {k: np.asarray(v, dtype=np.int64) for k, v in groups.items() if len(v)}
 
     def record(self, key, won: bool):

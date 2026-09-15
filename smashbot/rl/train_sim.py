@@ -153,8 +153,13 @@ class SimLeagueWorker:
         self.part = self.lg.partition(N, self.rng,
                                       max_pfsp_members=cfg.max_pfsp_members)
         opponents = []
+        slot = 0
         for key, idx in self.part.items():
-            pol, nc = self.lg.get(key)
+            if key == "self" or key.startswith("phillip:"):
+                pol, nc = self.lg.get(key)
+            else:  # PFSP member -> persistent slot skeleton (in-place load)
+                pol, nc = self.lg.get(key, slot=slot)
+                slot += 1
             opponents.append((key, pol, idx, key != "self", nc))
         # per-env characters: student uniform MAIN_12; opponent uniform
         # MAIN_12 except fox imports (char-locked FOX, as in v10)
@@ -290,10 +295,13 @@ def run(args) -> None:
         pol.requires_grad_(False)
         pol.eval()
         if args.runtime.compile:
-            # "default" (fusion, no cudagraph pool): five phillips under
-            # reduce-overhead would hold five private graph pools, and their
-            # tx_like LSTM graph-breaks under compile anyway
-            pol.sample = torch.compile(pol.sample, mode="default")
+            # reduce-overhead: phillip fracs are fixed fractions of a fixed
+            # num_envs, so each phillip's batch is CONSTANT across periods —
+            # one graph each, replayed forever. The measured collect
+            # bottleneck is per-frame launch overhead of many small
+            # forwards; cudagraph replay is the cure. Pool cost: 5 small
+            # shapes, within the N=320 headroom.
+            pol.sample = torch.compile(pol.sample, mode="reduce-overhead")
         phillips[tier] = (pol, frac, resolve_name_code(pnm, "Master Player"))
         print(f"phillip:{tier} <- {fname} ({frac:.0%} of envs)")
     fox = {}
@@ -307,6 +315,12 @@ def run(args) -> None:
         self_frac=scfg.self_frac, device=device,
         pfsp_hard_frac=scfg.pfsp_hard_frac, pfsp_explore=scfg.pfsp_explore,
         config_from=args.ckpt, self_name_code=name_code,
+        # PFSP slot skeletons compile once per slot shape; member swaps are
+        # in-place weight copies visible to the captured graphs
+        compile_fn=(
+            (lambda s: torch.compile(s, mode="reduce-overhead"))
+            if args.runtime.compile else None
+        ),
     )
     if not league.league.archive:
         league.league.save(policy, start_step)
