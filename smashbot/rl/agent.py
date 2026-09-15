@@ -79,11 +79,23 @@ class BatchedPolicyAgent:
         device: str = "cpu",
         batch_steps: int = 1,
         precision: str = "fp32",
+        state_dtype: torch.dtype | None = None,
     ):
         self.policy = policy
         self.num_envs = num_envs
         self.device = device
         self.temperature = temperature
+        # fp16 carried state (opponent seats only — nothing downstream of an
+        # opponent's numbers enters a loss): the fp16-autocast forward
+        # computes the state in fp16 anyway, and seeding the initial zeros
+        # fp16 makes the KV cat sustain it (fp32 zeros promote the cat back
+        # to fp32 forever). Verified bit-identical vs fp32 storage by
+        # scripts/check_fp16_state.py. NOT for the student seat: its logits
+        # feed the PPO ratio.
+        assert state_dtype is None or precision == "fp16", (
+            "state_dtype override requires the fp16 autocast forward"
+        )
+        self.state_dtype = state_dtype
         # "fp16": the network runs under fp16 autocast (sampling math stays
         # fp32 — embed.py casts logits up); logits are stored fp16. Gated by
         # the precision probe (docs/precision): the learner's ratio
@@ -105,7 +117,7 @@ class BatchedPolicyAgent:
             self._embed_controller.from_state(neutral),
         )
 
-        self.hidden = policy.initial_state(num_envs, device)
+        self.hidden = self._cast_state(policy.initial_state(num_envs, device))
         self._prev_action = tree.map_structure(lambda t: t.clone(), self._neutral_encoded)
         # flat_controllers=True (the rollout worker): queues hold 13-float
         # rows and step() returns rows (env rebuilds the struct) — no
@@ -123,12 +135,23 @@ class BatchedPolicyAgent:
         self._buf_states: list = []
         self._buf_resets: list[torch.Tensor] = []
 
+    def _cast_state(self, state):
+        if self.state_dtype is None:
+            return state
+        return tree.map_structure(
+            lambda t: t.to(self.state_dtype)
+            if isinstance(t, torch.Tensor) and t.is_floating_point() else t,
+            state,
+        )
+
     def reset_env(self, i: int) -> None:
         """Fresh game in env i: zero its recurrent state, queue, and prev action."""
         mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self._name.device)
         mask[i] = True
         self.hidden = _mask_state(
-            mask, self.policy.initial_state(self.num_envs, self.device), self.hidden
+            mask,
+            self._cast_state(self.policy.initial_state(self.num_envs, self.device)),
+            self.hidden,
         )
         self._queues[i] = collections.deque([self._neutral()] * self.delay)
         tree.map_structure(

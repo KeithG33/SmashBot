@@ -111,6 +111,29 @@ def main():
     print(f"max relative logit delta: {max_rel:.2e}")
     print(f"frames with any component disagreement: {len(disagree_by_frame)}"
           + (f" (first at frame {disagree_by_frame[0]})" if disagree_by_frame else ""))
+
+    # ---- seat-B twin: BatchedPolicyAgent fp32-state vs fp16-state ----
+    del fp32_arm, fp16_arm
+    torch.cuda.empty_cache()
+    pol, _, _ = load_policy(V10, DEV)
+    pol.eval()
+    arms = [BatchedPolicyAgent(pol, NENV, name_code=1, device=DEV,
+                               precision="fp16", state_dtype=sd,
+                               temperature=1e-3)
+            for sd in (None, torch.float16)]
+    b_agree = b_total = 0
+    b_rel = 0.0
+    for enc, rst in zip(stream, resets):
+        st = _states_to_torch(enc, DEV)
+        r = torch.as_tensor(rst, device=DEV)
+        recs = [a.infer(st, r, want_snapshot=False)[0][0] for a in arms]
+        for l32, l16 in zip(tree.flatten(recs[0].logits), tree.flatten(recs[1].logits)):
+            d = (l32.float() - l16.float()).abs().max().item()
+            b_rel = max(b_rel, d / (l32.float().abs().max().item() + 1e-6))
+            b_agree += (l32.float().argmax(-1) == l16.float().argmax(-1)).sum().item()
+            b_total += l32.shape[0] * (l32.shape[1] if l32.dim() > 2 else 1)
+    print(f"seat-B (BatchedPolicyAgent): agreement {b_agree}/{b_total} = "
+          f"{100 * b_agree / max(1, b_total):.3f}% | max rel logit delta {b_rel:.2e}")
     print("FP16_STATE_CHECK_DONE")
 
 

@@ -115,14 +115,15 @@ class _Group:
     """One opponent identity serving a fixed subset of env rows."""
 
     def __init__(self, gid, policy, env_idx, harvest, unroll, device, name_code,
-                 reencode=None, precision="fp32"):
+                 reencode=None, precision="fp32", state_dtype=None):
         self.gid = gid
         self.env_idx = np.asarray(env_idx, dtype=np.int64)   # env rows this opp plays
         self.idx_t = torch.as_tensor(self.env_idx, device=device)  # GPU gather index
         self.harvest = harvest
         self.n = len(self.env_idx)
         self.agent = BatchedPolicyAgent(policy, self.n, name_code=name_code,
-                                        device=device, precision=precision)
+                                        device=device, precision=precision,
+                                        state_dtype=state_dtype)
         self.assembler = ChunkAssembler(unroll, policy.delay) if harvest else None
         self.reencode = reencode
         self._pushed = 0
@@ -172,9 +173,15 @@ class MultiOpponentSimWorker:
                           f"{pol.delay} vs student {student_policy.delay} "
                           f"({pol.delay - student_policy.delay:+d} frames)",
                           flush=True)
+            # seat-B fp16 state: the self-play mirror is an OPPONENT seat
+            # (never harvested, no loss path) — same argument/verification
+            # as the grid's fp16 state. Diagnostic: rl/self/win_rate_ema
+            # must hold ~0.5 (a degraded seat B shows as seat A winning).
+            sd = (torch.float16
+                  if gid == "self" and precision == "fp16" else None)
             self.groups.append(
                 _Group(gid, pol, idx, harv, unroll_length, device, nc, re,
-                       precision=precision))
+                       precision=precision, state_dtype=sd))
         for g in self.groups:
             g.agent.set_flat_controllers(True)
         # env -> opponent gid, for outcome recording
