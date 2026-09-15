@@ -233,11 +233,9 @@ class SimLeagueWorker:
             self._env_char.append(opp_c.name)
         stages = [self.rng.choice(list(msl.Stage)) for _ in range(N)]
         if self._worker is not None:
-            # NEW PERIOD, SAME AGENTS: rebuilding made the cudagraph trees
-            # re-record (+0.6 GiB pools per period -> the 40025 OOM).
-            # Group sizes are constant, so remap in place. Falls through to
-            # a full rebuild only if the group structure actually changed
-            # (fresh-run league growth in the slot-fallback mode).
+            # new period, same agents: rebuilding re-records the cudagraph
+            # trees (pool ratchet). Remap in place; full rebuild only if
+            # the group structure changed (fresh-run league growth).
             new_map = {gid: idx for (gid, _p, idx, _h, _nc) in opponents}
             same = (grids == self._worker.grids
                     and {g.gid for g in self._worker.groups} == set(new_map)
@@ -372,8 +370,7 @@ def run(args) -> None:
         pol.train_value_head = False
         pol.requires_grad_(False)
         pol.eval()
-        # no per-phillip compile: all tiers serve from the phillip GRID
-        # (one stacked hand-rolled-LSTM forward, captured there)
+        # all tiers serve from the phillip grid (one stacked forward)
         phillips[tier] = (pol, frac, resolve_name_code(pnm, "Master Player"))
         print(f"phillip:{tier} <- {fname} ({frac:.0%} of envs)")
     fox = {}
@@ -550,12 +547,9 @@ def run(args) -> None:
             _pre_step(i)  # θ final: previous update joined
             _publish()
             if i == start_step:
-                # FIRST learner step runs SEQUENTIALLY: the step's one-time
-                # allocations (cuBLAS/cuDNN workspace benchmarking, autocast
-                # weight-cast caches) must not co-peak with a concurrent
-                # collect — that collision OOM'd three launch attempts at
-                # 496 while the harness (which warms up sequentially, then
-                # overlaps) measured 17.9 GiB at the same nominal phase.
+                # FIRST learner step runs sequentially: its one-time
+                # allocations (cuBLAS/cuDNN workspaces, autocast caches)
+                # must not co-peak with a concurrent collect.
                 state, metrics = learner.step(
                     trajectories, state,
                     progress=i / max(1, args.runtime.steps))

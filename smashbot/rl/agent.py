@@ -85,13 +85,12 @@ class BatchedPolicyAgent:
         self.num_envs = num_envs
         self.device = device
         self.temperature = temperature
-        # fp16 carried state (opponent seats only — nothing downstream of an
-        # opponent's numbers enters a loss): the fp16-autocast forward
-        # computes the state in fp16 anyway, and seeding the initial zeros
-        # fp16 makes the KV cat sustain it (fp32 zeros promote the cat back
-        # to fp32 forever). Verified bit-identical vs fp32 storage by
-        # scripts/check_fp16_state.py. NOT for the student seat: its logits
-        # feed the PPO ratio.
+        # fp16 carried state — OPPONENT seats only (nothing downstream of
+        # them enters a loss; the student's logits feed the PPO ratio). The
+        # fp16-autocast forward computes state in fp16 anyway; seeding the
+        # initial zeros fp16 keeps the KV cat in fp16 (fp32 zeros would
+        # promote it back). Bit-identical vs fp32 storage:
+        # scripts/check_fp16_state.py.
         assert state_dtype is None or precision == "fp16", (
             "state_dtype override requires the fp16 autocast forward"
         )
@@ -422,11 +421,9 @@ class LeagueAgent:
         self._graph = None
         self._vm = self._make_vmap()
         self._timer = None  # optional profiler callback (name) -> None
-        # eager-path recurrent state [S, N, ...]; the CAPTURED path keeps
-        # state in its static in/out buffers, so allocate lazily — on the
-        # capture path this was a third full copy of the grid state
-        # (review finding: the code's own comment calls those buffers "the
-        # grid's biggest resident term")
+        # eager-path recurrent state [S, N, ...]; the captured path keeps
+        # state in its static in/out buffers — lazy, so capture-mode never
+        # allocates this third full copy
         self._hidden = None if self._use_capture else self._initial_hidden()
 
     # ---------------------------------------------------------- weights
@@ -540,10 +537,8 @@ class LeagueAgent:
             *h0,
         )
         if self.state_dtype is not None:
-            # fp16 recurrent state (the KV caches dominate): the fp16-weights
-            # forward computes under fp16 autocast anyway, so storing the
-            # carried state fp16 loses nothing — and at window-256 x 6 layers
-            # the in+out static buffers are the grid's biggest resident term.
+            # fp16 carried state: computed under fp16 autocast anyway; the
+            # in/out static buffers are the grid's biggest resident term.
             stacked = tree.map_structure(
                 lambda t: t.to(self.state_dtype)
                 if isinstance(t, torch.Tensor) and t.is_floating_point() else t,

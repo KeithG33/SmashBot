@@ -1,7 +1,7 @@
 """Multi-opponent sim rollout: a pool of opponents on player-1, grouped by
 weights, with imitation harvest of every non-self seat.
 
-Builds on sim_rollout's single-opponent loop. Each env is assigned an opponent
+Each env is assigned an opponent
 group (self / a phillip tier / a PFSP-pool member); player-1 inference runs one
 forward per group on the slot-swapped view, and every harvested group assembles
 its seat into a kind="imitation" Trajectory (advantage-weighted imitation in the
@@ -21,14 +21,13 @@ import random as _random
 
 import numpy as np
 import torch
-import tree
 
 from smashbot.rl.agent import BatchedPolicyAgent
 from smashbot.rl.pool import SnapshotPool
 from smashbot.rl.rollouts import ChunkAssembler, compute_reward
 from smashbot.rl.ppo import slice_trajectory_rows
 from smashbot.rl import sim_env
-from smashbot.rl.sim_rollout import _states_to_torch, _seat_stats
+from smashbot.rl.sim_env import seat_stats, states_to_torch  # noqa: F401
 
 
 def make_reencoder(opp_embed, stu_embed, student_name_code, device):
@@ -147,11 +146,11 @@ class _Group:
 class MultiOpponentSimWorker:
     def __init__(self, student_policy, opponents, batch_size, unroll_length, data_dir,
                  stage, char_pairs, name_code=1, device="cpu", record_fn=None,
-                 precision="fp32", grid: PfspGrid | None = None, grids=(),
-                 event_fn=None):
+                 precision="fp32", grids=(), event_fn=None):
         """opponents: list of (gid, policy, env_idx, harvest, name_code) —
-        the per-policy groups (self + phillips). PFSP members ride in `grid`
-        (a PfspGrid already assign()ed for this period) as one merged forward.
+        the per-policy groups (just self in training). Grid opponents ride
+        in `grids` (PfspGrids already assign()ed for this period), one
+        merged forward each.
         char_pairs: [(p0_char, p1_char)] per env (len == batch_size).
         stage: one msl.Stage for all envs, or a per-env list (len == batch_size).
         record_fn(env_i, opponent_gid, student_stocks, opp_stocks): called on
@@ -169,10 +168,9 @@ class MultiOpponentSimWorker:
         self.device = device
         self.record_fn = record_fn
         self.event_fn = event_fn
-        # grids: any number of LeagueAgent-backed opponent grids (PFSP
-        # slots, the phillip grid); `grid` kept as the single-grid alias
-        self.grids = list(grids) + ([grid] if grid is not None else [])
-        self.grid = self.grids[0] if self.grids else None  # legacy alias
+        # grids: any number of LeagueAgent-backed opponent grids (the
+        # PFSP slots, the phillip tiers)
+        self.grids = list(grids)
         self.student = BatchedPolicyAgent(student_policy, batch_size, name_code=name_code,
                                           device=device, precision=precision)
         self.student.set_flat_controllers(True)
@@ -234,15 +232,12 @@ class MultiOpponentSimWorker:
         self.env.reset_all()
 
     def reassign(self, new_env_idx: dict, char_pairs, stage) -> None:
-        """New period WITHOUT rebuilding agents: rebuilding makes the
-        cudagraph trees re-record (changed liveness between replays), which
-        grew the private pools +0.6 GiB per period and OOM'd the launch.
-        Group sizes are constant by construction, so a period is just:
-        remap env rows, reset every seat (the existing reset path clears
-        queues/hidden/prev), reconfigure matches. The grid must already be
-        assign()ed for this period. Assemblers keep their buffered tail —
-        the learner sees the boundary as a normal all-envs game reset
-        (is_resetting masks state and zeroes the boundary reward)."""
+        """New period WITHOUT rebuilding agents (rebuilding re-records the
+        cudagraph trees and ratchets their pools). Group sizes are constant
+        by construction, so a period is: remap env rows, reset every seat,
+        reconfigure matches. Grids must already be assign()ed. Assemblers
+        keep their buffered tail — the boundary is a normal all-envs game
+        reset to the learner."""
         import melee_sim as msl
         for g in self.groups:
             idx = np.asarray(new_env_idx[g.gid], dtype=np.int64)
@@ -278,17 +273,14 @@ class MultiOpponentSimWorker:
             reset_t = torch.as_tensor(reset_np, device=dev)
 
             # ---- student (player 0) ----
-            # EXECUTE (pop the delay queue) BEFORE infer: on reset frames
-            # execute() rebuilds the queue, and an infer-first order lets
-            # that rebuild discard the fresh sample — after which the queue
-            # runs at delay-1 forever (review finding #1: every seat was
-            # acting one frame ahead of its BC conditioning).
+            # EXECUTE (pop the delay queue) BEFORE infer: a reset frame's
+            # queue rebuild would otherwise discard the fresh sample and
+            # leave the seat at delay-1 permanently.
             reset_idx = np.nonzero(reset_np)[0].tolist()
             p0_rows = np.stack(self.student.execute(reset_idx))
             sim_env.write_controller_rows(env, p0_rows, player=0)
-            # flat encoding: ONE numpy encode, THREE H2D copies; the swap
-            # is a column permutation and every view below is 3 gathers +
-            # struct views (was ~120 per-leaf launches per view)
+            # flat encoding: one numpy encode + three H2D copies; the swap
+            # is a column permutation, every view below is 3 gathers
             flats = self.ff.to_device(sim_env.encode_flats(obs))
             states = self.ff.view(flats)
             want = (self._pushed % T == 0)
@@ -302,9 +294,9 @@ class MultiOpponentSimWorker:
                     g.agent.execute(np.nonzero(g._reset)[0].tolist()))
                 gstates = self.ff.view(opp_flats, rows=g.idx_t)
                 greset = torch.as_tensor(g._reset, device=dev)
-                # want_snapshot only for harvested groups: self's _pushed
-                # never advances, so the old expression cloned the self
-                # seat's full KV state EVERY frame (review finding #3)
+                # snapshots only for harvested groups (self's _pushed
+                # never advances — an unconditioned flag would deep-clone
+                # its full KV state every frame)
                 gwant = g.harvest and (g._pushed % T == 0)
                 grecords, _gh = g.agent.infer(gstates, greset, want_snapshot=gwant)
                 if g.harvest:
@@ -333,7 +325,7 @@ class MultiOpponentSimWorker:
             sim_env.write_controller_rows(env, p1_rows, player=1)
 
             # ---- rewards ----
-            stocks, percent = _seat_stats(obs)         # [N,2] self,opp (player-0 view)
+            stocks, percent = seat_stats(obs)         # [N,2] self,opp (player-0 view)
             if self._prev is not None and self.event_fn is not None:
                 # kill/death events on the prev->current transition (reset
                 # frames excluded: the respawn fake-drop is not a stock take)
@@ -367,7 +359,7 @@ class MultiOpponentSimWorker:
             if self.record_fn is not None:
                 done = np.asarray(term["done"], dtype=bool)
                 if done.any():
-                    fs, _ = _seat_stats(env.current_frame)  # terminal frame stocks
+                    fs, _ = seat_stats(env.current_frame)  # terminal frame stocks
                     for i in np.nonzero(done)[0]:
                         self.record_fn(int(i), self.env_opp[i],
                                        int(fs[i, 0]), int(fs[i, 1]))
@@ -525,13 +517,10 @@ class SimLeague:
             self.compile_fn = fn
 
     # ---- per-env assignment ----
-    def partition(self, N, rng=None, max_pfsp_members=None):
+    def partition(self, N, rng=None, max_pfsp_members=8):
         """{member_key: np.ndarray(env indices)} covering all N envs.
-
-        max_pfsp_members bounds the number of DISTINCT PFSP opponents drawn
-        this period (each is a full resident policy — memory discipline, like
-        the Dolphin league's fixed weight slots). None = draw per env (one
-        group per distinct draw, unbounded residency)."""
+        max_pfsp_members = the PFSP grid's slot count: that many DISTINCT
+        members drawn per period, equal-size slots."""
         rng = rng or _random.Random()
         idx = list(range(N))
         rng.shuffle(idx)
@@ -548,11 +537,7 @@ class SimLeague:
         for tier, (_pol, frac, _nc) in self.phillips.items():
             groups[f"phillip:{tier}"] = take(round(frac * N))
         pfsp_envs = idx[cur:]
-        if max_pfsp_members is None:
-            for i in pfsp_envs:                       # one group per distinct draw
-                m = self.league.draw_member(rng) or "self"
-                groups.setdefault(m, []).append(i)
-        elif pfsp_envs:
+        if pfsp_envs:
             # K distinct members, EQUAL-size slots (remainder envs fold into
             # self): every group's row count is then constant across periods,
             # so per-slot compiled graphs never see a new shape.

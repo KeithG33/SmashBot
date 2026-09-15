@@ -37,14 +37,14 @@ train_rl --backend sim                        (rl/train_rl.py dispatch)
         │             Bare-state members (snapshots, fox imports) built
         │             from config_from. max_pfsp_members bounds resident
         │             policies per period.
-        └─ MultiOpponentSimWorker: per-frame loop — student on player-0,
-                       one forward per opponent group on the slot-swapped
-                       view, harvest-all-but-self as kind="imitation"
-                       (phillip chunks re-encoded through the student
-                       embedding + name reconditioned: make_reencoder),
-                       rewards, ChunkAssembler, step_and_reset.
-  rl/sim_env.py       obs → encoded Game struct; decoded controllers → sim
-  rl/sim_rollout.py   single-opponent reference worker (benchmarks)
+        └─ MultiOpponentSimWorker: per-frame loop — student + self +
+                       two PfspGrids (phillip tiers, PFSP slots), each ONE
+                       stacked forward; harvest-all-but-self as
+                       kind="imitation" (phillip chunks re-encoded via
+                       make_reencoder), kill/death events, rewards,
+                       ChunkAssembler, step_and_reset.
+  rl/sim_env.py       obs → encoded Game struct (flat 3-tensor path +
+                      FlatFrames views); controller rows → sim
 ```
 
 ## Launch

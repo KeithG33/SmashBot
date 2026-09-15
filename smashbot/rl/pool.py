@@ -273,9 +273,8 @@ class SnapshotPool:
         d = self.PAYOFF_DECAY
         entry["wins_d"] = d * entry["wins_d"] + float(won)
         entry["games_d"] = d * entry["games_d"] + 1.0
-        # payoff_autosave=False (sim worker): games end inside the frame
-        # loop several times a second — the caller flushes at period /
-        # checkpoint boundaries instead of json-dumping per game
+        # payoff_autosave=False (sim worker): the caller flushes at
+        # checkpoint cadence instead of json-dumping per decided game
         if getattr(self, "payoff_autosave", True):
             self._save_payoff()
 

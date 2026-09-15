@@ -24,7 +24,7 @@ from smashbot.eval.game import load_policy, resolve_name_code
 from smashbot.rl.agent import BatchedPolicyAgent, LeagueAgent
 from smashbot.rl import sim_env
 from smashbot.rl.sim_league import SimLeague
-from smashbot.rl.sim_rollout import _states_to_torch
+from smashbot.rl.sim_env import states_to_torch as _states_to_torch
 
 DEV = "cuda"
 V10 = "/home/kage/drive2/ShineBot/runs/rl-pool-v10/latest.pt"

@@ -5,9 +5,9 @@ phillips + bounded PFSP pool + harvest), collects one real unroll chunk, runs
 learner.step, and reports the VRAM breakdown exactly like train_rl's [vram]
 line. This is the number that decides num_envs on the 3090.
 
-Student forward is compiled reduce-overhead (training's mode). Opponents run
-eager here (real training also compiles them reduce-overhead -> a bit more
-cudagraph-pool VRAM; noted).
+Serves through the REAL SimLeagueWorker (grids + trackers), compiled as the
+launch is. NB: measures a fresh process — the launch process itself remains
+the final authority on peaks (validate with --runtime.steps start+30).
 """
 from __future__ import annotations
 
@@ -116,9 +116,7 @@ def main():
         phillips[tier] = (pol, frac, resolve_name_code(pnm, "Master Player"))
     fox = {k: v for k, v in FOX.items() if os.path.exists(v)}
 
-    # tuple is (policy, frac, name_code) — frac is the MIDDLE element (a
-    # prior version summed the name codes here, silently collapsing the
-    # partition to pfsp-only and invalidating those measurements)
+    # (policy, frac, name_code) — frac is the middle element
     self_frac = 1.0 - sum(frac for _, frac, _ in phillips.values()) - 0.35
     lg = SimLeague(policy, args.snapshot_dir, phillips=phillips, fox_imports=fox,
                    self_frac=self_frac, device=dev,

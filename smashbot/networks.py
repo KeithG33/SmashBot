@@ -41,10 +41,8 @@ def _mask_state(reset: torch.Tensor, initial, prev):
                 mask = mask.unsqueeze(-1)
         else:  # [layers, B, H] torch RNN convention
             mask = reset.view(1, -1, *([1] * (state.dim() - 2)))
-        # match the CARRIED state's dtype: fp32 zeros vs an fp16 carried
-        # state would type-promote the whole masked state to fp32 — inside
-        # a captured CUDA graph those full-size fp32 intermediates live
-        # permanently in the capture's private pool
+        # match the carried state's dtype (fp32 zeros would promote the
+        # masked state to fp32 — permanent pool residency under capture)
         if init.dtype != state.dtype and init.is_floating_point():
             init = init.to(state.dtype)
         return torch.where(mask, init, state)
@@ -116,13 +114,10 @@ class RecurrentWrapper(Network):
 
     def step(self, inputs, prev_state):
         if getattr(self, "manual_step", False):
-            # Hand-rolled LSTM cell: cuDNN's fused step has no vmap
-            # batching rule, so a stacked-weights grid (LeagueAgent over
-            # tx_like phillips) needs the math spelled out. Same
-            # parameters, same equations as nn.LSTM (gate order i,f,g,o);
-            # not bit-identical to cuDNN (fusion order) but well inside
-            # the fp16-autocast noise the rollout already runs under.
-            # Training unrolls never take this path.
+            # Hand-rolled LSTM cell (cuDNN's fused step has no vmap rule;
+            # the stacked-weights phillip grid needs one). Same parameters
+            # and equations as nn.LSTM (gate order i,f,g,o); ~5e-5 off
+            # cuDNN (fusion order). Training unrolls never take this path.
             assert isinstance(self._core, nn.LSTM), "manual_step is LSTM-only"
             h, c = prev_state                       # each [1, B, H]
             gates = (

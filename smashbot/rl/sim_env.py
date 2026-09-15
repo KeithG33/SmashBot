@@ -213,3 +213,27 @@ def write_controller_rows(env, rows: np.ndarray, player: int) -> None:
     b = p["buttons"]
     for j, name in enumerate(_BUTTONS):
         b[name] = rows[:, 5 + j] > 0.5
+
+def states_to_torch(encoded, device):
+    """Encoded struct (numpy leaves) -> torch on device (int64/bool/float32,
+    the learner's conventions). The flat path (FlatFrames) supersedes this
+    in the training loop; kept for evals and probes."""
+    import torch
+    import tree
+
+    def cvt(x):
+        a = np.asarray(x)
+        if a.dtype == np.bool_:
+            return torch.as_tensor(a, device=device)
+        if a.dtype.kind in "iu":
+            return torch.as_tensor(a.astype(np.int64), device=device)
+        return torch.as_tensor(a.astype(np.float32), device=device)
+    return tree.map_structure(cvt, encoded)
+
+
+def seat_stats(obs):
+    """(stocks[N,2], percent[N,2]) with col0=self (slot0), col1=opp (slot1)."""
+    s = obs["slots"]
+    stocks = np.stack([s[:, 0]["stocks"], s[:, 1]["stocks"]], axis=1).astype(np.float32)
+    percent = np.stack([s[:, 0]["percent"], s[:, 1]["percent"]], axis=1).astype(np.float32)
+    return stocks, percent
