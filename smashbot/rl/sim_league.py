@@ -42,14 +42,16 @@ class _Group:
 
 class MultiOpponentSimWorker:
     def __init__(self, student_policy, opponents, batch_size, unroll_length, data_dir,
-                 stage, char_pairs, name_code=1, device="cpu"):
+                 stage, char_pairs, name_code=1, device="cpu", record_fn=None):
         """opponents: list of (gid, policy, env_idx, harvest, name_code).
-        char_pairs: [(p0_char, p1_char)] per env (len == batch_size)."""
+        char_pairs: [(p0_char, p1_char)] per env (len == batch_size).
+        record_fn(opponent_gid, student_won): called on each decided game."""
         import melee_sim as msl
         self.msl = msl
         self.N = batch_size
         self.unroll = unroll_length
         self.device = device
+        self.record_fn = record_fn
         self.student = BatchedPolicyAgent(student_policy, batch_size, name_code=name_code, device=device)
         self.assembler = ChunkAssembler(unroll_length, student_policy.delay)
         self._pushed = 0
@@ -59,6 +61,10 @@ class MultiOpponentSimWorker:
             _Group(gid, pol, idx, harv, unroll_length, device, nc)
             for (gid, pol, idx, harv, nc) in opponents
         ]
+        # env -> opponent gid, for outcome recording
+        self.env_opp = np.empty(batch_size, dtype=object)
+        for g in self.groups:
+            self.env_opp[g.env_idx] = g.gid
         # env_idx must partition [0, N)
         covered = np.concatenate([g.env_idx for g in self.groups]) if self.groups else np.array([], int)
         assert sorted(covered.tolist()) == list(range(batch_size)), "opponent env_idx must partition all envs"
@@ -121,8 +127,14 @@ class MultiOpponentSimWorker:
                 self.assembler.push_frame(rec, reset_t, snap)
                 self._pushed += 1
 
-            is_resetting, _term = env.step_and_reset()
+            is_resetting, term = env.step_and_reset()
             self._reset_mask = np.asarray(is_resetting, dtype=bool)
+            if self.record_fn is not None:
+                done = np.asarray(term["done"], dtype=bool)
+                if done.any():
+                    fs, _ = _seat_stats(env.current_frame)  # terminal frame stocks
+                    for i in np.nonzero(done)[0]:
+                        self.record_fn(self.env_opp[i], bool(fs[i, 0] > fs[i, 1]))
             for g in self.groups:
                 g._reset = self._reset_mask[g.env_idx]
 
@@ -162,8 +174,10 @@ class SimLeague:
 
     def __init__(self, current_policy, snapshot_dir, phillips, fox_imports,
                  self_frac=0.30, device="cpu", pfsp_hard_frac=0.25, pfsp_explore=0.15,
-                 name_resolver=None):
+                 name_resolver=None, config_from=None):
         # phillips: {tier_id: (policy, frac, name_code)}; fox_imports: {"import:NAME": path}
+        # config_from: full checkpoint whose config builds the bare-state members
+        #   (snapshots + fox imports are saved as bare state_dicts, no config).
         self.current = current_policy
         self.device = device
         self.self_frac = self_frac
@@ -176,6 +190,10 @@ class SimLeague:
         )
         self._cache = {}          # member_key -> (policy, name_code)
         self._resolve = name_resolver or (lambda nm: 1)
+        self._cfg = None
+        if config_from is not None:
+            from smashbot import saving
+            self._cfg = saving.load_checkpoint(config_from)["config"]
 
     # ---- policy resolution (lazy load + cache) ----
     def get(self, key):
@@ -188,22 +206,53 @@ class SimLeague:
             return pol, nc
         if key in self._cache:
             return self._cache[key]
-        from smashbot.eval.game import load_policy, resolve_name_code
         path = self.fox_paths[key] if key.startswith("import:") else key
-        pol, nm, _ = load_policy(path, self.device)
+        pol, _nm = self._load_bare(path)
         pol.train_value_head = False
         pol.requires_grad_(False)
         pol.eval()
-        val = (pol, resolve_name_code(nm, "Master Player"))
+        # snapshots share the student's name_map exactly; fox imports lack their
+        # own map -> self name_code is the correct/defensible conditioning.
+        val = (pol, self._sc)
         self._cache[key] = val
         return val
+
+    def _load_bare(self, path):
+        """Build a policy skeleton from config_from and load a bare state_dict
+        (snapshots + fox imports carry no config of their own)."""
+        import torch as _torch
+        from smashbot import configs, embed as embed_lib
+        from smashbot.policy import build_policy
+        if self._cfg is None:
+            raise RuntimeError("SimLeague needs config_from to load bare-state members")
+        cfg = self._cfg
+        pol = build_policy(
+            embed_config=embed_lib.EmbedConfig(),
+            controller_config=embed_lib.ControllerConfig(
+                axis_spacing=cfg["head"]["axis_spacing"],
+                shoulder_spacing=cfg["head"]["shoulder_spacing"],
+            ),
+            network_config=configs.NetworkConfig(**cfg["network"]),
+            head_config=configs.ControllerHeadConfig(**cfg["head"]),
+            policy_config=configs.PolicyConfig(**cfg["policy"]),
+            num_names=cfg["data"]["max_names"],
+        ).to(self.device)
+        state = _torch.load(path, map_location=self.device, weights_only=True)
+        pol.load_state_dict(state)
+        pol.eval()
+        return pol, {}
 
     def set_self_name_code(self, nc):
         self._sc = nc
 
     # ---- per-env assignment ----
-    def partition(self, N, rng=None):
-        """{member_key: np.ndarray(env indices)} covering all N envs."""
+    def partition(self, N, rng=None, max_pfsp_members=None):
+        """{member_key: np.ndarray(env indices)} covering all N envs.
+
+        max_pfsp_members bounds the number of DISTINCT PFSP opponents drawn
+        this period (each is a full resident policy — memory discipline, like
+        the Dolphin league's fixed weight slots). None = draw per env (one
+        group per distinct draw, unbounded residency)."""
         rng = rng or _random.Random()
         idx = list(range(N))
         rng.shuffle(idx)
@@ -219,10 +268,25 @@ class SimLeague:
         groups["self"] = take(round(self.self_frac * N))
         for tier, (_pol, frac, _nc) in self.phillips.items():
             groups[f"phillip:{tier}"] = take(round(frac * N))
-        # everything left is the PFSP pool
-        for i in idx[cur:]:
-            m = self.league.draw_member(rng) or "self"
-            groups.setdefault(m, []).append(i)
+        pfsp_envs = idx[cur:]
+        if max_pfsp_members is None:
+            for i in pfsp_envs:                       # one group per distinct draw
+                m = self.league.draw_member(rng) or "self"
+                groups.setdefault(m, []).append(i)
+        elif pfsp_envs:
+            # draw up to K distinct members, spread the pfsp envs across them
+            members, seen = [], set()
+            for _ in range(max_pfsp_members * 8):
+                if len(members) >= max_pfsp_members:
+                    break
+                m = self.league.draw_member(rng) or "self"
+                if m not in seen:
+                    seen.add(m)
+                    members.append(m)
+            if not members:
+                members = ["self"]
+            for j, i in enumerate(pfsp_envs):
+                groups.setdefault(members[j % len(members)], []).append(i)
         return {k: np.asarray(v, dtype=np.int64) for k, v in groups.items() if len(v)}
 
     def record(self, key, won: bool):
