@@ -505,6 +505,24 @@ def run(args) -> None:
                 _post_step(fut_i, metrics)
             _pre_step(i)  # θ final: previous update joined
             _publish()
+            if i == start_step:
+                # FIRST learner step runs SEQUENTIALLY: the step's one-time
+                # allocations (cuBLAS/cuDNN workspace benchmarking, autocast
+                # weight-cast caches) must not co-peak with a concurrent
+                # collect — that collision OOM'd three launch attempts at
+                # 496 while the harness (which warms up sequentially, then
+                # overlaps) measured 17.9 GiB at the same nominal phase.
+                state, metrics = learner.step(
+                    trajectories, state,
+                    progress=i / max(1, args.runtime.steps))
+                _post_step(i, metrics)
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                print(f"[vram] post-first-step: "
+                      f"alloc {torch.cuda.memory_allocated()/2**30:.2f} "
+                      f"reserved {torch.cuda.memory_reserved()/2**30:.2f} GiB",
+                      flush=True)
+                continue
             ready = torch.cuda.Event()
             ready.record()
 
