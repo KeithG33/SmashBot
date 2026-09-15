@@ -88,10 +88,7 @@ def main():
     disagree_by_frame = []
     for f, (enc, rst) in enumerate(zip(stream, resets)):
         views = tree.map_structure(
-            lambda x: torch.as_tensor(
-                np.ascontiguousarray(x.astype(np.int64) if x.dtype.kind in "iu"
-                                     else x.astype(np.float32))
-            ).to(DEV)[None], enc)   # [1, NENV, ...]
+            lambda t: t[None], _states_to_torch(enc, DEV))   # [1, NENV, ...]
         r = torch.as_tensor(rst[None], device=DEV)
         rec32 = fp32_arm.infer(views, r)
         rec16 = fp16_arm.infer(views, r)

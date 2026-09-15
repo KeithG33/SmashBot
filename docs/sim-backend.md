@@ -56,26 +56,29 @@ snapshot dir from v10 (symlinks + pfsp.json with ghost keys rewritten).
 
 ## Memory + throughput (RTX 3090, 24 GB — scripts/measure_sim_footprint.py)
 
-With the optimized serving (one-pass swapped-view encode + every opponent on
-a constant-shape cudagraph via slot skeletons, fp16 rollouts):
+Serving is v10's league stack ported to the sim: one swapped-view encode +
+GPU tree-slices; PFSP slots on ONE LeagueAgent grid (stacked fp16 weights +
+fp16 carried state, captured vmap forward, in-place load_slice on member
+swap); phillips on 5 constant-shape reduce-overhead graphs (their LSTM has
+no vmap rule); self on the student's compiled graph; vectorized [N,13] row
+controller writes. fp16 opponent state verified BIT-IDENTICAL to fp32
+storage over a 300-frame lockstep stream (scripts/check_fp16_state.py) —
+the forward computes fp16 under autocast either way.
 
-| num_envs | micro_batches | fps (overlapped) | learner peak | reserved |
+REAL-pool overlapped measurements (`--overlap` = the actual training
+pipeline; an earlier harness bug had collapsed the pool to pfsp-only and
+those numbers were retracted):
+
+| num_envs | micro_batches | fps (overlapped) | co-peak | reserved |
 |---:|---:|---:|---:|---:|
-| **320 (launch)** | **6** | **3,277** | **12.5 GiB** | **16.0 GiB** |
-| 448 | 8 | 3,743 | 16.8 GiB | 20.7 GiB |
+| **448 (launch)** | **12** | **3,390** | **16.4 GiB** | **~21.3 GiB** |
+| 512 | 14 | OOM at overlap co-peak | — | — |
 
-v10's Dolphin backend ran ~2,200 fps at 283 envs — 320 is 1.5x that. 448 is
-rejected for launch: training's learner_overlap holds the in-flight
-trajectory set on top of these sequential-cycle numbers, leaving ~1 GiB.
-(Pre-optimization, per-group encodes + eager opponents measured 1,700 fps /
-20.8 GiB reserved at 320, and 384 OOM'd — the serving rework bought speed
-and memory at once.)
+v10's Dolphin backend ran ~2,200 fps at 283 envs — 448 is 1.54x that with
+the full pool (self 139 / phillips 157 / 8 grid slots x 19).
 
-The remaining batch-proportional term is the KV recurrent state of the
-windowed-attention "sgu" net (6 layers x window 256 x 576 ≈ 7 MB/env/seat,
-fp32) held by the rollout seats AND the learner's carried policy/teacher
-states — untouchable by micro_batches. Storing those caches fp16 is the
-next memory lever (~halves ≈10 GB of KV at N=320); needs a precision-probe
-pass first. Collect still dominates (23s vs 4s learner); merging the ~14
-graph replays into one stacked-vmap forward (LeagueAgent proper) is the
-next speed lever.
+To unlock 512+: the learner's carried policy/teacher recurrent states
+(fp32, ~7 MB/env each) are the remaining batch-proportional term — storing
+them fp16 needs a precision-probe pass (they enter loss computation, unlike
+opponent state). The self-play opponent seat's fp32 KV is also convertible
+under the (now-verified) opponent-state argument.
