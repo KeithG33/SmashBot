@@ -113,7 +113,7 @@ def export(args):
     variables = policy.variables
     names = [v.name for v in variables]
     weights = {f"w_{i:03d}": v.numpy() for i, v in enumerate(variables)}
-    np.savez(os.path.join(args.scratch, "medium_v2_weights.npz"), **weights)
+    np.savez(os.path.join(args.scratch, "port_weights.npz"), **weights)
     print(f"dumped {len(variables)} variables")
 
     # --- meta: config + name_map + step ---
@@ -131,7 +131,7 @@ def export(args):
         "name_map": name_map,
         "step": int(state["state"].get("step", 0)) if "step" in state.get("state", {}) else None,
     }
-    with open(os.path.join(args.scratch, "medium_v2_meta.json"), "w") as f:
+    with open(os.path.join(args.scratch, "port_meta.json"), "w") as f:
         json.dump(meta, f, indent=1, default=str)
     print("wrote meta json; state keys:", list(state.keys()), "state['state'] keys:",
           list(state.get("state", {}).keys()))
@@ -240,8 +240,8 @@ def convert(args):
 
     torch.set_num_threads(4)
 
-    weights = np.load(os.path.join(args.scratch, "medium_v2_weights.npz"))
-    with open(os.path.join(args.scratch, "medium_v2_meta.json")) as f:
+    weights = np.load(os.path.join(args.scratch, "port_weights.npz"))
+    with open(os.path.join(args.scratch, "port_meta.json")) as f:
         meta = json.load(f)
     names = meta["var_names"]
     assert len(names) == 141, len(names)
@@ -345,7 +345,8 @@ def convert(args):
         "policy": policy.state_dict(),
         "name_map": meta["name_map"] or {},
         "step": meta.get("step") or 0,
-        "ported_from": "slippi-ai medium-v2 (TF), via scripts/port_ref_model.py",
+        "ported_from": f"slippi-ai {os.path.basename(args.tf_ckpt)} (TF), "
+                       f"via scripts/port_ref_model.py",
     }
     saving.save_checkpoint(args.torch_ckpt, config, state, best_eval_loss=float("inf"))
     print(f"wrote {args.torch_ckpt}")
@@ -620,15 +621,15 @@ def verify(args):
     policy, _, _ = load_policy(args.torch_ckpt, "cpu")
     golden = np.load(os.path.join(args.scratch, "ref_port_golden.npz"))
     debug = np.load(os.path.join(args.scratch, "ref_port_debug.npz"))
-    weights = np.load(os.path.join(args.scratch, "medium_v2_weights.npz"))
+    weights = np.load(os.path.join(args.scratch, "port_weights.npz"))
 
     asset = _build_asset(policy, golden, debug, weights)
-    os.makedirs(os.path.dirname(GOLDEN_ASSET), exist_ok=True)
-    np.savez_compressed(GOLDEN_ASSET, **asset)
-    print(f"wrote {GOLDEN_ASSET} "
-          f"({os.path.getsize(GOLDEN_ASSET) / 1e6:.1f} MB)")
+    os.makedirs(os.path.dirname(args.golden_asset), exist_ok=True)
+    np.savez_compressed(args.golden_asset, **asset)
+    print(f"wrote {args.golden_asset} "
+          f"({os.path.getsize(args.golden_asset) / 1e6:.1f} MB)")
 
-    diffs = run_report(policy, np.load(GOLDEN_ASSET))
+    diffs = run_report(policy, np.load(args.golden_asset))
     for k in sorted(diffs):
         print(f"  {k:50s} {diffs[k]:.3e}")
     for prefix in ("embed", "exact64/", "fp32/"):
@@ -646,6 +647,9 @@ def main():
     parser.add_argument("--scratch", default=SCRATCH_DEFAULT)
     parser.add_argument("--tf-ckpt", default=TF_CKPT)
     parser.add_argument("--torch-ckpt", default=TORCH_CKPT)
+    # Where verify writes the golden asset. Defaults to the medium-v2 test
+    # fixture; override when porting other models so it isn't clobbered.
+    parser.add_argument("--golden-asset", default=GOLDEN_ASSET)
     args = parser.parse_args()
     os.makedirs(args.scratch, exist_ok=True)
     {"export": export, "convert": convert, "verify": verify}[args.phase](args)
