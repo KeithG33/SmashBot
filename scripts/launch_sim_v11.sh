@@ -25,7 +25,11 @@ exec /home/kage/smashbot_workspace/SmashBot/.venv/bin/python -m smashbot.rl.trai
   --ckpt $SHINE/models/rl-v4-teacher-frozen-ev07736.pt \
   --runtime.device cuda \
   --runtime.run-dir $SHINE/runs --runtime.tag rl-sim-v11 \
-  --runtime.restore $SHINE/runs/rl-pool-v10/latest.pt \
+  --runtime.restore "$(
+    [ -f $SHINE/runs/rl-sim-v11/latest.pt ] \
+      && echo auto \
+      || echo $SHINE/runs/rl-pool-v10/latest.pt
+  )" \
   --runtime.steps 100000 \
   --runtime.checkpoint-interval 25 \
   --runtime.teacher-check-interval 100 \
