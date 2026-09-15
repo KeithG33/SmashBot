@@ -71,8 +71,9 @@ those numbers were retracted):
 
 | num_envs | micro_batches | fps (overlapped) | co-peak | reserved |
 |---:|---:|---:|---:|---:|
-| **448 (launch)** | **12** | **3,390** | **16.4 GiB** | **~21.3 GiB** |
-| 512 | 14 | OOM at overlap co-peak | — | — |
+| **480 (launch)** | **14** | **3,530** | **17.2 GiB** | stable |
+| 448 (fallback) | 12 | 3,390 | 16.4 GiB | stable |
+| 512 | 14-16 | OOM at overlap co-peak | — | — |
 
 v10's Dolphin backend ran ~2,200 fps at 283 envs — 448 is 1.54x that with
 the full pool (self 139 / phillips 157 / 8 grid slots x 19).
