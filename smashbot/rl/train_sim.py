@@ -150,7 +150,16 @@ class SimLeagueWorker:
         cfg = self.cfg
         N = cfg.num_envs
         if self._worker is not None:
+            # release the old worker's agents (student KV alone is ~3.5 GiB
+            # at 496) BEFORE building the new ones — holding both sets alive
+            # double-allocates and OOMs the re-partition (the launch-day
+            # crash: first re-partition fired at the resume step itself)
             self._worker.close()
+            self._worker = None
+            import gc
+            gc.collect()
+            import torch as _torch
+            _torch.cuda.empty_cache()
         self.part = self.lg.partition(N, self.rng,
                                       max_pfsp_members=cfg.max_pfsp_members)
         opponents = []
@@ -367,7 +376,7 @@ def run(args) -> None:
     wandb.init(
         project="shinebot", id=args.runtime.wandb_id or args.runtime.tag,
         name=args.runtime.tag, mode=args.runtime.wandb_mode,
-        config=dataclasses.asdict(args),
+        config=dataclasses.asdict(args), resume="allow",
     )
 
     state = learner.initial_state(scfg.num_envs, device)
@@ -381,7 +390,7 @@ def run(args) -> None:
             path = league.league.save(policy, i)
             print(f"[{i}] snapshot saved: {os.path.basename(path)} joins the league",
                   flush=True)
-        if worker.maybe_repartition(i):
+        if i != start_step and worker.maybe_repartition(i):
             # no learner-state reset needed: the fresh worker's first
             # trajectories carry is_resetting=True on frame 0, which zeroes
             # the learner-side carried state per env
