@@ -59,7 +59,7 @@ snapshot dir from v10 (symlinks + pfsp.json with ghost keys rewritten).
 | num_envs | micro_batches | learner peak | reserved |
 |---:|---:|---:|---:|
 | 283 (v10) | 4 | 14.8 GiB | 18.5 GiB |
-| **320 (launch)** | **6** | **16.4 GiB** | **20.8 GiB** |
+| **320 (launch)** | **6** | **12.5 GiB** | **16.0 GiB** |
 | 352 | 8 | 17.9 GiB | 21.1 GiB |
 | 384 | 8 | OOM | — |
 

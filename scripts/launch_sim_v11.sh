@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Sim-backend league run v11: resume v10 weights/optimizer/pfsp -> 100k steps.
-# Locked settings (2026-09, measured on the 3090):
-#   num_envs 320 / micro_batches 6  -- measured VRAM ceiling w/ headroom
-#                                      (283=comfortable, 352=tight, 384=OOM)
+# Locked settings (2026-09, measured on the 3090 with the optimized serving):
+#   num_envs 320 / micro_batches 6  -- 3,277 fps (1.5x v10's ~2,200),
+#     reserved 16.0 GiB => ~6.5 GiB margin under overlap. 448/mb8 measured
+#     3,743 fps but reserved 20.7 GiB leaves ~1 GiB once overlap holds the
+#     in-flight trajectory set -- too tight for a multi-day run.
 #   leash: kl-teacher 0.025 flat (v10's final value, no decay)
 #   imitation: lambda 0.01 flat, all rows (imitation_rows=-1)
 #   pool: self 30% / phillips 35% (medium 4, plat 6, diamond 7, master 8,
