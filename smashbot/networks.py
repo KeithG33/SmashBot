@@ -41,6 +41,12 @@ def _mask_state(reset: torch.Tensor, initial, prev):
                 mask = mask.unsqueeze(-1)
         else:  # [layers, B, H] torch RNN convention
             mask = reset.view(1, -1, *([1] * (state.dim() - 2)))
+        # match the CARRIED state's dtype: fp32 zeros vs an fp16 carried
+        # state would type-promote the whole masked state to fp32 — inside
+        # a captured CUDA graph those full-size fp32 intermediates live
+        # permanently in the capture's private pool
+        if init.dtype != state.dtype and init.is_floating_point():
+            init = init.to(state.dtype)
         return torch.where(mask, init, state)
 
     return torch.utils._pytree.tree_map(where, initial, prev)

@@ -422,9 +422,12 @@ class LeagueAgent:
         self._graph = None
         self._vm = self._make_vmap()
         self._timer = None  # optional profiler callback (name) -> None
-        # eager-path recurrent state [S, N, ...] (the captured path keeps
-        # it in static buffers)
-        self._hidden = self._initial_hidden()
+        # eager-path recurrent state [S, N, ...]; the CAPTURED path keeps
+        # state in its static in/out buffers, so allocate lazily — on the
+        # capture path this was a third full copy of the grid state
+        # (review finding: the code's own comment calls those buffers "the
+        # grid's biggest resident term")
+        self._hidden = None if self._use_capture else self._initial_hidden()
 
     # ---------------------------------------------------------- weights
 
@@ -436,6 +439,8 @@ class LeagueAgent:
         its few occupants into its other slices). Bit-exact for the env."""
         (s0, n0), (s1, n1) = src, dst
         tree.map_structure(lambda t: t[s1, n1].copy_(t[s0, n0]), self._prev)
+        if not (self._use_capture and self._graph is not None) and self._hidden is None:
+            self._hidden = self._initial_hidden()   # lazy (pre-capture move)
         hidden = self._out_hidden if self._use_capture and self._graph is not None else self._hidden
         tree.map_structure(
             lambda t: t[s1, n1].copy_(t[s0, n0]) if isinstance(t, torch.Tensor) else None,

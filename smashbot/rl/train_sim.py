@@ -138,7 +138,8 @@ class SimLeagueWorker:
         return self.trackers["snapshots"]
 
     def _on_game(self, env_i: int, gid: str, s0: int, s1: int) -> None:
-        self.lg.record(gid, s0 > s1)     # PFSP payoff (ghosts + imports only)
+        if s0 != s1:  # ties never enter the PFSP ledger (dolphin's rule)
+            self.lg.record(gid, s0 > s1)
         # char-LOCKED members (fox imports) are excluded from by_char, as in
         # the dolphin worker: a locked member ties its character's column to
         # its own strength
@@ -400,8 +401,12 @@ def run(args) -> None:
     teacher_swaps = 0
     t0 = time.time()
 
+    league.league.payoff_autosave = False  # flushed below, not per game
+
     def _pre_step(i):
         nonlocal state, teacher_swaps
+        if (i + 1) % args.runtime.checkpoint_interval == 0:
+            league.league._save_payoff()   # debounced ledger flush
         if i > 0 and i % scfg.snapshot_interval == 0:
             path = league.league.save(policy, i)
             print(f"[{i}] snapshot saved: {os.path.basename(path)} joins the league",
@@ -486,10 +491,6 @@ def run(args) -> None:
                   f"{'REVERTED ' if log['rl/reverted'] else ''}| "
                   f"{log['rl/frames_per_sec']:.0f} fps", flush=True)
 
-        if (i + 1) % args.runtime.checkpoint_interval == 0:
-            _save_rl_checkpoint(f"{run_dir}/latest.pt", ckpt["config"], policy,
-                                value_fn, name_map, i, args.ckpt)
-
     # ---- publish + overlap pipeline (train_rl's pattern) ----
     import concurrent.futures
     overlap_pool = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="learner")
@@ -555,6 +556,10 @@ def run(args) -> None:
                 return out
 
             fut, fut_i = overlap_pool.submit(_run), i
+            # drop the loop's redundant reference: the closure keeps the
+            # trajectories alive for the learner; without this they also
+            # survive the whole NEXT collect (~0.5-1 GiB of dead co-peak)
+            trajectories = None
         if fut is not None:
             state, metrics = fut.result()
             _post_step(fut_i, metrics)

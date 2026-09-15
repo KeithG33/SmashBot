@@ -81,18 +81,21 @@ class SimRolloutWorker:
             reset_t = torch.as_tensor(reset_np, device=dev)
             reset_idx = np.nonzero(reset_np)[0].tolist()
 
+            # EXECUTE before infer: on reset frames execute() rebuilds the
+            # queue; infer-first lets the rebuild discard the fresh sample
+            # and the seat runs at delay-1 forever (see sim_league.collect)
+            to_execute = self.student.execute(reset_idx)          # delayed controllers
+            sim_env.write_controllers(env, to_execute, player=0)
             states = _states_to_torch(sim_env.encode_obs(obs), dev)
             want_snap = (self._records_pushed % T == 0)
             records, hidden_before = self.student.infer(states, reset_t, want_snapshot=want_snap)
-            to_execute = self.student.execute(reset_idx)          # delayed controllers
-            sim_env.write_controllers(env, to_execute, player=0)
 
             if self.opponent is not None:                          # player-1 opponent
+                opp_exec = self.opponent.execute(reset_idx)
+                sim_env.write_controllers(env, opp_exec, player=1)
                 opp_states = _states_to_torch(
                     sim_env.encode_obs(obs, self_slot=1, opp_slot=0), dev)
                 self.opponent.infer(opp_states, reset_t, want_snapshot=False)
-                opp_exec = self.opponent.execute(reset_idx)
-                sim_env.write_controllers(env, opp_exec, player=1)
 
             stocks, percent = _seat_stats(obs)
             if self._prev is not None:

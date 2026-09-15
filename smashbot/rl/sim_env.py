@@ -147,16 +147,16 @@ def write_controllers(env, controllers, player: int) -> None:
 def write_controller_rows(env, rows: np.ndarray, player: int) -> None:
     """Vectorized twin of write_controllers for the flat [N, 13] row format
     (encode.controller_rows / BatchedPolicyAgent flat_controllers /
-    LeagueAgent.execute) -- column assignments, no per-controller Python."""
-    import melee_sim as msl
-
-    ctrl = msl.neutral_controller((env.length, env.batch_size))
-    t = env.t
-    ctrl.main_stick.x[t] = rows[:, 0]
-    ctrl.main_stick.y[t] = rows[:, 1]
-    ctrl.c_stick.x[t] = rows[:, 2]
-    ctrl.c_stick.y[t] = rows[:, 3]
-    ctrl.shoulder[t] = rows[:, 4]
+    LeagueAgent.execute). Writes ONLY the current step's row of the action
+    ring via env.current_action_frame -- the previous version built a full
+    [length, N] neutral controller and whole-buffer-assigned it through
+    msl.write_controller, ~240x the numpy traffic, per player, per frame."""
+    p = env.current_action_frame["players"][..., int(player)]
+    p["main_stick_x"] = rows[:, 0]
+    p["main_stick_y"] = rows[:, 1]
+    p["c_stick_x"] = rows[:, 2]
+    p["c_stick_y"] = rows[:, 3]
+    p["shoulder"] = rows[:, 4]
+    b = p["buttons"]
     for j, name in enumerate(_BUTTONS):
-        getattr(ctrl.buttons, name)[t] = rows[:, 5 + j] > 0.5
-    msl.write_controller(env.controller_action_view, ctrl, player=player)
+        b[name] = rows[:, 5 + j] > 0.5

@@ -107,8 +107,6 @@ class PfspGrid:
             for n in range(self.Nc):
                 self.agent.reset_cell(s, n)
 
-    def gid_of_cell(self, cell: int) -> str:
-        return self.members[cell // self.Nc]
 
 
 class _Group:
@@ -197,6 +195,12 @@ class MultiOpponentSimWorker:
             covered.append(grid.flat_env)
         covered = np.concatenate(covered) if covered else np.array([], int)
         assert sorted(covered.tolist()) == list(range(batch_size)), "opponent env_idx must partition all envs"
+        if grid is not None:
+            # a FULL worker rebuild resets _prev, so the first frame pushes
+            # a record with no matching reward — the grid's PERSISTENT
+            # assembler would desync by one (and leak a FrameRecord) per
+            # rebuild. Fresh assembler on construction; reassign() keeps it.
+            grid.assembler = ChunkAssembler(unroll_length, grid.agent.delay)
         self.env = msl.EnvBatch(batch_size=batch_size, length=max(64, unroll_length + 1), data_dir=data_dir)
         stages = stage if isinstance(stage, (list, tuple)) else [stage] * batch_size
         cfgs = [msl.MatchConfig(stage=s, players=(msl.PlayerConfig(a), msl.PlayerConfig(b)))
@@ -250,11 +254,17 @@ class MultiOpponentSimWorker:
             reset_t = torch.as_tensor(reset_np, device=dev)
 
             # ---- student (player 0) ----
+            # EXECUTE (pop the delay queue) BEFORE infer: on reset frames
+            # execute() rebuilds the queue, and an infer-first order lets
+            # that rebuild discard the fresh sample — after which the queue
+            # runs at delay-1 forever (review finding #1: every seat was
+            # acting one frame ahead of its BC conditioning).
+            reset_idx = np.nonzero(reset_np)[0].tolist()
+            p0_rows = np.stack(self.student.execute(reset_idx))
+            sim_env.write_controller_rows(env, p0_rows, player=0)
             states = _states_to_torch(sim_env.encode_obs(obs), dev)
             want = (self._pushed % T == 0)
             records, hidden_before = self.student.infer(states, reset_t, want_snapshot=want)
-            p0_rows = np.stack(self.student.execute(np.nonzero(reset_np)[0].tolist()))
-            sim_env.write_controller_rows(env, p0_rows, player=0)
 
             # ---- opponents (player 1) ----
             # ONE swapped-view encode + H2D for all envs; groups and the
@@ -264,16 +274,20 @@ class MultiOpponentSimWorker:
                 sim_env.encode_obs(obs, self_slot=1, opp_slot=0), dev)
             p1_rows = np.empty((self.N, 13), dtype=np.float32)
             for g in self.groups:
-                gstates = tree.map_structure(lambda t: t[g.idx_t], opp_states)
-                greset = torch.as_tensor(g._reset, device=dev)
-                gwant = (g._pushed % T == 0)
-                grecords, ghidden = g.agent.infer(gstates, greset, want_snapshot=gwant)
                 p1_rows[g.env_idx] = np.stack(
                     g.agent.execute(np.nonzero(g._reset)[0].tolist()))
+                gstates = tree.map_structure(lambda t: t[g.idx_t], opp_states)
+                greset = torch.as_tensor(g._reset, device=dev)
+                # want_snapshot only for harvested groups: self's _pushed
+                # never advances, so the old expression cloned the self
+                # seat's full KV state EVERY frame (review finding #3)
+                gwant = g.harvest and (g._pushed % T == 0)
+                grecords, _gh = g.agent.infer(gstates, greset, want_snapshot=gwant)
                 if g.harvest:
                     for rec in grecords:
-                        snap = ghidden if g._pushed % T == 0 else None
-                        g.assembler.push_frame(rec, greset, snap)
+                        # initial_state=None: the imitation learner starts
+                        # from zeros and never reads it (grid convention)
+                        g.assembler.push_frame(rec, greset, None)
                         g._pushed += 1
             if self.grid is not None:            # PFSP slots: ONE forward
                 gr = self.grid
@@ -296,11 +310,12 @@ class MultiOpponentSimWorker:
             if self._prev is not None:
                 reward = compute_reward(
                     torch.as_tensor(self._prev[0]), torch.as_tensor(stocks),
-                    torch.as_tensor(self._prev[1]), torch.as_tensor(percent), reset_t.cpu()).to(dev)
+                    torch.as_tensor(self._prev[1]), torch.as_tensor(percent),
+                    torch.as_tensor(reset_np)).to(dev)
                 self.assembler.push_reward(reward)
                 for g in self.groups:
                     if g.harvest:  # opponent seat reward = zero-sum mirror
-                        g.assembler.push_reward((-reward[g.env_idx]).clone())
+                        g.assembler.push_reward((-reward[g.idx_t]).clone())
                 if self.grid is not None:
                     self.grid.assembler.push_reward((-reward[self.grid.idx_t]).clone())
             self._prev = (stocks, percent)
@@ -377,7 +392,6 @@ class SimLeague:
             pfsp_hard_frac=pfsp_hard_frac, pfsp_explore=pfsp_explore,
             league_members=list(fox_imports.keys()),
         )
-        self._cache = {}          # member_key -> dedicated skeleton (slotless path)
         self._slots = []          # [skeleton, loaded_key] per PFSP slot
         self.compile_fn = compile_fn  # sample -> compiled sample, for skeletons
         self._sc = self_name_code
@@ -402,13 +416,8 @@ class SimLeague:
         if key.startswith("phillip:"):
             pol, _frac, nc = self.phillips[key.split(":", 1)[1]]
             return pol, nc
-        import torch as _torch
         path = self.fox_paths[key] if key.startswith("import:") else key
-        if slot is None:                      # legacy: dedicated instance
-            if key not in self._cache:
-                self._cache[key] = self._make_skeleton()
-                self._load_into(self._cache[key], path)
-            return self._cache[key], self._sc
+        assert slot is not None, "bare-state members are served from slots"
         while len(self._slots) <= slot:
             self._slots.append([None, None])  # [skeleton, loaded_key]
         sk = self._slots[slot]

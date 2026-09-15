@@ -273,7 +273,11 @@ class SnapshotPool:
         d = self.PAYOFF_DECAY
         entry["wins_d"] = d * entry["wins_d"] + float(won)
         entry["games_d"] = d * entry["games_d"] + 1.0
-        self._save_payoff()
+        # payoff_autosave=False (sim worker): games end inside the frame
+        # loop several times a second — the caller flushes at period /
+        # checkpoint boundaries instead of json-dumping per game
+        if getattr(self, "payoff_autosave", True):
+            self._save_payoff()
 
     # ~100-game effective recency window at large n; exact mean at small n
     PAYOFF_DECAY = 0.99
