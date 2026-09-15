@@ -55,8 +55,7 @@ class SimRolloutConfig:
     # --- PFSP / snapshots (v10 values) ---
     pfsp_hard_frac: float = 0.25
     pfsp_explore: float = 0.075
-    snapshot_interval: int = 1500
-    snapshot_keep: int = 0       # keep all
+    snapshot_interval: int = 1500  # snapshots are kept forever (SimLeague keep=0)
     # seed a fresh run's snapshot dir from a previous run (symlinks + pfsp.json)
     seed_snapshots_from: str = ""
     # --- matches ---
@@ -139,7 +138,11 @@ class SimLeagueWorker:
 
     def _on_game(self, env_i: int, gid: str, s0: int, s1: int) -> None:
         self.lg.record(gid, s0 > s1)     # PFSP payoff (ghosts + imports only)
-        self._tracker_of(gid).add_game((s0, s1), self._env_char[env_i])
+        # char-LOCKED members (fox imports) are excluded from by_char, as in
+        # the dolphin worker: a locked member ties its character's column to
+        # its own strength
+        char = None if gid.startswith("import:") else self._env_char[env_i]
+        self._tracker_of(gid).add_game((s0, s1), char)
 
     def _build(self) -> None:
         msl = _msl()
@@ -287,7 +290,10 @@ def run(args) -> None:
         pol.requires_grad_(False)
         pol.eval()
         if args.runtime.compile:
-            pol.sample = torch.compile(pol.sample, mode="reduce-overhead")
+            # "default" (fusion, no cudagraph pool): five phillips under
+            # reduce-overhead would hold five private graph pools, and their
+            # tx_like LSTM graph-breaks under compile anyway
+            pol.sample = torch.compile(pol.sample, mode="default")
         phillips[tier] = (pol, frac, resolve_name_code(pnm, "Master Player"))
         print(f"phillip:{tier} <- {fname} ({frac:.0%} of envs)")
     fox = {}
@@ -300,9 +306,8 @@ def run(args) -> None:
         serving_policy, snap_dir, phillips=phillips, fox_imports=fox,
         self_frac=scfg.self_frac, device=device,
         pfsp_hard_frac=scfg.pfsp_hard_frac, pfsp_explore=scfg.pfsp_explore,
-        config_from=args.ckpt,
+        config_from=args.ckpt, self_name_code=name_code,
     )
-    league.set_self_name_code(name_code)
     if not league.league.archive:
         league.league.save(policy, start_step)
         print(f"boot snapshot: seeded empty archive at step {start_step}", flush=True)
@@ -360,6 +365,9 @@ def run(args) -> None:
                 print(f"[{i}] TEACHER SWAPPED (#{teacher_swaps})")
 
     def _post_step(i, metrics):
+        if (i + 1) % args.runtime.checkpoint_interval == 0:
+            _save_rl_checkpoint(f"{run_dir}/latest.pt", ckpt["config"], policy,
+                                value_fn, name_map, i, args.ckpt)
         if i % args.runtime.log_interval != 0:
             return
         frames = ((i + 1 - start_step) * args.runtime.trajectories_per_step

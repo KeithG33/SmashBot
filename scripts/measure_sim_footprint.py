@@ -83,20 +83,20 @@ def main():
     torch._dynamo.config.recompile_limit = 128
     policy.sample = torch.compile(policy.sample, mode="reduce-overhead")
 
-    # --- phillips (full ckpts) ---
+    # --- phillips (full ckpts), compiled as the launch does ---
     phillips = {}
     for tier, path, frac in PHILLIPS:
         if not os.path.exists(path):
             print(f"  (skip phillip {tier}: {path} missing)"); continue
         pol, pnm, _ = load_policy(path, dev); pol.eval(); pol.requires_grad_(False)
+        pol.sample = torch.compile(pol.sample, mode="default")
         phillips[tier] = (pol, frac, resolve_name_code(pnm, "Master Player"))
     fox = {k: v for k, v in FOX.items() if os.path.exists(v)}
 
     self_frac = 1.0 - sum(f for _, _, f in phillips.values()) - 0.35  # phillips + 35% pfsp
     lg = SimLeague(policy, args.snapshot_dir, phillips=phillips, fox_imports=fox,
-                   self_frac=self_frac, device=dev, name_resolver=lambda nm: sc,
-                   config_from=args.ckpt)
-    lg.set_self_name_code(sc)
+                   self_frac=self_frac, device=dev,
+                   config_from=args.ckpt, self_name_code=sc)
 
     rng = random.Random(0)
     part = lg.partition(N, rng, max_pfsp_members=args.max_pfsp)
@@ -142,6 +142,22 @@ def main():
           f"reserved {resv/2**30:.2f} GiB")
     print(f"        ppo_trajs={len(ppo)} imit_trajs={len(imit)} "
           f"| metrics finite={all(np.isfinite(v) for v in metrics.values() if isinstance(v,(int,float)))}")
+
+    # ---- throughput: timed steady-state cycles (sequential = the floor;
+    # learner_overlap in training hides the shorter of the two phases) ----
+    import time
+    for cyc in range(3):
+        torch.cuda.synchronize(); t0 = time.perf_counter()
+        ppo, imit = [], []
+        while len(ppo) < 1:
+            p, i = w.collect(30); ppo += p; imit += i
+        torch.cuda.synchronize(); t1 = time.perf_counter()
+        state, _m = learner.step(ppo + imit, state, progress=step / 40000)
+        torch.cuda.synchronize(); t2 = time.perf_counter()
+        frames = N * T
+        print(f"[cycle {cyc}] collect {t1-t0:.1f}s ({frames/(t1-t0):,.0f} fps) | "
+              f"learner {t2-t1:.1f}s | sequential {frames/(t2-t0):,.0f} fps | "
+              f"overlapped-> {frames/max(t1-t0, t2-t1):,.0f} fps", flush=True)
     w.close()
 
 

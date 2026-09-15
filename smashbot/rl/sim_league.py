@@ -7,19 +7,23 @@ forward per group on the slot-swapped view, and every harvested group assembles
 its seat into a kind="imitation" Trajectory (advantage-weighted imitation in the
 learner). The student seat is the kind="ppo" Trajectory.
 
-This first version uses a STATIC split assignment (partition envs by the pool
-shares) with no mid-run re-draw. PFSP selection + payoff updates + reset re-roll
-layer on top next.
+SimLeague owns the pool: shares partitioned per period (worker rebuilt on the
+period boundary by train_sim.SimLeagueWorker — within a period an env keeps
+its opponent), PFSP draw + payoff via SnapshotPool (pfsp.json), decided games
+recorded through record_fn.
 
 Reuses unchanged: BatchedPolicyAgent (sample+delay), ChunkAssembler (Trajectory
 assembly), compute_reward, EnvBatch.step_and_reset.
 """
 from __future__ import annotations
 
+import random as _random
+
 import numpy as np
 import torch
 
 from smashbot.rl.agent import BatchedPolicyAgent
+from smashbot.rl.pool import SnapshotPool
 from smashbot.rl.rollouts import ChunkAssembler, compute_reward
 from smashbot.rl import sim_env
 from smashbot.rl.sim_rollout import _states_to_torch, _seat_stats
@@ -71,7 +75,6 @@ class _Group:
         self.assembler = ChunkAssembler(unroll, policy.delay) if harvest else None
         self.reencode = reencode
         self._pushed = 0
-        self._prev = None
         self._reset = np.ones(self.n, dtype=bool)   # its envs start fresh
 
 
@@ -212,10 +215,6 @@ class MultiOpponentSimWorker:
 
 # ---------------------------------------------------------------- opponent pool
 
-import random as _random
-
-from smashbot.rl.pool import SnapshotPool
-
 
 class SimLeague:
     """Opponent pool + per-env assignment for the sim league.
@@ -234,11 +233,13 @@ class SimLeague:
     """
 
     def __init__(self, current_policy, snapshot_dir, phillips, fox_imports,
-                 self_frac=0.30, device="cpu", pfsp_hard_frac=0.25, pfsp_explore=0.15,
-                 name_resolver=None, config_from=None):
+                 self_frac=0.30, device="cpu", pfsp_hard_frac=0.25, pfsp_explore=0.075,
+                 config_from=None, self_name_code=1):
         # phillips: {tier_id: (policy, frac, name_code)}; fox_imports: {"import:NAME": path}
         # config_from: full checkpoint whose config builds the bare-state members
         #   (snapshots + fox imports are saved as bare state_dicts, no config).
+        # self_name_code: the student's conditioning code — also used for bare
+        #   members (snapshots share the student's name_map; imports lack one).
         self.current = current_policy
         self.device = device
         self.self_frac = self_frac
@@ -250,7 +251,7 @@ class SimLeague:
             league_members=list(fox_imports.keys()),
         )
         self._cache = {}          # member_key -> (policy, name_code)
-        self._resolve = name_resolver or (lambda nm: 1)
+        self._sc = self_name_code
         self._cfg = None
         if config_from is not None:
             from smashbot import saving
@@ -268,7 +269,7 @@ class SimLeague:
         if key in self._cache:
             return self._cache[key]
         path = self.fox_paths[key] if key.startswith("import:") else key
-        pol, _nm = self._load_bare(path)
+        pol = self._load_bare(path)
         pol.train_value_head = False
         pol.requires_grad_(False)
         pol.eval()
@@ -301,10 +302,7 @@ class SimLeague:
         state = _torch.load(path, map_location=self.device, weights_only=True)
         pol.load_state_dict(state)
         pol.eval()
-        return pol, {}
-
-    def set_self_name_code(self, nc):
-        self._sc = nc
+        return pol
 
     # ---- per-env assignment ----
     def partition(self, N, rng=None, max_pfsp_members=None):

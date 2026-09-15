@@ -10,8 +10,10 @@ Reuses, unchanged:
 New here is only the orchestration: encode sim frames, feed the agent, write its
 controllers back, step, compute rewards.
 
-First version drives player-0 with the student and leaves player-1 neutral
-(mechanics/Trajectory validation). Opponent policies on player-1 come next.
+Single-opponent worker: player-0 is the student, player-1 one optional policy
+(None = neutral). Kept as the minimal reference path and the benchmark harness
+(scripts/bench_sim_throughput.py); training uses sim_league's
+MultiOpponentSimWorker, which layers grouped opponents + harvest on this loop.
 """
 from __future__ import annotations
 
