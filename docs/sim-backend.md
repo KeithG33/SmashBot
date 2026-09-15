@@ -10,9 +10,9 @@ was removed once training and eval both validated sim-side; git history
 has it.
 
 Eval tools (all sim, CPU-friendly, deterministic slates):
-  scripts/battery.py     student vs the phillip/fox slate, GameTracker stats
+  scripts/battery.py     student vs the phillip/fox slate; --grid = the
+                         full 144-pair baseline mode with per-pair results
   scripts/tournament.py  checkpoint round-robin, standings
-  scripts/h2h_vs_gm.py   the fixed 144-pair grid vs phillip-gm
   smashbot/eval/sim_arena.py  the shared MatchSet engine
 
 ## Setup (once per machine)

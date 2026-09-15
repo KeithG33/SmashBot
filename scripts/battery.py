@@ -20,7 +20,7 @@ import os
 import torch
 
 from smashbot.eval.game import load_policy, resolve_name_code
-from smashbot.eval.sim_arena import MatchSet, full_grid, stratified
+from smashbot.eval.sim_arena import MatchSet, full_grid, stratified  # noqa: F401
 
 MODELS = "/home/kage/drive2/ShineBot/models"
 V10_SNAPS = "/home/kage/drive2/ShineBot/runs/rl-pool-v10/snapshots"
@@ -70,6 +70,10 @@ def main():
     ap.add_argument("--threads", type=int, default=16)
     ap.add_argument("--opponents", default="",
                     help="comma list from the slate (default: all)")
+    ap.add_argument("--grid", action="store_true",
+                    help="full 144-pair character grid per opponent (the "
+                         "v10-vs-gm baseline mode), per-pair results in the "
+                         "report")
     ap.add_argument("--data-dir",
                     default=os.environ.get("MSL_DATA_DIR",
                                            "/home/kage/drive2/ShineBot/msl-data"))
@@ -102,13 +106,20 @@ def main():
     for name in names:
         opp, oc = load_opponent(name, SLATE[name], args.device,
                                 args.config_from or args.ckpt)
-        pairs = (stratified(args.envs, opponent_char="FOX", seed=args.seed)
-                 if name in FOX_LOCKED
-                 else stratified(args.envs, seed=args.seed))
+        if args.grid:
+            pairs = full_grid(args.seed)
+        elif name in FOX_LOCKED:
+            pairs = stratified(args.envs, opponent_char="FOX", seed=args.seed)
+        else:
+            pairs = stratified(args.envs, seed=args.seed)
         ms = MatchSet(student, opp, pairs, args.data_dir, args.device,
                       student_name_code=sc, opp_name_code=oc)
         ms.run(min_games=args.games)
         st = ms.stats()
+        if args.grid:   # per-pair first decisions (grid/baseline mode)
+            st["pairs"] = {f"{a}|{b}": list(ms.first[i])
+                           for i, (a, b) in enumerate(ms.pairs)
+                           if i in ms.first}
         ms.close()
         del opp
         report["opponents"][name] = st
