@@ -11,7 +11,7 @@ measured with cudagraph compilation (the setting we run) on GPU, in ms per call.
 | ffw+lstm                | 30k        | 3/512  | 11.3M  | 0.923     | 4.38  | 4.56   |
 | SGU (scaled → teacher)  | 30k/1.8M      | 6/576  | 25.7M  | 0.873/0.774     | 3.18  | 4.61   |
 | Transformer (scaled)    | —          | 6/576  | 25.9M  | —         | 3.39  | 7.42   |
-| ffw+lstm (Phillip)      | —  | 3/768  | 23.9M  | —         | 4.43  | 7.32   |
+| ffw+lstm (Phillip)      | 100k | 3/768  | 23.9M  | 0.904     | 4.43  | 7.32   |
 
 ## Notes
 
@@ -34,8 +34,11 @@ measured with cudagraph compilation (the setting we run) on GPU, in ms per call.
 - **Scaling SGU was nearly free:** 14.3M → 25.7M params and eval 0.909 → 0.774 moved
   latency only 2.83 → 3.18ms @1.
 - `ffw+lstm` = tx_like = slippi-ai's / Phillip's architecture (LSTM recurrent core).
-  The "scaled Transformer" and "Phillip" rows have blank steps/eval — they were never
-  trained in this comparison; benchmarked for latency reference only.
+  The "scaled Transformer" row has blank steps/eval — never trained here;
+  benchmarked for latency reference only.
+- **Phillip-arch long run (2026-09-15): 0.9946 @30k -> 0.904 @100k — at 3.3x
+  the steps it still trails scaled SGU's 0.873 @30k.** SGU wins per-step and
+  per-ms; comparison closed.
 - Params are totals (network + controller head + value head).
 
 
