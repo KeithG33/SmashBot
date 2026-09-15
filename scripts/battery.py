@@ -70,6 +70,9 @@ def main():
     ap.add_argument("--threads", type=int, default=16)
     ap.add_argument("--opponents", default="",
                     help="comma list from the slate (default: all)")
+    ap.add_argument("--grid-games", type=int, default=1,
+                    help="grid mode: min decided games per pair (1 = the "
+                         "baseline's single-game cells)")
     ap.add_argument("--grid", action="store_true",
                     help="full 144-pair character grid per opponent (the "
                          "v10-vs-gm baseline mode), per-pair results in the "
@@ -114,12 +117,14 @@ def main():
             pairs = stratified(args.envs, seed=args.seed)
         ms = MatchSet(student, opp, pairs, args.data_dir, args.device,
                       student_name_code=sc, opp_name_code=oc)
-        ms.run(min_games=args.games)
+        if args.grid:
+            ms.run_per_pair(args.grid_games)
+        else:
+            ms.run(min_games=args.games)
         st = ms.stats()
-        if args.grid:   # per-pair first decisions (grid/baseline mode)
-            st["pairs"] = {f"{a}|{b}": list(ms.first[i])
-                           for i, (a, b) in enumerate(ms.pairs)
-                           if i in ms.first}
+        if args.grid:   # per-pair decided games (grid/baseline mode)
+            st["pairs"] = {f"{a}|{b}": [list(g) for g in ms.per_env.get(i, [])]
+                           for i, (a, b) in enumerate(ms.pairs)}
         ms.close()
         del opp
         report["opponents"][name] = st

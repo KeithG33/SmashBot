@@ -62,13 +62,15 @@ class MatchSet:
         char_pairs = [(msl.Character[a], msl.Character[b]) for a, b in pairs]
         self.tracker = GameTracker()
         self.first: dict[int, tuple[int, int]] = {}   # env -> first decided
+        self.per_env: dict[int, list] = {}            # env -> all decided games
         self.games = 0
 
         def on_game(i, gid, s0, s1):
             self.games += 1
             self.tracker.add_game((s0, s1), pairs[i][1])
-            if i not in self.first and s0 != s1:
-                self.first[i] = (s0, s1)
+            if s0 != s1:
+                self.first.setdefault(i, (s0, s1))
+                self.per_env.setdefault(i, []).append((s0, s1))
 
         def on_event(i, gid, kind, pct):
             (self.tracker.add_kill if kind == "kill"
@@ -86,6 +88,17 @@ class MatchSet:
     def run(self, min_games: int, max_frames: int = 200_000) -> None:
         frames = 0
         while self.games < min_games and frames < max_frames:
+            self.worker.collect(self._unroll)
+            frames += self._unroll
+
+    def run_per_pair(self, games_per_pair: int, max_frames: int = 600_000) -> None:
+        """Run until EVERY env(pair) has >= games_per_pair decided games
+        (each env replays its own pair after every game end)."""
+        frames = 0
+        def done():
+            return all(len(self.per_env.get(i, [])) >= games_per_pair
+                       for i in range(self.N))
+        while not done() and frames < max_frames:
             self.worker.collect(self._unroll)
             frames += self._unroll
 
