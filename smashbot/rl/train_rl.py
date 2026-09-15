@@ -37,11 +37,6 @@ class RuntimeConfig:
     wandb_id: str = ""
     name: str = "Master Player"
     compile: bool = True  # compile sample_n (the batched flush)
-    # Hot-swappable teacher: poll this path (default: the --ckpt file) every
-    # teacher_check_interval learner steps; on change, safely reload the
-    # frozen teacher in place (see rl/teacher_watch.py).
-    teacher_watch: str = ""
-    teacher_check_interval: int = 100  # ~20 min at 64 envs (one step ~15s)
     restore: str = ""  # RL checkpoint path, or "auto" for <run_dir>/<tag>/latest.pt
     device: str = "cpu"  # rollouts are CPU-bound; learner device
 
@@ -128,7 +123,6 @@ def main() -> None:
     from smashbot.rl.agent import BatchedPolicyAgent
     from smashbot.rl.ppo import Learner
     from smashbot.rl.rollouts import DolphinRolloutWorker
-    from smashbot.rl.teacher_watch import TeacherWatcher
 
     args = tyro.cli(Config)
     if args.backend == "sim":
@@ -432,35 +426,15 @@ def main() -> None:
         print(f"boot snapshot: seeded empty archive at step {start_step}",
               flush=True)
     state = learner.initial_state(args.rollouts.num_envs, device)
-    watcher = TeacherWatcher(args.runtime.teacher_watch or args.ckpt)
-    teacher_swaps = 0
     t0 = time.time()
 
     def _pre_step(i):
-            nonlocal state, teacher_swaps
             if league_envs and i > 0 and i % rcfg.snapshot_interval == 0:
                 # a new ghost joins the league; envs draw it per match
                 # from now on (no auction, no swaps)
                 path = snapshot_pool.save(policy, i)
                 print(f"[{i}] snapshot saved: {os.path.basename(path)} "
                       f"joins the league", flush=True)
-            if i > 0 and i % args.runtime.teacher_check_interval == 0:
-                new_teacher = watcher.poll()
-                if new_teacher is not None:
-                    teacher.load_state_dict(new_teacher)  # in-place copy
-                    if runtime is not None and "teacher" in league:
-                        # refresh the league-served copy (legacy mode only;
-                        # in v9 the teacher exists only as the KL anchor)
-                        weights.set("teacher", {
-                            k: v.detach().cpu() for k, v in teacher.state_dict().items()
-                        })
-                    state = state._replace(
-                        teacher=teacher.initial_state(
-                            args.rollouts.num_envs, device
-                        )
-                    )
-                    teacher_swaps += 1
-                    print(f"[{i}] TEACHER SWAPPED (#{teacher_swaps})")
 
     def _post_step(i, metrics):
             if i % args.runtime.log_interval == 0:
@@ -491,7 +465,6 @@ def main() -> None:
                     if not _quiet(k, v)
                 })
                 log["rl/reverted"] = float(metrics["reverted"])
-                log["rl/teacher_swaps"] = teacher_swaps
                 if learner.grad_scaler is not None:
                     # fp16 health gauge: collapsing scale = repeated overflow
                     # skips; a steady 2^15..2^17 is the healthy regime

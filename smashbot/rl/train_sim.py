@@ -298,7 +298,6 @@ def run(args) -> None:
     from smashbot.eval.game import load_policy, resolve_name_code
     from smashbot.rl.ppo import Learner
     from smashbot.rl.sim_league import SimLeague
-    from smashbot.rl.teacher_watch import TeacherWatcher
     from smashbot.rl.train_rl import build_value_function, _save_rl_checkpoint
 
     scfg: SimRolloutConfig = args.sim
@@ -424,14 +423,11 @@ def run(args) -> None:
     torch.cuda.synchronize()
     print(f"[vram] boot complete: alloc {torch.cuda.memory_allocated()/2**30:.2f} "
           f"reserved {torch.cuda.memory_reserved()/2**30:.2f} GiB", flush=True)
-    watcher = TeacherWatcher(args.runtime.teacher_watch or args.ckpt)
-    teacher_swaps = 0
     t0 = time.time()
 
     league.league.payoff_autosave = False  # flushed below, not per game
 
     def _pre_step(i):
-        nonlocal state, teacher_swaps
         if (i + 1) % args.runtime.checkpoint_interval == 0:
             league.league._save_payoff()   # debounced ledger flush
         if i > 0 and i % scfg.snapshot_interval == 0:
@@ -445,14 +441,6 @@ def run(args) -> None:
             print(f"[{i}] re-partitioned: "
                   + " ".join(f"{k}={v}" for k, v in sorted(worker.env_share().items())),
                   flush=True)
-        if i > 0 and i % args.runtime.teacher_check_interval == 0:
-            new_teacher = watcher.poll()
-            if new_teacher is not None:
-                teacher.load_state_dict(new_teacher)
-                state = state._replace(
-                    teacher=teacher.initial_state(scfg.num_envs, device))
-                teacher_swaps += 1
-                print(f"[{i}] TEACHER SWAPPED (#{teacher_swaps})")
 
     def _post_step(i, metrics):
         if (i + 1) % args.runtime.checkpoint_interval == 0:
@@ -472,7 +460,6 @@ def run(args) -> None:
         log.update({"rl/value_" + k: v for k, v in metrics["value"].items()
                     if not _quiet(k, v)})
         log["rl/reverted"] = float(metrics["reverted"])
-        log["rl/teacher_swaps"] = teacher_swaps
         if learner.grad_scaler is not None:
             log["rl/grad_scaler_scale"] = learner.grad_scaler.get_scale()
         im = metrics.get("imitation")
