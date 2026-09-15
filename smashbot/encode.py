@@ -216,6 +216,25 @@ def flatten_typed(struct) -> tuple:
     )
 
 
+def flatten_typed_batched(struct, batch: int) -> tuple:
+    """Batched twin of flatten_typed: leaves are [batch, ...]; returns
+    (bools[batch, B], ints[batch, I], floats[batch, F]) with per-frame
+    column offsets IDENTICAL to layout_of(per-frame struct) — so the flat
+    tensors reconstruct through the same layout / swap_perm."""
+    import tree
+
+    parts: dict = {"bool": [], "int": [], "float": []}
+    for leaf in tree.flatten(struct):
+        a = np.asarray(leaf)
+        assert a.shape[0] == batch, (a.shape, batch)
+        parts[_KIND[a.dtype.kind]].append(a.reshape(batch, -1))
+    cat = lambda k, dt: (
+        np.concatenate(parts[k], axis=1).astype(dt, copy=False)
+        if parts[k] else np.zeros((batch, 0), dt)
+    )
+    return cat("bool", np.bool_), cat("int", np.int32), cat("float", np.float32)
+
+
 def layout_of(struct) -> list:
     """Per leaf in tree order: (kind, offset, size, shape) — computed from a
     dummy struct of the embedding (shapes are fixed for a run)."""

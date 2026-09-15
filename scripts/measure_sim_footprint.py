@@ -17,6 +17,7 @@ import random
 
 import numpy as np
 import torch
+import torch._dynamo  # noqa: F401 (config below)
 
 import melee_sim as msl
 from smashbot import saving
@@ -65,11 +66,31 @@ def main():
     ap.add_argument("--overlap", action="store_true",
                     help="pipeline learner on a second stream (train_sim's "
                          "real loop): true co-peak VRAM + wall-clock fps")
+    ap.add_argument("--memdebug-dump", default="",
+                    help="record allocator history and dump a snapshot to "
+                         "this path when allocated crosses --memdebug-gib")
+    ap.add_argument("--memdebug-gib", type=float, default=15.5)
     ap.add_argument("--data-dir", default=os.environ.get("MSL_DATA_DIR"))
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
     dev = args.device
     N, T = args.num_envs, args.unroll
+
+    if args.memdebug_dump:
+        import threading
+        torch.cuda.memory._record_memory_history(max_entries=200000)
+
+        def _watch():
+            import time as _t
+            while True:
+                if torch.cuda.memory_allocated() / 2**30 > args.memdebug_gib:
+                    torch.cuda.memory._dump_snapshot(args.memdebug_dump)
+                    print(f"[memdebug] snapshot at "
+                          f"{torch.cuda.memory_allocated()/2**30:.2f} GiB -> "
+                          f"{args.memdebug_dump}", flush=True)
+                    return
+                _t.sleep(0.05)
+        threading.Thread(target=_watch, daemon=True).start()
 
     # --- policies (student / teacher / value), as train_rl.main does ---
     policy, name_map, step = load_policy(args.ckpt, dev)
@@ -82,7 +103,6 @@ def main():
 
     learner = Learner(v10_learner_config(T, args.micro_batches), policy, teacher, value_fn)
     # training compiles the rollout student reduce-overhead (train_rl:199)
-    import torch._dynamo
     torch._dynamo.config.recompile_limit = 128
     policy.sample = torch.compile(policy.sample, mode="reduce-overhead")
 
@@ -92,7 +112,7 @@ def main():
         if not os.path.exists(path):
             print(f"  (skip phillip {tier}: {path} missing)"); continue
         pol, pnm, _ = load_policy(path, dev); pol.eval(); pol.requires_grad_(False)
-        pol.sample = torch.compile(pol.sample, mode="reduce-overhead")
+        # served from the phillip grid (SimLeagueWorker); no individual compile
         phillips[tier] = (pol, frac, resolve_name_code(pnm, "Master Player"))
     fox = {k: v for k, v in FOX.items() if os.path.exists(v)}
 

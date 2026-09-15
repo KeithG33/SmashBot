@@ -116,7 +116,8 @@ class SimLeagueWorker:
         self.device = device
         self.rng = random.Random(cfg.partition_seed)
         self._worker = None
-        self._grid = None                # persistent PfspGrid (captured graph)
+        self._grid = None                # persistent PFSP grid (captured graph)
+        self._phillip_grid = None        # persistent phillip grid (5 tiers)
         self._env_char = None            # per-env opponent char name (for trackers)
         self.part: dict = {}
         from smashbot.rl.rollouts import GameTracker
@@ -153,25 +154,56 @@ class SimLeagueWorker:
         self.part = self.lg.partition(N, self.rng,
                                       max_pfsp_members=cfg.max_pfsp_members)
         opponents = []
-        pfsp = []                        # [(key, env_rows)] for the grid
+        pfsp = []                        # [(key, env_rows)] for the PFSP grid
+        phillip = []                     # [(key, env_rows)] for the phillip grid
         for key, idx in self.part.items():
-            if key == "self" or key.startswith("phillip:"):
+            if key == "self":
                 pol, nc = self.lg.get(key)
-                opponents.append((key, pol, idx, key != "self", nc))
+                opponents.append((key, pol, idx, False, nc))
+            elif key.startswith("phillip:"):
+                phillip.append((key, idx))
             else:
                 pfsp.append((key, idx))
-        grid = None
+        from smashbot.rl.sim_league import PfspGrid, make_reencoder
+        grids = []
+        # --- phillip grid: all 5 tiers on ONE stacked forward (their LSTM
+        # steps via the hand-rolled cell — cuDNN has no vmap rule). Slices
+        # are padded to the largest tier; members never change.
+        if phillip:
+            phillip.sort(key=lambda kv: kv[0])          # stable slice order
+            if self._phillip_grid is None:
+                tiers = [k.split(":", 1)[1] for k, _ in phillip]
+                tmpl = self.lg.phillips[tiers[0]][0]
+                for m in tmpl.modules():
+                    if type(m).__name__ == "RecurrentWrapper":
+                        m.manual_step = True
+                stu_embed = self.policy.controller_head.controller_embedding
+                self._phillip_grid = PfspGrid(
+                    tmpl, len(phillip), max(len(r) for _, r in phillip),
+                    self.name_code, cfg.unroll_length, self.device,
+                    reencode=make_reencoder(
+                        tmpl.controller_head.controller_embedding,
+                        stu_embed, self.name_code, self.device),
+                )
+                for s, t in enumerate(tiers):           # per-slice name codes
+                    self._phillip_grid.agent._name[s] = self.lg.phillips[t][2]
+                print(f"phillip grid: {len(phillip)} tiers x "
+                      f"{self._phillip_grid.Nc} cells (delay {tmpl.delay})",
+                      flush=True)
+            self._phillip_grid.assign(
+                phillip,
+                lambda key: self.lg.phillips[key.split(':', 1)[1]][0].state_dict())
+            grids.append(self._phillip_grid)
         K = cfg.max_pfsp_members
         if len(pfsp) == K and len({len(r) for _, r in pfsp}) == 1:
             # full house of equal slots -> ONE captured vmap forward for all
             # PFSP members (member swaps are in-place load_slice)
-            from smashbot.rl.sim_league import PfspGrid
             if self._grid is None:
                 self._grid = PfspGrid(
                     self.lg.make_grid_template(), K, len(pfsp[0][1]),
                     self.name_code, cfg.unroll_length, self.device)
             self._grid.assign(pfsp, self.lg.get_state)
-            grid = self._grid
+            grids.append(self._grid)
         else:
             # league too small to fill the slots (fresh run boot): fall back
             # to per-slot compiled skeletons until it grows
@@ -203,7 +235,7 @@ class SimLeagueWorker:
             # a full rebuild only if the group structure actually changed
             # (fresh-run league growth in the slot-fallback mode).
             new_map = {gid: idx for (gid, _p, idx, _h, _nc) in opponents}
-            same = (grid is self._worker.grid
+            same = (grids == self._worker.grids
                     and {g.gid for g in self._worker.groups} == set(new_map)
                     and all(len(new_map[g.gid]) == g.n
                             for g in self._worker.groups))
@@ -221,7 +253,7 @@ class SimLeagueWorker:
             self.policy, opponents, N, cfg.unroll_length, cfg.data_dir,
             stages, char_pairs, name_code=self.name_code, device=self.device,
             record_fn=self._on_game, precision=cfg.rollout_precision,
-            grid=grid,
+            grids=grids,
         )
 
     def maybe_repartition(self, step: int) -> bool:
@@ -336,14 +368,8 @@ def run(args) -> None:
         pol.train_value_head = False
         pol.requires_grad_(False)
         pol.eval()
-        if args.runtime.compile:
-            # reduce-overhead: phillip fracs are fixed fractions of a fixed
-            # num_envs, so each phillip's batch is CONSTANT across periods —
-            # one graph each, replayed forever. The measured collect
-            # bottleneck is per-frame launch overhead of many small
-            # forwards; cudagraph replay is the cure. Pool cost: 5 small
-            # shapes, within the N=320 headroom.
-            pol.sample = torch.compile(pol.sample, mode="reduce-overhead")
+        # no per-phillip compile: all tiers serve from the phillip GRID
+        # (one stacked hand-rolled-LSTM forward, captured there)
         phillips[tier] = (pol, frac, resolve_name_code(pnm, "Master Player"))
         print(f"phillip:{tier} <- {fname} ({frac:.0%} of envs)")
     fox = {}

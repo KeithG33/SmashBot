@@ -112,6 +112,59 @@ def encode_obs(obs: np.ndarray, self_slot: int = 0, opp_slot: int = 1):
     return _EMBED.from_state(obs_to_game(obs, self_slot, opp_slot))
 
 
+# ---- flat encoding (the dolphin worker's 3-tensor path, batched) ----
+# One encode + THREE host->GPU copies per frame; perspective swap is a
+# column permutation, per-group views are 3 row gathers + struct views
+# (encode.unflatten_typed_torch) instead of ~120 per-leaf launches each.
+from smashbot import encode as _encode  # noqa: E402
+
+_LAYOUT = _encode.layout_of(_DUMMY)
+_SWAP_PERM_NP = _encode.swap_perm(_DUMMY, _LAYOUT)
+
+
+def encode_flats(obs: np.ndarray) -> tuple:
+    """(bools[N,B], ints[N,I], floats[N,F]) numpy flats of the UNSWAPPED
+    (player-0 view) encoded frame."""
+    return _encode.flatten_typed_batched(
+        _EMBED.from_state(obs_to_game(obs)), len(obs))
+
+
+class FlatFrames:
+    """Device-side frame views built from the flats: student view, swapped
+    (opponent) view, and row-gathered sub-views — all views into three
+    tensors."""
+
+    _KINDS = ("bool", "int", "float")
+
+    def __init__(self, device):
+        import torch
+        self.device = device
+        self.perm = {
+            k: (None if p is None else torch.from_numpy(p).to(device))
+            for k, p in _SWAP_PERM_NP.items()
+        }
+
+    def to_device(self, flats_np: tuple) -> tuple:
+        import torch
+        return tuple(
+            torch.from_numpy(np.ascontiguousarray(a)).to(self.device, non_blocking=True)
+            for a in flats_np
+        )
+
+    def swap(self, flats: tuple) -> tuple:
+        return tuple(
+            t if self.perm[k] is None else t.index_select(-1, self.perm[k])
+            for k, t in zip(self._KINDS, flats)
+        )
+
+    def view(self, flats: tuple, rows=None, lead=None):
+        if rows is not None:
+            flats = tuple(t.index_select(0, rows) for t in flats)
+        if lead is not None:
+            flats = tuple(t.view(*lead, t.shape[-1]) for t in flats)
+        return _encode.unflatten_typed_torch(_DUMMY, _LAYOUT, *flats)
+
+
 # --------------------------------------------------------------- action side
 
 # A/B/X/Y/Z/L/R/D_UP -- our decoded controller and the sim's use the same set.
