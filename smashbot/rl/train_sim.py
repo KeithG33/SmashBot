@@ -138,6 +138,10 @@ class SimLeagueWorker:
             return self.trackers["imports"]
         return self.trackers["snapshots"]
 
+    def _on_event(self, env_i: int, gid: str, kind: str, percent: float) -> None:
+        tr = self._tracker_of(gid)
+        (tr.add_kill if kind == "kill" else tr.add_death)(percent)
+
     def _on_game(self, env_i: int, gid: str, s0: int, s1: int) -> None:
         if s0 != s1:  # ties never enter the PFSP ledger (dolphin's rule)
             self.lg.record(gid, s0 > s1)
@@ -253,7 +257,7 @@ class SimLeagueWorker:
             self.policy, opponents, N, cfg.unroll_length, cfg.data_dir,
             stages, char_pairs, name_code=self.name_code, device=self.device,
             record_fn=self._on_game, precision=cfg.rollout_precision,
-            grids=grids,
+            grids=grids, event_fn=self._on_event,
         )
 
     def maybe_repartition(self, step: int) -> bool:

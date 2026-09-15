@@ -147,7 +147,8 @@ class _Group:
 class MultiOpponentSimWorker:
     def __init__(self, student_policy, opponents, batch_size, unroll_length, data_dir,
                  stage, char_pairs, name_code=1, device="cpu", record_fn=None,
-                 precision="fp32", grid: PfspGrid | None = None, grids=()):
+                 precision="fp32", grid: PfspGrid | None = None, grids=(),
+                 event_fn=None):
         """opponents: list of (gid, policy, env_idx, harvest, name_code) —
         the per-policy groups (self + phillips). PFSP members ride in `grid`
         (a PfspGrid already assign()ed for this period) as one merged forward.
@@ -155,6 +156,10 @@ class MultiOpponentSimWorker:
         stage: one msl.Stage for all envs, or a per-env list (len == batch_size).
         record_fn(env_i, opponent_gid, student_stocks, opp_stocks): called on
         each decided game (terminal-frame stocks, student = player 0).
+        event_fn(env_i, opponent_gid, kind, percent): per kill/death event —
+        kind "kill" carries the OPPONENT's percent when the student took the
+        stock, "death" the student's own percent when it died (feeds
+        GameTracker.add_kill/add_death, the punish-quality panels).
         precision: BatchedPolicyAgent precision for every seat ("fp16" is the
         probe-validated rollout setting from v10)."""
         import melee_sim as msl
@@ -163,6 +168,7 @@ class MultiOpponentSimWorker:
         self.unroll = unroll_length
         self.device = device
         self.record_fn = record_fn
+        self.event_fn = event_fn
         # grids: any number of LeagueAgent-backed opponent grids (PFSP
         # slots, the phillip grid); `grid` kept as the single-grid alias
         self.grids = list(grids) + ([grid] if grid is not None else [])
@@ -328,6 +334,15 @@ class MultiOpponentSimWorker:
 
             # ---- rewards ----
             stocks, percent = _seat_stats(obs)         # [N,2] self,opp (player-0 view)
+            if self._prev is not None and self.event_fn is not None:
+                # kill/death events on the prev->current transition (reset
+                # frames excluded: the respawn fake-drop is not a stock take)
+                ps, pp = self._prev
+                live = ~reset_np
+                for i in np.nonzero(live & (stocks[:, 1] < ps[:, 1]))[0]:
+                    self.event_fn(int(i), self.env_opp[i], "kill", float(pp[i, 1]))
+                for i in np.nonzero(live & (stocks[:, 0] < ps[:, 0]))[0]:
+                    self.event_fn(int(i), self.env_opp[i], "death", float(pp[i, 0]))
             if self._prev is not None:
                 reward = compute_reward(
                     torch.as_tensor(self._prev[0]), torch.as_tensor(stocks),
