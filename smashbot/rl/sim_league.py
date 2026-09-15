@@ -204,6 +204,41 @@ class MultiOpponentSimWorker:
         self.env.configure_matches(cfgs)
         self.env.reset_all()
 
+    def reassign(self, new_env_idx: dict, char_pairs, stage) -> None:
+        """New period WITHOUT rebuilding agents: rebuilding makes the
+        cudagraph trees re-record (changed liveness between replays), which
+        grew the private pools +0.6 GiB per period and OOM'd the launch.
+        Group sizes are constant by construction, so a period is just:
+        remap env rows, reset every seat (the existing reset path clears
+        queues/hidden/prev), reconfigure matches. The grid must already be
+        assign()ed for this period. Assemblers keep their buffered tail —
+        the learner sees the boundary as a normal all-envs game reset
+        (is_resetting masks state and zeroes the boundary reward)."""
+        import melee_sim as msl
+        for g in self.groups:
+            idx = np.asarray(new_env_idx[g.gid], dtype=np.int64)
+            assert len(idx) == g.n, (g.gid, len(idx), g.n)
+            g.env_idx = idx
+            g.idx_t = torch.as_tensor(idx, device=self.device)
+            g._reset = np.ones(g.n, dtype=bool)
+        self._reset_mask = np.ones(self.N, dtype=bool)
+        self.env_opp = np.empty(self.N, dtype=object)
+        for g in self.groups:
+            self.env_opp[g.env_idx] = g.gid
+        if self.grid is not None:
+            for s in range(self.grid.S):
+                self.env_opp[self.grid.env_idx[s]] = self.grid.members[s]
+        covered = [g.env_idx for g in self.groups]
+        if self.grid is not None:
+            covered.append(self.grid.flat_env)
+        covered = np.concatenate(covered)
+        assert sorted(covered.tolist()) == list(range(self.N)), "reassign must partition all envs"
+        stages = stage if isinstance(stage, (list, tuple)) else [stage] * self.N
+        cfgs = [msl.MatchConfig(stage=s, players=(msl.PlayerConfig(a), msl.PlayerConfig(b)))
+                for s, (a, b) in zip(stages, char_pairs)]
+        self.env.configure_matches(cfgs)
+        self.env.reset_all()
+
     def collect(self, num_frames):
         ppo_out, imit_out = [], []
         env, dev, T = self.env, self.device, self.unroll

@@ -149,17 +149,6 @@ class SimLeagueWorker:
         msl = _msl()
         cfg = self.cfg
         N = cfg.num_envs
-        if self._worker is not None:
-            # release the old worker's agents (student KV alone is ~3.5 GiB
-            # at 496) BEFORE building the new ones — holding both sets alive
-            # double-allocates and OOMs the re-partition (the launch-day
-            # crash: first re-partition fired at the resume step itself)
-            self._worker.close()
-            self._worker = None
-            import gc
-            gc.collect()
-            import torch as _torch
-            _torch.cuda.empty_cache()
         self.part = self.lg.partition(N, self.rng,
                                       max_pfsp_members=cfg.max_pfsp_members)
         opponents = []
@@ -206,6 +195,26 @@ class SimLeagueWorker:
             char_pairs.append((student_c, opp_c))
             self._env_char.append(opp_c.name)
         stages = [self.rng.choice(list(msl.Stage)) for _ in range(N)]
+        if self._worker is not None:
+            # NEW PERIOD, SAME AGENTS: rebuilding made the cudagraph trees
+            # re-record (+0.6 GiB pools per period -> the 40025 OOM).
+            # Group sizes are constant, so remap in place. Falls through to
+            # a full rebuild only if the group structure actually changed
+            # (fresh-run league growth in the slot-fallback mode).
+            new_map = {gid: idx for (gid, _p, idx, _h, _nc) in opponents}
+            same = (grid is self._worker.grid
+                    and {g.gid for g in self._worker.groups} == set(new_map)
+                    and all(len(new_map[g.gid]) == g.n
+                            for g in self._worker.groups))
+            if same:
+                self._worker.reassign(new_map, char_pairs, stages)
+                return
+            print("re-partition: group structure changed — full rebuild",
+                  flush=True)
+            self._worker.close()
+            self._worker = None
+            import gc
+            gc.collect()
         from smashbot.rl.sim_league import MultiOpponentSimWorker
         self._worker = MultiOpponentSimWorker(
             self.policy, opponents, N, cfg.unroll_length, cfg.data_dir,
