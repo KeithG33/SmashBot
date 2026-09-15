@@ -380,6 +380,9 @@ def run(args) -> None:
     )
 
     state = learner.initial_state(scfg.num_envs, device)
+    torch.cuda.synchronize()
+    print(f"[vram] boot complete: alloc {torch.cuda.memory_allocated()/2**30:.2f} "
+          f"reserved {torch.cuda.memory_reserved()/2**30:.2f} GiB", flush=True)
     watcher = TeacherWatcher(args.runtime.teacher_watch or args.ckpt)
     teacher_swaps = 0
     t0 = time.time()
@@ -492,6 +495,11 @@ def run(args) -> None:
         fut_i = None
         for i in range(start_step, args.runtime.steps):
             trajectories = worker.collect(args.runtime.trajectories_per_step)
+            if i < start_step + 5 or os.environ.get("SMASHBOT_PROFILE"):
+                print(f"[vram] post-collect {i}: "
+                      f"alloc {torch.cuda.memory_allocated()/2**30:.2f} "
+                      f"peak {torch.cuda.max_memory_allocated()/2**30:.2f} "
+                      f"reserved {torch.cuda.memory_reserved()/2**30:.2f} GiB", flush=True)
             if fut is not None:
                 state, metrics = fut.result()
                 _post_step(fut_i, metrics)
