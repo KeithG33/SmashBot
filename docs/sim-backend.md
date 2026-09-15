@@ -1,11 +1,19 @@
 # Sim training backend (melee-sim-light)
 
-RL rollouts run on [melee-sim-light](https://github.com/kyhavlov/melee-sim-light)
-(a deterministic batched SSBM sim built on the decompilation) instead of the
-Dolphin fleet. **Training only** — watching, playing, tournaments, and eval
-stay on Dolphin; a sim-trained model transfers because the sim is ~1:1 parity
-with the game. The Dolphin RL path (`DolphinRolloutWorker` + `LeagueRuntime`)
-remains the proven fallback until a sim run has validated end-to-end.
+RL rollouts AND evaluation run on
+[melee-sim-light](https://github.com/kyhavlov/melee-sim-light) (a
+deterministic batched SSBM sim built on the decompilation). **Dolphin
+remains for humans only** — play.py and watch_live.py via eval/game.py —
+and serves as the final eyeball transfer check on sim-trained models.
+The Dolphin RL/eval fleet (DolphinRolloutWorker, env_process, league grid)
+was removed once training and eval both validated sim-side; git history
+has it.
+
+Eval tools (all sim, CPU-friendly, deterministic slates):
+  scripts/battery.py     student vs the phillip/fox slate, GameTracker stats
+  scripts/tournament.py  checkpoint round-robin, standings
+  scripts/h2h_vs_gm.py   the fixed 144-pair grid vs phillip-gm
+  smashbot/eval/sim_arena.py  the shared MatchSet engine
 
 ## Setup (once per machine)
 

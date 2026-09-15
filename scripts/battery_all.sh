@@ -64,9 +64,9 @@ for snap in "${targets[@]}"; do
     fi
     echo "[battery_all $(date +%H:%M:%S)] running battery on $snap"
     if OMP_NUM_THREADS=4 "$PY" "$ROOT/scripts/battery.py" \
-        --snapshot "$snap" \
+        --ckpt "$snap" \
         --config-from "$RUN_DIR/latest.pt" \
-        --device cpu; then
+        --device cpu --out "$out"; then
         ran=$((ran + 1))
     else
         failed=$((failed + 1))

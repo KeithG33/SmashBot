@@ -83,11 +83,11 @@ def test_spec_is_plain_data_and_picklable():
 
 
 def test_encode_module_never_imports_torch():
-    # everything an env process (and the __main__ it re-imports) touches
+    # cheap-import modules stay torch-free (fast CLI boot; nothing forks
+    # env processes anymore, but the property is worth keeping)
     code = (
         "import sys; import smashbot.encode, smashbot.rl.config, "
-        "smashbot.eval.dolphin_setup, smashbot.rl.env_process, "
-        "smashbot.rl.train_rl; "
+        "smashbot.eval.dolphin_setup, smashbot.rl.train_rl; "
         "print('torch' in sys.modules)"
     )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)

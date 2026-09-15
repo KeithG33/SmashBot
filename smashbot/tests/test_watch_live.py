@@ -13,7 +13,7 @@ import torch
 from smashbot import configs, embed as embed_lib, saving
 from smashbot.eval.agent import AsyncDelayedAgent
 from smashbot.policy import build_policy
-from smashbot.rl.pool import MAIN_12
+from smashbot.rl.config import MAIN_12
 
 _WATCH_PATH = (
     pathlib.Path(__file__).resolve().parents[2] / "scripts" / "watch_live.py"
