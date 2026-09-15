@@ -71,7 +71,8 @@ those numbers were retracted):
 
 | num_envs | micro_batches | fps (overlapped) | co-peak | reserved |
 |---:|---:|---:|---:|---:|
-| **480 (launch)** | **14** | **3,530** | **17.2 GiB** | stable |
+| **496 (launch)** | **14** | **3,585** | **~17.9 GiB** | stable |
+| 480 | 14 | 3,530 | 17.2 GiB | stable |
 | 448 (fallback) | 12 | 3,390 | 16.4 GiB | stable |
 | 512 | 14-16 | OOM at overlap co-peak | — | — |
 

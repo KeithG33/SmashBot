@@ -2,9 +2,9 @@
 # Sim-backend league run v11: resume v10 weights/optimizer/pfsp -> 100k steps.
 # Locked settings (2026-09-15, v10-parity grid serving, REAL-pool overlapped
 # measurements after the harness self_frac fix):
-#   num_envs 480 / micro_batches 14 -- 3,530 fps (1.6x v10's ~2,200),
-#     co-peak 17.2 GiB stable. 448/mb12 = 3,390 fps fallback. 512 OOMs
-#     at the overlap co-peak (needs the learner-state fp16 lever first).
+#   num_envs 496 / micro_batches 14 -- 3,585 fps (1.63x v10's ~2,200),
+#     co-peak ~17.9 GiB stable (ceiling ~20 per Keith's 2-3GB buffer).
+#     Fallbacks: 480/mb14=3,530, 448/mb12=3,390. 512 OOMs (needs learner-state fp16).
 #   leash: kl-teacher 0.025 flat (v10's final value, no decay)
 #   imitation: lambda 0.01 flat, all rows (imitation_rows=-1)
 #   pool: self 30% / phillips 35% (medium 4, plat 6, diamond 7, master 8,
@@ -38,7 +38,7 @@ exec /home/kage/smashbot_workspace/SmashBot/.venv/bin/python -m smashbot.rl.trai
   --learner.imitation-rows -1 \
   --learner.imitation-lambda 0.01 \
   --learner.imitation-lambda-final-frac 1.0 \
-  --sim.num-envs 480 \
+  --sim.num-envs 496 \
   --sim.unroll-length 240 \
   --sim.snapshot-interval 1500 \
   --sim.seed-snapshots-from $SHINE/runs/rl-pool-v10/snapshots \
