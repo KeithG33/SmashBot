@@ -38,6 +38,8 @@ def main():
     ap.add_argument("--n", type=int, default=8)
     ap.add_argument("--steps", type=int, default=300)
     ap.add_argument("--compile", action="store_true")
+    ap.add_argument("--precision", default="fp32", choices=["fp32", "bf16", "fp16"],
+                    help="autocast dtype for the forward (match the training precision)")
     ap.add_argument("--profile", action="store_true")
     # config-spec mode: build a random-init policy of a given architecture
     # instead of loading --ckpt (weights don't affect timing).
@@ -81,6 +83,10 @@ def main():
             lambda x: torch.from_numpy(np.ascontiguousarray(
                 x.astype(np.int64) if x.dtype.kind in "iu" else x)).to(device), enc)
     states = [state() for _ in range(4)]
+    import contextlib
+    ac = (contextlib.nullcontext() if args.precision == "fp32" else torch.autocast(
+        "cuda", dtype=torch.bfloat16 if args.precision == "bf16" else torch.float16))
+    ac.__enter__()
     resets = torch.zeros(args.n, dtype=torch.bool, device=device)
     for i in range(30):
         agent.step(states[i % 4], resets)
@@ -89,7 +95,8 @@ def main():
     for i in range(args.steps):
         agent.step(states[i % 4], resets)
     torch.cuda.synchronize()
-    print(f"[{label}] n={args.n} compile={args.compile}: {(time.perf_counter() - t0) / args.steps * 1e3:.3f} ms/step")
+    ac.__exit__(None, None, None)
+    print(f"[{label}] {args.precision} n={args.n} compile={args.compile}: {(time.perf_counter() - t0) / args.steps * 1e3:.3f} ms/step")
     if args.profile:
         pr = cProfile.Profile(); pr.enable()
         for i in range(100):
