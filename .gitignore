@@ -11,3 +11,4 @@ runs/
 scripts/tournament_results/
 scripts/battery_results/
 vendor/
+.claude/
