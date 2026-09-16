@@ -121,11 +121,29 @@ n=1 2.89 -> 3.01 (WORSE, +4%) | n=32 4.49 -> 4.37 | n=128 8.93 -> 7.75 (-13%)
 
 Still opt-in (`capture=False` default); nothing in training uses it yet.
 
-### Next, to collect the same win in the sim rollout
-1. Pass `capture=True` for the student agent in MultiOpponentSimWorker (400 rows).
-2. LeagueAgent already captures manually, but still carries its state in PYTHON
-   (`_captured_forward` does `tree.map_structure(copy_, self._in_hidden,
-   self._out_hidden)` every frame). Moving that carry INSIDE the captured graph
-   is the same fix and helps the PFSP grid, whose members are the student
-   architecture (160 cells x 255-frame window x 6 layers ~ 280 MB of state
-   copied per frame). The phillip grid is LSTM, so it gains little.
+### Collected in the sim rollout
+1. DONE: `SimRolloutConfig.capture_serving` (default True) passes `capture=True`
+   to the student agent and compiles `sample` without cudagraph trees. Parity at
+   the exact production config (400 rows, precision="fp16", 120 frames with
+   resets): bit-identical, 0.000e+00 on logits and carried state. GPU smoke of
+   the real SimLeagueWorker: runs, finite trajectories, queues invariant.
+2. NOT WORTH IT (measured): moving LeagueAgent's carry inside its captured graph
+   gained nothing (11.755 -> 11.725 ms at the 40x4 PFSP grid). Its python carry
+   was already a plain static-buffer copy, so the carry only MOVES — the copy
+   itself is 0.862 ms for 329 MiB at 745 GiB/s either way. The student won
+   because its clone was an ALLOCATION plus a copy, on top of inductor's
+   placeholder copies. Reverted (it also changes move_cell's target buffer,
+   i.e. risk for no gain).
+
+Phase split of the PFSP grid at 40x4 (LeagueAgent.infer): forward 11.1 ms
+(88%), record+to_cpu 1.35 ms, decode+queues 0.14 ms. GPU-bound, and the
+per-cell cost (69 us) is worse than the student's per-row cost (50 us) because
+a vmap over 40 separate weight sets is 40 skinny matmuls. Slice count is the
+throughput<->fallback knob; see the routing notes.
+
+### Remaining (unattempted)
+The student's capture still pays one in-graph carry copy (~2.3 ms at 400 rows).
+Removing it needs ping-pong buffers or in-place ring updates inside the manual
+graph (no functionalization there, so `index_copy_` is legal). The ring's
+non-canonical state layout is acceptable for SERVING state, which is never
+compared or checkpointed — unlike the learner's.

@@ -42,6 +42,12 @@ class SimRolloutConfig:
     unroll_length: int = 240
     data_dir: str = "/home/kage/drive2/ShineBot/msl-data"
     rollout_precision: str = "fp16"
+    # manual static-buffer CUDA-graph capture for the STUDENT forward: the
+    # graph carries the recurrent state in place instead of cloning it every
+    # frame. Measured -15.6% on the 400-row forward (23.9 -> 20.1 ms) and
+    # bit-identical outputs; requires compiling sample WITHOUT cudagraph
+    # trees (a graph cannot contain a graph).
+    capture_serving: bool = True
     # --- pool shares (fractions of num_envs) ---
     self_frac: float = 0.30       # of envs (row share 2s/(1+s))
     phillip_tiers: tuple[str, ...] = ("medium", "plat", "diamond", "master", "gm")
@@ -237,7 +243,8 @@ class SimLeagueWorker:
             record_fn=self._on_game, precision=cfg.rollout_precision,
             grids=[self._phillip_grid], event_fn=self._on_event,
             self_idx=self.part["self"], league=self.league, pfsp_grid=self._grid,
-            match_fn=self._match, max_frame=cfg.max_game_frames, seed=cfg.seed)
+            match_fn=self._match, max_frame=cfg.max_game_frames, seed=cfg.seed,
+            capture=cfg.capture_serving)
         self.rows = self._worker.rows
 
     def env_share(self) -> dict:
@@ -346,7 +353,11 @@ def run(args) -> None:
     if args.runtime.compile:
         import torch._dynamo
         torch._dynamo.config.recompile_limit = 128
-        serving_policy.sample = torch.compile(serving_policy.sample, mode="reduce-overhead")
+        # capture mode wraps this in our own CUDA graph, so compile for
+        # kernels only (cudagraph trees cannot nest inside a manual capture)
+        serving_policy.sample = torch.compile(
+            serving_policy.sample,
+            mode=None if scfg.capture_serving else "reduce-overhead")
 
     # ---- league ----
     snap_dir = f"{run_dir}/snapshots"
