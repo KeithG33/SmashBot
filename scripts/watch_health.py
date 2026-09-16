@@ -29,7 +29,7 @@ KEYS = [
     "rl/phillip/medium/win_rate_ema", "rl/phillip/plat/win_rate_ema",
     "rl/phillip/diamond/win_rate_ema", "rl/phillip/master/win_rate_ema",
     "rl/phillip/gm/win_rate_ema",
-    "rl/snapshots/imp9000", "rl/snapshots/imp10000", "rl/snapshots/s9500",
+    "rl/snapshots/imp9000", "rl/snapshots/imp10000", "rl/snapshots/imp9500",
     "rl/value_loss",
 ]
 
@@ -96,7 +96,7 @@ def main():
         if v < peak - 0.15:
             alerts.append(f"phillip:{tier} dropped {peak:.2f}->{v:.2f} (>0.15 off rolling max)")
         hi[k] = max(peak, v)
-    for imp in ("imp9000", "imp10000", "s9500"):
+    for imp in ("imp9000", "imp10000", "imp9500"):
         k = f"rl/snapshots/{imp}"
         v = recent(k, n=10)
         if v is None:
@@ -122,7 +122,7 @@ def main():
             for t in ("medium", "plat", "diamond", "master", "gm"))
         fox = " ".join(
             f"{i}:{recent(f'rl/snapshots/{i}', 5) or float('nan'):.2f}"
-            for i in ("imp9000", "imp10000", "s9500"))
+            for i in ("imp9000", "imp10000", "imp9500"))
         line = (f"step {step} | tKL {tkl:.4f} aKL {akl:.1e} imit {im:.3f} "
                 f"self {sw if sw is not None else float('nan'):.2f} | {phil} | {fox} | {fps:.0f} fps")
         print(("DIGEST " if args.digest else "OK ") + line)
