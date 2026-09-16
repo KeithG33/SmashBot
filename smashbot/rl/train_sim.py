@@ -210,6 +210,8 @@ class SimLeagueWorker:
                                     lambda k: self.lg.phillips[k.split(':', 1)[1]][0].state_dict())
             self._phillip_grid.agent._name[s] = self.lg.phillips[t][2]
         self._phillip_grid.assign_static(rows)
+        for t in tiers:   # weights live in the grid stack now; free the GPU copies
+            self.lg.phillips[t][0].to("cpu")
         print(f"phillip grid: {len(tiers)} tiers x {self._phillip_grid.Nc} cells "
               f"(delay {tmpl.delay})", flush=True)
         # --- PFSP grid: S slices x Nc cells with one slice's worth of slack
