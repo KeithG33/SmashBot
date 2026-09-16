@@ -79,3 +79,25 @@ static-buffer rework removes. LSTM @400 is 8.3 either way.
 
 The T==1 branch in SGUBlock.mix is load-bearing: forcing the conv path for all T
 costs 2.4x at n=400 (58.2 vs 23.9) and +30% at n=1.
+
+## SGU optimization campaign — everything tried (2026-09-16)
+
+| change | parity | ms @400 | verdict |
+|---|---|---:|---|
+| ring buffer, out-of-place `index_copy` | 1.9e-05 | 27.8 | no gain; state layout non-canonical -> reverted |
+| ring buffer, in-place `index_copy_` | 1.9e-05 | 28.2 | inductor functionalizes it back to a copy -> reverted |
+| `max-autotune` | n/a | 28.3 | no gain (bandwidth, not kernels) |
+| mask hoisted 6x -> 1x, window not materialized, contiguous caches | 0.00e+00 | 26.6 | KEPT (strictly less work; no speedup) |
+| drop the carried-state clone in BatchedPolicyAgent | — | — | torch REJECTS it: "accessing tensor output of CUDAGraphs that has been overwritten" -> reverted |
+| remove the T==1 branch (always conv) | — | 58.2 | 2.4x worse @400, +43% @32, +30% @1 -> branch KEPT |
+| T>1: conv vs unfold+einsum | 0.00e+00 | — | conv flat in T (0.19/0.13/0.13 ms at T=2/4/8) vs unfold linear (0.16/0.30/0.56) -> conv KEPT |
+
+Production-equivalent SGU 6/576 @400 is **23.9 ms** (one state clone), not the
+26-27 ms the bench default showed. Learner unroll B=32 T=240: 19.3 ms (80 us/frame).
+
+**Nothing further is available inside networks.py.** The one remaining lever is a
+manual static-buffer CUDA-graph capture of `policy.sample` in BatchedPolicyAgent
+(LeagueAgent already works this way): the state lives in static buffers the graph
+updates in place, removing the 3.4 ms/frame clone and the copies into the graph's
+input placeholders. Worth ~14%+ of the student forward; it touches the live
+serving path, so it wants its own branch and a lockstep parity run.

@@ -250,6 +250,13 @@ class BatchedPolicyAgent:
                     StateAction(state=states, action=prev, name=self._name),
                     self.hidden, is_resetting=reset_t, temperature=self.temperature,
                 )
+            # carried state MUST be cloned: with cudagraph trees the
+            # forward's output lives in the graph's pool and the next replay
+            # overwrites it (torch raises "accessing tensor output of
+            # CUDAGraphs that has been overwritten by a subsequent run" if
+            # you feed it straight back). Measured cost: 3.4 ms/frame at 400
+            # rows for the windowed cores, 0 for the LSTM. Removing it needs
+            # a manual static-buffer capture, as LeagueAgent does.
             self.hidden = tree.map_structure(
                 lambda t: t.clone() if isinstance(t, torch.Tensor) else t, hidden
             )
@@ -291,6 +298,13 @@ class BatchedPolicyAgent:
                 )
             # clones: retained across flushes / fed back next flush, and
             # compiled (cudagraph) replay reuses output buffers
+            # carried state MUST be cloned: with cudagraph trees the
+            # forward's output lives in the graph's pool and the next replay
+            # overwrites it (torch raises "accessing tensor output of
+            # CUDAGraphs that has been overwritten by a subsequent run" if
+            # you feed it straight back). Measured cost: 3.4 ms/frame at 400
+            # rows for the windowed cores, 0 for the LSTM. Removing it needs
+            # a manual static-buffer capture, as LeagueAgent does.
             self.hidden = tree.map_structure(
                 lambda t: t.clone() if isinstance(t, torch.Tensor) else t, hidden
             )
