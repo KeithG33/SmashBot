@@ -502,10 +502,7 @@ class SGUBlock(nn.Module):
             # serving: never materialize the [B, W, d] window. The grouped
             # conv with one output position is a per-channel weighted sum,
             # so the cache and the current frame can be reduced separately
-            # and the next cache is one contiguous shift. This branch is
-            # worth keeping: measured 2.4x at n=400 (23.9 vs 58.2 ms) and
-            # +30% at n=1 — cuDNN handles kernel=W, groups=d, one output
-            # position badly.
+            # and the next cache is one contiguous shift.
             w = self.spatial.weight.squeeze(1)  # [d, W]
             v_mixed = (
                 (v_cache * w[:, : W - 1].t()).sum(dim=1)

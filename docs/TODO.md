@@ -101,3 +101,31 @@ manual static-buffer CUDA-graph capture of `policy.sample` in BatchedPolicyAgent
 updates in place, removing the 3.4 ms/frame clone and the copies into the graph's
 input placeholders. Worth ~14%+ of the student forward; it touches the live
 serving path, so it wants its own branch and a lockstep parity run.
+
+## DONE: manual static-buffer capture in BatchedPolicyAgent (2026-09-16)
+`BatchedPolicyAgent(capture=True)` records one `policy.sample` into a manual
+CUDA graph over static input buffers, and the graph's last op copies the new
+recurrent state back into the buffer it read from. No per-frame clone, no
+placeholder copies. `policy.sample` must be uncompiled or compiled WITHOUT
+cudagraph trees (`torch.compile(fn)` default mode) — a graph inside a graph is
+not capturable.
+
+Parity: bit-identical (0.000e+00 on logits AND carried state) over 150 frames
+with resets exercised inside the graph, against the clone path running the same
+compiled kernels.
+
+Measured (scaled SGU bf16, --no-snapshot), trees+clone -> capture:
+n=1 2.89 -> 3.01 (WORSE, +4%) | n=32 4.49 -> 4.37 | n=128 8.93 -> 7.75 (-13%)
+| n=400 23.87 -> 20.15 (-15.6%). LSTM @400 8.63 -> 8.29 (tiny state, as expected).
+=> enable for the rollout batch, NOT for the batch-1 play path.
+
+Still opt-in (`capture=False` default); nothing in training uses it yet.
+
+### Next, to collect the same win in the sim rollout
+1. Pass `capture=True` for the student agent in MultiOpponentSimWorker (400 rows).
+2. LeagueAgent already captures manually, but still carries its state in PYTHON
+   (`_captured_forward` does `tree.map_structure(copy_, self._in_hidden,
+   self._out_hidden)` every frame). Moving that carry INSIDE the captured graph
+   is the same fix and helps the PFSP grid, whose members are the student
+   architecture (160 cells x 255-frame window x 6 layers ~ 280 MB of state
+   copied per frame). The phillip grid is LSTM, so it gains little.

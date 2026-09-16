@@ -43,6 +43,8 @@ def main():
     ap.add_argument("--precision", default="fp32", choices=["fp32", "bf16", "fp16"],
                     help="autocast dtype for the forward (match the training precision)")
     ap.add_argument("--profile", action="store_true")
+    ap.add_argument("--capture", action="store_true",
+                    help="manual static-buffer CUDA graph (no per-frame state clone)")
     ap.add_argument("--no-snapshot", action="store_true",
                     help="skip the chunk-boundary state clone (production takes "
                          "it every unroll_length frames, not every frame)")
@@ -79,8 +81,11 @@ def main():
     policy.requires_grad_(False)
     policy.eval()
     if args.compile:
-        policy.sample = torch.compile(policy.sample, mode=args.compile_mode)
-    agent = BatchedPolicyAgent(policy, args.n, name_code=1, device=device, batch_steps=1)
+        # a manual graph cannot contain cudagraph trees: compile for kernels only
+        policy.sample = torch.compile(
+            policy.sample, mode=None if args.capture else args.compile_mode)
+    agent = BatchedPolicyAgent(policy, args.n, name_code=1, device=device,
+                               batch_steps=1, capture=args.capture)
     game = embed_lib.EmbedConfig().make_game_embedding()
     rng = np.random.default_rng(0)
 
