@@ -2,7 +2,9 @@
 # Sim-backend league run v11: resume v10 weights/optimizer/pfsp -> 100k steps.
 # Locked settings (2026-09-15, v10-parity grid serving, REAL-pool overlapped
 # measurements after the harness self_frac fix):
-#   345 envs = 449 learner rows (self 30% of envs, both seats) / 60 pfsp slices / mb 12,
+#   345 envs = 449 learner rows (self 30% of envs, both seats) / 48 pfsp slices / mb 24
+#   (the real first learner step needs ~4 GiB more than the harness measures: 21.4 GiB
+#    at mb12/60 slices -> OOM; unattributed, sized to the real number),
 #     co-peak ~17.9 GiB stable (ceiling ~20 per Keith's 2-3GB buffer).
 #     Fallbacks: 480/mb14=3,530, 448/mb12=3,390. 512 OOMs (needs learner-state fp16).
 #   leash: kl-teacher 0.025 flat (v10's final value, no decay)
@@ -34,7 +36,7 @@ exec /home/kage/smashbot_workspace/SmashBot/.venv/bin/python -m smashbot.rl.trai
   --runtime.checkpoint-interval 25 \
   --learner.learning-rate 3e-5 \
   --learner.precision fp16 \
-  --learner.micro-batches 12 \
+  --learner.micro-batches 24 \
   --learner.kl-teacher-weight 0.025 \
   --learner.kl-teacher-weight-final -1 \
   --learner.entropy-weight 1e-4 \
@@ -42,6 +44,7 @@ exec /home/kage/smashbot_workspace/SmashBot/.venv/bin/python -m smashbot.rl.trai
   --learner.imitation-lambda 0.01 \
   --learner.imitation-lambda-final-frac 1.0 \
   --sim.num-envs 345 \
+  --sim.pfsp-slices 48 \
   --sim.unroll-length 240 \
   --sim.snapshot-interval 1500 \
   --sim.seed-snapshots-from $SHINE/runs/rl-pool-v10/snapshots \
