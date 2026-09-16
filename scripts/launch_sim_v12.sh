@@ -17,7 +17,7 @@ exec /home/kage/smashbot_workspace/SmashBot/.venv/bin/python -m smashbot.rl.trai
   --backend sim \
   --ckpt $SHINE/models/rl-v4-teacher-frozen-ev07736.pt \
   --runtime.device cuda \
-  --runtime.run-dir $SHINE/runs --runtime.tag rl-sim-v12 \
+  --runtime.run-dir $SHINE/runs --runtime.tag rl-sim-v12 --runtime.wandb-id rl-sim-v12b \
   --runtime.restore "$(
     [ -f $SHINE/runs/rl-sim-v12/latest.pt ] \
       && echo auto \
