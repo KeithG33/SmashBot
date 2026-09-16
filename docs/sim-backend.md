@@ -66,7 +66,7 @@ by porting the v5 design above.)
 ## Launch
 
 `scripts/launch_sim_v12.sh` — fresh run from v10 weights → 100k. Shares of
-envs: self 30% (both seats are learner rows) / phillips 30% / PFSP 40%
+envs: self 30% (both seats are learner rows) / phillips 35% / PFSP 35%
 (the 30 hardest v10 ghosts from 17k+ plus imp9000/imp10000/imp9500), 60
 PFSP slices, snapshots every 1500. Seeds the run's snapshot dir from v10
 (symlinks + pfsp.json with ghost keys rewritten).

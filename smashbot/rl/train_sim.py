@@ -34,9 +34,10 @@ _MSL_CHAR = {
 class SimRolloutConfig:
     # learner rows = num_envs + self envs (each self env feeds BOTH seats,
     # v10's layout); rows are the VRAM budget: 345 envs @ self_frac .30
-    # = 449 rows. Shares are of ENVS: self 30 / phillips 30 / pfsp 40 ->
-    # rows self 46% / phillips 23% / pfsp 31% (Keith, 2026-09-15: fewer
-    # PFSP envs per slice is what keeps the per-match draw honest)
+    # = 449 rows. Shares are of ENVS: self 30 / phillips 35 / pfsp 35 ->
+    # rows self 46% / phillips 27% / pfsp 27%; 120 pfsp envs over 60
+    # slices = 2.0 games per loaded brain (fewer games per slice is what
+    # keeps the per-match draw honest)
     num_envs: int = 345
     unroll_length: int = 240
     data_dir: str = "/home/kage/drive2/ShineBot/msl-data"
@@ -44,7 +45,7 @@ class SimRolloutConfig:
     # --- pool shares (fractions of num_envs) ---
     self_frac: float = 0.30       # of envs (row share 2s/(1+s))
     phillip_tiers: tuple[str, ...] = ("medium", "plat", "diamond", "master", "gm")
-    phillip_fracs: tuple[float, ...] = (0.0343, 0.0514, 0.06, 0.0686, 0.0857)  # 30% total
+    phillip_fracs: tuple[float, ...] = (0.04, 0.06, 0.07, 0.08, 0.10)  # 35% of envs
     # everything left after self+phillips (~35%) is the PFSP pool
     # names match v10's ledger keys (import:imp9000/imp10000/imp9500) so
     # their payoff rows carry over on a seeded run
@@ -55,8 +56,8 @@ class SimRolloutConfig:
     )
     # PFSP grid weight slices = resident members. v10 ran 36 slices x 4
     # cells so a per-match draw usually found its member resident; each
-    # fp16 slice is ~54 MB; 60 slices for 138 pfsp envs = 2.3 envs/slice,
-    # the knee where per-match draws find an empty slice (v10: 2.6) —
+    # fp16 slice is ~54 MB; 60 slices for 120 pfsp envs = 2.0 envs/slice,
+    # past the knee where per-match draws find an empty slice (v10: 2.6) —
     # simulated 0% fallback on the curated league; watch rl/league/*
     pfsp_slices: int = 60
     max_game_frames: int = 28800  # Melee's 8-minute timer (60 fps)
