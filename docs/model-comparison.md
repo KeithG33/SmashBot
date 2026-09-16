@@ -4,15 +4,15 @@ Imitation-learning (behavior-cloning) architecture comparison. Metric is
 `eval/best_policy_loss` (policy cross-entropy, lower = better). Inference latency
 measured with cudagraph compilation (the setting we run) on GPU, in ms per call.
 
-| Architecture            | Steps         | L / H  | Batch | Params | Eval Ploss        | ms @1 | ms @32 |
-|-------------------------|--------------:|:------:|------:|-------:|:-----------------:|------:|-------:|
-| Transformer             | 30k           | 4/512  | 512   | 14.3M  | 0.907             | 2.85  | 4.90   |
-| SGU                     | 30k           | 4/512  | 512   | 14.3M  | 0.909             | 2.79  | 3.80   |
-| ffw+lstm                | 30k           | 3/512  | 512   | 11.3M  | 0.923             | 4.38  | 4.56   |
-|                         |               |        |       |        |                   |       |        |
-| SGU (scaled)  | 30k/100k/1.8M | 6/576  | 512   | 25.7M  | 0.873/0.829/0.774 | 3.18  | 4.61   |
-| Transformer (scaled)    | 30k/100k      | 6/576  | 352*   | 25.9M  | 0.887/0.867       | 3.39  | 7.42   |
-| ffw+lstm (Phillip)      | 30k/100k      | 3/768  | 512   | 23.9M  | 0.936/0.904       | 4.43  | 7.32   |
+| Architecture            | Steps         | L / H  | Batch | Params | Eval Ploss        | ms @1 | ms @32 | ms @128 |
+|-------------------------|--------------:|:------:|------:|-------:|:-----------------:|------:|-------:|--------:|
+| Transformer             | 30k           | 4/512  | 512   | 14.3M  | 0.907             | 2.85  | 4.90   | 11.40   |
+| SGU                     | 30k           | 4/512  | 512   | 14.3M  | 0.909             | 2.79  | 3.80   | 6.75    |
+| ffw+lstm                | 30k           | 3/512  | 512   | 11.3M  | 0.923             | 4.38  | 4.56   | 4.86    |
+|                         |               |        |       |        |                   |       |        |         |
+| SGU (scaled)  | 30k/100k/1.8M | 6/576  | 512   | 25.7M  | 0.873/0.829/0.774 | 3.18  | 4.61   | 9.33    |
+| Transformer (scaled)    | 30k/100k      | 6/576  | 352*   | 25.9M  | 0.887/0.867       | 3.39  | 7.42   | —       |
+| ffw+lstm (Phillip)      | 30k/100k      | 3/768  | 512   | 23.9M  | 0.936/0.904       | 4.43  | 7.32   | —       |
 
 \* Largest batch that fit in memory  
 <br>
@@ -45,6 +45,13 @@ jigglypuff, cptfalcon, peach, yoshi, popo, luigi, pikachu, samus).
   the replay/launch cost. They diverge at any real batch, and the gap *widens*:
   transformer/SGU = 4.9/3.8ms @32 (+29%), 11.4/6.7ms @128 (+69%). SGU is genuinely
   faster once you're batching; only n=1 hides it.
+- **@128 caveat (2026-09-16):** the small ffw+lstm is the *fastest* of its block
+  at n=128 (4.86ms — its LSTM runs eager via cuDNN, which scales well with batch,
+  while the compiled SGU/Transformer costs grow with rows). The sim backend now
+  serves the student at ~400 rows per forward, so the latency ranking that picked
+  SGU (measured at the Dolphin-era n=32) should be re-measured at rollout-scale
+  batches. The two missing @128 cells (scaled Transformer, Phillip-size ffw+lstm)
+  need an idle GPU.
 - **Params are near-identical but NOT equal.** Transformer 4/512 = 14,267,250;
   SGU 4/512 = 14,268,786 (1,536 apart). Different architectures (`TransformerCore`
   vs `SGUCore`), coincidentally within 0.01% at this size — both just round to 14.3M.
