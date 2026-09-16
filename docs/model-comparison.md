@@ -12,7 +12,7 @@ measured with cudagraph compilation (the setting we run) on GPU, in ms per call.
 |                         |               |        |       |        |           |                   |       |        |         |
 | SGU (scaled)  | 30k/100k | 6/576  | 512   | 25.7M  | bf16      | 0.873/0.829 | 3.18  | 4.61   | 9.33    |
 | Transformer (scaled)    | 30k/100k      | 6/576  | 352*   | 25.9M  | bf16      | 0.887/0.867       | 3.39  | 7.42   | —       |
-| ffw+lstm (Phillip)      | 30k/100k      | 3/768  | 512   | 23.9M  | bf16      | 0.936/0.904       | 4.43  | 7.32   | —       |
+| ffw+lstm (Phillip)      | 30k/100k      | 3/768  | 512   | 23.9M  | bf16      | 0.936/0.904       | —     | —      | —       |
 | ffw+lstm (Phillip) fp32 | 30k/100k      | 3/768  | 512   | 23.9M  | fp32      | pending           | —     | —      | —       |
 
 \* Largest batch that fit in memory  
