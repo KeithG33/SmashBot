@@ -71,33 +71,12 @@ envs: self 30% (both seats are learner rows) / phillips 35% / PFSP 35%
 PFSP slices, snapshots every 1500. Seeds the run's snapshot dir from v10
 (symlinks + pfsp.json with ghost keys rewritten).
 
-## Memory + throughput (RTX 3090, 24 GB — scripts/measure_sim_footprint.py)
+## Memory + throughput
 
-Serving is v10's league stack ported to the sim: one swapped-view encode +
-GPU tree-slices; PFSP slots on ONE LeagueAgent grid (stacked fp16 weights +
-fp16 carried state, captured vmap forward, in-place load_slice on member
-swap); phillips on 5 constant-shape reduce-overhead graphs (their LSTM has
-no vmap rule); self on the student's compiled graph; vectorized [N,13] row
-controller writes. fp16 opponent state verified BIT-IDENTICAL to fp32
-storage over a 300-frame lockstep stream (scripts/check_fp16_state.py) —
-the forward computes fp16 under autocast either way.
+Measure with the REAL run, never a harness (a re-implemented loop drifted
+from the launch path three times and caused a launch OOM): run the launch
+script with `--runtime.steps <start+6> --runtime.wandb-mode disabled` and
+read the `[vram]` lines (first sequential learner step peak, then the
+overlapped steps' peak/reserved) and the `fps` in the step ticker.
 
-REAL-pool overlapped measurements (`--overlap` = the actual training
-pipeline; an earlier harness bug had collapsed the pool to pfsp-only and
-those numbers were retracted):
-
-| num_envs | micro_batches | fps (overlapped) | co-peak | reserved |
-|---:|---:|---:|---:|---:|
-| **496 (launch)** | **14** | **3,585** | **~17.9 GiB** | stable |
-| 480 | 14 | 3,530 | 17.2 GiB | stable |
-| 448 (fallback) | 12 | 3,390 | 16.4 GiB | stable |
-| 512 | 14-16 | OOM at overlap co-peak | — | — |
-
-v10's Dolphin backend ran ~2,200 fps at 283 envs — 448 is 1.54x that with
-the full pool (self 139 / phillips 157 / 8 grid slots x 19).
-
-To unlock 512+: the learner's carried policy/teacher recurrent states
-(fp32, ~7 MB/env each) are the remaining batch-proportional term — storing
-them fp16 needs a precision-probe pass (they enter loss computation, unlike
-opponent state). The self-play opponent seat's fp32 KV is also convertible
-under the (now-verified) opponent-state argument.
+v12 (345 envs = 449 rows, 48 pfsp slices, mb 24): see the launch log.

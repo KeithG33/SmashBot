@@ -515,6 +515,13 @@ def run(args) -> None:
             if fut is not None:
                 state, metrics = fut.result()
                 _post_step(fut_i, metrics)
+                if fut_i < start_step + 6:
+                    # the footprint measurement IS the real run: launch with
+                    # --runtime.steps <start+6> --runtime.wandb-mode disabled
+                    print(f"[vram] overlapped step {fut_i}: "
+                          f"peak {torch.cuda.max_memory_allocated()/2**30:.2f} "
+                          f"reserved {torch.cuda.memory_reserved()/2**30:.2f} GiB",
+                          flush=True)
             _pre_step(i)  # θ final: previous update joined
             _publish()
             if i == start_step:
@@ -525,12 +532,12 @@ def run(args) -> None:
                     trajectories, state,
                     progress=i / max(1, args.runtime.steps))
                 _post_step(i, metrics)
-                torch.cuda.empty_cache()
                 torch.cuda.synchronize()
-                print(f"[vram] post-first-step: "
-                      f"alloc {torch.cuda.memory_allocated()/2**30:.2f} "
+                print(f"[vram] first learner step: "
+                      f"peak {torch.cuda.max_memory_allocated()/2**30:.2f} "
                       f"reserved {torch.cuda.memory_reserved()/2**30:.2f} GiB",
                       flush=True)
+                torch.cuda.empty_cache()
                 continue
             ready = torch.cuda.Event()
             ready.record()
