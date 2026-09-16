@@ -19,8 +19,8 @@ import json
 import math
 import os
 
-RUN = "keithg33/shinebot/rl-sim-v11"
-STATE = "/home/kage/drive2/ShineBot/runs/rl-sim-v11/health_state.json"
+RUN = "keithg33/shinebot/rl-sim-v12"
+STATE = "/home/kage/drive2/ShineBot/runs/rl-sim-v12/health_state.json"
 
 KEYS = [
     "rl/teacher_kl", "rl/actor_kl_mean", "rl/reverted",

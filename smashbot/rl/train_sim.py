@@ -1,14 +1,12 @@
 """Sim-backend RL training driver: melee-sim-light rollouts + the existing
 PPO learner. Reached via `train_rl --backend sim`; reuses train_rl's learner,
-checkpoint schema, teacher watcher, and overlap pipeline, but replaces the
-Dolphin fleet with SimLeague + MultiOpponentSimWorker.
+checkpoint schema and overlap pipeline over SimLeague + MultiOpponentSimWorker.
 
-Pool design (locked): fixed self-play (no harvest) / 5 fixed phillip tiers
-(harvest, medium 4% < plat 6% < diamond 7% < master 8% < gm 10%) / PFSP pool
-(v10 snapshots + top-3 fox imports, harvest). Coarse re-partition every
-`repartition_interval` learner steps — within a period each env keeps its
-opponent, so a game reset only resets hidden state (no cross-group state
-migration).
+Pool design (locked): self-play (both seats are learner rows, no harvest) /
+5 fixed phillip tiers (harvest, medium 4% < plat 6% < diamond 7% < master 8%
+< gm 10%) / PFSP pool (v10 snapshots + top-3 fox imports, harvest, drawn PER
+MATCH with replacement and routed on the PFSP grid at each env's own game
+boundary — rl/league.py). Env layout is static; every game runs to its end.
 
 Logging: `rl/phillip/{tier}/*` per fixed tier, fox imports under
 `rl/snapshots/{name}` (they sit in the PFSP ledger next to the ghosts),
@@ -34,12 +32,15 @@ _MSL_CHAR = {
 
 @dataclasses.dataclass
 class SimRolloutConfig:
-    num_envs: int = 320          # measured 3090 ceiling w/ headroom (mb 6)
+    # learner rows = num_envs + self envs (each self env feeds BOTH seats,
+    # v10's layout); rows are the VRAM budget: 381 envs @ self_frac .176
+    # = 448 rows with the v10-era 30/35/35 self/phillip/pfsp ROW mix
+    num_envs: int = 381
     unroll_length: int = 240
     data_dir: str = "/home/kage/drive2/ShineBot/msl-data"
     rollout_precision: str = "fp16"
     # --- pool shares (fractions of num_envs) ---
-    self_frac: float = 0.30
+    self_frac: float = 0.176      # of envs; row share = 2s/(1+s) = 0.30
     phillip_tiers: tuple[str, ...] = ("medium", "plat", "diamond", "master", "gm")
     phillip_fracs: tuple[float, ...] = (0.04, 0.06, 0.07, 0.08, 0.10)
     # everything left after self+phillips (~35%) is the PFSP pool
@@ -50,17 +51,30 @@ class SimRolloutConfig:
         f"imp10000:{MODELS}/rl-best-step0010000-phillip56.pt",
         "s9500:/home/kage/drive2/ShineBot/runs/rl-pool-v3/snapshots/snapshot-0009500.pt",
     )
-    max_pfsp_members: int = 8    # distinct resident PFSP policies per period
-    repartition_interval: int = 25  # learner steps between coarse re-partitions
+    # PFSP grid weight slices = resident members. v10 ran 36 slices x 4
+    # cells so a per-match draw usually found its member resident; each
+    # fp16 slice is ~54 MB; 48 (~5 cells each, draining slices reload for
+    # fresh draws) measured 21.6 GiB reserved at 448 rows and ~25%
+    # fallbacks on the curated league — watch rl/league/fallback_rate
+    pfsp_slices: int = 48
+    max_game_frames: int = 28800  # Melee's 8-minute timer (60 fps)
     # --- PFSP / snapshots (v10 values) ---
     pfsp_hard_frac: float = 0.25
     pfsp_explore: float = 0.075
     snapshot_interval: int = 1500  # snapshots are kept forever (SimLeague keep=0)
-    # seed a fresh run's snapshot dir from a previous run (symlinks + pfsp.json)
+    # seed a fresh run's snapshot dir from a previous run (symlinks + pfsp.json),
+    # curated: ghosts before seed_min_step dropped, 500-step spacing thinned
+    # to seed_thin_step below seed_thin_until (adjacent ghosts are near
+    # duplicates), ghosts the student already beats >= seed_max_winrate
+    # dropped — fewer members keep the PFSP grid's fallback rate low
     seed_snapshots_from: str = ""
+    seed_min_step: int = 17000
+    seed_thin_step: int = 1000
+    seed_thin_until: int = 30000
+    seed_max_winrate: float = 0.72
     # --- matches ---
     char_whitelist: tuple[str, ...] = tuple(_MSL_CHAR)  # uniform MAIN_12
-    partition_seed: int = 0
+    seed: int = 0                 # match draws (chars/stage/ports/engine seed)
 
 
 def _msl():
@@ -68,44 +82,54 @@ def _msl():
     return msl
 
 
-def _seed_snapshots(dst_dir: str, src_dir: str) -> None:
+def _seed_snapshots(dst_dir: str, src_dir: str, min_step: int = 0,
+                    thin_step: int = 0, thin_until: int = 0,
+                    max_winrate: float = 1.0) -> None:
     """Symlink a previous run's snapshots + carry its pfsp.json into a fresh
-    snapshot dir, so SnapshotPool adopts the archive and payoff on boot.
-    Ghost payoff keys are absolute snapshot paths — rewritten to the new dir
-    (else the resumed pool drops every ghost's winrate)."""
+    snapshot dir (SnapshotPool adopts archive + payoff on boot), curated by
+    step and ledger winrate. Ghost payoff keys are absolute snapshot paths —
+    rewritten to the new dir (else every ghost's winrate is dropped)."""
     import json
+    from smashbot.rl.pool import SnapshotPool
     os.makedirs(dst_dir, exist_ok=True)
     if any(f.endswith(".pt") for f in os.listdir(dst_dir)):
         return  # already populated (resumed run)
-    n = 0
     src_dir = os.path.abspath(src_dir)
-    for f in sorted(os.listdir(src_dir)):
-        if f.endswith(".pt"):
-            os.symlink(os.path.join(src_dir, f), os.path.join(dst_dir, f))
-            n += 1
+    src = SnapshotPool(src_dir, keep=0, pfsp=True)
+    src.payoff_autosave = False
+    kept, dropped = [], []
+    for g in src.archive:
+        st = src._step_of(g)
+        ok = (st >= min_step and src.win_estimate(g) < max_winrate
+              and not (thin_step and st < thin_until and st % thin_step))
+        (kept if ok else dropped).append(g)
+    for g in kept:
+        os.symlink(g, os.path.join(dst_dir, os.path.basename(g)))
     pfsp = os.path.join(src_dir, "pfsp.json")
     k = 0
     if os.path.exists(pfsp):
         with open(pfsp) as fh:
             payoff = json.load(fh)
-        remapped = {
-            (os.path.join(dst_dir, os.path.basename(key))
-             if os.path.dirname(key) == src_dir else key): v
-            for key, v in payoff.items()
-        }
+        keep_paths = set(kept)
+        remapped = {}
+        for key, v in payoff.items():
+            if os.path.dirname(key) == src_dir:
+                if key not in keep_paths:
+                    continue
+                key = os.path.join(dst_dir, os.path.basename(key))
+            remapped[key] = v
         k = len(remapped)
         with open(os.path.join(dst_dir, "pfsp.json"), "w") as fh:
             json.dump(remapped, fh)
-    print(f"seeded {n} snapshots + {k} payoff entries from {src_dir}", flush=True)
+    print(f"seeded {len(kept)} snapshots (dropped {len(dropped)}: step<{min_step}, "
+          f"thinned to {thin_step} below {thin_until}, winrate>={max_winrate}) "
+          f"+ {k} payoff entries from {src_dir}", flush=True)
 
 
 class SimLeagueWorker:
-    """Owns the SimLeague + the current-period MultiOpponentSimWorker.
-
-    collect(n) matches DolphinRolloutWorker's contract: run until n PPO
-    chunks are assembled, return them with harvested imitation chunks
-    appended. maybe_repartition(step) rebuilds the worker on period
-    boundaries (envs reset; opponents re-drawn; PFSP re-sampled)."""
+    """Owns the SimLeague, the static env layout, both opponent grids and
+    the per-match PFSP routing (rl/league.League). collect(n) runs until n
+    PPO chunks are assembled, imitation chunks appended."""
 
     def __init__(self, cfg: SimRolloutConfig, league, serving_policy,
                  name_code: int, device: str):
@@ -114,14 +138,8 @@ class SimLeagueWorker:
         self.policy = serving_policy
         self.name_code = name_code
         self.device = device
-        self.rng = random.Random(cfg.partition_seed)
-        self._worker = None
-        self._grid = None                # persistent PFSP grid (captured graph)
-        self._phillip_grid = None        # persistent phillip grid (5 tiers)
-        self._env_char = None            # per-env opponent char name (for trackers)
-        self.part: dict = {}
+        self.rng = random.Random(cfg.seed)
         from smashbot.rl.rollouts import GameTracker
-        # tracker per logging class; phillip tiers get their own
         self.trackers = {
             "self": GameTracker(),
             "snapshots": GameTracker(),
@@ -130,7 +148,6 @@ class SimLeagueWorker:
         }
         self._build()
 
-    # ---- period lifecycle ----
     def _tracker_of(self, gid: str):
         if gid == "self" or gid.startswith("phillip:"):
             return self.trackers[gid]
@@ -143,139 +160,114 @@ class SimLeagueWorker:
         (tr.add_kill if kind == "kill" else tr.add_death)(percent)
 
     def _on_game(self, env_i: int, gid: str, s0: int, s1: int) -> None:
-        if s0 != s1:  # ties never enter the PFSP ledger (dolphin's rule)
+        if s0 != s1:  # ties never enter the PFSP ledger
             self.lg.record(gid, s0 > s1)
-        # char-LOCKED members (fox imports) are excluded from by_char, as in
-        # the dolphin worker: a locked member ties its character's column to
-        # its own strength
-        char = None if gid.startswith("import:") else self._env_char[env_i]
+        # char-locked members (fox imports) stay out of by_char: a locked
+        # member ties its character's column to its own strength
+        char = None if gid.startswith("import:") else self._worker.game_info[env_i]
         self._tracker_of(gid).add_game((s0, s1), char)
+
+    def _match(self, env_i: int, member: str):
+        """The next match for env_i vs `member`: uniform chars (FOX lock for
+        imports), uniform stage, student on port 1 or 2 at random (v10:
+        cancels port priority in aggregate), fresh engine seed, 8-min timer."""
+        msl = _msl()
+        student_c = self.rng.choice(self._chars)
+        opp_c = msl.Character.FOX if member.startswith("import:") else self.rng.choice(self._chars)
+        stage = self.rng.choice(self._stages)
+        sp = self.rng.randrange(2)
+        cfg = msl.MatchConfig(
+            stage=stage,
+            players=(msl.PlayerConfig(student_c, controller_port=sp),
+                     msl.PlayerConfig(opp_c, controller_port=1 - sp)),
+            seed=self.rng.getrandbits(31), max_frame=self.cfg.max_game_frames)
+        return cfg, opp_c.name
 
     def _build(self) -> None:
         msl = _msl()
         cfg = self.cfg
         N = cfg.num_envs
-        self.part = self.lg.partition(N, self.rng,
-                                      max_pfsp_members=cfg.max_pfsp_members)
-        opponents = []
-        pfsp = []                        # [(key, env_rows)] for the PFSP grid
-        phillip = []                     # [(key, env_rows)] for the phillip grid
-        for key, idx in self.part.items():
-            if key == "self":
-                pol, nc = self.lg.get(key)
-                opponents.append((key, pol, idx, False, nc))
-            elif key.startswith("phillip:"):
-                phillip.append((key, idx))
-            else:
-                pfsp.append((key, idx))
-        from smashbot.rl.sim_league import PfspGrid, make_reencoder
-        grids = []
-        # --- phillip grid: all 5 tiers on ONE stacked forward (their LSTM
-        # steps via the hand-rolled cell — cuDNN has no vmap rule). Slices
-        # are padded to the largest tier; members never change.
-        if phillip:
-            phillip.sort(key=lambda kv: kv[0])          # stable slice order
-            if self._phillip_grid is None:
-                tiers = [k.split(":", 1)[1] for k, _ in phillip]
-                tmpl = self.lg.phillips[tiers[0]][0]
-                for m in tmpl.modules():
-                    if type(m).__name__ == "RecurrentWrapper":
-                        m.manual_step = True
-                stu_embed = self.policy.controller_head.controller_embedding
-                self._phillip_grid = PfspGrid(
-                    tmpl, len(phillip), max(len(r) for _, r in phillip),
-                    self.name_code, cfg.unroll_length, self.device,
-                    reencode=make_reencoder(
-                        tmpl.controller_head.controller_embedding,
-                        stu_embed, self.name_code, self.device),
-                )
-                for s, t in enumerate(tiers):           # per-slice name codes
-                    self._phillip_grid.agent._name[s] = self.lg.phillips[t][2]
-                print(f"phillip grid: {len(phillip)} tiers x "
-                      f"{self._phillip_grid.Nc} cells (delay {tmpl.delay})",
-                      flush=True)
-            self._phillip_grid.assign(
-                phillip,
-                lambda key: self.lg.phillips[key.split(':', 1)[1]][0].state_dict())
-            grids.append(self._phillip_grid)
-        K = cfg.max_pfsp_members
-        if len(pfsp) == K and len({len(r) for _, r in pfsp}) == 1:
-            # full house of equal slots -> ONE captured vmap forward for all
-            # PFSP members (member swaps are in-place load_slice)
-            if self._grid is None:
-                self._grid = PfspGrid(
-                    self.lg.make_grid_template(), K, len(pfsp[0][1]),
-                    self.name_code, cfg.unroll_length, self.device)
-            self._grid.assign(pfsp, self.lg.get_state)
-            grids.append(self._grid)
-        else:
-            # league too small to fill the slots (fresh run boot): fall back
-            # to per-slot compiled skeletons until it grows
-            for slot, (key, idx) in enumerate(pfsp):
-                pol, nc = self.lg.get(key, slot=slot)
-                opponents.append((key, pol, idx, True, nc))
-        # per-env characters: student uniform MAIN_12; opponent uniform
-        # MAIN_12 except fox imports (char-locked FOX, as in v10)
-        chars = [getattr(msl.Character, _MSL_CHAR[c.upper()])
-                 for c in cfg.char_whitelist]
-        env_opp = {}
-        for key, idx in self.part.items():
-            for i in idx:
-                env_opp[int(i)] = key
-        char_pairs, self._env_char = [], []
-        for i in range(N):
-            student_c = self.rng.choice(chars)
-            if env_opp[i].startswith("import:"):
-                opp_c = msl.Character.FOX
-            else:
-                opp_c = self.rng.choice(chars)
-            char_pairs.append((student_c, opp_c))
-            self._env_char.append(opp_c.name)
-        stages = [self.rng.choice(list(msl.Stage)) for _ in range(N)]
-        if self._worker is not None:
-            # new period, same agents: rebuilding re-records the cudagraph
-            # trees (pool ratchet). Remap in place; full rebuild only if
-            # the group structure changed (fresh-run league growth).
-            new_map = {gid: idx for (gid, _p, idx, _h, _nc) in opponents}
-            same = (grids == self._worker.grids
-                    and {g.gid for g in self._worker.groups} == set(new_map)
-                    and all(len(new_map[g.gid]) == g.n
-                            for g in self._worker.groups))
-            if same:
-                self._worker.reassign(new_map, char_pairs, stages)
-                return
-            print("re-partition: group structure changed — full rebuild",
-                  flush=True)
-            self._worker.close()
-            self._worker = None
-            import gc
-            gc.collect()
-        from smashbot.rl.sim_league import MultiOpponentSimWorker
+        self._chars = [getattr(msl.Character, _MSL_CHAR[c.upper()]) for c in cfg.char_whitelist]
+        self._stages = list(msl.Stage)
+        self.part = self.lg.layout(N)
+        from smashbot.rl.league import LeagueSeats
+        from smashbot.rl.sim_league import (MultiOpponentSimWorker, PfspGrid,
+                                            make_reencoder)
+        stu_embed = self.policy.controller_head.controller_embedding
+        # --- phillip grid: all tiers on ONE stacked forward (their LSTM
+        # steps via the hand-rolled cell — cuDNN has no vmap rule); static
+        # cells, slices padded to the largest tier
+        tiers = list(cfg.phillip_tiers)
+        rows = [self.part[f"phillip:{t}"] for t in tiers]
+        tmpl = self.lg.phillips[tiers[0]][0]
+        for m in tmpl.modules():
+            if type(m).__name__ == "RecurrentWrapper":
+                m.manual_step = True
+        self._phillip_grid = PfspGrid(
+            tmpl, len(tiers), max(len(r) for r in rows), self.name_code,
+            cfg.unroll_length, self.device,
+            reencode=make_reencoder(tmpl.controller_head.controller_embedding,
+                                    stu_embed, self.name_code, self.device))
+        for s, t in enumerate(tiers):
+            self._phillip_grid.load(s, f"phillip:{t}",
+                                    lambda k: self.lg.phillips[k.split(':', 1)[1]][0].state_dict())
+            self._phillip_grid.agent._name[s] = self.lg.phillips[t][2]
+        self._phillip_grid.assign_static(rows)
+        print(f"phillip grid: {len(tiers)} tiers x {self._phillip_grid.Nc} cells "
+              f"(delay {tmpl.delay})", flush=True)
+        # --- PFSP grid: S slices x Nc cells with one slice's worth of slack
+        # (v5 sizing) so seats float to demand; League routes per match
+        pfsp_envs = self.part["pfsp"]
+        S = cfg.pfsp_slices
+        Nc = -(-(len(pfsp_envs) + S) // S)
+        self._grid = PfspGrid(self.lg.make_grid_template(), S, Nc,
+                              self.name_code, cfg.unroll_length, self.device)
+        seats = LeagueSeats(S, Nc,
+                            loader=lambda s, k: self._grid.load(s, k, self.lg.get_state),
+                            mover=self._grid.move)
+        self.league = self.lg.make_league(seats, self.rng)
+        self.league.boot([int(e) for e in pfsp_envs])
+        for e in pfsp_envs:
+            s, n = seats.seat_of(int(e))
+            self._grid.seat(int(e), s, n)
+        print(f"pfsp grid: {S} slices x {Nc} cells for {len(pfsp_envs)} envs; "
+              f"boot seated {seats.occupancy()} ({seats.loads} slice loads)", flush=True)
         self._worker = MultiOpponentSimWorker(
-            self.policy, opponents, N, cfg.unroll_length, cfg.data_dir,
-            stages, char_pairs, name_code=self.name_code, device=self.device,
+            self.policy, [], N, cfg.unroll_length, cfg.data_dir, None, None,
+            name_code=self.name_code, device=self.device,
             record_fn=self._on_game, precision=cfg.rollout_precision,
-            grids=grids, event_fn=self._on_event,
-        )
-
-    def maybe_repartition(self, step: int) -> bool:
-        if step > 0 and step % self.cfg.repartition_interval == 0:
-            self._build()
-            return True
-        return False
+            grids=[self._phillip_grid], event_fn=self._on_event,
+            self_idx=self.part["self"], league=self.league, pfsp_grid=self._grid,
+            match_fn=self._match, max_frame=cfg.max_game_frames, seed=cfg.seed)
+        self.rows = self._worker.rows
 
     def env_share(self) -> dict:
-        """{logging_class: env count} for the current period."""
-        out: dict = {}
-        for key, idx in self.part.items():
-            if key == "self" or key.startswith("phillip:"):
-                c = key
-            elif key.startswith("import:"):
-                c = "imports"
-            else:
-                c = "snapshots"
-            out[c] = out.get(c, 0) + len(idx)
+        """{logging_class: env count} (pfsp split by current seating)."""
+        out = {k: len(v) for k, v in self.part.items() if k != "pfsp"}
+        for e in self.part["pfsp"]:
+            m = self.league.member_now[int(e)]
+            c = "imports" if m.startswith("import:") else "snapshots"
+            out[c] = out.get(c, 0) + 1
         return out
+
+    def league_stats(self) -> dict:
+        seats = self.league.seats
+        return {"fallback_rate": self.league.fallback_rate,
+                "draws": self.league.draws, "slice_loads": seats.loads,
+                "compactions": seats.compactions,
+                "prefetches": self.league.prefetches,
+                "resident_members": len({p.member for p in seats.slices if p.member})}
+
+    def by_char(self) -> dict:
+        """Pooled opponent-char winrates over every unlocked class."""
+        agg: dict = {}
+        for k, tr in self.trackers.items():
+            if k == "imports":
+                continue
+            for c, (w, g) in tr.by_char.items():
+                pw, pg = agg.get(c, (0, 0))
+                agg[c] = (pw + w, pg + g)
+        return agg
 
     def collect(self, num_trajectories: int) -> list:
         ppo, imit = [], []
@@ -360,7 +352,8 @@ def run(args) -> None:
     # ---- league ----
     snap_dir = f"{run_dir}/snapshots"
     if scfg.seed_snapshots_from:
-        _seed_snapshots(snap_dir, scfg.seed_snapshots_from)
+        _seed_snapshots(snap_dir, scfg.seed_snapshots_from, scfg.seed_min_step,
+                        scfg.seed_thin_step, scfg.seed_thin_until, scfg.seed_max_winrate)
     phillips = {}
     for tier, frac in zip(scfg.phillip_tiers, scfg.phillip_fracs):
         fname = "medium-v2-torch.pt" if tier == "medium" else f"{tier}-torch.pt"
@@ -383,19 +376,15 @@ def run(args) -> None:
         self_frac=scfg.self_frac, device=device,
         pfsp_hard_frac=scfg.pfsp_hard_frac, pfsp_explore=scfg.pfsp_explore,
         config_from=args.ckpt, self_name_code=name_code,
-        # PFSP slot skeletons compile once per slot shape; member swaps are
-        # in-place weight copies visible to the captured graphs
-        compile_fn=(
-            (lambda s: torch.compile(s, mode="reduce-overhead"))
-            if args.runtime.compile else None
-        ),
     )
     if not league.league.archive:
         league.league.save(policy, start_step)
         print(f"boot snapshot: seeded empty archive at step {start_step}", flush=True)
     worker = SimLeagueWorker(scfg, league, serving_policy, name_code, device)
-    print(f"sim league: {len(worker.part)} groups over {scfg.num_envs} envs "
-          f"(re-partition every {scfg.repartition_interval} steps)", flush=True)
+    print(f"sim league: {scfg.num_envs} envs -> {worker.rows} learner rows "
+          f"(self {len(worker.part['self'])} x2, phillips "
+          f"{sum(len(v) for k, v in worker.part.items() if k.startswith('phillip'))}, "
+          f"pfsp {len(worker.part['pfsp'])})", flush=True)
     if restored_trackers:
         # dolphin-run kinds -> sim tracker keys ("reference" was the
         # dedicated medium-v2 phillip in v10)
@@ -419,7 +408,7 @@ def run(args) -> None:
         config=dataclasses.asdict(args), resume="allow",
     )
 
-    state = learner.initial_state(scfg.num_envs, device)
+    state = learner.initial_state(worker.rows, device)
     torch.cuda.synchronize()
     print(f"[vram] boot complete: alloc {torch.cuda.memory_allocated()/2**30:.2f} "
           f"reserved {torch.cuda.memory_reserved()/2**30:.2f} GiB", flush=True)
@@ -434,13 +423,6 @@ def run(args) -> None:
             path = league.league.save(policy, i)
             print(f"[{i}] snapshot saved: {os.path.basename(path)} joins the league",
                   flush=True)
-        if i != start_step and worker.maybe_repartition(i):
-            # no learner-state reset needed: the fresh worker's first
-            # trajectories carry is_resetting=True on frame 0, which zeroes
-            # the learner-side carried state per env
-            print(f"[{i}] re-partitioned: "
-                  + " ".join(f"{k}={v}" for k, v in sorted(worker.env_share().items())),
-                  flush=True)
 
     def _post_step(i, metrics):
         if (i + 1) % args.runtime.checkpoint_interval == 0:
@@ -449,7 +431,7 @@ def run(args) -> None:
         if i % args.runtime.log_interval != 0:
             return
         frames = ((i + 1 - start_step) * args.runtime.trajectories_per_step
-                  * scfg.num_envs * scfg.unroll_length)
+                  * worker.rows * scfg.unroll_length)
 
         def _quiet(k, v):
             return v == 0 and (k.startswith("nf_") or k.endswith("_nonfinite")
@@ -489,6 +471,11 @@ def run(args) -> None:
             row = pool.payoff.get(key)
             if row and row.get("games"):
                 log[f"rl/snapshots/{key.split(':', 1)[1]}"] = pool.win_estimate(key)
+        for k, v in worker.league_stats().items():   # routing health
+            log[f"rl/league/{k}"] = v
+        for c, (w, g) in worker.by_char().items():   # per-matchup weakness
+            if g >= 20:
+                log[f"bychar/{c}"] = w / g
         log["rl/frames_per_sec"] = frames / max(1e-9, time.time() - t0)
         log["rl/frames"] = frames
         wandb.log(log, step=i)

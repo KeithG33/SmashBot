@@ -1,28 +1,29 @@
-"""Multi-opponent sim rollout: a pool of opponents on player-1, grouped by
-weights, with imitation harvest of every non-self seat.
+"""Multi-opponent sim rollout (v10's league design on melee-sim-light).
 
-Each env is assigned an opponent
-group (self / a phillip tier / a PFSP-pool member); player-1 inference runs one
-forward per group on the slot-swapped view, and every harvested group assembles
-its seat into a kind="imitation" Trajectory (advantage-weighted imitation in the
-learner). The student seat is the kind="ppo" Trajectory.
+Env layout is STATIC: self envs / phillip-tier envs / PFSP envs, fixed for
+the run — no periods, no re-partition. Every game runs to its natural end
+(stock-out or the 8-minute timer); at each env's own game boundary the
+worker records the result, re-draws the match (chars, stage, ports, seed)
+and, for PFSP envs, re-seats the env on the grid for the opponent drawn a
+game ahead (rl/league.py: weights only ever load into EMPTY slices, so no
+seat is swapped mid-game).
 
-SimLeague owns the pool: shares partitioned per period (worker rebuilt on the
-period boundary by train_sim.SimLeagueWorker — within a period an env keeps
-its opponent), PFSP draw + payoff via SnapshotPool (pfsp.json), decided games
-recorded through record_fn.
-
-Reuses unchanged: BatchedPolicyAgent (sample+delay), ChunkAssembler (Trajectory
-assembly), compute_reward, EnvBatch.step_and_reset.
+Learner rows = every env's student seat + the second seat of each self
+env, all served by ONE student forward (v10's row layout: rows are the
+VRAM budget, envs are cheap). Opponent seats: the phillip grid (static
+cells) and the PFSP grid (dynamic cells), one stacked forward each; every
+non-self seat is harvested as a kind="imitation" Trajectory.
 """
 from __future__ import annotations
 
+import math
 import random as _random
 
 import numpy as np
 import torch
 
 from smashbot.rl.agent import BatchedPolicyAgent
+from smashbot.rl.league import League, LeagueSeats, MemberWeights
 from smashbot.rl.pool import SnapshotPool
 from smashbot.rl.rollouts import ChunkAssembler, compute_reward
 from smashbot.rl.ppo import slice_trajectory_rows
@@ -63,75 +64,100 @@ def make_reencoder(opp_embed, stu_embed, student_name_code, device):
 
 
 class PfspGrid:
-    """A set of opponent slots on ONE LeagueAgent: S slices (one member
-    each) x Nc cells, stepped as a single captured vmap forward per frame —
-    dolphin's league serving transplanted to the sim. fp16 stacked weights
-    and carried state; a member swap is an in-place load_slice (visible to
-    the captured graph), never a rebuild. Persists across re-partition
-    periods: assign() reloads changed members and remaps cells to this
-    period's env rows. Slices may serve FEWER env rows than Nc (padding):
-    pad cells forward garbage against env 0 with reset always high, and
-    their rows are sliced out of every emitted chunk.
+    """S weight slices x Nc cells on ONE LeagueAgent (one captured vmap
+    forward per frame). Cells are seats: `seat`/`unseat`/`move` keep the
+    cell->env map that the per-frame gather uses; idle cells forward
+    garbage against env 0 with reset held high and their rows are sliced
+    out of every emitted chunk. Harvest eligibility follows v10: a cell's
+    rows enter a chunk only if it was occupied for the WHOLE chunk.
 
-    Harvest: one ChunkAssembler over all S*Nc cells; initial_state=None
-    (the dolphin grid harvest convention — the learner's imitation path
-    never unrolls from a carried state). `reencode` (optional) fixes up
-    emitted chunks for members with their own schema (the phillips)."""
+    Static use (the phillip tiers): assign_static() seats contiguous env
+    rows once. Dynamic use (PFSP): rl/league.League drives seat changes at
+    game boundaries; load() is the LeagueSeats loader."""
 
     def __init__(self, template, slices, cells, name_code, unroll, device,
                  reencode=None):
         from smashbot.rl.agent import LeagueAgent
         self.S, self.Nc = slices, cells
         cuda = torch.device(device).type == "cuda"
-        dt = torch.float16 if cuda else torch.float32   # fp16 needs autocast
+        dt = torch.float16 if cuda else torch.float32
         self.agent = LeagueAgent(template, slices, cells, name_code, device,
                                  weights_dtype=dt,
                                  state_dtype=torch.float16 if cuda else None)
         self.assembler = ChunkAssembler(unroll, template.delay)
         self.reencode = reencode
-        self.members = [None] * slices        # member key per slice
-        self.env_idx = None                   # [S][rows] env rows (per period)
-        self.cell_env = None                  # [S*Nc] env row per cell (pad -> 0)
-        self.valid = None                     # [S*Nc] real (non-pad) cells
-        self.idx_t = None                     # gather index on device
         self.device = device
+        self.members = [None] * slices
+        n = slices * cells
+        self.cell_env = np.zeros(n, dtype=np.int64)
+        self.valid = np.zeros(n, dtype=bool)
+        self.chunk_valid = np.zeros(n, dtype=bool)
+        self._cell_of: dict[int, int] = {}
+        self._dirty = True
+        self.idx_t = self.valid_t = None
+        self.sync()
 
-    def assign(self, assignments, get_state):
-        """assignments: [(key, env_rows)] one per slice, this period's map
-        (len(env_rows) <= Nc; the rest of the slice is padding). Loads
-        changed members in place and resets every cell (a re-partition
-        resets all envs)."""
-        assert len(assignments) == self.S, (len(assignments), self.S)
-        self.env_idx = []
-        cell_env = np.zeros(self.S * self.Nc, dtype=np.int64)
-        valid = np.zeros(self.S * self.Nc, dtype=bool)
-        for s, (key, rows) in enumerate(assignments):
-            rows = np.asarray(rows, dtype=np.int64)
-            assert len(rows) <= self.Nc, (key, len(rows), self.Nc)
-            if self.members[s] != key:
-                self.agent.load_slice(s, get_state(key))
-                self.members[s] = key
-            self.env_idx.append(rows)
-            cell_env[s * self.Nc:s * self.Nc + len(rows)] = rows
-            valid[s * self.Nc:s * self.Nc + len(rows)] = True
-        self.cell_env = cell_env
-        self.valid = valid
-        self.valid_t = torch.as_tensor(np.nonzero(valid)[0], device=self.device)
-        self.idx_t = torch.as_tensor(cell_env, device=self.device)
-        for s in range(self.S):
-            for n in range(self.Nc):
-                self.agent.reset_cell(s, n)
+    # ---- weights ----
+    def load(self, s, key, get_state):
+        self.agent.load_slice(s, get_state(key))
+        self.members[s] = key
 
+    # ---- seating ----
+    def assign_static(self, rows_per_slice):
+        for s, rows in enumerate(rows_per_slice):
+            assert len(rows) <= self.Nc, (s, len(rows), self.Nc)
+            for n, e in enumerate(rows):
+                self.seat(int(e), s, n)
+        self.chunk_valid[:] = self.valid
+
+    def seat(self, env, s, n):
+        cell = s * self.Nc + n
+        assert not self.valid[cell], f"cell {cell} occupied"
+        self.cell_env[cell] = env
+        self.valid[cell] = True
+        self._cell_of[env] = cell
+        self.agent.reset_cell(s, n)
+        self._dirty = True
+
+    def unseat(self, env):
+        cell = self._cell_of.pop(env)
+        self.valid[cell] = False
+        self.chunk_valid[cell] = False
+        self._dirty = True
+
+    def move(self, src, dst):
+        """LeagueSeats compaction: exact cell-state move between slices of
+        the same member. Both cells drop out of the current harvest chunk."""
+        self.agent.move_cell(src, dst)
+        a = src[0] * self.Nc + src[1]
+        b = dst[0] * self.Nc + dst[1]
+        env = int(self.cell_env[a])
+        self.cell_env[b] = env
+        self.valid[b], self.valid[a] = True, False
+        self.chunk_valid[b] = self.chunk_valid[a] = False
+        self._cell_of[env] = b
+        self._dirty = True
+
+    def sync(self):
+        if self._dirty:
+            self.idx_t = torch.as_tensor(self.cell_env, device=self.device)
+            self.valid_t = torch.as_tensor(np.nonzero(self.valid)[0],
+                                           device=self.device)
+            self._dirty = False
+
+    def occupied(self):
+        return int(self.valid.sum())
 
 
 class _Group:
-    """One opponent identity serving a fixed subset of env rows."""
+    """One opponent identity serving a fixed subset of env rows (the eval
+    arena's single opponent; not used by training)."""
 
     def __init__(self, gid, policy, env_idx, harvest, unroll, device, name_code,
                  reencode=None, precision="fp32", state_dtype=None):
         self.gid = gid
-        self.env_idx = np.asarray(env_idx, dtype=np.int64)   # env rows this opp plays
-        self.idx_t = torch.as_tensor(self.env_idx, device=device)  # GPU gather index
+        self.env_idx = np.asarray(env_idx, dtype=np.int64)
+        self.idx_t = torch.as_tensor(self.env_idx, device=device)
         self.harvest = harvest
         self.n = len(self.env_idx)
         self.agent = BatchedPolicyAgent(policy, self.n, name_code=name_code,
@@ -140,27 +166,26 @@ class _Group:
         self.assembler = ChunkAssembler(unroll, policy.delay) if harvest else None
         self.reencode = reencode
         self._pushed = 0
-        self._reset = np.ones(self.n, dtype=bool)   # its envs start fresh
+        self._reset = np.ones(self.n, dtype=bool)
 
 
 class MultiOpponentSimWorker:
     def __init__(self, student_policy, opponents, batch_size, unroll_length, data_dir,
                  stage, char_pairs, name_code=1, device="cpu", record_fn=None,
-                 precision="fp32", grids=(), event_fn=None):
-        """opponents: list of (gid, policy, env_idx, harvest, name_code) —
-        the per-policy groups (just self in training). Grid opponents ride
-        in `grids` (PfspGrids already assign()ed for this period), one
-        merged forward each.
-        char_pairs: [(p0_char, p1_char)] per env (len == batch_size).
-        stage: one msl.Stage for all envs, or a per-env list (len == batch_size).
-        record_fn(env_i, opponent_gid, student_stocks, opp_stocks): called on
-        each decided game (terminal-frame stocks, student = player 0).
-        event_fn(env_i, opponent_gid, kind, percent): per kill/death event —
-        kind "kill" carries the OPPONENT's percent when the student took the
-        stock, "death" the student's own percent when it died (feeds
-        GameTracker.add_kill/add_death, the punish-quality panels).
-        precision: BatchedPolicyAgent precision for every seat ("fp16" is the
-        probe-validated rollout setting from v10)."""
+                 precision="fp32", grids=(), event_fn=None, self_idx=(),
+                 league=None, pfsp_grid=None, match_fn=None, max_frame=28800,
+                 seed=0):
+        """opponents: [(gid, policy, env_idx, harvest, name_code)] fixed
+        groups (eval arena). grids: static PfspGrids (phillip tiers), env ->
+        gid via gid_of_env below. self_idx: envs whose player-1 seat is the
+        student too; those seats are learner rows N.. (v10 layout).
+        league/pfsp_grid: per-match PFSP routing (rl/league.League) over a
+        dynamic PfspGrid. match_fn(env, member) -> (MatchConfig, info): the
+        match for env's NEXT game (called at boot and every game end);
+        default = the fixed stage/char_pairs given, fresh seed per game.
+        record_fn(env, gid, s0, s1) / event_fn(env, gid, kind, pct) are
+        called with the gid of the game the frames belong to; game_info[env]
+        holds match_fn's info for that game."""
         import melee_sim as msl
         self.msl = msl
         self.N = batch_size
@@ -168,10 +193,13 @@ class MultiOpponentSimWorker:
         self.device = device
         self.record_fn = record_fn
         self.event_fn = event_fn
-        # grids: any number of LeagueAgent-backed opponent grids (the
-        # PFSP slots, the phillip tiers)
         self.grids = list(grids)
-        self.student = BatchedPolicyAgent(student_policy, batch_size, name_code=name_code,
+        self.pfsp_grid = pfsp_grid
+        self.league = league
+        self.self_idx = np.asarray(list(self_idx), dtype=np.int64)
+        self.self_idx_t = torch.as_tensor(self.self_idx, device=device)
+        self.rows = batch_size + len(self.self_idx)
+        self.student = BatchedPolicyAgent(student_policy, self.rows, name_code=name_code,
                                           device=device, precision=precision)
         self.student.set_flat_controllers(True)
         self.ff = sim_env.FlatFrames(device)
@@ -184,151 +212,137 @@ class MultiOpponentSimWorker:
         for (gid, pol, idx, harv, nc) in opponents:
             re = None
             if harv:
-                # student-schema fixup (see make_reencoder): identity for
-                # matching configs (snapshots/imports), a real re-encode +
-                # name recondition for the phillips
-                re = make_reencoder(
-                    pol.controller_head.controller_embedding, stu_embed,
-                    name_code, device)
+                re = make_reencoder(pol.controller_head.controller_embedding,
+                                    stu_embed, name_code, device)
                 if pol.delay != student_policy.delay:
                     print(f"NOTE: imitation harvest delay mismatch — {gid} "
-                          f"{pol.delay} vs student {student_policy.delay} "
-                          f"({pol.delay - student_policy.delay:+d} frames)",
-                          flush=True)
-            # seat-B fp16 state: the self-play mirror is an OPPONENT seat
-            # (never harvested, no loss path) — same argument/verification
-            # as the grid's fp16 state. Diagnostic: rl/self/win_rate_ema
-            # must hold ~0.5 (a degraded seat B shows as seat A winning).
-            sd = (torch.float16
-                  if gid == "self" and precision == "fp16" else None)
-            self.groups.append(
-                _Group(gid, pol, idx, harv, unroll_length, device, nc, re,
-                       precision=precision, state_dtype=sd))
+                          f"{pol.delay} vs student {student_policy.delay}", flush=True)
+            self.groups.append(_Group(gid, pol, idx, harv, unroll_length, device,
+                                      nc, re, precision=precision))
         for g in self.groups:
             g.agent.set_flat_controllers(True)
-        # env -> opponent gid, for outcome recording
+        # env -> gid of the game its frames belong to (committed at the
+        # entry frame; pending between a game's end and its successor's
+        # first frame so terminal-transition events credit the right game)
         self.env_opp = np.empty(batch_size, dtype=object)
+        self.game_info = [None] * batch_size
+        self._pending: dict[int, tuple] = {}
+        self.env_opp[self.self_idx] = "self"
         for g in self.groups:
             self.env_opp[g.env_idx] = g.gid
         for gr in self.grids:
             for s in range(gr.S):
-                self.env_opp[gr.env_idx[s]] = gr.members[s]
-        # groups + grids must partition [0, N)
-        covered = [g.env_idx for g in self.groups] + [
-            gr.cell_env[gr.valid] for gr in self.grids]
-        covered = np.concatenate(covered) if covered else np.array([], int)
-        assert sorted(covered.tolist()) == list(range(batch_size)), "opponent env_idx must partition all envs"
-        for gr in self.grids:
-            # a FULL worker rebuild resets _prev, so the first frame pushes
-            # a record with no matching reward — the grids' PERSISTENT
-            # assemblers would desync by one (and leak a FrameRecord) per
-            # rebuild. Fresh assemblers on construction; reassign() keeps them.
-            gr.assembler = ChunkAssembler(unroll_length, gr.agent.delay)
-        self.env = msl.EnvBatch(batch_size=batch_size, length=max(64, unroll_length + 1), data_dir=data_dir)
-        stages = stage if isinstance(stage, (list, tuple)) else [stage] * batch_size
-        cfgs = [msl.MatchConfig(stage=s, players=(msl.PlayerConfig(a), msl.PlayerConfig(b)))
-                for s, (a, b) in zip(stages, char_pairs)]
+                for n in range(gr.Nc):
+                    c = s * gr.Nc + n
+                    if gr.valid[c]:
+                        self.env_opp[gr.cell_env[c]] = gr.members[s]
+        self._pfsp_envs = set()
+        if league is not None:
+            for e, m in league.member_now.items():
+                self.env_opp[e] = m
+                self._pfsp_envs.add(e)
+        covered = np.concatenate(
+            [self.self_idx] + [g.env_idx for g in self.groups]
+            + [gr.cell_env[gr.valid] for gr in self.grids]
+            + ([pfsp_grid.cell_env[pfsp_grid.valid]] if pfsp_grid is not None else []))
+        assert sorted(covered.tolist()) == list(range(batch_size)), \
+            "seats must partition all envs"
+        self.max_frame = max_frame
+        self._rng = _random.Random(seed)
+        if match_fn is None:
+            stages = stage if isinstance(stage, (list, tuple)) else [stage] * batch_size
+
+            def match_fn(e, member):
+                a, b = char_pairs[e]
+                cfg = msl.MatchConfig(
+                    stage=stages[e], players=(msl.PlayerConfig(a), msl.PlayerConfig(b)),
+                    seed=self._rng.getrandbits(31), max_frame=self.max_frame)
+                return cfg, None
+        self.match_fn = match_fn
+        self.env = msl.EnvBatch(batch_size=batch_size, length=max(64, unroll_length + 1),
+                                data_dir=data_dir)
+        cfgs = []
+        for e in range(batch_size):
+            cfg, info = self.match_fn(e, self.env_opp[e])
+            self.game_info[e] = info
+            cfgs.append(cfg)
         self.env.configure_matches(cfgs)
         self.env.reset_all()
 
-    def reassign(self, new_env_idx: dict, char_pairs, stage) -> None:
-        """New period WITHOUT rebuilding agents (rebuilding re-records the
-        cudagraph trees and ratchets their pools). Group sizes are constant
-        by construction, so a period is: remap env rows, reset every seat,
-        reconfigure matches. Grids must already be assign()ed. Assemblers
-        keep their buffered tail — the boundary is a normal all-envs game
-        reset to the learner."""
-        import melee_sim as msl
-        for g in self.groups:
-            idx = np.asarray(new_env_idx[g.gid], dtype=np.int64)
-            assert len(idx) == g.n, (g.gid, len(idx), g.n)
-            g.env_idx = idx
-            g.idx_t = torch.as_tensor(idx, device=self.device)
-            g._reset = np.ones(g.n, dtype=bool)
-        self._reset_mask = np.ones(self.N, dtype=bool)
-        self.env_opp = np.empty(self.N, dtype=object)
-        for g in self.groups:
-            self.env_opp[g.env_idx] = g.gid
-        for gr in self.grids:
-            for sl in range(gr.S):
-                self.env_opp[gr.env_idx[sl]] = gr.members[sl]
-        covered = [g.env_idx for g in self.groups] + [
-            gr.cell_env[gr.valid] for gr in self.grids]
-        covered = np.concatenate(covered)
-        assert sorted(covered.tolist()) == list(range(self.N)), "reassign must partition all envs"
-        stages = stage if isinstance(stage, (list, tuple)) else [stage] * self.N
-        cfgs = [msl.MatchConfig(stage=s, players=(msl.PlayerConfig(a), msl.PlayerConfig(b)))
-                for s, (a, b) in zip(stages, char_pairs)]
-        self.env.configure_matches(cfgs)
-        self.env.reset_all()
+    # ---- per-frame loop ----
+    def _all_grids(self):
+        return self.grids + ([self.pfsp_grid] if self.pfsp_grid is not None else [])
 
     def collect(self, num_frames):
         ppo_out, imit_out = [], []
         env, dev, T = self.env, self.device, self.unroll
+        N = self.N
         for _ in range(num_frames):
             if env.t >= env.length:
                 env.reset_cursor()
+            if self.league is not None:
+                self.league.tick()          # drawn-ahead members -> empty slices
             obs = env.current_frame
             reset_np = self._reset_mask
+            for e in np.nonzero(reset_np)[0]:      # entry frames: commit
+                pend = self._pending.pop(int(e), None)
+                if pend is not None:
+                    self.env_opp[e], self.game_info[e] = pend
             reset_t = torch.as_tensor(reset_np, device=dev)
+            reset_rows_np = np.concatenate([reset_np, reset_np[self.self_idx]])
+            reset_rows = torch.as_tensor(reset_rows_np, device=dev)
 
-            # ---- student (player 0) ----
-            # EXECUTE (pop the delay queue) BEFORE infer: a reset frame's
-            # queue rebuild would otherwise discard the fresh sample and
-            # leave the seat at delay-1 permanently.
-            reset_idx = np.nonzero(reset_np)[0].tolist()
-            p0_rows = np.stack(self.student.execute(reset_idx))
-            sim_env.write_controller_rows(env, p0_rows, player=0)
-            # flat encoding: one numpy encode + three H2D copies; the swap
-            # is a column permutation, every view below is 3 gathers
+            # ---- student rows: every env's player 0 + self envs' player 1 ----
+            # execute (pop) BEFORE infer: a reset frame's queue rebuild would
+            # otherwise discard the fresh sample (delay-1 forever)
+            rows = np.stack(self.student.execute(np.nonzero(reset_rows_np)[0].tolist()))
+            sim_env.write_controller_rows(env, rows[:N], player=0)
             flats = self.ff.to_device(sim_env.encode_flats(obs))
-            states = self.ff.view(flats)
-            want = (self._pushed % T == 0)
-            records, hidden_before = self.student.infer(states, reset_t, want_snapshot=want)
-
-            # ---- opponents (player 1) ----
             opp_flats = self.ff.swap(flats)
-            p1_rows = np.empty((self.N, 13), dtype=np.float32)
+            if len(self.self_idx):
+                row_flats = tuple(torch.cat([a, b.index_select(0, self.self_idx_t)])
+                                  for a, b in zip(flats, opp_flats))
+            else:
+                row_flats = flats
+            states = self.ff.view(row_flats)
+            want = (self._pushed % T == 0)
+            records, hidden_before = self.student.infer(states, reset_rows, want_snapshot=want)
+
+            # ---- opponent seats (player 1) ----
+            p1_rows = np.empty((N, 13), dtype=np.float32)
+            if len(self.self_idx):
+                p1_rows[self.self_idx] = rows[N:]
             for g in self.groups:
                 p1_rows[g.env_idx] = np.stack(
                     g.agent.execute(np.nonzero(g._reset)[0].tolist()))
                 gstates = self.ff.view(opp_flats, rows=g.idx_t)
                 greset = torch.as_tensor(g._reset, device=dev)
-                # snapshots only for harvested groups (self's _pushed
-                # never advances — an unconditioned flag would deep-clone
-                # its full KV state every frame)
                 gwant = g.harvest and (g._pushed % T == 0)
                 grecords, _gh = g.agent.infer(gstates, greset, want_snapshot=gwant)
                 if g.harvest:
                     for rec in grecords:
-                        # initial_state=None: the imitation learner starts
-                        # from zeros and never reads it (grid convention)
                         g.assembler.push_frame(rec, greset, None)
                         g._pushed += 1
-            for gr in self.grids:                # each grid: ONE forward
-                gr_reset = reset_np[gr.cell_env]                  # [S*Nc]
-                gr_reset[~gr.valid] = True       # pads: perpetual reset
-                # queue rebuild only for REAL resetting cells (pads' rows
-                # are discarded; rebuilding their queues every frame would
-                # be pure python churn)
+            for gr in self._all_grids():           # each grid: ONE forward
+                gr.sync()
+                gr_reset = reset_np[gr.cell_env]
+                gr_reset[~gr.valid] = True         # idle cells: perpetual reset
                 for cell in np.nonzero(gr_reset & gr.valid)[0]:
                     gr.agent.reset_cell(cell // gr.Nc, cell % gr.Nc)
                 rows_all = gr.agent.execute()
                 p1_rows[gr.cell_env[gr.valid]] = rows_all[gr.valid]
-                gviews = self.ff.view(opp_flats, rows=gr.idx_t,
-                                      lead=(gr.S, gr.Nc))
+                gviews = self.ff.view(opp_flats, rows=gr.idx_t, lead=(gr.S, gr.Nc))
                 grec = gr.agent.infer(
-                    gviews, torch.as_tensor(
-                        gr_reset.reshape(gr.S, gr.Nc), device=dev))
-                gr.assembler.push_frame(
-                    grec, torch.as_tensor(gr_reset, device=dev), None)
+                    gviews, torch.as_tensor(gr_reset.reshape(gr.S, gr.Nc), device=dev))
+                if not gr.assembler._records:      # chunk start: eligibility window
+                    gr.chunk_valid[:] = gr.valid
+                gr.chunk_valid &= gr.valid
+                gr.assembler.push_frame(grec, torch.as_tensor(gr_reset, device=dev), None)
             sim_env.write_controller_rows(env, p1_rows, player=1)
 
             # ---- rewards ----
-            stocks, percent = seat_stats(obs)         # [N,2] self,opp (player-0 view)
+            stocks, percent = seat_stats(obs)
             if self._prev is not None and self.event_fn is not None:
-                # kill/death events on the prev->current transition (reset
-                # frames excluded: the respawn fake-drop is not a stock take)
                 ps, pp = self._prev
                 live = ~reset_np
                 for i in np.nonzero(live & (stocks[:, 1] < ps[:, 1]))[0]:
@@ -340,29 +354,30 @@ class MultiOpponentSimWorker:
                     torch.as_tensor(self._prev[0]), torch.as_tensor(stocks),
                     torch.as_tensor(self._prev[1]), torch.as_tensor(percent),
                     torch.as_tensor(reset_np)).to(dev)
-                self.assembler.push_reward(reward)
+                if len(self.self_idx):
+                    self.assembler.push_reward(
+                        torch.cat([reward, -reward.index_select(0, self.self_idx_t)]))
+                else:
+                    self.assembler.push_reward(reward)
                 for g in self.groups:
-                    if g.harvest:  # opponent seat reward = zero-sum mirror
+                    if g.harvest:
                         g.assembler.push_reward((-reward[g.idx_t]).clone())
-                for gr in self.grids:  # pads carry env0's mirror, sliced at emit
+                for gr in self._all_grids():
                     gr.assembler.push_reward((-reward[gr.idx_t]).clone())
             self._prev = (stocks, percent)
 
-            # ---- student records ----
             for rec in records:
                 snap = hidden_before if self._pushed % T == 0 else None
-                self.assembler.push_frame(rec, reset_t, snap)
+                self.assembler.push_frame(rec, reset_rows, snap)
                 self._pushed += 1
 
             is_resetting, term = env.step_and_reset()
             self._reset_mask = np.asarray(is_resetting, dtype=bool)
-            if self.record_fn is not None:
-                done = np.asarray(term["done"], dtype=bool)
-                if done.any():
-                    fs, _ = seat_stats(env.current_frame)  # terminal frame stocks
-                    for i in np.nonzero(done)[0]:
-                        self.record_fn(int(i), self.env_opp[i],
-                                       int(fs[i, 0]), int(fs[i, 1]))
+            done = np.asarray(term["done"], dtype=bool)
+            if done.any():
+                fs, _ = seat_stats(env.current_frame)   # terminal frame
+                for i in np.nonzero(done)[0]:
+                    self._on_done(int(i), int(fs[i, 0]), int(fs[i, 1]))
             for g in self.groups:
                 g._reset = self._reset_mask[g.env_idx]
 
@@ -374,16 +389,37 @@ class MultiOpponentSimWorker:
                     if g.reencode is not None:
                         traj = g.reencode(traj)
                     imit_out.append(traj)
-            for gr in self.grids:
+            for gr in self._all_grids():
                 if gr.assembler.ready():
-                    traj = gr.assembler.emit()._replace(kind="imitation")
-                    if not gr.valid.all():   # drop pad rows
-                        traj = slice_trajectory_rows(
-                            traj, np.nonzero(gr.valid)[0].tolist())
-                    if gr.reencode is not None:   # phillip schema fixup
+                    keep = np.nonzero(gr.chunk_valid & gr.valid)[0]
+                    traj = gr.assembler.emit()
+                    gr.chunk_valid[:] = gr.valid   # overlap frame starts the next
+                    if len(keep) == 0:
+                        continue
+                    traj = traj._replace(kind="imitation")
+                    if len(keep) < gr.S * gr.Nc:
+                        traj = slice_trajectory_rows(traj, keep.tolist())
+                    if gr.reencode is not None:
                         traj = gr.reencode(traj)
                     imit_out.append(traj)
         return ppo_out, imit_out
+
+    def _on_done(self, e, s0, s1):
+        """env e's game ended this step (terminal frame published; the sim
+        resets it on the next step). Record, re-seat (PFSP), re-draw the
+        match. The new gid/info commit on the entry frame."""
+        if self.record_fn is not None:
+            self.record_fn(e, self.env_opp[e], s0, s1)
+        if e in self._pfsp_envs:
+            self.pfsp_grid.unseat(e)
+            s, n = self.league.on_boundary(e)
+            self.pfsp_grid.seat(e, s, n)
+            member = self.league.member_now[e]
+        else:
+            member = self.env_opp[e]
+        cfg, info = self.match_fn(e, member)
+        self.env.configure_matches([cfg], env_ids=[e])
+        self._pending[e] = (member, info)
 
     def close(self):
         self.env.close()
@@ -393,29 +429,15 @@ class MultiOpponentSimWorker:
 
 
 class SimLeague:
-    """Opponent pool + per-env assignment for the sim league.
-
-    Three fixed shares (self / phillips / PFSP pool) per the design:
-      * self       -- the current policy (mirror), no harvest.
-      * phillips    -- 5 fixed tiers, per-tier env fraction, harvested.
-      * PFSP pool   -- snapshots (League.archive) + fox imports (import:NAME),
-                       drawn by League.draw_member, harvested.
-    Reuses League for the PFSP draw + payoff ledger (pfsp.json), so a resume
-    loads v10's archive + payoff table straight from the snapshot dir.
-
-    Assignment is coarse (re-partitioned every `repartition_every` frames), so
-    within a period an env keeps its opponent and a game reset just resets
-    hidden -- no cross-group state migration.
-    """
+    """Opponent pool for the sim league: self / phillip tiers / PFSP pool
+    (snapshots + fox imports through SnapshotPool's draw + payoff ledger,
+    pfsp.json — a resume loads v10's archive and table straight from the
+    snapshot dir). layout() fixes the env rows once per run."""
 
     def __init__(self, current_policy, snapshot_dir, phillips, fox_imports,
                  self_frac=0.30, device="cpu", pfsp_hard_frac=0.25, pfsp_explore=0.075,
-                 config_from=None, self_name_code=1, compile_fn=None):
-        # phillips: {tier_id: (policy, frac, name_code)}; fox_imports: {"import:NAME": path}
-        # config_from: full checkpoint whose config builds the bare-state members
-        #   (snapshots + fox imports are saved as bare state_dicts, no config).
-        # self_name_code: the student's conditioning code — also used for bare
-        #   members (snapshots share the student's name_map; imports lack one).
+                 config_from=None, self_name_code=1):
+        # phillips: {tier: (policy, frac, name_code)}; fox_imports: {"import:NAME": path}
         self.current = current_policy
         self.device = device
         self.self_frac = self_frac
@@ -426,49 +448,19 @@ class SimLeague:
             pfsp_hard_frac=pfsp_hard_frac, pfsp_explore=pfsp_explore,
             league_members=list(fox_imports.keys()),
         )
-        self._slots = []          # [skeleton, loaded_key] per PFSP slot
-        self.compile_fn = compile_fn  # sample -> compiled sample, for skeletons
+        self.weights = MemberWeights(self._path_of)
         self._sc = self_name_code
         self._cfg = None
         if config_from is not None:
             from smashbot import saving
             self._cfg = saving.load_checkpoint(config_from)["config"]
 
-    # ---- policy resolution ----
-    def get(self, key, slot=None):
-        """(policy, name_code) for an assignment key: 'self', 'phillip:<id>',
-        a snapshot path, or 'import:<name>'.
-
-        PFSP members (snapshots + imports) are served from persistent SLOT
-        skeletons: pass `slot` (0..K-1) and the member's weights are copied
-        in place into that slot's policy. The skeleton object — and its
-        compiled sample graph — persists across periods, so a member swap is
-        a weight copy, never a recompile (cudagraph replays read weights by
-        pointer)."""
-        if key == "self":
-            return self.current, self._sc
-        if key.startswith("phillip:"):
-            pol, _frac, nc = self.phillips[key.split(":", 1)[1]]
-            return pol, nc
-        path = self.fox_paths[key] if key.startswith("import:") else key
-        assert slot is not None, "bare-state members are served from slots"
-        while len(self._slots) <= slot:
-            self._slots.append([None, None])  # [skeleton, loaded_key]
-        sk = self._slots[slot]
-        if sk[0] is None:
-            sk[0] = self._make_skeleton()
-        if sk[1] != key:
-            self._load_into(sk[0], path)
-            sk[1] = key
-        # snapshots share the student's name_map exactly; fox imports lack
-        # their own map -> self name_code is the correct conditioning.
-        return sk[0], self._sc
+    def _path_of(self, key):
+        return self.fox_paths[key] if key.startswith("import:") else key
 
     def _make_skeleton(self):
         """Empty policy built from config_from (snapshots + fox imports are
-        bare state_dicts, no config of their own). compile_fn, if set, wraps
-        .sample once at construction — the wrapper then serves every member
-        loaded into this skeleton."""
+        bare state_dicts, no config of their own)."""
         from smashbot import configs, embed as embed_lib
         from smashbot.policy import build_policy
         if self._cfg is None:
@@ -488,79 +480,45 @@ class SimLeague:
         pol.train_value_head = False
         pol.requires_grad_(False)
         pol.eval()
-        if self.compile_fn is not None:
-            pol.sample = self.compile_fn(pol.sample)
         return pol
 
     def _load_into(self, skeleton, path):
-        """Copy a member's weights into a skeleton IN PLACE (compiled graphs
-        read parameters by pointer, so replays see the new member)."""
         import torch as _torch
         state = _torch.load(path, map_location=self.device, weights_only=True)
         with _torch.no_grad():
-            res = skeleton.load_state_dict(state, strict=True)
-        return res
+            return skeleton.load_state_dict(state, strict=True)
 
     def get_state(self, key):
-        """A PFSP member's raw state_dict (for PfspGrid.load_slice)."""
-        import torch as _torch
-        path = self.fox_paths[key] if key.startswith("import:") else key
-        return _torch.load(path, map_location=self.device, weights_only=True)
+        return self.weights.get(key)
 
     def make_grid_template(self):
-        """Uncompiled skeleton for PfspGrid/LeagueAgent (it deep-copies the
-        template and builds its own captured vmap forward)."""
-        fn, self.compile_fn = self.compile_fn, None
-        try:
-            return self._make_skeleton()
-        finally:
-            self.compile_fn = fn
+        return self._make_skeleton()
 
-    # ---- per-env assignment ----
-    def partition(self, N, rng=None, max_pfsp_members=8):
-        """{member_key: np.ndarray(env indices)} covering all N envs.
-        max_pfsp_members = the PFSP grid's slot count: that many DISTINCT
-        members drawn per period, equal-size slots."""
-        rng = rng or _random.Random()
-        idx = list(range(N))
-        rng.shuffle(idx)
+    def layout(self, N):
+        """Static env rows: {'self': rows, 'phillip:<tier>': rows, 'pfsp': rows}."""
         cur = 0
-        groups: dict[str, list] = {}
+        out = {}
 
         def take(n):
             nonlocal cur
-            g = idx[cur:cur + n]
+            rows = np.arange(cur, cur + n, dtype=np.int64)
             cur += n
-            return g
+            return rows
 
-        groups["self"] = take(round(self.self_frac * N))
+        out["self"] = take(round(self.self_frac * N))
         for tier, (_pol, frac, _nc) in self.phillips.items():
-            groups[f"phillip:{tier}"] = take(round(frac * N))
-        pfsp_envs = idx[cur:]
-        if pfsp_envs:
-            # K distinct members, EQUAL-size slots (remainder envs fold into
-            # self): every group's row count is then constant across periods,
-            # so per-slot compiled graphs never see a new shape.
-            members, seen = [], set()
-            for _ in range(max_pfsp_members * 8):
-                if len(members) >= max_pfsp_members:
-                    break
-                m = self.league.draw_member(rng) or "self"
-                if m not in seen and m != "self":
-                    seen.add(m)
-                    members.append(m)
-            per = len(pfsp_envs) // len(members) if members else 0
-            if per == 0:
-                groups["self"] += pfsp_envs
-            else:
-                for j, m in enumerate(members):
-                    groups[m] = pfsp_envs[j * per:(j + 1) * per]
-                groups["self"] += pfsp_envs[len(members) * per:]
-        return {k: np.asarray(v, dtype=np.int64) for k, v in groups.items() if len(v)}
+            out[f"phillip:{tier}"] = take(round(frac * N))
+        out["pfsp"] = np.arange(cur, N, dtype=np.int64)
+        return out
+
+    def make_league(self, seats, rng):
+        locks = {k: "FOX" for k in self.fox_paths}
+        return League(self.league, seats, locks, rng,
+                      warm=self.weights.warm, ready=self.weights.ready)
 
     def record(self, key, won: bool):
-        """Record a decided game outcome for a PFSP-pool member (snapshots +
-        fox imports). Phillips/self aren't in the PFSP ledger."""
+        """Decided game outcome for a PFSP member; phillips/self aren't in
+        the ledger."""
         if key == "self" or key.startswith("phillip:"):
             return
         self.league.record_result(key, won)

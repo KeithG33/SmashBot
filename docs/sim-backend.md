@@ -32,28 +32,36 @@ Add `vendor/melee-sim-light` to `PYTHONPATH` (the launch script does).
 ## Architecture
 
 ```
-train_rl --backend sim                        (rl/train_rl.py dispatch)
-  └─ rl/train_sim.py   run(): learner loop — reuses Learner, overlap
-     │                 pipeline, checkpoint schema, TeacherWatcher
-     ├─ SimLeagueWorker: period lifecycle — SimLeague.partition() →
-     │                   MultiOpponentSimWorker per period, coarse
-     │                   re-partition every repartition_interval steps,
-     │                   GameTracker per class, outcome recording
+train_rl (backend sim)                         (rl/train_rl.py dispatch)
+  └─ rl/train_sim.py   run(): learner loop — Learner, overlap pipeline,
+     │                 checkpoint schema; learner rows = envs + self envs
+     ├─ SimLeagueWorker: STATIC env layout (self / phillip tiers / pfsp),
+     │                   both grids, per-match PFSP routing, trackers,
+     │                   match draws (chars, stage, ports, seed, 8-min timer)
+     ├─ rl/league.py:  v5's per-match routing — LeagueSeats (slices are a
+     │                 weight cache; weights only load into EMPTY slices,
+     │                 compaction via move_cell), League (member_now /
+     │                 member_next drawn a game ahead, seat at the env's own
+     │                 game boundary, counted fallbacks), MemberWeights
+     │                 (LRU + background warm)
      └─ rl/sim_league.py
-        ├─ SimLeague: pool + assignment. Shares: self (no harvest) /
-        │             phillip tiers / PFSP (SnapshotPool draw + pfsp.json).
-        │             Bare-state members (snapshots, fox imports) built
-        │             from config_from. max_pfsp_members bounds resident
-        │             policies per period.
-        └─ MultiOpponentSimWorker: per-frame loop — student + self +
-                       two PfspGrids (phillip tiers, PFSP slots), each ONE
-                       stacked forward; harvest-all-but-self as
-                       kind="imitation" (phillip chunks re-encoded via
-                       make_reencoder), kill/death events, rewards,
-                       ChunkAssembler, step_and_reset.
-  rl/sim_env.py       obs → encoded Game struct (flat 3-tensor path +
-                      FlatFrames views); controller rows → sim
+        ├─ SimLeague: pool (SnapshotPool PFSP draw + pfsp.json), layout(),
+        │             bare-state member loading (config_from)
+        ├─ PfspGrid: S slices x Nc cells on ONE LeagueAgent; seat/unseat/
+        │            move keep the cell->env gather map; a cell harvests
+        │            only if occupied for the whole chunk
+        └─ MultiOpponentSimWorker: per-frame loop — one student forward
+                       over all learner rows (every env's seat A + self
+                       envs' seat B), phillip grid + PFSP grid forwards,
+                       harvest of every non-self seat, rewards, events,
+                       game-end handling (_on_done: record, re-seat, redraw)
+  rl/sim_env.py       obs -> encoded Game struct (flat 3-tensor path)
 ```
+
+Every game runs to its natural end; nothing resets an env except the sim's
+own game-over. (The first sim port re-partitioned all envs every 25 steps
+with reset_all — 96% of games truncated, trackers biased; fixed 2026-09-15
+by porting the v5 design above.)
 
 ## Launch
 

@@ -2,7 +2,7 @@
 # Sim-backend league run v11: resume v10 weights/optimizer/pfsp -> 100k steps.
 # Locked settings (2026-09-15, v10-parity grid serving, REAL-pool overlapped
 # measurements after the harness self_frac fix):
-#   num_envs 448 / micro_batches 12 -- ~6,000 fps with grid+flat serving,
+#   381 envs = 448 learner rows (self envs feed both seats) / micro_batches 12,
 #     co-peak ~17.9 GiB stable (ceiling ~20 per Keith's 2-3GB buffer).
 #     Fallbacks: 480/mb14=3,530, 448/mb12=3,390. 512 OOMs (needs learner-state fp16).
 #   leash: kl-teacher 0.025 flat (v10's final value, no decay)
@@ -10,7 +10,7 @@
 #   pool: self 30% / phillips 35% (medium 4, plat 6, diamond 7, master 8,
 #         gm 10) / PFSP 35% (v10 ghosts + imp9000, imp10000, s9500 fox)
 #   snapshots: every 1500, keep all; PFSP hard 0.25 explore 0.075 (v10)
-#   NEW wandb id (rl-sim-v11) -- v10's history stays untouched.
+#   NEW wandb id (rl-sim-v12) -- v10's history stays untouched.
 # DO NOT run without Keith's go-ahead.
 set -euo pipefail
 
@@ -24,9 +24,9 @@ exec /home/kage/smashbot_workspace/SmashBot/.venv/bin/python -m smashbot.rl.trai
   --backend sim \
   --ckpt $SHINE/models/rl-v4-teacher-frozen-ev07736.pt \
   --runtime.device cuda \
-  --runtime.run-dir $SHINE/runs --runtime.tag rl-sim-v11 \
+  --runtime.run-dir $SHINE/runs --runtime.tag rl-sim-v12 \
   --runtime.restore "$(
-    [ -f $SHINE/runs/rl-sim-v11/latest.pt ] \
+    [ -f $SHINE/runs/rl-sim-v12/latest.pt ] \
       && echo auto \
       || echo $SHINE/runs/rl-pool-v10/latest.pt
   )" \
@@ -41,7 +41,7 @@ exec /home/kage/smashbot_workspace/SmashBot/.venv/bin/python -m smashbot.rl.trai
   --learner.imitation-rows -1 \
   --learner.imitation-lambda 0.01 \
   --learner.imitation-lambda-final-frac 1.0 \
-  --sim.num-envs 448 \
+  --sim.num-envs 381 \
   --sim.unroll-length 240 \
   --sim.snapshot-interval 1500 \
   --sim.seed-snapshots-from $SHINE/runs/rl-pool-v10/snapshots \

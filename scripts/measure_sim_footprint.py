@@ -61,8 +61,9 @@ def main():
     ap.add_argument("--snapshot-dir", default="/home/kage/drive2/ShineBot/runs/rl-pool-v10/snapshots")
     ap.add_argument("--num-envs", type=int, default=283)
     ap.add_argument("--unroll", type=int, default=240)
-    ap.add_argument("--max-pfsp", type=int, default=8)
     ap.add_argument("--micro-batches", type=int, default=4)
+    ap.add_argument("--pfsp-slices", type=int, default=None,
+                    help="PFSP grid slices (default: SimRolloutConfig's)")
     ap.add_argument("--overlap", action="store_true",
                     help="pipeline learner on a second stream (train_sim's "
                          "real loop): true co-peak VRAM + wall-clock fps")
@@ -117,25 +118,22 @@ def main():
     fox = {k: v for k, v in FOX.items() if os.path.exists(v)}
 
     # (policy, frac, name_code) — frac is the middle element
-    self_frac = 1.0 - sum(frac for _, frac, _ in phillips.values()) - 0.35
+    from smashbot.rl.train_sim import SimRolloutConfig, SimLeagueWorker
+    self_frac = SimRolloutConfig.self_frac     # the launch layout (rows = envs + self)
     lg = SimLeague(policy, args.snapshot_dir, phillips=phillips, fox_imports=fox,
                    self_frac=self_frac, device=dev,
-                   config_from=args.ckpt, self_name_code=sc,
-                   compile_fn=lambda s: torch.compile(s, mode="reduce-overhead"))
+                   config_from=args.ckpt, self_name_code=sc)
 
-    # the REAL training worker (grid + groups + trackers), so the harness
+    # the REAL training worker (grids + league + trackers), so the harness
     # measures exactly the launch path
-    from smashbot.rl.train_sim import SimRolloutConfig, SimLeagueWorker
     scfg = SimRolloutConfig(num_envs=N, unroll_length=T, data_dir=args.data_dir,
-                            max_pfsp_members=args.max_pfsp)
+                            **({"pfsp_slices": args.pfsp_slices} if args.pfsp_slices else {}))
     w = SimLeagueWorker(scfg, lg, policy, sc, dev)
-    share = {k.split("/")[-1]: len(v) for k, v in w.part.items()}
-    print(f"num_envs={N} unroll={T} | groups={len(w.part)} "
-          f"(grid={'ON' if w._grid is not None else 'off'})")
-    print(f"pool: {share}")
-    assert "self" in share and any(k.startswith("phillip:") for k in share), (
-        "partition lost self/phillips — measuring the wrong pool")
-    state = learner.initial_state(N, dev)
+    share = {k: len(v) for k, v in w.part.items()}
+    print(f"num_envs={N} unroll={T} -> {w.rows} learner rows | layout {share}")
+    assert share.get("self") and any(k.startswith("phillip:") for k in share), (
+        "layout lost self/phillips — measuring the wrong pool")
+    state = learner.initial_state(w.rows, dev)
 
     # warmup: trigger compile / cudagraph capture, fill one chunk
     trajs = w.collect(1)
