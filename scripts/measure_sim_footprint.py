@@ -29,13 +29,9 @@ from smashbot.rl.train_rl import build_value_function
 
 MODELS = "/home/kage/drive2/ShineBot/models"
 # tier -> (torch ckpt, frac of N)   (medium weakest 4% ... gm strongest 10%)
-PHILLIPS = [
-    ("medium", f"{MODELS}/medium-v2-torch.pt", 0.04),
-    ("plat",   f"{MODELS}/plat-torch.pt",      0.06),
-    ("diamond",f"{MODELS}/diamond-torch.pt",   0.07),
-    ("master", f"{MODELS}/master-torch.pt",    0.08),
-    ("gm",     f"{MODELS}/gm-torch.pt",        0.10),
-]
+from smashbot.rl.train_sim import SimRolloutConfig as _SC
+PHILLIPS = [(t, f"{MODELS}/{'medium-v2-torch.pt' if t == 'medium' else t + '-torch.pt'}", f)
+            for t, f in zip(_SC.phillip_tiers, _SC.phillip_fracs)]   # the launch shares
 FOX = {
     "import:s9000": f"{MODELS}/rl-v3-tournament1st-step0009000.pt",
     "import:s10000": f"{MODELS}/rl-best-step0010000-phillip56.pt",

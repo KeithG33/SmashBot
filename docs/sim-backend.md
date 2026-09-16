@@ -65,10 +65,11 @@ by porting the v5 design above.)
 
 ## Launch
 
-`scripts/launch_sim_v11.sh` — resume v10 → 100k with the locked pool
-(self 30% / phillips 35%: medium 4, plat 6, diamond 7, master 8, gm 10 /
-PFSP 35%: v10 ghosts + imp9000, imp10000, s9500). Seeds the new run's
-snapshot dir from v10 (symlinks + pfsp.json with ghost keys rewritten).
+`scripts/launch_sim_v12.sh` — fresh run from v10 weights → 100k. Shares of
+envs: self 30% (both seats are learner rows) / phillips 30% / PFSP 40%
+(the 30 hardest v10 ghosts from 17k+ plus imp9000/imp10000/imp9500), 60
+PFSP slices, snapshots every 1500. Seeds the run's snapshot dir from v10
+(symlinks + pfsp.json with ghost keys rewritten).
 
 ## Memory + throughput (RTX 3090, 24 GB — scripts/measure_sim_footprint.py)
 

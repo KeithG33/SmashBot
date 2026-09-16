@@ -46,12 +46,12 @@ class SimRolloutConfig:
     phillip_tiers: tuple[str, ...] = ("medium", "plat", "diamond", "master", "gm")
     phillip_fracs: tuple[float, ...] = (0.0343, 0.0514, 0.06, 0.0686, 0.0857)  # 30% total
     # everything left after self+phillips (~35%) is the PFSP pool
-    # names match v10's ledger keys (import:imp9000/imp10000) so their payoff
-    # rows carry over on a seeded resume; s9500 is new to the ledger
+    # names match v10's ledger keys (import:imp9000/imp10000/imp9500) so
+    # their payoff rows carry over on a seeded run
     fox_imports: tuple[str, ...] = (
         f"imp9000:{MODELS}/rl-v3-tournament1st-step0009000.pt",
         f"imp10000:{MODELS}/rl-best-step0010000-phillip56.pt",
-        "s9500:/home/kage/drive2/ShineBot/runs/rl-pool-v3/snapshots/snapshot-0009500.pt",
+        "imp9500:/home/kage/drive2/ShineBot/runs/rl-pool-v3/snapshots/snapshot-0009500.pt",
     )
     # PFSP grid weight slices = resident members. v10 ran 36 slices x 4
     # cells so a per-match draw usually found its member resident; each
