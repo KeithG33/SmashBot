@@ -38,6 +38,8 @@ def main():
     ap.add_argument("--n", type=int, default=8)
     ap.add_argument("--steps", type=int, default=300)
     ap.add_argument("--compile", action="store_true")
+    ap.add_argument("--compile-mode", default="reduce-overhead",
+                    help="torch.compile mode (reduce-overhead = cudagraph trees; max-autotune adds Triton autotuning)")
     ap.add_argument("--precision", default="fp32", choices=["fp32", "bf16", "fp16"],
                     help="autocast dtype for the forward (match the training precision)")
     ap.add_argument("--profile", action="store_true")
@@ -72,7 +74,7 @@ def main():
     policy.requires_grad_(False)
     policy.eval()
     if args.compile:
-        policy.sample = torch.compile(policy.sample, mode="reduce-overhead")
+        policy.sample = torch.compile(policy.sample, mode=args.compile_mode)
     agent = BatchedPolicyAgent(policy, args.n, name_code=1, device=device, batch_steps=1)
     game = embed_lib.EmbedConfig().make_game_embedding()
     rng = np.random.default_rng(0)
@@ -96,7 +98,7 @@ def main():
         agent.step(states[i % 4], resets)
     torch.cuda.synchronize()
     ac.__exit__(None, None, None)
-    print(f"[{label}] {args.precision} n={args.n} compile={args.compile}: {(time.perf_counter() - t0) / args.steps * 1e3:.3f} ms/step")
+    print(f"[{label}] {args.precision} n={args.n} compile={args.compile_mode if args.compile else False}: {(time.perf_counter() - t0) / args.steps * 1e3:.3f} ms/step")
     if args.profile:
         pr = cProfile.Profile(); pr.enable()
         for i in range(100):

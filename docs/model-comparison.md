@@ -46,6 +46,11 @@ jigglypuff, cptfalcon, peach, yoshi, popo, luigi, pikachu, samus).
   forward) the ranking inverts: ffw+lstm at fp32 is 10.1ms vs SGU 27.2ms vs
   Transformer 59.8ms — the LSTM's eager cuDNN path is launch-bound and nearly flat
   in batch, while the compiled models grow ~linearly beyond n≈32.
+  `torch.compile(mode="max-autotune")` does not help (scaled SGU 9.8/18.8/28.3ms at
+  128/256/400, Transformer 58.5 @400): the cost is the per-frame window shift
+  (`torch.cat` rebuilding the [B, W, d] caches each step), i.e. memory traffic, not
+  kernel choice. A ring-buffered state (write one slot in place, rotate the conv
+  weights, mask by slot age) would remove it — candidate optimization.
 - **The n=1 "tie" (~2.83ms both) is NOT a real equivalence** — it's a cudagraph
   launch-overhead floor. At batch 1 the compute is trivial, so both bottom out at
   the replay/launch cost. They diverge at any real batch, and the gap *widens*:
