@@ -220,7 +220,7 @@ class SimLeagueWorker:
                               self.name_code, cfg.unroll_length, self.device)
         seats = LeagueSeats(S, Nc,
                             loader=lambda s, k: self._grid.load(s, k, self.lg.get_state),
-                            mover=self._grid.move)
+                            mover=self._grid.move, drain_slices=max(2, S // 12))
         self.league = self.lg.make_league(seats, self.rng)
         self.league.boot([int(e) for e in pfsp_envs])
         for e in pfsp_envs:
