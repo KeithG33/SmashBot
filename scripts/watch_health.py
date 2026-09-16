@@ -19,7 +19,7 @@ import json
 import math
 import os
 
-RUN = "keithg33/shinebot/rl-sim-v12"
+RUN = "keithg33/shinebot/rl-sim-v12b"
 STATE = "/home/kage/drive2/ShineBot/runs/rl-sim-v12/health_state.json"
 
 KEYS = [
