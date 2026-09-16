@@ -2,18 +2,9 @@
 # Sim-backend league run v11: resume v10 weights/optimizer/pfsp -> 100k steps.
 # Locked settings (2026-09-15, v10-parity grid serving, REAL-pool overlapped
 # measurements after the harness self_frac fix):
-#   345 envs = 449 learner rows (self 30% of envs, both seats) / 48 pfsp slices / mb 24
-#   (the real first learner step needs ~4 GiB more than the harness measures: 21.4 GiB
-#    at mb12/60 slices -> OOM; unattributed, sized to the real number),
-#     co-peak ~17.9 GiB stable (ceiling ~20 per Keith's 2-3GB buffer).
-#     Fallbacks: 480/mb14=3,530, 448/mb12=3,390. 512 OOMs (needs learner-state fp16).
-#   leash: kl-teacher 0.025 flat (v10's final value, no decay)
-#   imitation: lambda 0.01 flat, all rows (imitation_rows=-1)
-#   pool: self 30% / phillips 35% (medium 4, plat 6, diamond 7, master 8,
-#         gm 10) / PFSP 35% (v10 ghosts + imp9000, imp10000, s9500 fox)
-#   snapshots: every 1500, keep all; PFSP hard 0.25 explore 0.075 (v10)
-#   NEW wandb id (rl-sim-v12) -- v10's history stays untouched.
-# DO NOT run without Keith's go-ahead.
+#   280 envs = 364 learner rows (v10 scale; self 30% of envs, both seats) / 40 pfsp slices
+#   (98 pfsp envs = 2.5 per slice) / mb 12. 345 envs = 449 rows OOM'd at the first learner
+#   step twice (21.4-22.0 GiB allocated) — rows are the only lever that scales every term.
 set -euo pipefail
 
 REPO=/home/kage/smashbot_workspace/SmashBot-sim
@@ -36,15 +27,15 @@ exec /home/kage/smashbot_workspace/SmashBot/.venv/bin/python -m smashbot.rl.trai
   --runtime.checkpoint-interval 25 \
   --learner.learning-rate 3e-5 \
   --learner.precision fp16 \
-  --learner.micro-batches 24 \
+  --learner.micro-batches 12 \
   --learner.kl-teacher-weight 0.025 \
   --learner.kl-teacher-weight-final -1 \
   --learner.entropy-weight 1e-4 \
   --learner.imitation-rows -1 \
   --learner.imitation-lambda 0.01 \
   --learner.imitation-lambda-final-frac 1.0 \
-  --sim.num-envs 345 \
-  --sim.pfsp-slices 48 \
+  --sim.num-envs 280 \
+  --sim.pfsp-slices 40 \
   --sim.unroll-length 240 \
   --sim.snapshot-interval 1500 \
   --sim.seed-snapshots-from $SHINE/runs/rl-pool-v10/snapshots \
