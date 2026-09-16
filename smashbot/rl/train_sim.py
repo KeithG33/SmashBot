@@ -33,16 +33,18 @@ _MSL_CHAR = {
 @dataclasses.dataclass
 class SimRolloutConfig:
     # learner rows = num_envs + self envs (each self env feeds BOTH seats,
-    # v10's layout); rows are the VRAM budget: 381 envs @ self_frac .176
-    # = 448 rows with the v10-era 30/35/35 self/phillip/pfsp ROW mix
-    num_envs: int = 381
+    # v10's layout); rows are the VRAM budget: 345 envs @ self_frac .30
+    # = 449 rows. Shares are of ENVS: self 30 / phillips 30 / pfsp 40 ->
+    # rows self 46% / phillips 23% / pfsp 31% (Keith, 2026-09-15: fewer
+    # PFSP envs per slice is what keeps the per-match draw honest)
+    num_envs: int = 345
     unroll_length: int = 240
     data_dir: str = "/home/kage/drive2/ShineBot/msl-data"
     rollout_precision: str = "fp16"
     # --- pool shares (fractions of num_envs) ---
-    self_frac: float = 0.176      # of envs; row share = 2s/(1+s) = 0.30
+    self_frac: float = 0.30       # of envs (row share 2s/(1+s))
     phillip_tiers: tuple[str, ...] = ("medium", "plat", "diamond", "master", "gm")
-    phillip_fracs: tuple[float, ...] = (0.04, 0.06, 0.07, 0.08, 0.10)
+    phillip_fracs: tuple[float, ...] = (0.0343, 0.0514, 0.06, 0.0686, 0.0857)  # 30% total
     # everything left after self+phillips (~35%) is the PFSP pool
     # names match v10's ledger keys (import:imp9000/imp10000) so their payoff
     # rows carry over on a seeded resume; s9500 is new to the ledger
@@ -53,25 +55,22 @@ class SimRolloutConfig:
     )
     # PFSP grid weight slices = resident members. v10 ran 36 slices x 4
     # cells so a per-match draw usually found its member resident; each
-    # fp16 slice is ~54 MB; 48 (~5 cells each, draining slices reload for
-    # fresh draws) measured 21.6 GiB reserved at 448 rows and ~25%
-    # fallbacks on the curated league — watch rl/league/fallback_rate
-    pfsp_slices: int = 48
+    # fp16 slice is ~54 MB; 60 slices for 138 pfsp envs = 2.3 envs/slice,
+    # the knee where per-match draws find an empty slice (v10: 2.6) —
+    # simulated 0% fallback on the curated league; watch rl/league/*
+    pfsp_slices: int = 60
     max_game_frames: int = 28800  # Melee's 8-minute timer (60 fps)
     # --- PFSP / snapshots (v10 values) ---
     pfsp_hard_frac: float = 0.25
     pfsp_explore: float = 0.075
-    snapshot_interval: int = 1500  # snapshots are kept forever (SimLeague keep=0)
+    snapshot_interval: int = 2000  # kept forever (keep=0): ~30 new ghosts by 100k
     # seed a fresh run's snapshot dir from a previous run (symlinks + pfsp.json),
-    # curated: ghosts before seed_min_step dropped, 500-step spacing thinned
-    # to seed_thin_step below seed_thin_until (adjacent ghosts are near
-    # duplicates), ghosts the student already beats >= seed_max_winrate
-    # dropped — fewer members keep the PFSP grid's fallback rate low
+    # curated: ghosts from seed_min_step on, the seed_keep_best HARDEST by
+    # ledger winrate (Keith: early ghosts are weak; fewer members keep the
+    # PFSP grid's fallback rate low)
     seed_snapshots_from: str = ""
     seed_min_step: int = 17000
-    seed_thin_step: int = 1000
-    seed_thin_until: int = 30000
-    seed_max_winrate: float = 0.72
+    seed_keep_best: int = 30
     # --- matches ---
     char_whitelist: tuple[str, ...] = tuple(_MSL_CHAR)  # uniform MAIN_12
     seed: int = 0                 # match draws (chars/stage/ports/engine seed)
@@ -83,12 +82,12 @@ def _msl():
 
 
 def _seed_snapshots(dst_dir: str, src_dir: str, min_step: int = 0,
-                    thin_step: int = 0, thin_until: int = 0,
-                    max_winrate: float = 1.0) -> None:
+                    keep_best: int = 0) -> None:
     """Symlink a previous run's snapshots + carry its pfsp.json into a fresh
-    snapshot dir (SnapshotPool adopts archive + payoff on boot), curated by
-    step and ledger winrate. Ghost payoff keys are absolute snapshot paths —
-    rewritten to the new dir (else every ghost's winrate is dropped)."""
+    snapshot dir (SnapshotPool adopts archive + payoff on boot): ghosts from
+    min_step on, the keep_best hardest by ledger winrate (0 = all). Ghost
+    payoff keys are absolute snapshot paths — rewritten to the new dir
+    (else every ghost's winrate is dropped)."""
     import json
     from smashbot.rl.pool import SnapshotPool
     os.makedirs(dst_dir, exist_ok=True)
@@ -97,12 +96,9 @@ def _seed_snapshots(dst_dir: str, src_dir: str, min_step: int = 0,
     src_dir = os.path.abspath(src_dir)
     src = SnapshotPool(src_dir, keep=0, pfsp=True)
     src.payoff_autosave = False
-    kept, dropped = [], []
-    for g in src.archive:
-        st = src._step_of(g)
-        ok = (st >= min_step and src.win_estimate(g) < max_winrate
-              and not (thin_step and st < thin_until and st % thin_step))
-        (kept if ok else dropped).append(g)
+    cands = [g for g in src.archive if src._step_of(g) >= min_step]
+    cands.sort(key=src.win_estimate)          # hardest (lowest student winrate) first
+    kept = sorted(cands[:keep_best] if keep_best else cands)
     for g in kept:
         os.symlink(g, os.path.join(dst_dir, os.path.basename(g)))
     pfsp = os.path.join(src_dir, "pfsp.json")
@@ -121,8 +117,8 @@ def _seed_snapshots(dst_dir: str, src_dir: str, min_step: int = 0,
         k = len(remapped)
         with open(os.path.join(dst_dir, "pfsp.json"), "w") as fh:
             json.dump(remapped, fh)
-    print(f"seeded {len(kept)} snapshots (dropped {len(dropped)}: step<{min_step}, "
-          f"thinned to {thin_step} below {thin_until}, winrate>={max_winrate}) "
+    print(f"seeded {len(kept)} snapshots (steps >= {min_step}, {keep_best or 'all'} "
+          f"hardest of {len(cands)}; {len(src.archive) - len(kept)} dropped) "
           f"+ {k} payoff entries from {src_dir}", flush=True)
 
 
@@ -353,7 +349,7 @@ def run(args) -> None:
     snap_dir = f"{run_dir}/snapshots"
     if scfg.seed_snapshots_from:
         _seed_snapshots(snap_dir, scfg.seed_snapshots_from, scfg.seed_min_step,
-                        scfg.seed_thin_step, scfg.seed_thin_until, scfg.seed_max_winrate)
+                        scfg.seed_keep_best)
     phillips = {}
     for tier, frac in zip(scfg.phillip_tiers, scfg.phillip_fracs):
         fname = "medium-v2-torch.pt" if tier == "medium" else f"{tier}-torch.pt"
