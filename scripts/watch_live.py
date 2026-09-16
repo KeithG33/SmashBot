@@ -35,7 +35,7 @@ from melee.slippstream import EnetDisconnected
 
 from smashbot.eval import game as game_lib
 from smashbot.eval.agent import AsyncDelayedAgent
-from smashbot.rl.pool import MAIN_12
+from smashbot.rl.config import MAIN_12
 
 from slippi_ai import dolphin as dolphin_lib
 

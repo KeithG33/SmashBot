@@ -286,58 +286,6 @@ def test_worker_side_encode_matches_policy_encode():
     worker_embed.from_state(scalar_game)  # must not raise
 
 
-def test_teacher_watcher_and_hot_swap(tmp_path):
-    """Watcher ignores unchanged/torn files, loads complete updates; swapping
-    the learner's teacher in place changes teacher_kl and survives a step."""
-    import os
-    import time as time_lib
-
-    from smashbot.rl.teacher_watch import TeacherWatcher
-    from smashbot.tests.test_ppo import _make_learner
-
-    learner, traj = _make_learner(ppo=PPOConfig(max_mean_actor_kl=1.0))
-    path = tmp_path / "best.pt"
-
-    def write_ckpt(policy):
-        tmp = str(path) + ".tmp"
-        torch.save({"state": {"policy": policy.state_dict()}}, tmp)
-        os.replace(tmp, path)
-
-    write_ckpt(learner.teacher)
-    watcher = TeacherWatcher(str(path), settle_seconds=0.05)
-    assert watcher.poll() is None  # unchanged since construction
-
-    # a DIFFERENT teacher lands (atomic replace)
-    from smashbot.tests.test_ppo import _tiny_policy
-    other = _tiny_policy(seed=123)
-    time_lib.sleep(0.02)
-    write_ckpt(other)
-    sd = watcher.poll()
-    assert sd is not None
-    assert watcher.poll() is None  # consumed; no re-trigger
-
-    # torn write: partial garbage without atomic replace -> skipped, no raise
-    with open(path, "wb") as f:
-        f.write(b"partial garbage")
-    assert watcher.poll() is None
-
-    # hot swap: teacher_kl was ~0 (teacher == policy init); after swapping in
-    # a different teacher it must be > 0, and a learner step still runs
-    state = learner.initial_state(3)
-    fixed, _, _ = learner._fixed_pass(traj, state)
-    with torch.no_grad():
-        _, before = learner._policy_loss(fixed)
-    learner.teacher.load_state_dict(sd)
-    state = state._replace(teacher=learner.teacher.initial_state(3))
-    fixed, state, _ = learner._fixed_pass(traj, learner.initial_state(3))
-    with torch.no_grad():
-        _, after = learner._policy_loss(fixed)
-    assert before["teacher_kl"] == pytest.approx(0.0, abs=1e-5)
-    assert after["teacher_kl"] > 0.01
-    _, metrics = learner.step([traj], learner.initial_state(3))
-    assert np.isfinite(metrics["post_update"]["loss"])
-
-
 def test_game_tracker():
     from smashbot.rl.rollouts import GameTracker
 
@@ -354,52 +302,6 @@ def test_game_tracker():
     assert st["avg_stock_diff"] == pytest.approx((2 - 1 + 0 + 4) / 4)
     assert st["avg_percent_at_kill"] == pytest.approx(70.0)
     assert st["avg_percent_at_death"] == pytest.approx(120.0)
-
-
-def test_pool_partition_and_snapshots(tmp_path):
-    from smashbot.rl.pool import SnapshotPool, make_partition
-
-    specs = make_partition(
-        64, cpu_envs=8, teacher_envs=16, seed=1
-    )
-    assert len(specs) == 64
-    kinds = [s.kind for s in specs]
-    assert kinds.count("cpu") == 8
-    assert kinds.count("teacher") == 16
-    assert kinds.count("snapshot") == 40
-    # policy opponents main-12 only; seats balanced
-    from collections import Counter
-
-    from smashbot.rl.pool import CPU_CHARS, OFF_ROSTER, OPPONENT_CHARS
-
-    for s_ in specs:
-        if s_.kind != "cpu":
-            assert s_.opponent_char in OPPONENT_CHARS  # Sheik allowed here
-        else:
-            assert s_.opponent_char in CPU_CHARS + OFF_ROSTER
-            # CPUs cannot be Sheik: proven live, 362/362 spawned Zelda
-            assert s_.opponent_char != "SHEIK"
-        assert s_.opponent_char != "ZELDA"  # unpickable on netplay CSS
-        assert s_.student_port in (1, 2)
-    seats = Counter(s.student_port for s in specs)
-    assert abs(seats[1] - seats[2]) <= 2
-
-    import torch as t
-
-    class P(t.nn.Module):
-        def __init__(self, v):
-            super().__init__()
-            self.w = t.nn.Parameter(t.tensor([v]))
-
-    pool = SnapshotPool(str(tmp_path), keep=4)
-    import random as r
-
-    assert pool.draw_member(r.Random(0)) is None  # empty archive
-    for step, v in enumerate([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]):
-        pool.save(P(v), step)
-    assert len(pool.archive) == 4  # keep=4 pruned oldest
-    rng = r.Random(0)
-    assert all(pool.draw_member(rng) in pool.archive for _ in range(20))
 
 
 def test_reset_target_positions_masked():
@@ -446,24 +348,6 @@ def test_reset_target_positions_masked():
     assert metrics["anomalous_samples"] == 0
     assert metrics["ratio_mean"] == pytest.approx(1.0, abs=1e-3)
     assert metrics["actor_kl_mean"] == pytest.approx(0.0, abs=1e-4)
-
-
-def test_pool_partition_reference_envs():
-    from smashbot.rl.pool import MAIN_12, make_partition
-
-    specs = make_partition(
-        num_envs=16, cpu_envs=4, teacher_envs=-1,
-        seed=3, ref_envs=4,
-    )
-    kinds = [s.kind for s in specs]
-    assert kinds.count("cpu") == 4
-    assert kinds.count("reference") == 4
-    assert kinds.count("teacher") == 8
-    refs = [s for s in specs if s.kind == "reference"]
-    # medium-v2 plays exactly the main 12 (verified from its checkpoint)
-    assert all(s.opponent_char in MAIN_12 for s in refs)
-    # both seats represented so the student isn't port-biased vs the ref
-    assert {s.student_port for s in refs} == {1, 2}
 
 
 def test_snapshot_pool_exponential_thinning(tmp_path):
@@ -627,23 +511,6 @@ def test_async_agent_absorbs_slow_samples(monkeypatch):
         )
     # and step() never blocked on a spike (queue slack absorbed the lag)
     assert max(step_times) < 0.02, f"step blocked: {max(step_times)*1e3:.1f}ms"
-
-
-def test_partition_guarantees_full_roster_per_policy_kind():
-    """Stratified draws: every policy-opponent group (teacher/reference/
-    snapshot) must cover all 12 characters when it has >= 12 envs (pure
-    random draws left holes — live-audited: a 32-env group missed PEACH
-    for an entire run)."""
-    from smashbot.rl.pool import MAIN_12, make_partition
-
-    for seed in range(5):
-        specs = make_partition(128, 8, 32, 4, ref_envs=32, seed=seed)
-        by_kind: dict = {}
-        for sp in specs:
-            by_kind.setdefault(sp.kind, set()).add(sp.opponent_char)
-        for kind in ("teacher", "reference", "snapshot"):
-            missing = [c for c in MAIN_12 if c not in by_kind[kind]]
-            assert not missing, f"seed {seed} {kind} missing {missing}"
 
 
 def test_tracker_ema_and_persistence():

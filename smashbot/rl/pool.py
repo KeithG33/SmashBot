@@ -1,19 +1,9 @@
-"""Opponent pool: env partition (CPU / teacher / league), character
-sampling, random seats, the student-snapshot archive and the per-match
-PFSP draw (SnapshotPool.draw_member).
+"""Snapshot archive + PFSP draw (SnapshotPool): the student-ghost league.
 
-Design (user-decided):
-- Student plays characters from a whitelist (default FOX-only: RL round one
-  focuses one character; the BC prior retains the rest via the KL leash).
-  See student_whitelist() for the legacy bot_char interaction.
-- Opponent characters vary. Policy opponents (teacher/snapshots) draw from
-  the MAIN-12 roster only — the BC prior never saw off-roster characters and
-  would play them at garbage tier (noise, not diversity). CPU opponents draw
-  60% main-12 / 40% rest-of-cast: the engine AI genuinely plays anyone.
-- Random seats: each env independently seats the student on port 1 or 2,
-  cancelling Melee's port-priority edge in aggregate and preventing
-  priority-dependent habits.
-"""
+save() freezes policies as league members; draw_member() picks opponents
+weighted by AlphaStar's f_hard/f_var over the decayed-count payoff table
+(pfsp.json). The Dolphin env-partition machinery that shared this module
+left with the Dolphin fleet."""
 
 from __future__ import annotations
 
@@ -23,90 +13,6 @@ import random
 import typing as tp
 
 import torch
-
-from smashbot.rl.config import (  # noqa: F401  (re-exports)
-    CPU_CHARS, EnvSpec, MAIN_12, OFF_ROSTER, OPPONENT_CHARS, student_whitelist,
-)
-
-def make_partition(
-    num_envs: int,
-    cpu_envs: int,
-    teacher_envs: int,
-    main12_prob: float = 0.6,
-    seed: int = 0,
-    ref_envs: int = 0,
-    self_envs: int = 0,
-    char_whitelist: tp.Sequence[str] = ("FOX",),
-    # {"import:NAME": (path, char_lock|None)} -> import_envs_per dedicated
-    # envs per member (kind "import": pinned brain, static seat)
-    import_registry: tp.Mapping[str, tuple[str, tp.Optional[str]]] | None = None,
-    import_envs_per: int = 0,
-) -> list[EnvSpec]:
-    """Fixed env partition; seats alternate so each kind is port-balanced.
-    Every env not cpu/teacher/reference/self is a LEAGUE env (kind
-    "snapshot": its opponent is drawn per match from the league).
-
-    num_envs is the LEARNER trajectory budget, not the Dolphin count: a
-    self-play env contributes BOTH seats as PPO trajectories, so it costs 2
-    budget units while running one Dolphin. The returned list has
-    num_envs - self_envs specs (= Dolphins to boot). Order:
-    cpu / teacher / reference / import / self / league."""
-    import_envs = (
-        len(import_registry) * import_envs_per if import_registry else 0
-    )
-    if teacher_envs < 0:  # default: teacher takes every env not otherwise used
-        teacher_envs = (
-            num_envs - cpu_envs - ref_envs - import_envs - 2 * self_envs
-        )
-    league_envs = (
-        num_envs - cpu_envs - teacher_envs - ref_envs - import_envs
-        - 2 * self_envs
-    )
-    assert league_envs >= 0, "fixed-kind envs exceed num_envs"
-    rng = random.Random(seed)
-
-    def cpu_char() -> str:
-        pool = CPU_CHARS if rng.random() < main12_prob else OFF_ROSTER
-        return rng.choice(pool)
-
-    def stratified(n: int, roster: tp.Sequence[str] = OPPONENT_CHARS) -> list[str]:
-        """All roster chars guaranteed once (when n >= len(roster)), remainder
-        random, order shuffled — pure random draws left holes (live-audited:
-        Phillip's 32-env group drew zero PEACH for an entire run)."""
-        chars = list(roster) if n >= len(roster) else []
-        chars += [rng.choice(roster) for _ in range(n - len(chars))]
-        rng.shuffle(chars)
-        return chars
-
-    specs: list[EnvSpec] = []
-    for i in range(cpu_envs):
-        specs.append(EnvSpec("cpu", 1 + (i % 2), cpu_char()))
-    for i, ch in enumerate(stratified(teacher_envs)):
-        specs.append(EnvSpec("teacher", 1 + (i % 2), ch))
-    for i, ch in enumerate(stratified(ref_envs)):
-        # reference agent (e.g. medium-v2) plays the main 12 (user-verified)
-        specs.append(EnvSpec("reference", 1 + (i % 2), ch))
-    if import_registry:
-        for key, (_path, lock) in import_registry.items():
-            chars = (
-                [lock] * import_envs_per if lock
-                else stratified(import_envs_per)
-            )
-            for i, ch in enumerate(chars):
-                specs.append(EnvSpec(
-                    "import", 1 + (i % 2), ch, member=key, char_lock=lock,
-                ))
-    # self-play: both seats are the student, so the second seat's boot char
-    # draws from the student whitelist (stratified for coverage)
-    for i, ch in enumerate(stratified(self_envs, list(char_whitelist))):
-        specs.append(EnvSpec("self", 1 + (i % 2), ch))
-    for i, ch in enumerate(stratified(league_envs)):
-        specs.append(EnvSpec("snapshot", 1 + (i % 2), ch))
-    assert len(specs) == num_envs - self_envs, (
-        "dolphin count must be num_envs - self_envs (memory-neutral batching)"
-    )
-    return specs
-
 
 # Special (non-snapshot) league members that can compete for snapshot slots
 # when the league_teacher/league_cpu/league_phillip flags fold them into the
@@ -273,7 +179,10 @@ class SnapshotPool:
         d = self.PAYOFF_DECAY
         entry["wins_d"] = d * entry["wins_d"] + float(won)
         entry["games_d"] = d * entry["games_d"] + 1.0
-        self._save_payoff()
+        # payoff_autosave=False (sim worker): the caller flushes at
+        # checkpoint cadence instead of json-dumping per decided game
+        if getattr(self, "payoff_autosave", True):
+            self._save_payoff()
 
     # ~100-game effective recency window at large n; exact mean at small n
     PAYOFF_DECAY = 0.99

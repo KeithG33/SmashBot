@@ -79,11 +79,22 @@ class BatchedPolicyAgent:
         device: str = "cpu",
         batch_steps: int = 1,
         precision: str = "fp32",
+        state_dtype: torch.dtype | None = None,
     ):
         self.policy = policy
         self.num_envs = num_envs
         self.device = device
         self.temperature = temperature
+        # fp16 carried state — OPPONENT seats only (nothing downstream of
+        # them enters a loss; the student's logits feed the PPO ratio). The
+        # fp16-autocast forward computes state in fp16 anyway; seeding the
+        # initial zeros fp16 keeps the KV cat in fp16 (fp32 zeros would
+        # promote it back). Bit-identical vs fp32 storage:
+        # scripts/check_fp16_state.py.
+        assert state_dtype is None or precision == "fp16", (
+            "state_dtype override requires the fp16 autocast forward"
+        )
+        self.state_dtype = state_dtype
         # "fp16": the network runs under fp16 autocast (sampling math stays
         # fp32 — embed.py casts logits up); logits are stored fp16. Gated by
         # the precision probe (docs/precision): the learner's ratio
@@ -105,7 +116,7 @@ class BatchedPolicyAgent:
             self._embed_controller.from_state(neutral),
         )
 
-        self.hidden = policy.initial_state(num_envs, device)
+        self.hidden = self._cast_state(policy.initial_state(num_envs, device))
         self._prev_action = tree.map_structure(lambda t: t.clone(), self._neutral_encoded)
         # flat_controllers=True (the rollout worker): queues hold 13-float
         # rows and step() returns rows (env rebuilds the struct) — no
@@ -123,12 +134,23 @@ class BatchedPolicyAgent:
         self._buf_states: list = []
         self._buf_resets: list[torch.Tensor] = []
 
+    def _cast_state(self, state):
+        if self.state_dtype is None:
+            return state
+        return tree.map_structure(
+            lambda t: t.to(self.state_dtype)
+            if isinstance(t, torch.Tensor) and t.is_floating_point() else t,
+            state,
+        )
+
     def reset_env(self, i: int) -> None:
         """Fresh game in env i: zero its recurrent state, queue, and prev action."""
         mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self._name.device)
         mask[i] = True
         self.hidden = _mask_state(
-            mask, self.policy.initial_state(self.num_envs, self.device), self.hidden
+            mask,
+            self._cast_state(self.policy.initial_state(self.num_envs, self.device)),
+            self.hidden,
         )
         self._queues[i] = collections.deque([self._neutral()] * self.delay)
         tree.map_structure(
@@ -326,6 +348,7 @@ class LeagueAgent:
         self, template: Policy, slices: int, cells: int, name_code: int,
         device, temperature=None, capture: bool | None = None,
         weights_dtype: torch.dtype = torch.float32,
+        state_dtype: torch.dtype | None = None,
     ):
         import copy
 
@@ -335,6 +358,12 @@ class LeagueAgent:
         # fp16 stacked weights halve the per-slice VRAM (107 -> 54 MB); the
         # forward then runs under fp16 autocast (norms stay fp32)
         self.weights_dtype = weights_dtype
+        # optional recurrent-state storage dtype (see _initial_hidden); only
+        # meaningful with the fp16-autocast forward
+        self.state_dtype = state_dtype
+        assert state_dtype is None or weights_dtype == torch.float16, (
+            "state_dtype override is for the fp16 forward"
+        )
         assert weights_dtype == torch.float32 or self.device.type == "cuda", (
             "fp16 league weights need CUDA (fp16 autocast)"
         )
@@ -392,9 +421,10 @@ class LeagueAgent:
         self._graph = None
         self._vm = self._make_vmap()
         self._timer = None  # optional profiler callback (name) -> None
-        # eager-path recurrent state [S, N, ...] (the captured path keeps
-        # it in static buffers)
-        self._hidden = self._initial_hidden()
+        # eager-path recurrent state [S, N, ...]; the captured path keeps
+        # state in its static in/out buffers — lazy, so capture-mode never
+        # allocates this third full copy
+        self._hidden = None if self._use_capture else self._initial_hidden()
 
     # ---------------------------------------------------------- weights
 
@@ -406,6 +436,8 @@ class LeagueAgent:
         its few occupants into its other slices). Bit-exact for the env."""
         (s0, n0), (s1, n1) = src, dst
         tree.map_structure(lambda t: t[s1, n1].copy_(t[s0, n0]), self._prev)
+        if not (self._use_capture and self._graph is not None) and self._hidden is None:
+            self._hidden = self._initial_hidden()   # lazy (pre-capture move)
         hidden = self._out_hidden if self._use_capture and self._graph is not None else self._hidden
         tree.map_structure(
             lambda t: t[s1, n1].copy_(t[s0, n0]) if isinstance(t, torch.Tensor) else None,
@@ -500,10 +532,19 @@ class LeagueAgent:
 
     def _initial_hidden(self):
         h0 = [self._template.initial_state(self.N, self.device) for _ in range(self.S)]
-        return tree.map_structure(
+        stacked = tree.map_structure(
             lambda *xs: torch.stack(xs) if isinstance(xs[0], torch.Tensor) else xs[0],
             *h0,
         )
+        if self.state_dtype is not None:
+            # fp16 carried state: computed under fp16 autocast anyway; the
+            # in/out static buffers are the grid's biggest resident term.
+            stacked = tree.map_structure(
+                lambda t: t.to(self.state_dtype)
+                if isinstance(t, torch.Tensor) and t.is_floating_point() else t,
+                stacked,
+            )
+        return stacked
 
     def _make_vmap(self):
         from torch.func import functional_call, vmap

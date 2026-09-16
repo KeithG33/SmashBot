@@ -41,6 +41,10 @@ def _mask_state(reset: torch.Tensor, initial, prev):
                 mask = mask.unsqueeze(-1)
         else:  # [layers, B, H] torch RNN convention
             mask = reset.view(1, -1, *([1] * (state.dim() - 2)))
+        # match the carried state's dtype (fp32 zeros would promote the
+        # masked state to fp32 — permanent pool residency under capture)
+        if init.dtype != state.dtype and init.is_floating_point():
+            init = init.to(state.dtype)
         return torch.where(mask, init, state)
 
     return torch.utils._pytree.tree_map(where, initial, prev)
@@ -109,6 +113,21 @@ class RecurrentWrapper(Network):
         return h
 
     def step(self, inputs, prev_state):
+        if getattr(self, "manual_step", False):
+            # Hand-rolled LSTM cell (cuDNN's fused step has no vmap rule;
+            # the stacked-weights phillip grid needs one). Same parameters
+            # and equations as nn.LSTM (gate order i,f,g,o); ~5e-5 off
+            # cuDNN (fusion order). Training unrolls never take this path.
+            assert isinstance(self._core, nn.LSTM), "manual_step is LSTM-only"
+            h, c = prev_state                       # each [1, B, H]
+            gates = (
+                inputs @ self._core.weight_ih_l0.t() + self._core.bias_ih_l0
+                + h[0] @ self._core.weight_hh_l0.t() + self._core.bias_hh_l0
+            )
+            i, f, g, o = gates.chunk(4, -1)
+            c2 = torch.sigmoid(f) * c[0] + torch.sigmoid(i) * torch.tanh(g)
+            h2 = torch.sigmoid(o) * torch.tanh(c2)
+            return h2, (h2.unsqueeze(0), c2.unsqueeze(0))
         out, next_state = self._core(inputs.unsqueeze(1), prev_state)
         return out.squeeze(1), next_state
 

@@ -151,6 +151,9 @@ class _Fixed(tp.NamedTuple):
     # reset-substituted neutral at t+1 (a fictional action the actor never
     # sampled — the AR head's teacher-forcing chains diverge there and the
     # position carries no legitimate learning signal)
+    reset0: torch.Tensor  # [B] bool: the chunk starts a fresh game (the
+    # policy's initial state is masked to zeros per micro-batch chunk, not
+    # for the whole batch up front — two full-batch state copies otherwise)
 
 
 def imitation_weights(
@@ -378,13 +381,10 @@ class Learner:
         frames = self._frames(traj)
         batch_size = traj.rewards.shape[0]
 
-        # Actors reset mid-rollout invisibly to the learner; mask the policy's
-        # carried state back to zeros wherever a chunk starts fresh.
-        initial_policy_state = _mask_state(
-            traj.is_resetting[:, 0],
-            self.policy.initial_state(batch_size, traj.rewards.device),
-            traj.initial_state,
-        )
+        # Actors reset mid-rollout invisibly to the learner; the policy's
+        # carried state is masked back to zeros wherever a chunk starts
+        # fresh — per micro-batch chunk, in _policy_loss_inner
+        initial_policy_state = traj.initial_state
 
         budget = -(-batch_size // max(1, self.config.micro_batches))
         bounds = list(range(0, batch_size, budget)) + [batch_size]
@@ -489,6 +489,7 @@ class Learner:
             actor_logits=cat0(a_logits),
             actor_log_probs=cat0(a_logps),
             valid=(~traj.is_resetting[:, 1:]).float(),
+            reset0=traj.is_resetting[:, 0],
         )
         # Detach carried recurrent states: the next chunk's backward must not
         # reach into this chunk's (already-freed) graph.
@@ -517,9 +518,13 @@ class Learner:
 
     def _policy_loss_inner(self, fixed: _Fixed) -> tuple[torch.Tensor, dict]:
         cfg = self.config
-        out = self.policy.unroll(
-            fixed.frames, fixed.initial_policy_state, discount=cfg.discount
+        rows = fixed.valid.shape[0]
+        init = _mask_state(
+            fixed.reset0,
+            self.policy.initial_state(rows, fixed.valid.device),
+            fixed.initial_policy_state,
         )
+        out = self.policy.unroll(fixed.frames, init, discount=cfg.discount)
         # Probe: pre-clamp max |logit| split by validity (NaN counted as
         # inf so it can't hide from max()).
         with torch.no_grad():
