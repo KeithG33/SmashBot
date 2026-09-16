@@ -59,3 +59,23 @@ per-frame clone and no copy into the graph's input placeholder. That is where
 the 54% is. Do it in agent.py with a manual CUDA-graph capture of `policy.sample`
 (LeagueAgent already works this way — its `out -> in` carry can move inside the
 captured graph).
+
+## Benchmark hygiene (2026-09-16)
+`bench_agent_step.py` measures a full serving frame — delay-queue pop, state
+clones, the compiled forward, the device->host copy of the sampled controller,
+numpy decode, re-enqueue — i.e. what the rollout pays per frame, NOT just the
+network. Its `agent.step()` defaulted to `want_snapshot=True`, cloning the whole
+recurrent state EVERY frame; production takes that snapshot once per unroll
+(240 frames). Measured cost of one full-state clone at n=400: SGU 3.43 ms,
+LSTM 0 (its state is KB, not MB). So the published latency table overstates the
+windowed models and not the LSTM — re-measure with `--no-snapshot` for a fair
+architecture comparison.
+
+Decomposition at n=400 (scaled SGU, bf16): 27.4 bench default -> 23.9 with one
+clone (production) -> ~20.5 projected if the carried-state clone also goes.
+The earlier "~12 ms" projection was too optimistic: the profiler's 54% `copy_`
+includes the copies INTO the cudagraph input placeholders, which only the
+static-buffer rework removes. LSTM @400 is 8.3 either way.
+
+The T==1 branch in SGUBlock.mix is load-bearing: forcing the conv path for all T
+costs 2.4x at n=400 (58.2 vs 23.9) and +30% at n=1.

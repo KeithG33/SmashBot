@@ -43,6 +43,9 @@ def main():
     ap.add_argument("--precision", default="fp32", choices=["fp32", "bf16", "fp16"],
                     help="autocast dtype for the forward (match the training precision)")
     ap.add_argument("--profile", action="store_true")
+    ap.add_argument("--no-snapshot", action="store_true",
+                    help="skip the chunk-boundary state clone (production takes "
+                         "it every unroll_length frames, not every frame)")
     ap.add_argument("--torch-profile", action="store_true",
                     help="torch.profiler: top CUDA kernels by self time over 50 steps")
     # config-spec mode: build a random-init policy of a given architecture
@@ -92,12 +95,13 @@ def main():
         "cuda", dtype=torch.bfloat16 if args.precision == "bf16" else torch.float16))
     ac.__enter__()
     resets = torch.zeros(args.n, dtype=torch.bool, device=device)
+    snap = not args.no_snapshot
     for i in range(30):
-        agent.step(states[i % 4], resets)
+        agent.step(states[i % 4], resets, want_snapshot=snap)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     for i in range(args.steps):
-        agent.step(states[i % 4], resets)
+        agent.step(states[i % 4], resets, want_snapshot=snap)
     torch.cuda.synchronize()
     ac.__exit__(None, None, None)
     print(f"[{label}] {args.precision} n={args.n} compile={args.compile_mode if args.compile else False}: {(time.perf_counter() - t0) / args.steps * 1e3:.3f} ms/step")
