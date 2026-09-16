@@ -489,9 +489,9 @@ class SGUBlock(nn.Module):
         # fp32-initialized state must not promote the whole window)
         v_full = torch.cat([v_cache.to(v.dtype), v], dim=1)  # [B, W-1+T, d]
         if T == 1:
+            # Optimization for inductor fusion on play path; conv kernels handle B=1/groups=d badly
             # Grouped conv with one output position is just a per-channel
-            # weighted sum over the window; conv kernels handle B=1/groups=d
-            # badly (and defeat inductor fusion) on the play path.
+            # weighted sum over the window;
             w = self.spatial.weight.squeeze(1)  # [d, W]
             v_mixed = (v_full * w.t()).sum(dim=1, keepdim=True) + self.spatial.bias
         else:

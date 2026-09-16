@@ -16,7 +16,7 @@ measured with cudagraph compilation (the setting we run) on GPU, in ms per call.
 
 \* Largest batch that fit in memory  
 <br>
-  
+- All models tested in fp32
 - Both blocks train on the **same 12 characters** (fox, falco, marth, sheik,
 jigglypuff, cptfalcon, peach, yoshi, popo, luigi, pikachu, samus).
 - Top block is a small-scale experiment with 20k replays and smaller networks (under 5ms)

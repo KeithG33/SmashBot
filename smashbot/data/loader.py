@@ -77,15 +77,26 @@ def make_sources(
     config: DataConfig,
     extra_frames: int,
     name_map: tp.Optional[dict[str, int]] = None,
+    start_replay: int = 0,
 ) -> Sources:
     """Build train/test DataSources. extra_frames must be policy.delay + 1.
 
     name_map: pass the checkpoint's map when resuming — indices are assigned
     by frequency, so recomputing on changed data would silently permute them.
+    start_replay: the checkpoint's train replay_counter. The train source
+    cycles its (seeded-shuffle) replay list in a fixed order, so resuming
+    is exactly "continue from replay N": rotate the list to N and carry the
+    counter, instead of replaying the epoch from its start.
     """
     train_replays, test_replays = data_lib.train_test_split(config.dataset)
     if name_map is None:
         name_map = create_name_map(train_replays, config.max_names)
+    if start_replay:
+        if config.balance_characters:
+            print("WARNING: start_replay with balance_characters — the "
+                  "interleaved order is not a plain cycle; resume is approximate")
+        n = start_replay % len(train_replays)
+        train_replays = train_replays[n:] + train_replays[:n]
 
     def make(replays: list[data_lib.ReplayInfo]) -> data_lib.DataSource:
         return data_lib.DataSource(
@@ -100,7 +111,9 @@ def make_sources(
             num_workers=config.num_workers,
         )
 
-    return Sources(train=make(train_replays), test=make(test_replays), name_map=name_map)
+    train = make(train_replays)
+    train.replay_counter = start_replay   # epoch counter continues
+    return Sources(train=train, test=make(test_replays), name_map=name_map)
 
 
 def batch_to_frames(batch: data_lib.Batch, network, pin: bool = False):
