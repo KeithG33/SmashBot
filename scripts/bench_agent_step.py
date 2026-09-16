@@ -38,7 +38,18 @@ def main():
     ap.add_argument("--n", type=int, default=8)
     ap.add_argument("--steps", type=int, default=300)
     ap.add_argument("--compile", action="store_true")
+    ap.add_argument("--compile-mode", default="reduce-overhead",
+                    help="torch.compile mode (reduce-overhead = cudagraph trees; max-autotune adds Triton autotuning)")
+    ap.add_argument("--precision", default="fp32", choices=["fp32", "bf16", "fp16"],
+                    help="autocast dtype for the forward (match the training precision)")
     ap.add_argument("--profile", action="store_true")
+    ap.add_argument("--capture", action="store_true",
+                    help="manual static-buffer CUDA graph (no per-frame state clone)")
+    ap.add_argument("--no-snapshot", action="store_true",
+                    help="skip the chunk-boundary state clone (production takes "
+                         "it every unroll_length frames, not every frame)")
+    ap.add_argument("--torch-profile", action="store_true",
+                    help="torch.profiler: top CUDA kernels by self time over 50 steps")
     # config-spec mode: build a random-init policy of a given architecture
     # instead of loading --ckpt (weights don't affect timing).
     ap.add_argument("--arch", default="", help="tx_like | transformer | sgu; "
@@ -70,8 +81,11 @@ def main():
     policy.requires_grad_(False)
     policy.eval()
     if args.compile:
-        policy.sample = torch.compile(policy.sample, mode="reduce-overhead")
-    agent = BatchedPolicyAgent(policy, args.n, name_code=1, device=device, batch_steps=1)
+        # a manual graph cannot contain cudagraph trees: compile for kernels only
+        policy.sample = torch.compile(
+            policy.sample, mode=None if args.capture else args.compile_mode)
+    agent = BatchedPolicyAgent(policy, args.n, name_code=1, device=device,
+                               batch_steps=1, capture=args.capture)
     game = embed_lib.EmbedConfig().make_game_embedding()
     rng = np.random.default_rng(0)
 
@@ -81,15 +95,30 @@ def main():
             lambda x: torch.from_numpy(np.ascontiguousarray(
                 x.astype(np.int64) if x.dtype.kind in "iu" else x)).to(device), enc)
     states = [state() for _ in range(4)]
+    import contextlib
+    ac = (contextlib.nullcontext() if args.precision == "fp32" else torch.autocast(
+        "cuda", dtype=torch.bfloat16 if args.precision == "bf16" else torch.float16))
+    ac.__enter__()
     resets = torch.zeros(args.n, dtype=torch.bool, device=device)
+    snap = not args.no_snapshot
     for i in range(30):
-        agent.step(states[i % 4], resets)
+        agent.step(states[i % 4], resets, want_snapshot=snap)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     for i in range(args.steps):
-        agent.step(states[i % 4], resets)
+        agent.step(states[i % 4], resets, want_snapshot=snap)
     torch.cuda.synchronize()
-    print(f"[{label}] n={args.n} compile={args.compile}: {(time.perf_counter() - t0) / args.steps * 1e3:.3f} ms/step")
+    ac.__exit__(None, None, None)
+    print(f"[{label}] {args.precision} n={args.n} compile={args.compile_mode if args.compile else False}: {(time.perf_counter() - t0) / args.steps * 1e3:.3f} ms/step")
+    if args.torch_profile:
+        from torch.profiler import profile, ProfilerActivity
+        ac.__enter__()
+        with profile(activities=[ProfilerActivity.CUDA, ProfilerActivity.CPU]) as prof:
+            for i in range(50):
+                agent.step(states[i % 4], resets)
+            torch.cuda.synchronize()
+        ac.__exit__(None, None, None)
+        print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=22))
     if args.profile:
         pr = cProfile.Profile(); pr.enable()
         for i in range(100):

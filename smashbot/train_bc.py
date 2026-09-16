@@ -79,16 +79,20 @@ def main(config: TrainConfig) -> None:
     # On resume, the checkpoint's name_map is authoritative: indices are
     # frequency-assigned, so recomputing on changed data would permute them.
     restored_name_map = None
+    start_replay = 0
     if rt.restore:
         restore_path = (
             os.path.join(run_dir, "latest.pt") if rt.restore == "auto" else rt.restore
         )
-        restored_name_map = saving.load_checkpoint(restore_path)["state"].get("name_map")
+        _rs = saving.load_checkpoint(restore_path)["state"]
+        restored_name_map = _rs.get("name_map")
+        start_replay = _rs.get("replay_counter", 0)
 
     sources = loader.make_sources(
         config.data,
         extra_frames=config.policy.delay + 1,
         name_map=restored_name_map,
+        start_replay=start_replay,
     )
     print(f"name_map: {sources.name_map}")
 
@@ -204,6 +208,7 @@ def main(config: TrainConfig) -> None:
                 "value_opt": value_opt.state_dict(),
                 "step": step,
                 "name_map": sources.name_map,
+                "replay_counter": sources.train.replay_counter,
             },
             best_eval_loss,
         )

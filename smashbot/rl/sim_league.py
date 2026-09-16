@@ -174,7 +174,7 @@ class MultiOpponentSimWorker:
                  stage, char_pairs, name_code=1, device="cpu", record_fn=None,
                  precision="fp32", grids=(), event_fn=None, self_idx=(),
                  league=None, pfsp_grid=None, match_fn=None, max_frame=28800,
-                 seed=0):
+                 seed=0, capture=False):
         """opponents: [(gid, policy, env_idx, harvest, name_code)] fixed
         groups (eval arena). grids: static PfspGrids (phillip tiers), env ->
         gid via gid_of_env below. self_idx: envs whose player-1 seat is the
@@ -200,7 +200,8 @@ class MultiOpponentSimWorker:
         self.self_idx_t = torch.as_tensor(self.self_idx, device=device)
         self.rows = batch_size + len(self.self_idx)
         self.student = BatchedPolicyAgent(student_policy, self.rows, name_code=name_code,
-                                          device=device, precision=precision)
+                                          device=device, precision=precision,
+                                          capture=capture)
         self.student.set_flat_controllers(True)
         self.ff = sim_env.FlatFrames(device)
         self.assembler = ChunkAssembler(unroll_length, student_policy.delay)

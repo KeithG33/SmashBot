@@ -80,6 +80,7 @@ class BatchedPolicyAgent:
         batch_steps: int = 1,
         precision: str = "fp32",
         state_dtype: torch.dtype | None = None,
+        capture: bool = False,
     ):
         self.policy = policy
         self.num_envs = num_envs
@@ -133,6 +134,16 @@ class BatchedPolicyAgent:
         self.batch_steps = batch_steps
         self._buf_states: list = []
         self._buf_resets: list[torch.Tensor] = []
+        # manual CUDA-graph capture with STATIC buffers (batch_steps == 1).
+        # torch.compile's cudagraph trees hand back outputs that the next
+        # replay overwrites, forcing a full clone of the carried state every
+        # frame (3.4 ms at 400 rows for the windowed cores). Owning the
+        # buffers lets the graph carry the state in place instead.
+        self._use_capture = capture and torch.device(device).type == "cuda"
+        assert not self._use_capture or batch_steps == 1, (
+            "capture is for the batch_steps==1 serving path"
+        )
+        self._graph = None
 
     def _cast_state(self, state):
         if self.state_dtype is None:
@@ -245,17 +256,27 @@ class BatchedPolicyAgent:
                 ),
                 self._prev_action, self._neutral_encoded,
             )
-            with self._autocast():
-                out, hidden = self.policy.sample(
-                    StateAction(state=states, action=prev, name=self._name),
-                    self.hidden, is_resetting=reset_t, temperature=self.temperature,
+            if self._use_capture:
+                ctrl, logits = self._graph_step(states, prev, reset_t)
+            else:
+                with self._autocast():
+                    out, hidden = self.policy.sample(
+                        StateAction(state=states, action=prev, name=self._name),
+                        self.hidden, is_resetting=reset_t, temperature=self.temperature,
+                    )
+                ctrl, logits = out.controller_state, out.logits
+                # carried state MUST be cloned on this path: with cudagraph
+                # trees the forward's output lives in the graph's pool and the
+                # next replay overwrites it (torch raises "accessing tensor
+                # output of CUDAGraphs that has been overwritten"). Measured
+                # 3.4 ms/frame at 400 rows for the windowed cores, 0 for the
+                # LSTM. The capture path above avoids it entirely.
+                self.hidden = tree.map_structure(
+                    lambda t: t.clone() if isinstance(t, torch.Tensor) else t, hidden
                 )
-            self.hidden = tree.map_structure(
-                lambda t: t.clone() if isinstance(t, torch.Tensor) else t, hidden
-            )
             self._prev_action = tree.map_structure(
                 lambda t: t.clone() if t.dtype == torch.bool else t.long().clone(),
-                out.controller_state,
+                ctrl,
             )
             records.append(FrameRecord(
                 state=states,
@@ -263,12 +284,10 @@ class BatchedPolicyAgent:
                     lambda x: x.clone() if x.dtype == torch.bool else x.long().clone(),
                     prev,
                 ),
-                logits=tree.map_structure(lambda x: x.clone(), out.logits),
+                logits=tree.map_structure(lambda x: x.clone(), logits),
                 name=self._name.clone(),
             ))
-            encoded_np = tree.map_structure(
-                lambda x: x.cpu().numpy(), out.controller_state
-            )
+            encoded_np = tree.map_structure(lambda x: x.cpu().numpy(), ctrl)
             decoded = self._embed_controller.decode(encoded_np)
             self._enqueue(decoded)
             self._buf_states, self._buf_resets = [], []
@@ -291,6 +310,13 @@ class BatchedPolicyAgent:
                 )
             # clones: retained across flushes / fed back next flush, and
             # compiled (cudagraph) replay reuses output buffers
+            # carried state MUST be cloned: with cudagraph trees the
+            # forward's output lives in the graph's pool and the next replay
+            # overwrites it (torch raises "accessing tensor output of
+            # CUDAGraphs that has been overwritten by a subsequent run" if
+            # you feed it straight back). Measured cost: 3.4 ms/frame at 400
+            # rows for the windowed cores, 0 for the LSTM. Removing it needs
+            # a manual static-buffer capture, as LeagueAgent does.
             self.hidden = tree.map_structure(
                 lambda t: t.clone() if isinstance(t, torch.Tensor) else t, hidden
             )
@@ -323,6 +349,64 @@ class BatchedPolicyAgent:
         dev = torch.device(self.device).type
         return torch.autocast(dev, dtype=torch.float16,
                               enabled=self.precision == "fp16" and dev == "cuda")
+
+    def _capture_step(self, states, prev, resets) -> None:
+        """Record one policy.sample into a manual CUDA graph over static
+        input buffers. The graph's LAST op copies the new recurrent state
+        back into the buffer it read from, so a replay both consumes and
+        advances the state with no python-side clone and no placeholder
+        copy. policy.sample must be uncompiled or compiled WITHOUT cudagraph
+        trees (a graph inside a graph is not capturable)."""
+        self._in_states = tree.map_structure(lambda t: t.clone(), states)
+        self._in_prev = tree.map_structure(lambda t: t.clone(), prev)
+        self._in_resets = resets.clone()
+
+        def _forward():
+            with self._autocast():
+                return self.policy.sample(
+                    StateAction(state=self._in_states, action=self._in_prev,
+                                name=self._name),
+                    self.hidden, is_resetting=self._in_resets,
+                    temperature=self.temperature,
+                )
+
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(3):  # warm up allocations/autotuning before capture
+                _forward()
+        torch.cuda.current_stream().wait_stream(side)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out, new_hidden = _forward()
+            self._out_ctrl = out.controller_state
+            self._out_logits = out.logits
+            tree.map_structure(
+                lambda dst, src: dst.copy_(src) if isinstance(dst, torch.Tensor) else None,
+                self.hidden, new_hidden,
+            )
+        self._graph = graph
+        # warmup + capture ran on whatever frame arrived first: restart the
+        # carried state so the first replay begins from zeros
+        init = self._cast_state(self.policy.initial_state(self.num_envs, self.device))
+        tree.map_structure(
+            lambda dst, src: dst.copy_(src) if isinstance(dst, torch.Tensor) else None,
+            self.hidden, init,
+        )
+
+    def _graph_step(self, states, prev, resets):
+        """Replay the captured graph on this frame's inputs. Returns the
+        STATIC output buffers — every consumer below copies out of them
+        (prev_action clone, logits clone, .cpu() for the queues) before the
+        next replay overwrites them."""
+        if self._graph is None:
+            self._capture_step(states, prev, resets)
+        tree.map_structure(lambda dst, src: dst.copy_(src), self._in_states, states)
+        tree.map_structure(lambda dst, src: dst.copy_(src), self._in_prev, prev)
+        self._in_resets.copy_(resets)
+        self._graph.replay()
+        return self._out_ctrl, self._out_logits
 
     def hidden_snapshot(self) -> tp.Any:
         """Detached copy of the recurrent state (for Trajectory.initial_state)."""

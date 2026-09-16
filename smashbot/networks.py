@@ -476,49 +476,47 @@ class SGUBlock(nn.Module):
         self.down = nn.Linear(hidden, d, bias=False)
         nn.init.zeros_(self.down.weight)
 
-    def mix(self, x, v_cache, kv_cache, cache_len):
+    def mix(self, x, v_cache, kv_cache, attn_mask):
         """x: [B, T, d]; v_cache: [B, W-1, d]; kv_cache: [B, W-1, 2*dk];
-        cache_len: [B] valid entries. Returns (out, new_v_cache, new_kv_cache)."""
+        attn_mask: [B, 1, T, W-1+T], built ONCE per forward by SGUCore (every
+        layer's mask is identical — same window, same cache_len).
+        Returns (out, new_v_cache, new_kv_cache), both contiguous: the caller
+        clones the state every frame, and cloning a strided view costs far
+        more than the contiguous copy that produced it."""
         B, T, _ = x.shape
         W = self.window
         xn = self.mix_norm(x)
         u, v = self.uv(xn).chunk(2, dim=-1)
+        # caches follow the activation dtype: under fp16/bf16 autocast the
+        # fp32-initialized state must not promote the whole window
+        v_cache = v_cache.to(v.dtype)
 
-        # static mixing: causal depthwise conv over [cache || current]
-        # (caches follow the activation dtype: under fp16 autocast the
-        # fp32-initialized state must not promote the whole window)
-        v_full = torch.cat([v_cache.to(v.dtype), v], dim=1)  # [B, W-1+T, d]
-        if T == 1:
-            # Grouped conv with one output position is just a per-channel
-            # weighted sum over the window; conv kernels handle B=1/groups=d
-            # badly (and defeat inductor fusion) on the play path.
-            w = self.spatial.weight.squeeze(1)  # [d, W]
-            v_mixed = (v_full * w.t()).sum(dim=1, keepdim=True) + self.spatial.bias
-        else:
-            v_mixed = self.spatial(v_full.transpose(1, 2)).transpose(1, 2)
-
-        # tiny attention over the same causal window
         qkv = self.attn_qkv(xn)  # [B, T, 3*dk]
         q, k_new, va_new = qkv.chunk(3, dim=-1)
         kv_new = torch.cat([k_new, va_new], dim=-1)
-        kv_full = torch.cat([kv_cache.to(kv_new.dtype), kv_new], dim=1)  # [B, W-1+T, 2*dk]
+        kv_full = torch.cat([kv_cache.to(kv_new.dtype), kv_new], dim=1)
         keys, vals = kv_full.chunk(2, dim=-1)
+        new_kv = kv_full[:, -(W - 1):].contiguous()
 
-        # Same windowed-causal rule as the conv: key attendable iff at most
-        # W-1 frames older than the query (cache slot w ages out when w < t).
-        slot = torch.arange(W - 1, device=x.device)
-        t = torch.arange(T, device=x.device)
-        cache_valid = slot[None, :] >= (W - 1 - cache_len)[:, None]  # [B, W-1]
-        cache_in_window = slot[None, :] >= t[:, None]  # [T, W-1]
-        causal_window = (t[None, :] <= t[:, None]) & (
-            t[:, None] - t[None, :] <= W - 1
-        )  # [T, T]
-        mask = torch.cat(
-            [cache_valid[:, None, :] & cache_in_window[None, :, :],
-             causal_window[None].expand(B, T, T)], dim=2,
-        ).unsqueeze(1)  # [B, 1, T, W-1+T]
+        if T == 1:
+            # serving: never materialize the [B, W, d] window. The grouped
+            # conv with one output position is a per-channel weighted sum,
+            # so the cache and the current frame can be reduced separately
+            # and the next cache is one contiguous shift.
+            w = self.spatial.weight.squeeze(1)  # [d, W]
+            v_mixed = (
+                (v_cache * w[:, : W - 1].t()).sum(dim=1)
+                + v[:, 0] * w[:, W - 1]
+                + self.spatial.bias
+            ).unsqueeze(1)
+            new_v = torch.cat([v_cache[:, 1:], v], dim=1)
+        else:
+            v_full = torch.cat([v_cache, v], dim=1)  # [B, W-1+T, d]
+            v_mixed = self.spatial(v_full.transpose(1, 2)).transpose(1, 2)
+            new_v = v_full[:, -(W - 1):].contiguous()
+
         a = torch.nn.functional.scaled_dot_product_attention(
-            q.unsqueeze(1), keys.unsqueeze(1), vals.unsqueeze(1), attn_mask=mask
+            q.unsqueeze(1), keys.unsqueeze(1), vals.unsqueeze(1), attn_mask=attn_mask
         ).squeeze(1)  # [B, T, dk]
 
         x = x + self.mix_out(u * (v_mixed + self.attn_out(a)))
@@ -526,7 +524,7 @@ class SGUBlock(nn.Module):
         gate, up = self.gate_up(self.ffw_norm(x)).chunk(2, dim=-1)
         x = x + self.down(torch.nn.functional.silu(gate) * up)
 
-        return x, v_full[:, -(W - 1):], kv_full[:, -(W - 1):]
+        return x, new_v, new_kv
 
 
 class SGUCore(Network):
@@ -564,12 +562,33 @@ class SGUCore(Network):
             ],
         }
 
+    def _attn_mask(self, T, cache_len, B, device):
+        """The windowed-causal mask, shared by every layer: a key is
+        attendable iff it is at most W-1 frames older than the query and the
+        cache slot actually holds a frame (cache_len)."""
+        W = self.window
+        slot = torch.arange(W - 1, device=device)
+        cache_valid = slot[None, :] >= (W - 1 - cache_len)[:, None]  # [B, W-1]
+        if T == 1:  # every cache slot is in window; the current frame is too
+            ones = torch.ones(B, 1, dtype=torch.bool, device=device)
+            return torch.cat([cache_valid, ones], dim=1)[:, None, None, :]
+        t = torch.arange(T, device=device)
+        cache_in_window = slot[None, :] >= t[:, None]  # [T, W-1]
+        causal_window = (t[None, :] <= t[:, None]) & (
+            t[:, None] - t[None, :] <= W - 1
+        )  # [T, T]
+        return torch.cat(
+            [cache_valid[:, None, :] & cache_in_window[None, :, :],
+             causal_window[None].expand(B, T, T)], dim=2,
+        ).unsqueeze(1)  # [B, 1, T, W-1+T]
+
     def _forward(self, inputs, state):
         T = inputs.shape[1]
         x = self.encoder(inputs)
+        mask = self._attn_mask(T, state["cache_len"], inputs.shape[0], inputs.device)
         new_layers = []
         for block, (v_cache, kv_cache) in zip(self.blocks, state["layers"]):
-            x, nv, nkv = block.mix(x, v_cache, kv_cache, state["cache_len"])
+            x, nv, nkv = block.mix(x, v_cache, kv_cache, mask)
             new_layers.append((nv, nkv))
         next_state = {
             "cache_len": torch.clamp(state["cache_len"] + T, max=self.window - 1),
