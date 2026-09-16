@@ -42,6 +42,17 @@ state encode the same history with different layouts, so the 7 tests that compar
 state trees elementwise (`test_unroll_vs_step_equivalence`,
 `test_fixed_pass_chunking[with_resets]`) fail on layout, not math. Reverted.
 
+SECOND PASS over the SGU hot path (2026-09-16), three real inefficiencies, all
+fixed and BIT-EXACT (0.00e+00 on outputs and state, elementwise, 126 tests pass):
+mask built once per forward instead of once per layer (6x); the [B, W, d] window
+no longer materialized on the serving path (the one-position grouped conv is a
+per-channel weighted sum, so cache and current frame reduce separately); returned
+caches made contiguous. Measured at n=1/32/128/400: 3.14 / 4.75 / 9.27 / 26.63 ms
+vs baseline 3.13 / 4.73 / 9.34 / 27.23 — no gain beyond noise. Inductor was
+already fusing these patterns; they were never the cost. Kept for clarity, not
+speed.
+
+Conclusion after two passes: **nothing inside networks.py moves this number.**
 The remaining lever is agent-side (item 2 above): hold the recurrent state in
 static buffers and let the captured graph update it in place, so there is no
 per-frame clone and no copy into the graph's input placeholder. That is where
