@@ -10,7 +10,7 @@ measured with cudagraph compilation (the setting we run) on GPU, in ms per call.
 | SGU                     | 30k           | 4/512  | 512   | 14.3M  | 0.909             | 2.79  | 3.80   |
 | ffw+lstm                | 30k           | 3/512  | 512   | 11.3M  | 0.923             | 4.38  | 4.56   |
 |                         |               |        |       |        |                   |       |        |
-| SGU (scaled → teacher)  | 30k/100k/1.8M | 6/576  | 512   | 25.7M  | 0.873/0.829/0.774 | 3.18  | 4.61   |
+| SGU (scaled)  | 30k/100k/1.8M | 6/576  | 512   | 25.7M  | 0.873/0.829/0.774 | 3.18  | 4.61   |
 | Transformer (scaled)    | 30k/100k      | 6/576  | 352*   | 25.9M  | 0.887/0.867       | 3.39  | 7.42   |
 | ffw+lstm (Phillip)      | 30k/100k      | 3/768  | 512   | 23.9M  | 0.936/0.904       | 4.43  | 7.32   |
 
