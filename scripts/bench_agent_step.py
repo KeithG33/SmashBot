@@ -43,6 +43,8 @@ def main():
     ap.add_argument("--precision", default="fp32", choices=["fp32", "bf16", "fp16"],
                     help="autocast dtype for the forward (match the training precision)")
     ap.add_argument("--profile", action="store_true")
+    ap.add_argument("--torch-profile", action="store_true",
+                    help="torch.profiler: top CUDA kernels by self time over 50 steps")
     # config-spec mode: build a random-init policy of a given architecture
     # instead of loading --ckpt (weights don't affect timing).
     ap.add_argument("--arch", default="", help="tx_like | transformer | sgu; "
@@ -99,6 +101,15 @@ def main():
     torch.cuda.synchronize()
     ac.__exit__(None, None, None)
     print(f"[{label}] {args.precision} n={args.n} compile={args.compile_mode if args.compile else False}: {(time.perf_counter() - t0) / args.steps * 1e3:.3f} ms/step")
+    if args.torch_profile:
+        from torch.profiler import profile, ProfilerActivity
+        ac.__enter__()
+        with profile(activities=[ProfilerActivity.CUDA, ProfilerActivity.CPU]) as prof:
+            for i in range(50):
+                agent.step(states[i % 4], resets)
+            torch.cuda.synchronize()
+        ac.__exit__(None, None, None)
+        print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=22))
     if args.profile:
         pr = cProfile.Profile(); pr.enable()
         for i in range(100):
