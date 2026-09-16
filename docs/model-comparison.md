@@ -6,14 +6,14 @@ measured with cudagraph compilation (the setting we run) on GPU, in ms per call.
 
 | Architecture            | Steps         | L / H  | Batch | Params | Precision | Eval Ploss        | ms @1 | ms @32 | ms @128 | ms @256 | ms @400 |
 |-------------------------|--------------:|:------:|------:|-------:|:---------:|:-----------------:|------:|-------:|--------:|--------:|--------:|
-| Transformer             | 30k           | 4/512  | 512   | 14.3M  | bf16      | 0.907             | 2.67   | 4.79   | 9.77   | 17.8   | 26.1   |
-| SGU                     | 30k           | 4/512  | 512   | 14.3M  | bf16      | 0.909             | 2.66   | 3.64   | 5.96   | 10.6   | 15.6   |
-| ffw+lstm                | 30k           | 3/512  | 512   | 11.3M  | fp32      | 0.923             | 4.31   | 4.46   | 3.33   | 5.93   | 6.74   |
+| Transformer             | 30k           | 4/512  | 512   | 14.3M  | bf16      | 0.907             | 2.85   | 4.63   | 9.77   | 17.8   | 26.1   |
+| SGU                     | 30k           | 4/512  | 512   | 14.3M  | bf16      | 0.909             | 2.81   | 3.64   | 5.96   | 10.6   | 15.6   |
+| ffw+lstm                | 30k           | 3/512  | 512   | 11.3M  | fp32      | 0.923             | 2.57   | 2.89   | 3.33   | 5.93   | 6.74   |
 |                         |               |        |       |        |           |                   |       |        |         |         |         |
-| SGU (scaled)  | 30k/100k | 6/576  | 512   | 25.7M  | bf16      | 0.873/0.829 | 2.89   | 4.48   | 7.78   | 13.4   | 19.8   |
-| Transformer (scaled)    | 30k/100k      | 6/576  | 352*   | 25.9M  | bf16      | 0.887/0.867       | 3.08   | 6.88   | 16.0   | 31.5   | 47.4   |
+| SGU (scaled)  | 30k/100k | 6/576  | 512   | 25.7M  | bf16      | 0.873/0.829 | 2.99   | 4.34   | 7.78   | 13.4   | 19.8   |
+| Transformer (scaled)    | 30k/100k      | 6/576  | 352*   | 25.9M  | bf16      | 0.887/0.867       | 3.15   | 6.43   | 16.0   | 31.5   | 47.4   |
 | ffw+lstm (Phillip)      | 30k/100k      | 3/768  | 512   | 23.9M  | bf16      | 0.936/0.904       | —     | —      | —       | —       | —       |
-| ffw+lstm (Phillip) fp32 | 30k/100k      | 3/768  | 512   | 23.9M  | fp32      | pending           | 4.41   | 4.44   | 3.56   | 5.90   | 7.99   |
+| ffw+lstm (Phillip) fp32 | 30k/100k      | 3/768  | 512   | 23.9M  | fp32      | pending           | 2.60   | 3.01   | 3.56   | 5.90   | 8.12   |
 
 \* Largest batch that fit in memory  
 The fp32 Phillip row is the from-scratch run `txlike768w256-fp32-b512-12char-100k-v2`
@@ -46,7 +46,16 @@ jigglypuff, cptfalcon, peach, yoshi, popo, luigi, pikachu, samus).
   (-12 to -17% for the windowed cores at 400; -25 to -30% for the LSTMs at 128,
   where it removes launch overhead rather than a state clone) and loses at n=1.
   Our production batches are **400** (the student's rollout forward) and **1**
-  (human play). SGU was chosen at the Dolphin-era rollout batch
+  (human play). ALL cells use the capture path — the serving default — so rows
+  are internally comparable; mixing it with cudagraph trees produced a
+  non-monotonic table.
+- **ffw+lstm is the fastest architecture at EVERY batch**, including n=1
+  (2.57 vs SGU 2.81). Its apparent batch-1 weakness in earlier tables
+  (4.3-4.4 ms) was an artifact of cudagraph trees, not the architecture. SGU
+  was originally chosen on latency measured at n=32 under trees, on CPU, before
+  compilation — none of those conditions hold now. NOTE: live play runs on CPU
+  (`eval/play.py --device cpu`), where only SGU has been measured (~7 ms
+  compiled); the LSTM's CPU batch-1 cost is unmeasured. SGU was chosen at the Dolphin-era rollout batch
   (n=32), where it is fastest. At the sim's serving batch (~400 rows per student
   forward) the ranking inverts: ffw+lstm at fp32 is 10.1ms vs SGU 27.2ms vs
   Transformer 59.8ms — the LSTM's eager cuDNN path is launch-bound and nearly flat
