@@ -43,6 +43,6 @@ exec /home/kage/smashbot_workspace/SmashBot/.venv/bin/python -m smashbot.rl.trai
   --learner.imitation-lambda-final-frac 1.0 \
   --sim.num-envs 345 \
   --sim.unroll-length 240 \
-  --sim.snapshot-interval 2000 \
+  --sim.snapshot-interval 1500 \
   --sim.seed-snapshots-from $SHINE/runs/rl-pool-v10/snapshots \
   "$@"

@@ -63,7 +63,7 @@ class SimRolloutConfig:
     # --- PFSP / snapshots (v10 values) ---
     pfsp_hard_frac: float = 0.25
     pfsp_explore: float = 0.075
-    snapshot_interval: int = 2000  # kept forever (keep=0): ~30 new ghosts by 100k
+    snapshot_interval: int = 1500  # kept forever (keep=0): ~40 new ghosts by 100k
     # seed a fresh run's snapshot dir from a previous run (symlinks + pfsp.json),
     # curated: ghosts from seed_min_step on, the seed_keep_best HARDEST by
     # ledger winrate (Keith: early ghosts are weak; fewer members keep the
