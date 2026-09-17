@@ -11,7 +11,7 @@ measured with cudagraph compilation (the setting we run) on GPU, in ms per call.
 | ffw+lstm                | 30k           | 3/512  | 512   | 11.3M  | fp32      | 0.923             | —†    | —†     | —†      | —†      | —†      |
 |                         |               |        |       |        |           |                   |       |        |         |         |         |
 | SGU (scaled)            | 30k/100k      | 6/576  | 512   | 25.7M  | bf16      | 0.873/0.829       | 1.88   | 2.04   | 2.70   | 3.68   | 4.85   |
-| Transformer (scaled)    | 30k/100k      | 6/576  | 352*   | 25.9M  | bf16      | 0.887/0.867       | 1.85   | 3.10   | 7.02   | 12.4   | 16.8   |
+| Transformer (scaled)    | 30k/100k      | 6/576  | 352*   | 25.9M  | bf16      | 0.887/0.867       | 1.81   | 2.98   | 6.49   | 11.4   | 16.8   |
 | ffw+lstm (Phillip)      | 30k/100k      | 3/768  | 512   | 23.9M  | bf16      | 0.936/0.904       | —     | —      | —       | —       | —       |
 | ffw+lstm (Phillip) fp32 | 30k/100k      | 3/768  | 512   | 23.9M  | fp32      | 0.884/0.826       | 1.42   | 1.53   | 1.79   | 2.27   | 2.71   |
 
@@ -68,7 +68,7 @@ jigglypuff, cptfalcon, peach, yoshi, popo, luigi, pikachu, samus).
   4.85 ms @400; was 2.5x before the ring) and 1.3x at n=1 (1.42 vs 1.88). Both
   gained equally from the wrapper fixes (flats, packed D2H); the ring is SGU-only.
   The scaled Transformer, with no ring and full attention over W=256 per row, is
-  16.8 ms @400 — 3.5x SGU (its @32-@256 cells predate the duplicate-cat removal). What remains of SGU's GPU frame is structural: the
+  16.8 ms @400 — 3.5x SGU. What remains of SGU's GPU frame is structural: the
   window read (0.94 ms at W=256 — the model reads 255x576 per row per layer),
   attention (0.69), the kv traffic (~0.7, ring-able), GEMMs (~0.7). NOTE: live play
   runs on CPU (`eval/play.py --device cpu`), where only SGU has been measured
