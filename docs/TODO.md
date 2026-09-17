@@ -79,6 +79,12 @@ Not done from the review (measure-first): fuse `uv`+`attn_qkv` — MEASURED
 15 us @1 (~1%); changes state_dict keys -> not worth a load hook. Skipped.
 Still open: one-hot->lookup in the head decoder (unmeasured), league vmap
 compile (impossible: BatchedTensorImpl), fused ring kernel (done as the ring).
+Transformer (scaled) serving: 18.5 ms @400 — no ring, and its whole state is a
+2x576-wide kv cache (~1.4 GB/frame shifted + carried) plus 8-head attention over
+255 keys. A kv ring is EASIER than SGU's: attention is permutation-invariant over
+keys given the mask, so ring slots need only an age mask (no gather-by-age, no
+reduction-order question). Not done: it loses on loss (0.867) and would still be
+~2x SGU. Do it only if an fp32 Transformer run wins; the agent side is generic.
 
 **Measured ceiling for the ring buffer (fixed profiler, scaled SGU @400, fp16 +
 fp16 statics, capture; 50 frames): 8.1 ms GPU per 10.0 ms frame, of which ~5.3 ms

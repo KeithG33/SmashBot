@@ -306,63 +306,28 @@ class TransformerBlock(nn.Module):
         self.down = nn.Linear(hidden, d, bias=False)
         nn.init.zeros_(self.down.weight)
 
-    def attend(
-        self,
-        x: torch.Tensor,  # [B, T, d]
-        positions: torch.Tensor,  # [B, T] absolute positions of x
-        k_cache: torch.Tensor,  # [B, W, d] (rotated keys, newest right-aligned)
-        v_cache: torch.Tensor,  # [B, W, d]
-        cache_len: torch.Tensor,  # [B] valid entries in the cache
-    ):
+    def _attend(self, x, positions, k_cache, v_cache, mask):
         B, T, d = x.shape
         W = k_cache.shape[1]
         h = self.num_heads
-
-        qkv = self.qkv(self.attn_norm(x))
-        q, k, v = qkv.chunk(3, dim=-1)
-        q = self.q_norm(q.view(B, T, h, self.head_dim))
-        k = self.k_norm(k.view(B, T, h, self.head_dim))
-        q = _rope(q, positions)
-        k = _rope(k, positions)
-        k_flat = k.reshape(B, T, d)
-
-        keys = torch.cat([k_cache, k_flat], dim=1)  # [B, W+T, d]
+        q, k, v = self.qkv(self.attn_norm(x)).chunk(3, dim=-1)
+        q = _rope(self.q_norm(q.view(B, T, h, self.head_dim)), positions)
+        k = _rope(self.k_norm(k.view(B, T, h, self.head_dim)), positions)
+        keys = torch.cat([k_cache, k.reshape(B, T, d)], dim=1)  # [B, W+T, d]
         values = torch.cat([v_cache, v], dim=1)
-
-        # mask [B, 1, T, W+T]. A key is attendable iff it is causal AND at
-        # most `W` frames older than the query — the same horizon the step
-        # path's rolling cache enforces structurally. Cache slot w holds the
-        # frame W - w steps before the chunk (age t + W - w for query t), so
-        # it stays visible iff w >= t; chunk key t' has age t - t' <= W.
-        slot = torch.arange(W, device=x.device)
-        t = torch.arange(T, device=x.device)
-        cache_valid = slot[None, :] >= (W - cache_len)[:, None]  # [B, W]
-        cache_in_window = slot[None, :] >= t[:, None]  # [T, W]
-        causal_window = (t[None, :] <= t[:, None]) & (
-            t[:, None] - t[None, :] <= W
-        )  # [T(query), T(key)]
-        mask = torch.cat(
-            [
-                cache_valid[:, None, :] & cache_in_window[None, :, :],
-                causal_window[None, :, :].expand(B, T, T),
-            ],
-            dim=2,
-        ).unsqueeze(1)  # [B, 1, T, W+T]
-
         out = torch.nn.functional.scaled_dot_product_attention(
-            q.transpose(1, 2),  # [B, h, T, hd]
+            q.transpose(1, 2),
             keys.view(B, W + T, h, self.head_dim).transpose(1, 2),
             values.view(B, W + T, h, self.head_dim).transpose(1, 2),
             attn_mask=mask,
         )
-        x = x + self.attn_out(out.transpose(1, 2).reshape(B, T, d))
+        return self.attn_out(out.transpose(1, 2).reshape(B, T, d)), keys[:, -W:], values[:, -W:]
 
+    def attend(self, x, positions, k_cache, v_cache, mask):
+        attn, new_k, new_v = self._attend(x, positions, k_cache, v_cache, mask)
+        x = x + attn
         gate, up = self.gate_up(self.ffw_norm(x)).chunk(2, dim=-1)
         x = x + self.down(torch.nn.functional.silu(gate) * up)
-
-        # slide the cache: keep the last W of [cache + new]
-        new_k = torch.cat([k_cache, k_flat], dim=1)[:, -W:]
-        new_v = torch.cat([v_cache, v], dim=1)[:, -W:]
         return x, new_k, new_v
 
 
@@ -401,14 +366,28 @@ class TransformerCore(Network):
             ],
         }
 
+    def _attn_mask(self, T, cache_len, B, device):
+        # a key is attendable iff causal and at most W frames older than the
+        # query; cache slot w holds the frame W-w steps before the chunk
+        W = self.window
+        slot = torch.arange(W, device=device)
+        t = torch.arange(T, device=device)
+        cache_valid = slot[None, :] >= (W - cache_len)[:, None]
+        cache_in_window = slot[None, :] >= t[:, None]
+        causal_window = (t[None, :] <= t[:, None]) & (t[:, None] - t[None, :] <= W)
+        return torch.cat(
+            [cache_valid[:, None, :] & cache_in_window[None, :, :],
+             causal_window[None, :, :].expand(B, T, T)], dim=2,
+        ).unsqueeze(1)  # [B, 1, T, W+T]
+
     def _forward(self, inputs, state):
-        """inputs: [B, T, D_in] (one reset-free segment)."""
         T = inputs.shape[1]
         x = self.encoder(inputs)
         positions = state["pos"][:, None] + torch.arange(T, device=inputs.device)[None]
+        mask = self._attn_mask(T, state["cache_len"], inputs.shape[0], inputs.device)
         new_kv = []
         for block, (k_cache, v_cache) in zip(self.blocks, state["kv"]):
-            x, nk, nv = block.attend(x, positions, k_cache, v_cache, state["cache_len"])
+            x, nk, nv = block.attend(x, positions, k_cache, v_cache, mask)
             new_kv.append((nk, nv))
         next_state = {
             "pos": state["pos"] + T,
