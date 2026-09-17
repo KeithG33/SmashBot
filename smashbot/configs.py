@@ -76,3 +76,6 @@ class LearnerConfig:
     max_grad_norm: float = 0.0
     precision: str = "fp32"  # bf16 | fp32
     compile: bool = False
+    # BC: micro-batches per optimizer step (batch_size stays the logical batch;
+    # each micro-batch is batch_size/grad_accum rows, loss scaled by 1/grad_accum)
+    grad_accum: int = 1

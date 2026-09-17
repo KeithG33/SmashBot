@@ -67,6 +67,25 @@ class TrainConfig:
             self.data.dataset.meta_path = f"{root}/meta-20k.json"
 
 
+def _state_rows(state, lo, hi, batch):
+    """Rows [lo, hi) of a recurrent state; leaves are [B, ...] or torch-RNN [layers, B, H]."""
+    def take(t):
+        if not isinstance(t, torch.Tensor):
+            return t
+        return t[lo:hi] if t.dim() >= 1 and t.shape[0] == batch else t[:, lo:hi]
+    return tree.map_structure(take, state)
+
+
+def _state_cat(parts, batch):
+    def cat(*ts):
+        if not isinstance(ts[0], torch.Tensor):
+            return ts[0]
+        dim = 0 if ts[0].dim() >= 1 and sum(t.shape[0] for t in ts) == batch else 1
+        return torch.cat(ts, dim=dim)
+    return tree.map_structure(cat, *parts)
+
+
+
 def main(config: TrainConfig) -> None:
     rt = config.runtime
     run_dir = os.path.join(rt.run_dir, rt.tag)
@@ -249,28 +268,40 @@ def main(config: TrainConfig) -> None:
             frames, epoch = next(train_stream)
             frames = to_device(frames)
 
-            with autocast():
-                policy_loss, train_hidden, metrics = policy_loss_fn(
-                    frames, train_hidden
-                )
-            train_hidden = detach(train_hidden)
+            k = config.learner.grad_accum
+            bounds = [(i * B // k, (i + 1) * B // k) for i in range(k)]
+            mean = lambda ms: tree.map_structure(lambda *xs: sum(xs) / len(xs), *ms)
+
             policy_opt.zero_grad(set_to_none=True)
-            policy_loss.backward()
+            hids, ms = [], []
+            for lo, hi in bounds:
+                fr = frames if k == 1 else tree.map_structure(lambda t: t[lo:hi], frames)
+                hid = train_hidden if k == 1 else _state_rows(train_hidden, lo, hi, B)
+                with autocast():
+                    policy_loss, hid, m = policy_loss_fn(fr, hid)
+                (policy_loss / k).backward()
+                hids.append(detach(hid)); ms.append(m)
+            train_hidden = hids[0] if k == 1 else _state_cat(hids, B)
+            metrics = mean(ms)
             if config.learner.max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(
                     policy.parameters(), config.learner.max_grad_norm
                 )
             policy_opt.step()
 
-            sliced = slice_delayed_frames(frames, config.policy.delay)
-            sliced = tree.map_structure(lambda t: t.detach(), sliced)
-            with autocast():
-                value_loss, value_hidden, value_metrics = value_loss_fn(
-                    sliced, value_hidden, discount
-                )
-            value_hidden = detach(value_hidden)
             value_opt.zero_grad(set_to_none=True)
-            value_loss.backward()
+            hids, ms = [], []
+            for lo, hi in bounds:
+                fr = frames if k == 1 else tree.map_structure(lambda t: t[lo:hi], frames)
+                sliced = slice_delayed_frames(fr, config.policy.delay)
+                sliced = tree.map_structure(lambda t: t.detach(), sliced)
+                hid = value_hidden if k == 1 else _state_rows(value_hidden, lo, hi, B)
+                with autocast():
+                    value_loss, hid, m = value_loss_fn(sliced, hid, discount)
+                (value_loss / k).backward()
+                hids.append(detach(hid)); ms.append(m)
+            value_hidden = hids[0] if k == 1 else _state_cat(hids, B)
+            value_metrics = mean(ms)
             if config.learner.max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(
                     value_fn.parameters(), config.learner.max_grad_norm
