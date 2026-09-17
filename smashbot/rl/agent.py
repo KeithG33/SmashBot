@@ -94,6 +94,7 @@ class BatchedPolicyAgent:
         precision: str = "fp32",
         state_dtype: torch.dtype | None = None,
         capture: bool = False,
+        ring: bool | None = None,
     ):
         self.policy = policy
         self.num_envs = num_envs
@@ -153,10 +154,25 @@ class BatchedPolicyAgent:
         # frame (3.4 ms at 400 rows for the windowed cores). Owning the
         # buffers lets the graph carry the state in place instead.
         self._use_capture = capture and torch.device(device).type == "cuda"
+        # serving ring for the SGU v-cache (see SGUCore.initial_ring_state):
+        # the captured graph writes one slot per frame instead of carrying a
+        # shifted copy of every cache. Capture-only — under cudagraph trees
+        # inductor functionalizes the in-place write back into a copy.
+        self._core = getattr(getattr(policy, "network", None), "core", None)
+        self._ring = (self._use_capture and hasattr(self._core, "initial_ring_state")
+                      and ring is not False)
+        if self._ring:   # the ring state exists from the start: snapshots precede the first replay
+            self.hidden = self._cast_state(self._core.initial_ring_state(num_envs, device))
         assert not self._use_capture or batch_steps == 1, (
             "capture is for the batch_steps==1 serving path"
         )
         self._graph = None
+        # flat inputs (capture): the static inputs are the worker's three typed
+        # flats and the struct the forward reads is a view of them, built once —
+        # three copies per frame instead of one per leaf. Int storage is int64
+        # because unflatten's .long() would otherwise COPY, freezing the views.
+        self._view_fn = None
+        self._in_flats = None
 
     def _cast_state(self, state):
         if self.state_dtype is None:
@@ -171,11 +187,16 @@ class BatchedPolicyAgent:
         """Fresh game in env i: zero its recurrent state, queue, and prev action."""
         mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self._name.device)
         mask[i] = True
-        self.hidden = _mask_state(
-            mask,
-            self._cast_state(self.policy.initial_state(self.num_envs, self.device)),
-            self.hidden,
-        )
+        if self._ring:   # stale ring slots are masked by cache_len at read time
+            self.hidden["cache_len"][i] = 0
+            for _, kv in self.hidden["layers"]:
+                kv[i].zero_()
+        else:
+            self.hidden = _mask_state(
+                mask,
+                self._cast_state(self.policy.initial_state(self.num_envs, self.device)),
+                self.hidden,
+            )
         self._queues[i] = collections.deque([self._neutral()] * self.delay)
         tree.map_structure(
             lambda dst, src: dst[i].copy_(src[i]),
@@ -244,6 +265,7 @@ class BatchedPolicyAgent:
     # never comes
     def infer(
         self, states: tp.Any, resets: torch.Tensor, want_snapshot: bool = True,
+        flats: tuple | None = None,
     ) -> tuple[list[FrameRecord], tp.Any]:
         """states: encoded Game struct batched [N, ...]; resets: [N] bool.
 
@@ -270,7 +292,7 @@ class BatchedPolicyAgent:
                 self._prev_action, self._neutral_encoded,
             )
             if self._use_capture:
-                ctrl, logits = self._graph_step(states, prev, reset_t)
+                ctrl, logits = self._graph_step(states, prev, reset_t, flats)
             else:
                 with self._autocast():
                     out, hidden = self.policy.sample(
@@ -363,14 +385,28 @@ class BatchedPolicyAgent:
         return torch.autocast(dev, dtype=torch.float16,
                               enabled=self.precision == "fp16" and dev == "cuda")
 
-    def _capture_step(self, states, prev, resets) -> None:
+    def set_flat_inputs(self, view_fn) -> None:
+        """view_fn(flats) -> state struct (FlatFrames.view); pass flats= to infer."""
+        self._view_fn = view_fn
+
+    def _capture_step(self, states, prev, resets, flats=None) -> None:
         """Record one policy.sample into a manual CUDA graph over static
         input buffers. The graph's LAST op copies the new recurrent state
         back into the buffer it read from, so a replay both consumes and
         advances the state with no python-side clone and no placeholder
         copy. policy.sample must be uncompiled or compiled WITHOUT cudagraph
         trees (a graph inside a graph is not capturable)."""
-        self._in_states = tree.map_structure(lambda t: t.clone(), states)
+        if flats is not None:
+            assert self._view_fn is not None, "flats= needs set_flat_inputs(view_fn)"
+            self._in_flats = tuple(
+                t.clone().long() if not (t.is_floating_point() or t.dtype == torch.bool) else t.clone()
+                for t in flats)
+            self._in_states = self._view_fn(self._in_flats)
+            bases = {t.untyped_storage().data_ptr() for t in self._in_flats}
+            assert all(l.untyped_storage().data_ptr() in bases for l in tree.flatten(self._in_states)), \
+                "state views do not alias the static flats"
+        else:
+            self._in_states = tree.map_structure(lambda t: t.clone(), states)
         self._in_prev = tree.map_structure(lambda t: t.clone(), prev)
         self._in_resets = resets.clone()
 
@@ -395,27 +431,46 @@ class BatchedPolicyAgent:
             out, new_hidden = _forward()
             self._out_ctrl = out.controller_state
             self._out_logits = out.logits
-            tree.map_structure(
-                lambda dst, src: dst.copy_(src) if isinstance(dst, torch.Tensor) else None,
-                self.hidden, new_hidden,
-            )
+            if self._ring:
+                self._ring_carry(new_hidden)
+            else:
+                tree.map_structure(
+                    lambda dst, src: dst.copy_(src) if isinstance(dst, torch.Tensor) else None,
+                    self.hidden, new_hidden,
+                )
         self._graph = graph
         # warmup + capture ran on whatever frame arrived first: restart the
         # carried state so the first replay begins from zeros
-        init = self._cast_state(self.policy.initial_state(self.num_envs, self.device))
+        init = self._cast_state(
+            self._core.initial_ring_state(self.num_envs, self.device) if self._ring
+            else self.policy.initial_state(self.num_envs, self.device))
         tree.map_structure(
             lambda dst, src: dst.copy_(src) if isinstance(dst, torch.Tensor) else None,
             self.hidden, init,
         )
 
-    def _graph_step(self, states, prev, resets):
+    def _ring_carry(self, new_hidden):
+        ptr = self.hidden["ptr"]
+        for (v_ring, kv), (v_new, kv_new) in zip(self.hidden["layers"], new_hidden["layers"]):
+            assert v_new.dim() == 2 and v_ring.dim() == 3, "ring carry takes a [B, d] slot, never a cache"
+            v_ring.index_copy_(1, ptr.view(1), v_new.unsqueeze(1).to(v_ring.dtype))
+            kv.copy_(kv_new)
+        self.hidden["cache_len"].copy_(new_hidden["cache_len"])
+        ptr.add_(1)
+        ptr.remainder_(self._core.window - 1)
+
+    def _graph_step(self, states, prev, resets, flats=None):
         """Replay the captured graph on this frame's inputs. Returns the
         STATIC output buffers — every consumer below copies out of them
         (prev_action clone, logits clone, .cpu() for the queues) before the
         next replay overwrites them."""
         if self._graph is None:
-            self._capture_step(states, prev, resets)
-        tree.map_structure(lambda dst, src: dst.copy_(src), self._in_states, states)
+            self._capture_step(states, prev, resets, flats)
+        if self._in_flats is not None:
+            for dst, src in zip(self._in_flats, flats):
+                dst.copy_(src)
+        else:
+            tree.map_structure(lambda dst, src: dst.copy_(src), self._in_states, states)
         tree.map_structure(lambda dst, src: dst.copy_(src), self._in_prev, prev)
         self._in_resets.copy_(resets)
         self._graph.replay()
@@ -423,9 +478,10 @@ class BatchedPolicyAgent:
 
     def hidden_snapshot(self) -> tp.Any:
         """Detached copy of the recurrent state (for Trajectory.initial_state)."""
+        hidden = self._core.canonical_state(self.hidden) if self._ring else self.hidden
         return tree.map_structure(
             lambda t: t.detach().clone() if isinstance(t, torch.Tensor) else t,
-            self.hidden,
+            hidden,
         )
 
 
@@ -579,7 +635,7 @@ class LeagueAgent:
         return rows, self.infer(views, resets)
 
     @torch.no_grad()
-    def infer(self, views, resets: torch.Tensor) -> FrameRecord:
+    def infer(self, views, resets: torch.Tensor, flats=None) -> FrameRecord:
         """views: encoded Game struct batched [S, N, ...] on device; resets:
         [S, N] bool on device (True on a cell's first frame of a game —
         zeroes its recurrent state and substitutes the neutral prev action).
@@ -592,7 +648,7 @@ class LeagueAgent:
             self._prev, self._neutral,
         )
         if self._use_capture:
-            ctrl, logits = self._captured_forward(views, prev, resets)
+            ctrl, logits = self._captured_forward(views, prev, resets, flats)
         else:
             ctrl, logits, self._hidden = self._vm(
                 self._stacked_params, self._stacked_buffers, views, prev,
@@ -677,13 +733,17 @@ class LeagueAgent:
 
         return single
 
-    def _captured_forward(self, views, prev, resets):
+    def _captured_forward(self, views, prev, resets, flats=None):
         """Copy this frame's inputs into the static buffers, replay, return
         clones of the static outputs. Captured once at first use (shapes
         never change); in-place slice loads are visible to replays."""
         if self._graph is None:
-            self._capture(views, prev, resets)
-        tree.map_structure(lambda d, s: d.copy_(s), self._in_views, views)
+            self._capture(views, prev, resets, flats)
+        if getattr(self, "_in_flats", None) is not None:
+            for d, src in zip(self._in_flats, flats):
+                d.copy_(src)
+        else:
+            tree.map_structure(lambda d, s: d.copy_(s), self._in_views, views)
         tree.map_structure(lambda d, s: d.copy_(s), self._in_prev, prev)
         self._in_resets.copy_(resets)
         # recurrent state: static in <- last replay's static out
@@ -696,8 +756,22 @@ class LeagueAgent:
         logits = tree.map_structure(lambda t: t.clone(), self._out_logits)
         return ctrl, logits
 
-    def _capture(self, views, prev, resets):
-        self._in_views = tree.map_structure(lambda t: t.clone(), views)
+    def set_flat_inputs(self, view_fn) -> None:
+        """view_fn(flats) -> views struct; pass the grid's three flats to infer."""
+        self._view_fn = view_fn
+        self._in_flats = None
+
+    def _capture(self, views, prev, resets, flats=None):
+        if flats is not None:
+            self._in_flats = tuple(
+                t.clone().long() if not (t.is_floating_point() or t.dtype == torch.bool) else t.clone()
+                for t in flats)
+            self._in_views = self._view_fn(self._in_flats)
+            bases = {t.untyped_storage().data_ptr() for t in self._in_flats}
+            assert all(l.untyped_storage().data_ptr() in bases for l in tree.flatten(self._in_views)), \
+                "grid views do not alias the static flats"
+        else:
+            self._in_views = tree.map_structure(lambda t: t.clone(), views)
         self._in_prev = tree.map_structure(lambda t: t.clone(), prev)
         self._in_resets = resets.clone()
         self._in_hidden = self._initial_hidden()

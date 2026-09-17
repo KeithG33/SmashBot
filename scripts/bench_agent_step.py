@@ -42,6 +42,8 @@ def main():
                     help="torch.compile mode (reduce-overhead = cudagraph trees; max-autotune adds Triton autotuning)")
     ap.add_argument("--precision", default="fp32", choices=["fp32", "fp16"],
                     help="agent forward precision (production serves fp16)")
+    ap.add_argument("--flats", action="store_true",
+                    help="feed the worker's three typed flats (FlatFrames) instead of a leaf struct")
     ap.add_argument("--state-fp16", action="store_true",
                     help="fp16 carried-state buffers (requires --precision fp16)")
     ap.add_argument("--profile", action="store_true")
@@ -94,18 +96,29 @@ def main():
     game = embed_lib.EmbedConfig().make_game_embedding()
     rng = np.random.default_rng(0)
 
+    ff = None
+    if args.flats:
+        from smashbot import encode
+        from smashbot.rl import sim_env
+        ff = sim_env.FlatFrames(device)
+        agent.set_flat_inputs(ff.view)
+
     def state():
         enc = game.from_state(_rand_raw(game, rng, args.n))
+        if ff is not None:
+            flats = ff.to_device(encode.flatten_typed_batched(enc, args.n))
+            return ff.view(flats), flats
         return tree.map_structure(
             lambda x: torch.from_numpy(np.ascontiguousarray(
-                x.astype(np.int64) if x.dtype.kind in "iu" else x)).to(device), enc)
+                x.astype(np.int64) if x.dtype.kind in "iu" else x)).to(device), enc), None
     states = [state() for _ in range(4)]
     resets = torch.zeros(args.n, dtype=torch.bool, device=device)
     snap = not args.no_snapshot
 
     def frame(i):  # the worker's per-frame pattern: pop, then infer
         agent.execute(())
-        agent.infer(states[i % 4], resets, want_snapshot=snap)
+        st, fl = states[i % 4]
+        agent.infer(st, resets, want_snapshot=snap, flats=fl)
 
     for i in range(30):
         frame(i)
@@ -115,7 +128,7 @@ def main():
         frame(i)
     torch.cuda.synchronize()
     ms = (time.perf_counter() - t0) / args.steps * 1e3
-    print(f"[{label}] {args.precision}{'+state16' if args.state_fp16 else ''} n={args.n} "
+    print(f"[{label}] {args.precision}{'+state16' if args.state_fp16 else ''}{'+flats' if args.flats else ''} n={args.n} "
           f"compile={args.compile_mode if args.compile else False} capture={args.capture} "
           f"snapshot={snap}: {ms:.3f} ms/step")
     if args.torch_profile:

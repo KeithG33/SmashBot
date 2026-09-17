@@ -1,3 +1,49 @@
+## Serving frame after the ring branch (2026-09-16 late) — where the time is NOW
+Student @400 (bench, one method): 5.2 ms, GPU 4.3. **League grid (40 slices x 3
+cells, captured eager vmap, fp16 weights): 9.6 ms/frame — the largest item.**
+Phillip grid (PfspGrid: 5 tier slices x ~24 cells, tx_like with manual_step,
+captured eager vmap, fp16 weights): 2.7 ms/frame (GPU 1.67) — already near the
+LSTM's floor; fp32 weights would be 5.0. The PFSP grid is the biggest GPU item.
+Profile: GEMMs 2.6 (40 weight sets = 2.05 GB fp16 read per frame; bandwidth floor
+~2.3 — at the floor), EAGER elementwise ~2.3 (vmap forward is not compiled;
+nothing fuses), window-shift cats 1.1, carry/clone copies ~1.5, conv reduce 0.4,
+attention 0.15. Levers, both proven on the student: compile the vmap forward
+(Codex #5) and ring the grid's v-cache. Flat static inputs (1b) done for the
+grid: 10.8 -> 10.2. Phase 2 (pack prev-action/logits, ~0.4 ms) now ranks below
+these.
+Compile of the vmapped grid forward is a torch limitation: inductor raises
+`Cannot access storage of BatchedTensorImpl` on vmap+functional_call over stacked
+params, and vmap over a compiled fn is unsupported. Fusion for the grid means a
+grid-native forward (explicit bmm over the S dim, no vmap) or cheaper eager ops.
+Eager micro-bench at the grid shape [120,255,576] fp16, per layer: today's read
+0.37 ms (2.2/frame — the floor under eager; bmm 0.54 and the ring's gather 0.54
+are slower without inductor), reset `where` copy 0.13, window-shift cat 0.15,
+carry copy ~0.13. So a grid ring with the ROLL-THE-WEIGHTS read (same cost as
+today, ~1e-6 tolerance — acceptable for opponent seats) removes ~2.5 ms/frame:
+9.6 -> ~7. Beyond that only a compiled grid-native forward fuses the read.
+
+## DONE (branch ring-serving, worktree SmashBot-ring, 2026-09-16 late): SGU v-cache ring under capture
+Frame @400 (fixed bench, fp16 + fp16 statics, capture): 9.4 -> 6.3 ms; GPU 8.08 ->
+4.26 ms/frame — the window-shift cat (1.9) and in-graph carry (1.8) kernels are
+gone; the fused window read (0.94) remains, as it must. Parity: open loop, both
+paths under capture, 800 frames (3.1 wraps), staggered resets, logits AND the
+canonical snapshot compared on every frame: 0.00e+00. Suite 126. NOT merged to
+main; NOT run in production (launcher still points at the stale SmashBot-sim
+worktree — see below).
+Design (Codex review invariants all hold): ptr = next slot; read history (ages
+1..W-1, valid iff age <= cache_len, where-select so a stale NaN can't leak; costs
+~0.12 ms vs multiply, kept) before writing the current v; the compiled forward
+returns [B, d] slots, the captured graph does the only writes (index_copy_ per
+layer at a device ptr), carries kv + cache_len, advances ptr once; resets set
+cache_len=0 and never touch the ring; hidden_snapshot gathers, zeroes, drops ptr,
+clones — taken before the frame's replay. kv stays canonical (18% of traffic;
+cat+SDPA 0.129 vs ring-attn 0.233 ms/layer measured).
+Next lever, now visible: frame 6.3 ms vs GPU 4.3 — ~2 ms of CPU/launch/sync no
+longer hidden under GPU time. ~190 outside-graph launches per frame, mostly the
+122-leaf game-state struct copied leaf-by-leaf into the static inputs; production
+states are views into FlatFrames' three flat tensors, so the static input could
+be those three tensors (3 copies instead of 122). Then the kv ring if it earns it.
+
 ## CORRECTION 2026-09-16 (late): the serving-cost story below was built on a broken benchmark
 A Codex review found, and I verified against the code, that `bench_agent_step.py`
 (1) never passed `precision=` to the agent, whose inner `autocast(enabled=False)`
