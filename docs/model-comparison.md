@@ -7,13 +7,13 @@ measured with cudagraph compilation (the setting we run) on GPU, in ms per call.
 | Architecture            | Steps         | L / H  | Batch | Params | Precision | Eval Ploss        | ms @1 | ms @32 | ms @128 | ms @256 | ms @400 |
 |-------------------------|--------------:|:------:|------:|-------:|:---------:|:-----------------:|------:|-------:|--------:|--------:|--------:|
 | Transformer             | 30k           | 4/512  | 512   | 14.3M  | bf16      | 0.907             | —†    | —†     | —†      | —†      | —†      |
-| SGU                     | 30k           | 4/512  | 512   | 14.3M  | bf16      | 0.909             | 2.76   | 3.07   | 4.07   | 5.60   | 6.98   |
+| SGU                     | 30k           | 4/512  | 512   | 14.3M  | bf16      | 0.909             | 1.63   | 1.87   | 2.27   | 2.87   | 3.81   |
 | ffw+lstm                | 30k           | 3/512  | 512   | 11.3M  | fp32      | 0.923             | —†    | —†     | —†      | —†      | —†      |
 |                         |               |        |       |        |           |                   |       |        |         |         |         |
-| SGU (scaled)            | 30k/100k      | 6/576  | 512   | 25.7M  | bf16      | 0.873/0.829       | 3.00   | 3.51   | 5.22   | 7.07   | 9.36   |
+| SGU (scaled)            | 30k/100k      | 6/576  | 512   | 25.7M  | bf16      | 0.873/0.829       | 1.92   | 2.11   | 2.71   | 3.92   | 5.16   |
 | Transformer (scaled)    | 30k/100k      | 6/576  | 352*   | 25.9M  | bf16      | 0.887/0.867       | —†    | —†     | —†      | —†      | —†      |
 | ffw+lstm (Phillip)      | 30k/100k      | 3/768  | 512   | 23.9M  | bf16      | 0.936/0.904       | —     | —      | —       | —       | —       |
-| ffw+lstm (Phillip) fp32 | 30k/100k      | 3/768  | 512   | 23.9M  | fp32      | pending           | 2.75   | 2.86   | 3.13   | 3.43   | 3.87   |
+| ffw+lstm (Phillip) fp32 | 30k/100k      | 3/768  | 512   | 23.9M  | fp32      | pending           | 1.48   | 1.61   | 1.87   | 2.26   | 2.76   |
 
 \* Largest batch that fit in memory  
 The fp32 Phillip row is the from-scratch run `txlike768w256-fp32-b512-12char-100k-v2`
@@ -43,42 +43,38 @@ jigglypuff, cptfalcon, peach, yoshi, popo, luigi, pikachu, samus).
   batch = more steps per epoch) and against it on wall-clock — it still loses to
   SGU on both. Its run is named `transformer576-b382`, but the recorded config
   says 352; the name is wrong.
-- **Latency (re-measured 2026-09-16 on the FIXED benchmark; one method for every
-  cell).** `scripts/bench_agent_step.py --compile --capture --no-snapshot`: the
-  worker's per-frame path (`execute` + `infer`, flat controllers, one packed
-  controller D2H), manual static-buffer CUDA graph with fp16 state buffers, idle
-  3090, 30 warmup + 300 timed frames. The previous benchmark had three defects
-  (found in a Codex review): `--precision` never reached the forward, so every
-  "bf16" cell was fp32; it drove the non-production `step()` path (a GPU sync per
-  frame); and its profiler cloned the state every frame, so the "54% `aten::copy_`"
-  that motivated the capture work was an artifact. Attribution ladder, scaled SGU
-  @400, one change per rung: 21.1 ms (old bench) -> 16.7 (production path) ->
-  12.9 (fp16 forward) -> 12.6 (packed D2H) -> 9.6 (fp16 static buffers). The first
-  two are measurement corrections; the last two shipped (`capture_serving=True`,
-  student `state_dtype=fp16`). Production fps on the new path: not yet measured (the launcher still ran the
-  stale SmashBot-sim worktree; see TODO).
+- **Latency (2026-09-16, branch ring-serving; one method for every cell).**
+  `scripts/bench_agent_step.py --compile --capture --no-snapshot --flats` (+
+  `--precision fp16 --state-fp16` for the windowed cores): the worker's per-frame
+  path (`execute` + `infer`, flat controllers, one packed controller D2H), static
+  inputs = FlatFrames' three typed flats, manual static-buffer CUDA graph with
+  fp16 state buffers and the SGU v-cache as an in-place ring, idle 3090, 30 warmup
+  + 300 timed frames. Ladder for scaled SGU @400, one change per rung: 21.1 ms
+  (old, broken bench: fp32 forward, non-production `step()` path) -> 16.7 (worker
+  path) -> 12.9 (fp16) -> 12.6 (packed D2H) -> 9.6 (fp16 static buffers) -> 6.3
+  (v-cache ring) -> 5.2 (flat static inputs). The first two rungs are measurement
+  corrections; the rest shipped. Every rung bit-exact against the previous
+  (open-loop logits + canonical snapshots, 0.00e+00).
 - **Capture vs cudagraph trees at fp16:** with fp32 state buffers the captured
-  graph LOSES to trees (12.9 vs 12.0 ms @400) — it upcasts every layer's fp16
-  cache into the buffer and casts it back next replay. That is why the earlier
-  real-rollout A/B saw nothing. With fp16 buffers capture wins (9.4). At n=1
-  trees still edge it (2.83 vs 3.00; launch-bound either way).
-- **ffw+lstm is still ~2.5x faster than scaled SGU at the serving batch** (3.87 vs
-  9.36 ms @400) — the same ratio as the old table; both rows moved by the same
-  path correction. It is nearly flat in batch (2.75 -> 3.87 from n=1 to 400)
-  while SGU grows ~3x. At n=1 they tie (2.75 vs 3.00). NOTE: live play runs on
-  CPU (`eval/play.py --device cpu`), where only SGU has been measured (~7 ms
-  compiled); the LSTM's CPU batch-1 cost is unmeasured. SGU was chosen at the
-  Dolphin-era rollout batch (n=32) under different conditions (trees, CPU,
-  uncompiled) — none of which hold now.
-- **Scaling SGU 4/512 -> 6/576** costs 2.76 -> 3.00 ms @1 and 6.98 -> 9.36 @400
+  graph LOST to trees (12.9 vs 12.0 ms @400) — it upcast every layer's fp16
+  cache into the buffer and cast it back next replay; that is why the earlier
+  real-rollout A/B saw nothing. With fp16 buffers capture wins, and the ring is
+  capture-only (inductor functionalizes an in-place write back into a copy).
+- **ffw+lstm is ~1.9x faster than scaled SGU at the serving batch** (2.76 vs
+  5.16 ms @400; was 2.5x before the ring) and 1.3x at n=1 (1.48 vs 1.92). Both
+  gained equally from the wrapper fixes (flats, packed D2H); the ring is SGU-only.
+  What remains of SGU's GPU frame is structural: the window read (0.94 ms at
+  W=256 — the model reads 255x576 per row per layer), attention (0.69), the kv
+  traffic (~0.7, ring-able), GEMMs (~0.7). NOTE: live play runs on CPU
+  (`eval/play.py --device cpu`), where only SGU has been measured (~7 ms
+  compiled); the LSTM's CPU batch-1 cost is unmeasured.
+- **Scaling SGU 4/512 -> 6/576** costs 1.63 -> 1.92 ms @1 and 3.81 -> 5.16 @400
   for eval 0.909 -> 0.829 (different data regimes; see above).
-- Remaining serving lever for the windowed cores, MEASURED (fixed profiler, scaled
-  SGU @400): ~5.3 of the 8.1 ms GPU per frame is cache memory traffic — the
-  window shift (fused cat 1.9 ms) and the in-graph carry copy (1.8 ms) each move
-  the full 860 MB of caches; all GEMMs together are ~0.7 ms. A ring in the
-  capture's static buffers (write one slot, roll conv weights, age-mask attention,
-  canonicalize on snapshot) removes ~4.5 ms of the 9.4 — only under manual
-  capture; inductor functionalizes in-place writes back into copies, which is why
-  the earlier ring variants showed nothing.
+- Remaining serving levers, in order of measured size: (1) the ~70 remaining
+  outside-graph launches per frame — prev-action masking/clones and logit clones,
+  13 leaves each (pack; unpack once per chunk in ChunkAssembler); (2) the kv ring
+  (~0.7 ms of traffic; cat+SDPA beat a ring read for it, 0.129 vs 0.233 ms/layer,
+  so it needs a different attention formulation); (3) the window itself — W=128
+  halves the read, the ring and the kv cache, untested on eval loss.
 - `ffw+lstm` = tx_like = slippi-ai's / Phillip's architecture (LSTM recurrent core).
 - Params are totals (network + controller head + value head).
