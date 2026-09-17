@@ -476,50 +476,58 @@ class SGUBlock(nn.Module):
         self.down = nn.Linear(hidden, d, bias=False)
         nn.init.zeros_(self.down.weight)
 
-    def mix(self, x, v_cache, kv_cache, attn_mask):
-        """x: [B, T, d]; v_cache: [B, W-1, d]; kv_cache: [B, W-1, 2*dk];
-        attn_mask: [B, 1, T, W-1+T], built ONCE per forward by SGUCore (every
-        layer's mask is identical — same window, same cache_len).
-        Returns (out, new_v_cache, new_kv_cache), both contiguous: the caller
-        clones the state every frame, and cloning a strided view costs far
-        more than the contiguous copy that produced it."""
-        B, T, _ = x.shape
+    def _spatial(self, v, v_cache):
+        """Causal depthwise mixing over the last W frames + the cache for the
+        next step. v: [B, T, d]; v_cache: [B, W-1, d] (ring-free: chronological,
+        oldest first)."""
         W = self.window
-        xn = self.mix_norm(x)
-        u, v = self.uv(xn).chunk(2, dim=-1)
         # caches follow the activation dtype: under fp16/bf16 autocast the
         # fp32-initialized state must not promote the whole window
         v_cache = v_cache.to(v.dtype)
-
-        qkv = self.attn_qkv(xn)  # [B, T, 3*dk]
-        q, k_new, va_new = qkv.chunk(3, dim=-1)
-        kv_new = torch.cat([k_new, va_new], dim=-1)
-        kv_full = torch.cat([kv_cache.to(kv_new.dtype), kv_new], dim=1)
-        keys, vals = kv_full.chunk(2, dim=-1)
-        new_kv = kv_full[:, -(W - 1):].contiguous()
-
-        if T == 1:
+        if v.shape[1] == 1:
             # serving: never materialize the [B, W, d] window. The grouped
-            # conv with one output position is a per-channel weighted sum,
-            # so the cache and the current frame can be reduced separately
-            # and the next cache is one contiguous shift.
+            # conv with one output position is a per-channel weighted sum, so
+            # the cache and the current frame reduce separately and the next
+            # cache is one contiguous shift. This branch is worth keeping:
+            # measured 2.4x at n=400 (23.9 vs 58.2 ms) and +30% at n=1 — cuDNN
+            # handles kernel=W, groups=d, one output position badly.
             w = self.spatial.weight.squeeze(1)  # [d, W]
             v_mixed = (
                 (v_cache * w[:, : W - 1].t()).sum(dim=1)
                 + v[:, 0] * w[:, W - 1]
                 + self.spatial.bias
             ).unsqueeze(1)
-            new_v = torch.cat([v_cache[:, 1:], v], dim=1)
-        else:
-            v_full = torch.cat([v_cache, v], dim=1)  # [B, W-1+T, d]
-            v_mixed = self.spatial(v_full.transpose(1, 2)).transpose(1, 2)
-            new_v = v_full[:, -(W - 1):].contiguous()
+            return v_mixed, torch.cat([v_cache[:, 1:], v], dim=1)
+        v_full = torch.cat([v_cache, v], dim=1)  # [B, W-1+T, d]
+        v_mixed = self.spatial(v_full.transpose(1, 2)).transpose(1, 2)
+        return v_mixed, v_full[:, -(W - 1):].contiguous()
 
+    def _attend(self, xn, kv_cache, attn_mask):
+        """aMLP's tiny attention (single head, dk=64) over the same causal
+        window + the cache for the next step. Returns the OUT-PROJECTED
+        result, so the caller just adds it to the conv's output."""
+        W = self.window
+        q, k_new, va_new = self.attn_qkv(xn).chunk(3, dim=-1)  # [B, T, dk] x3
+        kv_new = torch.cat([k_new, va_new], dim=-1)
+        kv_full = torch.cat([kv_cache.to(kv_new.dtype), kv_new], dim=1)
+        keys, vals = kv_full.chunk(2, dim=-1)
         a = torch.nn.functional.scaled_dot_product_attention(
-            q.unsqueeze(1), keys.unsqueeze(1), vals.unsqueeze(1), attn_mask=attn_mask
+            q.unsqueeze(1), keys.unsqueeze(1), vals.unsqueeze(1),
+            attn_mask=attn_mask,
         ).squeeze(1)  # [B, T, dk]
+        return self.attn_out(a), kv_full[:, -(W - 1):].contiguous()
 
-        x = x + self.mix_out(u * (v_mixed + self.attn_out(a)))
+    def mix(self, x, v_cache, kv_cache, attn_mask):
+        """x: [B, T, d]; caches [B, W-1, *]; attn_mask is built ONCE per
+        forward by SGUCore (every layer's is identical — same window, same
+        cache_len). Returns (out, new_v_cache, new_kv_cache); both caches are
+        contiguous because the caller clones the state every frame, and
+        cloning a strided view costs more than the copy that produced it."""
+        xn = self.mix_norm(x)
+        u, v = self.uv(xn).chunk(2, dim=-1)
+        v_mixed, new_v = self._spatial(v, v_cache)
+        attn, new_kv = self._attend(xn, kv_cache, attn_mask)
+        x = x + self.mix_out(u * (v_mixed + attn))
 
         gate, up = self.gate_up(self.ffw_norm(x)).chunk(2, dim=-1)
         x = x + self.down(torch.nn.functional.silu(gate) * up)
