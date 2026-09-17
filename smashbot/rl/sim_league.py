@@ -154,7 +154,7 @@ class _Group:
     arena's single opponent; not used by training)."""
 
     def __init__(self, gid, policy, env_idx, harvest, unroll, device, name_code,
-                 reencode=None, precision="fp32", state_dtype=None):
+                 reencode=None, precision="fp32", state_dtype=None, capture=False):
         self.gid = gid
         self.env_idx = np.asarray(env_idx, dtype=np.int64)
         self.idx_t = torch.as_tensor(self.env_idx, device=device)
@@ -162,7 +162,7 @@ class _Group:
         self.n = len(self.env_idx)
         self.agent = BatchedPolicyAgent(policy, self.n, name_code=name_code,
                                         device=device, precision=precision,
-                                        state_dtype=state_dtype)
+                                        state_dtype=state_dtype, capture=capture)
         self.assembler = ChunkAssembler(unroll, policy.delay) if harvest else None
         self.reencode = reencode
         self._pushed = 0
@@ -209,7 +209,7 @@ class MultiOpponentSimWorker:
         self.student.set_flat_controllers(True)
         self.ff = sim_env.FlatFrames(device)
         self.student.set_flat_inputs(self.ff.view)
-        for gr in self.grids:
+        for gr in self._all_grids():   # phillip grid AND the PFSP grid step through flats
             gr.agent.set_flat_inputs(self.ff.view)
         self.assembler = ChunkAssembler(unroll_length, student_policy.delay)
         self._pushed = 0
@@ -226,9 +226,10 @@ class MultiOpponentSimWorker:
                     print(f"NOTE: imitation harvest delay mismatch — {gid} "
                           f"{pol.delay} vs student {student_policy.delay}", flush=True)
             self.groups.append(_Group(gid, pol, idx, harv, unroll_length, device,
-                                      nc, re, precision=precision))
+                                      nc, re, precision=precision, capture=capture))
         for g in self.groups:
             g.agent.set_flat_controllers(True)
+            g.agent.set_flat_inputs(self.ff.view)
         # env -> gid of the game its frames belong to (committed at the
         # entry frame; pending between a game's end and its successor's
         # first frame so terminal-transition events credit the right game)
@@ -324,10 +325,12 @@ class MultiOpponentSimWorker:
             for g in self.groups:
                 p1_rows[g.env_idx] = np.stack(
                     g.agent.execute(np.nonzero(g._reset)[0].tolist()))
-                gstates = self.ff.view(opp_flats, rows=g.idx_t)
+                gflats = tuple(t.index_select(0, g.idx_t) for t in opp_flats)
+                gstates = self.ff.view(gflats)
                 greset = torch.as_tensor(g._reset, device=dev)
                 gwant = g.harvest and (g._pushed % T == 0)
-                grecords, _gh = g.agent.infer(gstates, greset, want_snapshot=gwant)
+                grecords, _gh = g.agent.infer(gstates, greset, want_snapshot=gwant,
+                                              flats=gflats)
                 if g.harvest:
                     for rec in grecords:
                         g.assembler.push_frame(rec, greset, None)

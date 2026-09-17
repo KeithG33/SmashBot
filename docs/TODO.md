@@ -1,3 +1,27 @@
+## Serving frame after the ring branch (2026-09-16 late) — where the time is NOW
+Student @400 (bench, one method): 5.2 ms, GPU 4.3. **League grid (40 slices x 3
+cells, captured eager vmap, fp16 weights): 9.6 ms/frame — the largest item.**
+Phillip grid (PfspGrid: 5 tier slices x ~24 cells, tx_like with manual_step,
+captured eager vmap, fp16 weights): 2.7 ms/frame (GPU 1.67) — already near the
+LSTM's floor; fp32 weights would be 5.0. The PFSP grid is the biggest GPU item.
+Profile: GEMMs 2.6 (40 weight sets = 2.05 GB fp16 read per frame; bandwidth floor
+~2.3 — at the floor), EAGER elementwise ~2.3 (vmap forward is not compiled;
+nothing fuses), window-shift cats 1.1, carry/clone copies ~1.5, conv reduce 0.4,
+attention 0.15. Levers, both proven on the student: compile the vmap forward
+(Codex #5) and ring the grid's v-cache. Flat static inputs (1b) done for the
+grid: 10.8 -> 10.2. Phase 2 (pack prev-action/logits, ~0.4 ms) now ranks below
+these.
+Compile of the vmapped grid forward is a torch limitation: inductor raises
+`Cannot access storage of BatchedTensorImpl` on vmap+functional_call over stacked
+params, and vmap over a compiled fn is unsupported. Fusion for the grid means a
+grid-native forward (explicit bmm over the S dim, no vmap) or cheaper eager ops.
+Eager micro-bench at the grid shape [120,255,576] fp16, per layer: today's read
+0.37 ms (2.2/frame — the floor under eager; bmm 0.54 and the ring's gather 0.54
+are slower without inductor), reset `where` copy 0.13, window-shift cat 0.15,
+carry copy ~0.13. So a grid ring with the ROLL-THE-WEIGHTS read (same cost as
+today, ~1e-6 tolerance — acceptable for opponent seats) removes ~2.5 ms/frame:
+9.6 -> ~7. Beyond that only a compiled grid-native forward fuses the read.
+
 ## DONE (branch ring-serving, worktree SmashBot-ring, 2026-09-16 late): SGU v-cache ring under capture
 Frame @400 (fixed bench, fp16 + fp16 statics, capture): 9.4 -> 6.3 ms; GPU 8.08 ->
 4.26 ms/frame — the window-shift cat (1.9) and in-graph carry (1.8) kernels are
