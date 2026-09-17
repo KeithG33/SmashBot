@@ -199,9 +199,13 @@ class MultiOpponentSimWorker:
         self.self_idx = np.asarray(list(self_idx), dtype=np.int64)
         self.self_idx_t = torch.as_tensor(self.self_idx, device=device)
         self.rows = batch_size + len(self.self_idx)
-        self.student = BatchedPolicyAgent(student_policy, self.rows, name_code=name_code,
-                                          device=device, precision=precision,
-                                          capture=capture)
+        self.student = BatchedPolicyAgent(
+            student_policy, self.rows, name_code=name_code, device=device,
+            precision=precision, capture=capture,
+            # capture's static state buffers hold fp16-computed values; fp32
+            # storage costs an up/down cast per layer per frame (12.9 -> 9.4 ms
+            # at 400 rows) and the snapshot values are identical
+            state_dtype=torch.float16 if capture and precision == "fp16" else None)
         self.student.set_flat_controllers(True)
         self.ff = sim_env.FlatFrames(device)
         self.assembler = ChunkAssembler(unroll_length, student_policy.delay)

@@ -42,15 +42,11 @@ class SimRolloutConfig:
     unroll_length: int = 240
     data_dir: str = "/home/kage/drive2/ShineBot/msl-data"
     rollout_precision: str = "fp16"
-    # manual static-buffer CUDA-graph capture for the STUDENT forward (the
-    # graph carries the recurrent state in place instead of cloning it every
-    # frame). Bit-identical, and -15.6% on the 400-row forward in isolation
-    # (23.9 -> 20.1 ms) -- but the REAL rollout A/B (v12, same run either
-    # side of a restart) showed 6510 -> ~6540 fps, i.e. nothing, while the
-    # static buffers + graph pool cost +1.25 GiB (peak 18.6 -> 19.8, free
-    # VRAM 1.9 -> 0.85 GiB). Default OFF: the isolated win does not survive
-    # contact with the overlapped learner, and the margin matters more.
-    capture_serving: bool = False
+    # Manual static-buffer CUDA graph for the student forward. Its state
+    # buffers are fp16 (sim_league): with fp32 statics the graph paid an
+    # up/down cast per layer per frame and lost to cudagraph trees at fp16
+    # (12.9 vs 12.0 ms @400 rows); with fp16 statics it wins (9.4 ms).
+    capture_serving: bool = True
     # --- pool shares (fractions of num_envs) ---
     self_frac: float = 0.30       # of envs (row share 2s/(1+s))
     phillip_tiers: tuple[str, ...] = ("medium", "plat", "diamond", "master", "gm")
