@@ -1,3 +1,37 @@
+## CORRECTION 2026-09-16 (late): the serving-cost story below was built on a broken benchmark
+A Codex review found, and I verified against the code, that `bench_agent_step.py`
+(1) never passed `precision=` to the agent, whose inner `autocast(enabled=False)`
+overrides any outer context — every "bf16" latency in the table was fp32;
+(2) ran its profiler loops with `want_snapshot=True`, cloning the full state every
+frame — the "~54% aten::copy_ outside the graph" below measured a cost production
+pays once per 240 frames, so the agent-clone hunt (ring buffers, in-graph carry,
+manual capture) was chasing an artifact; (3) timed the non-production `step()`
+path (GPU `nonzero().tolist()` sync per frame, per-env Controller structs).
+Fixed (c5d2279). Attribution ladder, scaled SGU @400: 21.1 (old bench) -> 16.7
+(worker path) -> 12.9 (fp16) -> 12.6 (packed controller D2H, e53c775) -> 9.6
+(fp16 static state buffers under capture, d5ab201). The real production defect
+was capture's fp32 statics: at fp16 the graph paid an up/down cast per layer per
+frame and LOST to cudagraph trees (12.9 vs 12.0) — hence the neutral A/B.
+Shipped: capture ON + fp16 statics (bit-exact vs fp32 statics: logits, actions,
+snapshots 0.00e+00 over 300x64 with resets). ffw+lstm on the same bench: 3.87 @400
+(was 8.12 by the same path correction) — the 2.5x ratio to SGU is unchanged.
+Production dry-run of the v12 resume: NOT DONE — the launcher's REPO points at the
+SmashBot-sim worktree (still e93055a), so the dry-run measured the OLD code (Codex
+caught it). Until that worktree is merged or REPO points at main, launches run
+without any of the above. Also: `--runtime.restore auto` is tag-relative, so a
+`-dryrun` tag starts FRESH; a resume dry-run must pass the explicit v12 path.
+Measured and REVERTED: packing the controller inside the captured graph (Codex
+follow-up) — n=1 2.94-3.01 vs ~3.00, n=400 9.43-9.77 vs 9.36-9.56: neutral.
+Capture path verified faithful: OPEN-LOOP logits vs eager and vs compiled(mode=None)
+are 0.00e+00 over 300x64 frames. A CLOSED-loop capture-vs-trees comparison is NOT
+a valid parity test — the captured graph samples from graph-registered philox state,
+so per-frame torch.manual_seed reseeds only the non-capture side; near-tie samples
+differ and cascade (looked like 5.5k/19.2k row mismatches). Compare logits open-loop
+(fixed prev_action stream), or compare two runs on the SAME path.
+Not done from the review (measure-first): fuse `uv`+`attn_qkv` (same input;
+changes state_dict keys -> needs a load pre-hook), one-hot->lookup in the head
+decoder, compile the league's vmap forward, fused ring kernel (the lever above).
+
 # TODO
 
 ## Serving cost of windowed models at rollout batch (SGU @400 rows = 27 ms)
