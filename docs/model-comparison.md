@@ -13,11 +13,12 @@ measured with cudagraph compilation (the setting we run) on GPU, in ms per call.
 | SGU (scaled)            | 30k/100k      | 6/576  | 512   | 25.7M  | bf16      | 0.873/0.829       | 1.88   | 2.04   | 2.70   | 3.68   | 4.85   |
 | Transformer (scaled)    | 30k/100k      | 6/576  | 352*   | 25.9M  | bf16      | 0.887/0.867       | 1.84   | 3.10   | 7.02   | 12.4   | 18.5   |
 | ffw+lstm (Phillip)      | 30k/100k      | 3/768  | 512   | 23.9M  | bf16      | 0.936/0.904       | —     | —      | —       | —       | —       |
-| ffw+lstm (Phillip) fp32 | 30k/100k      | 3/768  | 512   | 23.9M  | fp32      | pending           | 1.42   | 1.53   | 1.79   | 2.27   | 2.71   |
+| ffw+lstm (Phillip) fp32 | 30k/100k      | 3/768  | 512   | 23.9M  | fp32      | 0.884/0.826       | 1.42   | 1.53   | 1.79   | 2.27   | 2.71   |
 
 \* Largest batch that fit in memory  
 The fp32 Phillip row is the from-scratch run `txlike768w256-fp32-b512-12char-100k-v2`
-(in progress); the LSTM needs fp32 training (a contaminated fp32 attempt reached 0.868 @74k).  
+(clean: no restarts, 0.27 epoch continuous). The LSTM needs fp32 training: at 30k, on
+identical data, fp32 is 0.884 vs bf16 0.9365.
 <br>
 - Precision = training precision. Latency is measured at the SERVING precision: fp16 for
   SGU/Transformer (what the rollout runs), fp32 for the LSTM (it needs it).
@@ -34,10 +35,13 @@ jigglypuff, cptfalcon, peach, yoshi, popo, luigi, pikachu, samus).
   repeating data. The scaled runs at 100k steps have seen only ~0.20 of one
   epoch of the full set. Bake-off eval numbers are subset-limited and the two
   blocks' absolute losses should not be read against each other.
-- **Matched at 100k, SGU wins outright: 0.829 vs Transformer 0.867 vs ffw+lstm
-  0.904.** All three scaled runs are now trained to the same step count on the
-  same 12-character data at bf16, so this is the clean architecture comparison.
-  The ordering is the same at 30k (0.873 / 0.887 / 0.936). Comparison closed.
+- **At 100k: fp32 ffw+lstm 0.826 vs bf16 SGU 0.829 vs bf16 Transformer 0.867.**
+  The LSTM's earlier 0.904 was a precision artifact (bf16 training hurts LSTM
+  recurrence); in fp32 it matches SGU on loss while serving ~1.8x faster. SGU and
+  the Transformer have only been trained in bf16 — SGU-fp32 (batch 512 as 2x256
+  via grad accumulation, since a 512 micro-batch OOMs at fp32) is the run that
+  decides the architecture. The bf16 LSTM run also restarted at 30k into the old
+  dataloader bug (re-saw data); the SGU and Transformer 100k runs were clean.
 - **The scaled Transformer had to drop to batch 352** to fit VRAM; the other two
   ran 512. That is a real confound in its favour on a per-step basis (smaller
   batch = more steps per epoch) and against it on wall-clock — it still loses to
