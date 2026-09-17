@@ -477,52 +477,35 @@ class SGUBlock(nn.Module):
         nn.init.zeros_(self.down.weight)
 
     def _spatial(self, v, v_cache):
-        """Causal depthwise mixing over the last W frames + the cache for the
-        next step. v: [B, T, d]; v_cache: [B, W-1, d] (ring-free: chronological,
-        oldest first)."""
         W = self.window
-        # caches follow the activation dtype: under fp16/bf16 autocast the
-        # fp32-initialized state must not promote the whole window
         v_cache = v_cache.to(v.dtype)
         if v.shape[1] == 1:
-            # serving: never materialize the [B, W, d] window. The grouped
-            # conv with one output position is a per-channel weighted sum, so
-            # the cache and the current frame reduce separately and the next
-            # cache is one contiguous shift. This branch is worth keeping:
-            # measured 2.4x at n=400 (23.9 vs 58.2 ms) and +30% at n=1 — cuDNN
-            # handles kernel=W, groups=d, one output position badly.
-            w = self.spatial.weight.squeeze(1)  # [d, W]
+            # one output position is a per-channel weighted sum, not a conv:
+            # 2.4x faster at n=400, +30% at n=1. Don't "simplify" it away.
+            w = self.spatial.weight.squeeze(1)
             v_mixed = (
                 (v_cache * w[:, : W - 1].t()).sum(dim=1)
                 + v[:, 0] * w[:, W - 1]
                 + self.spatial.bias
             ).unsqueeze(1)
             return v_mixed, torch.cat([v_cache[:, 1:], v], dim=1)
-        v_full = torch.cat([v_cache, v], dim=1)  # [B, W-1+T, d]
+        v_full = torch.cat([v_cache, v], dim=1)
         v_mixed = self.spatial(v_full.transpose(1, 2)).transpose(1, 2)
         return v_mixed, v_full[:, -(W - 1):].contiguous()
 
     def _attend(self, xn, kv_cache, attn_mask):
-        """aMLP's tiny attention (single head, dk=64) over the same causal
-        window + the cache for the next step. Returns the OUT-PROJECTED
-        result, so the caller just adds it to the conv's output."""
         W = self.window
-        q, k_new, va_new = self.attn_qkv(xn).chunk(3, dim=-1)  # [B, T, dk] x3
+        q, k_new, va_new = self.attn_qkv(xn).chunk(3, dim=-1)
         kv_new = torch.cat([k_new, va_new], dim=-1)
         kv_full = torch.cat([kv_cache.to(kv_new.dtype), kv_new], dim=1)
         keys, vals = kv_full.chunk(2, dim=-1)
         a = torch.nn.functional.scaled_dot_product_attention(
             q.unsqueeze(1), keys.unsqueeze(1), vals.unsqueeze(1),
             attn_mask=attn_mask,
-        ).squeeze(1)  # [B, T, dk]
+        ).squeeze(1)
         return self.attn_out(a), kv_full[:, -(W - 1):].contiguous()
 
     def mix(self, x, v_cache, kv_cache, attn_mask):
-        """x: [B, T, d]; caches [B, W-1, *]; attn_mask is built ONCE per
-        forward by SGUCore (every layer's is identical — same window, same
-        cache_len). Returns (out, new_v_cache, new_kv_cache); both caches are
-        contiguous because the caller clones the state every frame, and
-        cloning a strided view costs more than the copy that produced it."""
         xn = self.mix_norm(x)
         u, v = self.uv(xn).chunk(2, dim=-1)
         v_mixed, new_v = self._spatial(v, v_cache)
@@ -571,13 +554,10 @@ class SGUCore(Network):
         }
 
     def _attn_mask(self, T, cache_len, B, device):
-        """The windowed-causal mask, shared by every layer: a key is
-        attendable iff it is at most W-1 frames older than the query and the
-        cache slot actually holds a frame (cache_len)."""
         W = self.window
         slot = torch.arange(W - 1, device=device)
-        cache_valid = slot[None, :] >= (W - 1 - cache_len)[:, None]  # [B, W-1]
-        if T == 1:  # every cache slot is in window; the current frame is too
+        cache_valid = slot[None, :] >= (W - 1 - cache_len)[:, None]
+        if T == 1:
             ones = torch.ones(B, 1, dtype=torch.bool, device=device)
             return torch.cat([cache_valid, ones], dim=1)[:, None, None, :]
         t = torch.arange(T, device=device)
