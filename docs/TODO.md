@@ -1,3 +1,25 @@
+## DONE (branch ring-serving, worktree SmashBot-ring, 2026-09-16 late): SGU v-cache ring under capture
+Frame @400 (fixed bench, fp16 + fp16 statics, capture): 9.4 -> 6.3 ms; GPU 8.08 ->
+4.26 ms/frame — the window-shift cat (1.9) and in-graph carry (1.8) kernels are
+gone; the fused window read (0.94) remains, as it must. Parity: open loop, both
+paths under capture, 800 frames (3.1 wraps), staggered resets, logits AND the
+canonical snapshot compared on every frame: 0.00e+00. Suite 126. NOT merged to
+main; NOT run in production (launcher still points at the stale SmashBot-sim
+worktree — see below).
+Design (Codex review invariants all hold): ptr = next slot; read history (ages
+1..W-1, valid iff age <= cache_len, where-select so a stale NaN can't leak; costs
+~0.12 ms vs multiply, kept) before writing the current v; the compiled forward
+returns [B, d] slots, the captured graph does the only writes (index_copy_ per
+layer at a device ptr), carries kv + cache_len, advances ptr once; resets set
+cache_len=0 and never touch the ring; hidden_snapshot gathers, zeroes, drops ptr,
+clones — taken before the frame's replay. kv stays canonical (18% of traffic;
+cat+SDPA 0.129 vs ring-attn 0.233 ms/layer measured).
+Next lever, now visible: frame 6.3 ms vs GPU 4.3 — ~2 ms of CPU/launch/sync no
+longer hidden under GPU time. ~190 outside-graph launches per frame, mostly the
+122-leaf game-state struct copied leaf-by-leaf into the static inputs; production
+states are views into FlatFrames' three flat tensors, so the static input could
+be those three tensors (3 copies instead of 122). Then the kv ring if it earns it.
+
 ## CORRECTION 2026-09-16 (late): the serving-cost story below was built on a broken benchmark
 A Codex review found, and I verified against the code, that `bench_agent_step.py`
 (1) never passed `precision=` to the agent, whose inner `autocast(enabled=False)`

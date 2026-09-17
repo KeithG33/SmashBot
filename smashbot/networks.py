@@ -505,6 +505,33 @@ class SGUBlock(nn.Module):
         ).squeeze(1)
         return self.attn_out(a), kv_full[:, -(W - 1):].contiguous()
 
+    def _spatial_ring(self, v, v_ring, idx, valid):
+        # gather-by-age is fused into the reduction by inductor (no window
+        # materialized; measured), so the summation order matches _spatial
+        W = self.window
+        w = self.spatial.weight.squeeze(1)
+        hist = torch.where(valid[:, :, None], v_ring.index_select(1, idx).to(v.dtype), 0.0)
+        v_mixed = (
+            (hist * w[:, : W - 1].t()).sum(dim=1)
+            + v[:, 0] * w[:, W - 1]
+            + self.spatial.bias
+        ).unsqueeze(1)
+        return v_mixed, v[:, 0]
+
+    def mix_ring(self, x, v_ring, kv_cache, attn_mask, idx, valid):
+        """Serving with the v-cache as a ring: returns the NEW slot [B, d]
+        instead of a shifted cache; the caller writes it in place."""
+        xn = self.mix_norm(x)
+        u, v = self.uv(xn).chunk(2, dim=-1)
+        v_mixed, v_new = self._spatial_ring(v, v_ring, idx, valid)
+        attn, new_kv = self._attend(xn, kv_cache, attn_mask)
+        x = x + self.mix_out(u * (v_mixed + attn))
+
+        gate, up = self.gate_up(self.ffw_norm(x)).chunk(2, dim=-1)
+        x = x + self.down(torch.nn.functional.silu(gate) * up)
+
+        return x, v_new, new_kv
+
     def mix(self, x, v_cache, kv_cache, attn_mask):
         xn = self.mix_norm(x)
         u, v = self.uv(xn).chunk(2, dim=-1)
@@ -570,18 +597,65 @@ class SGUCore(Network):
              causal_window[None].expand(B, T, T)], dim=2,
         ).unsqueeze(1)  # [B, 1, T, W-1+T]
 
+    # ---- serving ring: the v-cache is a ring written in place by the agent
+    # (kv stays canonical — small, and cat+SDPA beats a ring read for it).
+    # Ring mode is keyed by "ptr" in the state; the learner never sees it. ----
+    def initial_ring_state(self, batch_size, device=None):
+        s = self.initial_state(batch_size, device)
+        s["ptr"] = torch.zeros((), dtype=torch.long, device=device)
+        return s
+
+    def _ring_index(self, ptr, cache_len, device):
+        W = self.window
+        i = torch.arange(W - 1, device=device)
+        idx = (i + ptr) % (W - 1)                 # canonical position i -> ring slot
+        valid = i[None, :] >= (W - 1 - cache_len)[:, None]
+        return idx, valid
+
+    def canonical_state(self, state):
+        """Ring state -> the chronological state the learner expects."""
+        idx, valid = self._ring_index(state["ptr"], state["cache_len"], state["cache_len"].device)
+        layers = [
+            (torch.where(valid[:, :, None], v_ring.index_select(1, idx), 0.0), kv)
+            for v_ring, kv in state["layers"]
+        ]
+        return {"cache_len": state["cache_len"], "layers": layers}
+
+    def step_with_reset(self, inputs, reset, prev_state):
+        if "ptr" not in prev_state:
+            return super().step_with_reset(inputs, reset, prev_state)
+        # stale ring slots are masked at read time by cache_len; never rewrite the ring
+        initial = self.initial_state(reset.shape[0], device=reset.device)
+        state = {
+            "cache_len": torch.where(reset, 0, prev_state["cache_len"]),
+            "ptr": prev_state["ptr"],
+            "layers": [(v_ring, _mask_state(reset, ikv, kv))
+                       for (v_ring, kv), (_, ikv) in zip(prev_state["layers"], initial["layers"])],
+        }
+        return self.step(inputs, state)
+
     def _forward(self, inputs, state):
         T = inputs.shape[1]
         x = self.encoder(inputs)
         mask = self._attn_mask(T, state["cache_len"], inputs.shape[0], inputs.device)
+        ring = "ptr" in state
+        if ring:
+            assert T == 1, "ring mode is the serving path"
+            idx, valid = self._ring_index(state["ptr"], state["cache_len"], inputs.device)
         new_layers = []
         for block, (v_cache, kv_cache) in zip(self.blocks, state["layers"]):
-            x, nv, nkv = block.mix(x, v_cache, kv_cache, mask)
-            new_layers.append((nv, nkv))
+            if ring:
+                x, v_new, nkv = block.mix_ring(x, v_cache, kv_cache, mask, idx, valid)
+                new_layers.append((v_new, nkv))
+            else:
+                x, nv, nkv = block.mix(x, v_cache, kv_cache, mask)
+                new_layers.append((nv, nkv))
         next_state = {
             "cache_len": torch.clamp(state["cache_len"] + T, max=self.window - 1),
             "layers": new_layers,
         }
+        if ring:
+            next_state["ptr"] = state["ptr"]      # advanced by the agent after the write
         return self.final_norm(x), next_state
 
     def step(self, inputs, prev_state):

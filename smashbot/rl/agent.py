@@ -94,6 +94,7 @@ class BatchedPolicyAgent:
         precision: str = "fp32",
         state_dtype: torch.dtype | None = None,
         capture: bool = False,
+        ring: bool | None = None,
     ):
         self.policy = policy
         self.num_envs = num_envs
@@ -153,6 +154,15 @@ class BatchedPolicyAgent:
         # frame (3.4 ms at 400 rows for the windowed cores). Owning the
         # buffers lets the graph carry the state in place instead.
         self._use_capture = capture and torch.device(device).type == "cuda"
+        # serving ring for the SGU v-cache (see SGUCore.initial_ring_state):
+        # the captured graph writes one slot per frame instead of carrying a
+        # shifted copy of every cache. Capture-only — under cudagraph trees
+        # inductor functionalizes the in-place write back into a copy.
+        self._core = getattr(getattr(policy, "network", None), "core", None)
+        self._ring = (self._use_capture and hasattr(self._core, "initial_ring_state")
+                      and ring is not False)
+        if self._ring:   # the ring state exists from the start: snapshots precede the first replay
+            self.hidden = self._cast_state(self._core.initial_ring_state(num_envs, device))
         assert not self._use_capture or batch_steps == 1, (
             "capture is for the batch_steps==1 serving path"
         )
@@ -171,11 +181,16 @@ class BatchedPolicyAgent:
         """Fresh game in env i: zero its recurrent state, queue, and prev action."""
         mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self._name.device)
         mask[i] = True
-        self.hidden = _mask_state(
-            mask,
-            self._cast_state(self.policy.initial_state(self.num_envs, self.device)),
-            self.hidden,
-        )
+        if self._ring:   # stale ring slots are masked by cache_len at read time
+            self.hidden["cache_len"][i] = 0
+            for _, kv in self.hidden["layers"]:
+                kv[i].zero_()
+        else:
+            self.hidden = _mask_state(
+                mask,
+                self._cast_state(self.policy.initial_state(self.num_envs, self.device)),
+                self.hidden,
+            )
         self._queues[i] = collections.deque([self._neutral()] * self.delay)
         tree.map_structure(
             lambda dst, src: dst[i].copy_(src[i]),
@@ -395,18 +410,33 @@ class BatchedPolicyAgent:
             out, new_hidden = _forward()
             self._out_ctrl = out.controller_state
             self._out_logits = out.logits
-            tree.map_structure(
-                lambda dst, src: dst.copy_(src) if isinstance(dst, torch.Tensor) else None,
-                self.hidden, new_hidden,
-            )
+            if self._ring:
+                self._ring_carry(new_hidden)
+            else:
+                tree.map_structure(
+                    lambda dst, src: dst.copy_(src) if isinstance(dst, torch.Tensor) else None,
+                    self.hidden, new_hidden,
+                )
         self._graph = graph
         # warmup + capture ran on whatever frame arrived first: restart the
         # carried state so the first replay begins from zeros
-        init = self._cast_state(self.policy.initial_state(self.num_envs, self.device))
+        init = self._cast_state(
+            self._core.initial_ring_state(self.num_envs, self.device) if self._ring
+            else self.policy.initial_state(self.num_envs, self.device))
         tree.map_structure(
             lambda dst, src: dst.copy_(src) if isinstance(dst, torch.Tensor) else None,
             self.hidden, init,
         )
+
+    def _ring_carry(self, new_hidden):
+        ptr = self.hidden["ptr"]
+        for (v_ring, kv), (v_new, kv_new) in zip(self.hidden["layers"], new_hidden["layers"]):
+            assert v_new.dim() == 2 and v_ring.dim() == 3, "ring carry takes a [B, d] slot, never a cache"
+            v_ring.index_copy_(1, ptr.view(1), v_new.unsqueeze(1).to(v_ring.dtype))
+            kv.copy_(kv_new)
+        self.hidden["cache_len"].copy_(new_hidden["cache_len"])
+        ptr.add_(1)
+        ptr.remainder_(self._core.window - 1)
 
     def _graph_step(self, states, prev, resets):
         """Replay the captured graph on this frame's inputs. Returns the
@@ -423,9 +453,10 @@ class BatchedPolicyAgent:
 
     def hidden_snapshot(self) -> tp.Any:
         """Detached copy of the recurrent state (for Trajectory.initial_state)."""
+        hidden = self._core.canonical_state(self.hidden) if self._ring else self.hidden
         return tree.map_structure(
             lambda t: t.detach().clone() if isinstance(t, torch.Tensor) else t,
-            self.hidden,
+            hidden,
         )
 
 
