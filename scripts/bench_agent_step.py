@@ -1,6 +1,6 @@
-"""Micro-benchmark of BatchedPolicyAgent.step (rollout inference wrapper):
-ms per call at a given batch size with a real compiled policy, plus an
-optional cProfile of the call. No Dolphins, no worker."""
+"""Micro-benchmark of the rollout serving frame (BatchedPolicyAgent
+execute + infer, flat controllers — the worker's per-frame pattern): ms per
+frame at a given batch size with a real compiled policy."""
 
 import argparse
 import cProfile
@@ -40,8 +40,10 @@ def main():
     ap.add_argument("--compile", action="store_true")
     ap.add_argument("--compile-mode", default="reduce-overhead",
                     help="torch.compile mode (reduce-overhead = cudagraph trees; max-autotune adds Triton autotuning)")
-    ap.add_argument("--precision", default="fp32", choices=["fp32", "bf16", "fp16"],
-                    help="autocast dtype for the forward (match the training precision)")
+    ap.add_argument("--precision", default="fp32", choices=["fp32", "fp16"],
+                    help="agent forward precision (production serves fp16)")
+    ap.add_argument("--state-fp16", action="store_true",
+                    help="fp16 carried-state buffers (requires --precision fp16)")
     ap.add_argument("--profile", action="store_true")
     ap.add_argument("--capture", action="store_true",
                     help="manual static-buffer CUDA graph (no per-frame state clone)")
@@ -85,7 +87,10 @@ def main():
         policy.sample = torch.compile(
             policy.sample, mode=None if args.capture else args.compile_mode)
     agent = BatchedPolicyAgent(policy, args.n, name_code=1, device=device,
-                               batch_steps=1, capture=args.capture)
+                               batch_steps=1, capture=args.capture,
+                               precision=args.precision,
+                               state_dtype=torch.float16 if args.state_fp16 else None)
+    agent.set_flat_controllers(True)
     game = embed_lib.EmbedConfig().make_game_embedding()
     rng = np.random.default_rng(0)
 
@@ -95,34 +100,35 @@ def main():
             lambda x: torch.from_numpy(np.ascontiguousarray(
                 x.astype(np.int64) if x.dtype.kind in "iu" else x)).to(device), enc)
     states = [state() for _ in range(4)]
-    import contextlib
-    ac = (contextlib.nullcontext() if args.precision == "fp32" else torch.autocast(
-        "cuda", dtype=torch.bfloat16 if args.precision == "bf16" else torch.float16))
-    ac.__enter__()
     resets = torch.zeros(args.n, dtype=torch.bool, device=device)
     snap = not args.no_snapshot
+
+    def frame(i):  # the worker's per-frame pattern: pop, then infer
+        agent.execute(())
+        agent.infer(states[i % 4], resets, want_snapshot=snap)
+
     for i in range(30):
-        agent.step(states[i % 4], resets, want_snapshot=snap)
+        frame(i)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     for i in range(args.steps):
-        agent.step(states[i % 4], resets, want_snapshot=snap)
+        frame(i)
     torch.cuda.synchronize()
-    ac.__exit__(None, None, None)
-    print(f"[{label}] {args.precision} n={args.n} compile={args.compile_mode if args.compile else False}: {(time.perf_counter() - t0) / args.steps * 1e3:.3f} ms/step")
+    ms = (time.perf_counter() - t0) / args.steps * 1e3
+    print(f"[{label}] {args.precision}{'+state16' if args.state_fp16 else ''} n={args.n} "
+          f"compile={args.compile_mode if args.compile else False} capture={args.capture} "
+          f"snapshot={snap}: {ms:.3f} ms/step")
     if args.torch_profile:
         from torch.profiler import profile, ProfilerActivity
-        ac.__enter__()
         with profile(activities=[ProfilerActivity.CUDA, ProfilerActivity.CPU]) as prof:
             for i in range(50):
-                agent.step(states[i % 4], resets)
+                frame(i)
             torch.cuda.synchronize()
-        ac.__exit__(None, None, None)
         print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=22))
     if args.profile:
         pr = cProfile.Profile(); pr.enable()
         for i in range(100):
-            agent.step(states[i % 4], resets)
+            frame(i)
         torch.cuda.synchronize(); pr.disable()
         pstats.Stats(pr).sort_stats("tottime").print_stats(16)
 
