@@ -69,6 +69,19 @@ class FrameRecord(tp.NamedTuple):
     name: torch.Tensor  # [N]
 
 
+def _controller_to_host(ctrl):
+    """One device-to-host copy for the whole sampled controller (13 uint8/bool
+    leaves -> one [.., 13] tensor); each leaf comes back in its own dtype."""
+    leaves = tree.flatten(ctrl)
+    pack = (torch.uint8 if all(t.dtype in (torch.bool, torch.uint8) for t in leaves)
+            else torch.int64)
+    packed = torch.stack([t.to(pack) for t in leaves], dim=-1).cpu().numpy()
+    return tree.unflatten_as(ctrl, [
+        packed[..., k].astype(torch.empty(0, dtype=t.dtype).numpy().dtype)
+        for k, t in enumerate(leaves)
+    ])
+
+
 class BatchedPolicyAgent:
     def __init__(
         self,
@@ -287,7 +300,7 @@ class BatchedPolicyAgent:
                 logits=tree.map_structure(lambda x: x.clone(), logits),
                 name=self._name.clone(),
             ))
-            encoded_np = tree.map_structure(lambda x: x.cpu().numpy(), ctrl)
+            encoded_np = _controller_to_host(ctrl)
             decoded = self._embed_controller.decode(encoded_np)
             self._enqueue(decoded)
             self._buf_states, self._buf_resets = [], []
@@ -602,7 +615,7 @@ class LeagueAgent:
         )
         from smashbot import encode
 
-        encoded_np = tree.map_structure(lambda x: flat(x).cpu().numpy(), ctrl)
+        encoded_np = _controller_to_host(tree.map_structure(flat, ctrl))
         if self._timer is not None:
             self._timer("record+to_cpu")
         rows = encode.controller_rows(self._embed_controller.decode(encoded_np))
