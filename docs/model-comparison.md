@@ -28,6 +28,37 @@ identical data, fp32 is 0.884 vs bf16 0.9365.
 jigglypuff, cptfalcon, peach, yoshi, popo, luigi, pikachu, samus).
 - Top block is a small-scale experiment with 20k replays and smaller networks (under 5ms)
 - Bottom block is scaled up nets (and actual Phillip) using full 841,682 replay dataset
+## SGU depth/width at ~25M params (2026-09-17)
+
+The 6/576 shape was chosen under conditions that no longer hold (cudagraph
+trees, n=32, no ring). At fixed parameters the GEMM work is constant but the
+window read and the ring/kv traffic scale with layers x width x window, and
+batch-1 cost is a chain of per-layer kernels — so shallower-and-wider should be
+faster. Measured, SGU only, one method (compile + manual capture + fp16 static
+state + flat inputs, no-snapshot, idle 3090):
+
+| shape | params | state/row | ms @400 | @128 | @1 | serving VRAM @400 | learner peak* | fps @25* |
+|-------|-------:|----------:|--------:|-----:|---:|------------------:|--------------:|---------:|
+| 3/768 | 23.1M  | 1.36 MB   | **3.67** | 2.31 | **1.64** | **2.23 GiB** | **12.42 GiB** | **5472** |
+| 3/832 | 26.4M  | 1.47 MB   | 3.82    | 2.28 | 1.69 | 2.39 GiB | 13.35 GiB | 5365 |
+| 4/704 | 25.4M  | 1.70 MB   | 4.20    | 2.48 | 1.72 | 2.75 GiB | — | — |
+| 5/640 | 25.9M  | 1.96 MB   | 4.58    | 2.55 | 1.79 | 3.17 GiB | — | — |
+| 6/576 (current) | 25.7M | 2.15 MB | 5.01 | 2.74 | 1.91 | 3.48 GiB | 15.53 GiB | 4914 |
+| 8/512 | 26.7M  | 2.61 MB   | 5.84    | 3.07 | 1.92 | 4.23 GiB | — | — |
+
+\* real entrypoint (`train_rl --backend sim`), 400 rows / 40 slices / mb 12,
+fresh start from a random-init checkpoint of the shape, empty league, no
+imports, wandb disabled, 30 steps; identical settings for the three shapes, so
+read relatively (the 6/576 peak matches the resume dry-runs' 15.51). fps is
+cumulative-since-boot at step 25 and warmup-limited.
+
+- Monotonic at every batch: 3/768 is -27% @400 and -14% @1 vs 6/576, 1.25 GiB
+  lighter in serving and **3.1 GiB lighter at the learner peak** (rows are the
+  budget). It is also the LSTM's shape (Phillip is 3/768) and 2.6M params smaller.
+- Speed only. Whether three layers hold eval loss at these params is the open
+  question — a BC run (fp32, batch 512 as 2x256) on the box after the 6/576
+  fp32 run finishes.
+
 ## Notes
 
 - **The two blocks see data very differently.** At 30k steps the bake-off had
