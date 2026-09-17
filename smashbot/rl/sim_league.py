@@ -208,6 +208,7 @@ class MultiOpponentSimWorker:
             state_dtype=torch.float16 if capture and precision == "fp16" else None)
         self.student.set_flat_controllers(True)
         self.ff = sim_env.FlatFrames(device)
+        self.student.set_flat_inputs(self.ff.view)
         self.assembler = ChunkAssembler(unroll_length, student_policy.delay)
         self._pushed = 0
         self._prev = None
@@ -311,7 +312,8 @@ class MultiOpponentSimWorker:
                 row_flats = flats
             states = self.ff.view(row_flats)
             want = (self._pushed % T == 0)
-            records, hidden_before = self.student.infer(states, reset_rows, want_snapshot=want)
+            records, hidden_before = self.student.infer(states, reset_rows, want_snapshot=want,
+                                                        flats=row_flats)
 
             # ---- opponent seats (player 1) ----
             p1_rows = np.empty((N, 13), dtype=np.float32)

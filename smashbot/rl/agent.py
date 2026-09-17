@@ -167,6 +167,12 @@ class BatchedPolicyAgent:
             "capture is for the batch_steps==1 serving path"
         )
         self._graph = None
+        # flat inputs (capture): the static inputs are the worker's three typed
+        # flats and the struct the forward reads is a view of them, built once —
+        # three copies per frame instead of one per leaf. Int storage is int64
+        # because unflatten's .long() would otherwise COPY, freezing the views.
+        self._view_fn = None
+        self._in_flats = None
 
     def _cast_state(self, state):
         if self.state_dtype is None:
@@ -259,6 +265,7 @@ class BatchedPolicyAgent:
     # never comes
     def infer(
         self, states: tp.Any, resets: torch.Tensor, want_snapshot: bool = True,
+        flats: tuple | None = None,
     ) -> tuple[list[FrameRecord], tp.Any]:
         """states: encoded Game struct batched [N, ...]; resets: [N] bool.
 
@@ -285,7 +292,7 @@ class BatchedPolicyAgent:
                 self._prev_action, self._neutral_encoded,
             )
             if self._use_capture:
-                ctrl, logits = self._graph_step(states, prev, reset_t)
+                ctrl, logits = self._graph_step(states, prev, reset_t, flats)
             else:
                 with self._autocast():
                     out, hidden = self.policy.sample(
@@ -378,14 +385,28 @@ class BatchedPolicyAgent:
         return torch.autocast(dev, dtype=torch.float16,
                               enabled=self.precision == "fp16" and dev == "cuda")
 
-    def _capture_step(self, states, prev, resets) -> None:
+    def set_flat_inputs(self, view_fn) -> None:
+        """view_fn(flats) -> state struct (FlatFrames.view); pass flats= to infer."""
+        self._view_fn = view_fn
+
+    def _capture_step(self, states, prev, resets, flats=None) -> None:
         """Record one policy.sample into a manual CUDA graph over static
         input buffers. The graph's LAST op copies the new recurrent state
         back into the buffer it read from, so a replay both consumes and
         advances the state with no python-side clone and no placeholder
         copy. policy.sample must be uncompiled or compiled WITHOUT cudagraph
         trees (a graph inside a graph is not capturable)."""
-        self._in_states = tree.map_structure(lambda t: t.clone(), states)
+        if flats is not None:
+            assert self._view_fn is not None, "flats= needs set_flat_inputs(view_fn)"
+            self._in_flats = tuple(
+                t.clone().long() if not (t.is_floating_point() or t.dtype == torch.bool) else t.clone()
+                for t in flats)
+            self._in_states = self._view_fn(self._in_flats)
+            bases = {t.untyped_storage().data_ptr() for t in self._in_flats}
+            assert all(l.untyped_storage().data_ptr() in bases for l in tree.flatten(self._in_states)), \
+                "state views do not alias the static flats"
+        else:
+            self._in_states = tree.map_structure(lambda t: t.clone(), states)
         self._in_prev = tree.map_structure(lambda t: t.clone(), prev)
         self._in_resets = resets.clone()
 
@@ -438,14 +459,18 @@ class BatchedPolicyAgent:
         ptr.add_(1)
         ptr.remainder_(self._core.window - 1)
 
-    def _graph_step(self, states, prev, resets):
+    def _graph_step(self, states, prev, resets, flats=None):
         """Replay the captured graph on this frame's inputs. Returns the
         STATIC output buffers — every consumer below copies out of them
         (prev_action clone, logits clone, .cpu() for the queues) before the
         next replay overwrites them."""
         if self._graph is None:
-            self._capture_step(states, prev, resets)
-        tree.map_structure(lambda dst, src: dst.copy_(src), self._in_states, states)
+            self._capture_step(states, prev, resets, flats)
+        if self._in_flats is not None:
+            for dst, src in zip(self._in_flats, flats):
+                dst.copy_(src)
+        else:
+            tree.map_structure(lambda dst, src: dst.copy_(src), self._in_states, states)
         tree.map_structure(lambda dst, src: dst.copy_(src), self._in_prev, prev)
         self._in_resets.copy_(resets)
         self._graph.replay()
