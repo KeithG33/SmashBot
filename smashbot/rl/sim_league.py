@@ -209,6 +209,8 @@ class MultiOpponentSimWorker:
         self.student.set_flat_controllers(True)
         self.ff = sim_env.FlatFrames(device)
         self.student.set_flat_inputs(self.ff.view)
+        for gr in self.grids:
+            gr.agent.set_flat_inputs(self.ff.view)
         self.assembler = ChunkAssembler(unroll_length, student_policy.delay)
         self._pushed = 0
         self._prev = None
@@ -338,9 +340,12 @@ class MultiOpponentSimWorker:
                     gr.agent.reset_cell(cell // gr.Nc, cell % gr.Nc)
                 rows_all = gr.agent.execute()
                 p1_rows[gr.cell_env[gr.valid]] = rows_all[gr.valid]
-                gviews = self.ff.view(opp_flats, rows=gr.idx_t, lead=(gr.S, gr.Nc))
+                gflats = tuple(t.index_select(0, gr.idx_t).view(gr.S, gr.Nc, t.shape[-1])
+                               for t in opp_flats)
+                gviews = self.ff.view(gflats)
                 grec = gr.agent.infer(
-                    gviews, torch.as_tensor(gr_reset.reshape(gr.S, gr.Nc), device=dev))
+                    gviews, torch.as_tensor(gr_reset.reshape(gr.S, gr.Nc), device=dev),
+                    flats=gflats)
                 if not gr.assembler._records:      # chunk start: eligibility window
                     gr.chunk_valid[:] = gr.valid
                 gr.chunk_valid &= gr.valid

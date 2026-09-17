@@ -635,7 +635,7 @@ class LeagueAgent:
         return rows, self.infer(views, resets)
 
     @torch.no_grad()
-    def infer(self, views, resets: torch.Tensor) -> FrameRecord:
+    def infer(self, views, resets: torch.Tensor, flats=None) -> FrameRecord:
         """views: encoded Game struct batched [S, N, ...] on device; resets:
         [S, N] bool on device (True on a cell's first frame of a game —
         zeroes its recurrent state and substitutes the neutral prev action).
@@ -648,7 +648,7 @@ class LeagueAgent:
             self._prev, self._neutral,
         )
         if self._use_capture:
-            ctrl, logits = self._captured_forward(views, prev, resets)
+            ctrl, logits = self._captured_forward(views, prev, resets, flats)
         else:
             ctrl, logits, self._hidden = self._vm(
                 self._stacked_params, self._stacked_buffers, views, prev,
@@ -733,13 +733,17 @@ class LeagueAgent:
 
         return single
 
-    def _captured_forward(self, views, prev, resets):
+    def _captured_forward(self, views, prev, resets, flats=None):
         """Copy this frame's inputs into the static buffers, replay, return
         clones of the static outputs. Captured once at first use (shapes
         never change); in-place slice loads are visible to replays."""
         if self._graph is None:
-            self._capture(views, prev, resets)
-        tree.map_structure(lambda d, s: d.copy_(s), self._in_views, views)
+            self._capture(views, prev, resets, flats)
+        if getattr(self, "_in_flats", None) is not None:
+            for d, src in zip(self._in_flats, flats):
+                d.copy_(src)
+        else:
+            tree.map_structure(lambda d, s: d.copy_(s), self._in_views, views)
         tree.map_structure(lambda d, s: d.copy_(s), self._in_prev, prev)
         self._in_resets.copy_(resets)
         # recurrent state: static in <- last replay's static out
@@ -752,8 +756,22 @@ class LeagueAgent:
         logits = tree.map_structure(lambda t: t.clone(), self._out_logits)
         return ctrl, logits
 
-    def _capture(self, views, prev, resets):
-        self._in_views = tree.map_structure(lambda t: t.clone(), views)
+    def set_flat_inputs(self, view_fn) -> None:
+        """view_fn(flats) -> views struct; pass the grid's three flats to infer."""
+        self._view_fn = view_fn
+        self._in_flats = None
+
+    def _capture(self, views, prev, resets, flats=None):
+        if flats is not None:
+            self._in_flats = tuple(
+                t.clone().long() if not (t.is_floating_point() or t.dtype == torch.bool) else t.clone()
+                for t in flats)
+            self._in_views = self._view_fn(self._in_flats)
+            bases = {t.untyped_storage().data_ptr() for t in self._in_flats}
+            assert all(l.untyped_storage().data_ptr() in bases for l in tree.flatten(self._in_views)), \
+                "grid views do not alias the static flats"
+        else:
+            self._in_views = tree.map_structure(lambda t: t.clone(), views)
         self._in_prev = tree.map_structure(lambda t: t.clone(), prev)
         self._in_resets = resets.clone()
         self._in_hidden = self._initial_hidden()
