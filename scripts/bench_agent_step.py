@@ -131,6 +131,8 @@ def main():
     print(f"[{label}] {args.precision}{'+state16' if args.state_fp16 else ''}{'+flats' if args.flats else ''} n={args.n} "
           f"compile={args.compile_mode if args.compile else False} capture={args.capture} "
           f"snapshot={snap}: {ms:.3f} ms/step")
+    print(f"[{label}] n={args.n} vram: peak {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB "
+          f"reserved {torch.cuda.memory_reserved() / 2**30:.2f} GiB")
     if args.torch_profile:
         from torch.profiler import profile, ProfilerActivity
         with profile(activities=[ProfilerActivity.CUDA, ProfilerActivity.CPU]) as prof:
