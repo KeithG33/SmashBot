@@ -147,3 +147,28 @@ Removing it needs ping-pong buffers or in-place ring updates inside the manual
 graph (no functionalization there, so `index_copy_` is legal). The ring's
 non-canonical state layout is acceptable for SERVING state, which is never
 compared or checkpointed — unlike the learner's.
+
+## v13 design decisions (Keith, 2026-09-16 evening — NO action yet)
+Launch only once the teacher question is settled; the teacher cannot change
+mid-run, and three things are open at once (fp32 vs bf16; SGU vs tx_like now
+that the latency table inverted; delay 18 vs 21).
+
+- **Pool mix.** v12 runs self 46% / phillips 27% / PFSP 27% of learner ROWS,
+  because `self_frac=0.30` is a share of ENVS and each self env contributes two
+  rows (`2s/(1+s)`). That silently cut phillip signal from v11's 35%. Keith wants
+  one learner row per self-play game plus a larger phillip share. Note the two
+  routes are not equivalent:
+    - `self_frac=0.176`, both seats -> 30% self rows, no extra envs, but the two
+      rows of a game are CORRELATED (same trajectory, mirrored).
+    - one row per self game -> independent rows, but needs ~400 envs for 400
+      rows (~30% more sim CPU per frame).
+- **Schedules.** v12 holds both flat (`kl-teacher-weight 0.025 --final -1`,
+  `imitation-lambda 0.01 --final-frac 1.0`). v10 phase 2 held imitation at
+  0.002, so v12 runs 5x that constantly. Decay both over the run (the machinery
+  exists: `kl_teacher_weight_final`, `imitation_lambda_final_frac`).
+- **Open question, cheap to test:** the phillips are LSTMs served under fp16
+  autocast. If precision hurts LSTM recurrence (the BC result suggests it may),
+  our opponents play below true strength and "winrate vs gm" is not calibrated.
+  `check_fp16_state.py` does NOT cover this — it compared fp16 vs fp32 STATE
+  STORAGE with the forward in fp16 both times. Test = lockstep fp32 vs fp16
+  forward for one phillip, compare action agreement.
