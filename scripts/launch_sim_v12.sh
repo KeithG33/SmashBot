@@ -7,7 +7,7 @@
 #   step twice (21.4-22.0 GiB allocated) — rows are the only lever that scales every term.
 set -euo pipefail
 
-REPO=/home/kage/smashbot_workspace/SmashBot-sim
+REPO=/home/kage/smashbot_workspace/SmashBot
 SHINE=/home/kage/drive2/ShineBot
 export PYTHONPATH=$REPO:/home/kage/smashbot_workspace/SmashBot/vendor/melee-sim-light
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
