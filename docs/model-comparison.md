@@ -10,10 +10,10 @@ measured with cudagraph compilation (the setting we run) on GPU, in ms per call.
 | SGU                     | 30k           | 4/512  | 512   | 14.3M  | bf16      | 0.909             | 1.63   | 1.87   | 2.27   | 2.87   | 3.81   |
 | ffw+lstm                | 30k           | 3/512  | 512   | 11.3M  | fp32      | 0.923             | —†    | —†     | —†      | —†      | —†      |
 |                         |               |        |       |        |           |                   |       |        |         |         |         |
-| SGU (scaled)            | 30k/100k      | 6/576  | 512   | 25.7M  | bf16      | 0.873/0.829       | 1.92   | 2.11   | 2.71   | 3.92   | 5.16   |
-| Transformer (scaled)    | 30k/100k      | 6/576  | 352*   | 25.9M  | bf16      | 0.887/0.867       | —†    | —†     | —†      | —†      | —†      |
+| SGU (scaled)            | 30k/100k      | 6/576  | 512   | 25.7M  | bf16      | 0.873/0.829       | 1.88   | 2.04   | 2.70   | 3.68   | 4.85   |
+| Transformer (scaled)    | 30k/100k      | 6/576  | 352*   | 25.9M  | bf16      | 0.887/0.867       | 1.84   | 3.10   | 7.02   | 12.4   | 18.5   |
 | ffw+lstm (Phillip)      | 30k/100k      | 3/768  | 512   | 23.9M  | bf16      | 0.936/0.904       | —     | —      | —       | —       | —       |
-| ffw+lstm (Phillip) fp32 | 30k/100k      | 3/768  | 512   | 23.9M  | fp32      | pending           | 1.48   | 1.61   | 1.87   | 2.26   | 2.76   |
+| ffw+lstm (Phillip) fp32 | 30k/100k      | 3/768  | 512   | 23.9M  | fp32      | pending           | 1.42   | 1.53   | 1.79   | 2.27   | 2.71   |
 
 \* Largest batch that fit in memory  
 The fp32 Phillip row is the from-scratch run `txlike768w256-fp32-b512-12char-100k-v2`
@@ -21,7 +21,7 @@ The fp32 Phillip row is the from-scratch run `txlike768w256-fp32-b512-12char-100
 <br>
 - Precision = training precision. Latency is measured at the SERVING precision: fp16 for
   SGU/Transformer (what the rollout runs), fp32 for the LSTM (it needs it).
-- † not re-measured on the fixed benchmark (2026-09-16); the earlier numbers were fp32
+- † small-model rows not re-measured on the fixed benchmark; their earlier numbers were fp32
   on a non-production code path and are not comparable — see the latency note.
 - Both blocks train on the **same 12 characters** (fox, falco, marth, sheik,
 jigglypuff, cptfalcon, peach, yoshi, popo, luigi, pikachu, samus).
@@ -60,15 +60,16 @@ jigglypuff, cptfalcon, peach, yoshi, popo, luigi, pikachu, samus).
   cache into the buffer and cast it back next replay; that is why the earlier
   real-rollout A/B saw nothing. With fp16 buffers capture wins, and the ring is
   capture-only (inductor functionalizes an in-place write back into a copy).
-- **ffw+lstm is ~1.9x faster than scaled SGU at the serving batch** (2.76 vs
-  5.16 ms @400; was 2.5x before the ring) and 1.3x at n=1 (1.48 vs 1.92). Both
+- **ffw+lstm is ~1.8x faster than scaled SGU at the serving batch** (2.71 vs
+  4.85 ms @400; was 2.5x before the ring) and 1.3x at n=1 (1.42 vs 1.88). Both
   gained equally from the wrapper fixes (flats, packed D2H); the ring is SGU-only.
-  What remains of SGU's GPU frame is structural: the window read (0.94 ms at
-  W=256 — the model reads 255x576 per row per layer), attention (0.69), the kv
-  traffic (~0.7, ring-able), GEMMs (~0.7). NOTE: live play runs on CPU
-  (`eval/play.py --device cpu`), where only SGU has been measured (~7 ms
-  compiled); the LSTM's CPU batch-1 cost is unmeasured.
-- **Scaling SGU 4/512 -> 6/576** costs 1.63 -> 1.92 ms @1 and 3.81 -> 5.16 @400
+  The scaled Transformer, with no ring and full attention over W=256 per row, is
+  18.5 ms @400 — 3.8x SGU. What remains of SGU's GPU frame is structural: the
+  window read (0.94 ms at W=256 — the model reads 255x576 per row per layer),
+  attention (0.69), the kv traffic (~0.7, ring-able), GEMMs (~0.7). NOTE: live play
+  runs on CPU (`eval/play.py --device cpu`), where only SGU has been measured
+  (~7 ms compiled); the LSTM's CPU batch-1 cost is unmeasured.
+- **Scaling SGU 4/512 -> 6/576** costs 1.63 -> 1.88 ms @1 and 3.81 -> 4.85 @400
   for eval 0.909 -> 0.829 (different data regimes; see above).
 - Remaining serving levers, in order of measured size: (1) the ~70 remaining
   outside-graph launches per frame — prev-action masking/clones and logit clones,

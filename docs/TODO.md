@@ -74,9 +74,11 @@ a valid parity test — the captured graph samples from graph-registered philox 
 so per-frame torch.manual_seed reseeds only the non-capture side; near-tie samples
 differ and cascade (looked like 5.5k/19.2k row mismatches). Compare logits open-loop
 (fixed prev_action stream), or compare two runs on the SAME path.
-Not done from the review (measure-first): fuse `uv`+`attn_qkv` (same input;
-changes state_dict keys -> needs a load pre-hook), one-hot->lookup in the head
-decoder, compile the league's vmap forward, fused ring kernel (the lever above).
+Not done from the review (measure-first): fuse `uv`+`attn_qkv` — MEASURED
+2026-09-17 inside a CUDA graph at the serving shapes: saves 54 us/frame @400,
+15 us @1 (~1%); changes state_dict keys -> not worth a load hook. Skipped.
+Still open: one-hot->lookup in the head decoder (unmeasured), league vmap
+compile (impossible: BatchedTensorImpl), fused ring kernel (done as the ring).
 
 **Measured ceiling for the ring buffer (fixed profiler, scaled SGU @400, fp16 +
 fp16 statics, capture; 50 frames): 8.1 ms GPU per 10.0 ms frame, of which ~5.3 ms
