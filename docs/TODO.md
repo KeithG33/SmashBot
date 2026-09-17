@@ -32,6 +32,23 @@ Not done from the review (measure-first): fuse `uv`+`attn_qkv` (same input;
 changes state_dict keys -> needs a load pre-hook), one-hot->lookup in the head
 decoder, compile the league's vmap forward, fused ring kernel (the lever above).
 
+**Measured ceiling for the ring buffer (fixed profiler, scaled SGU @400, fp16 +
+fp16 statics, capture; 50 frames): 8.1 ms GPU per 10.0 ms frame, of which ~5.3 ms
+(65%) is cache memory traffic** — fused cat/slice for the window shift 1.92,
+in-graph carry `hidden.copy_(new_hidden)` 1.79, kv cat/contiguous + DtoD + misc
+to_copy ~1.6; the T==1 weighted-sum conv 0.93 (reads the window once —
+unavoidable), attention 0.69, ALL GEMMs ~0.7. Consistent with pure bandwidth:
+6 x [400,255,576] fp16 = 860 MB read+written for the shift and again for the
+carry. Avoidable ~4.5 ms of the 9.4 ms frame (I earlier wrote "~1 ms" — wrong).
+Design: the static cache buffer IS the ring (manual capture only — inductor/trees
+functionalize in-place writes back into copies, which is why the three earlier
+ring variants showed nothing): write one 2.8 MB slot per frame, roll the conv
+weights by the shared pointer, mask attention by slot age (age < cache_len),
+canonicalize only in hidden_snapshot() (once per 240 frames); the learner's T>1
+path is untouched. At n=1 the frame is CPU-bound instead (190 outside-graph
+launches: the 122-leaf state struct copied into the statics + prev/logit clones);
+not a production path (play is CPU), so not worth code.
+
 # TODO
 
 ## Serving cost of windowed models at rollout batch (SGU @400 rows = 27 ms)

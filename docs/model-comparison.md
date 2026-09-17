@@ -72,10 +72,13 @@ jigglypuff, cptfalcon, peach, yoshi, popo, luigi, pikachu, samus).
   uncompiled) — none of which hold now.
 - **Scaling SGU 4/512 -> 6/576** costs 2.76 -> 3.00 ms @1 and 6.98 -> 9.36 @400
   for eval 0.909 -> 0.829 (different data regimes; see above).
-- Remaining serving lever for the windowed cores: the per-layer window shift
-  (`cat` + contiguous rebuild of the caches). Plain in-place `index_copy_` gave
-  nothing (inductor functionalizes it back to a copy; 3 variants measured); it
-  needs a fused kernel that reads the window, masks by slot age and writes one
-  slot — and must still export chronological state at chunk boundaries.
+- Remaining serving lever for the windowed cores, MEASURED (fixed profiler, scaled
+  SGU @400): ~5.3 of the 8.1 ms GPU per frame is cache memory traffic — the
+  window shift (fused cat 1.9 ms) and the in-graph carry copy (1.8 ms) each move
+  the full 860 MB of caches; all GEMMs together are ~0.7 ms. A ring in the
+  capture's static buffers (write one slot, roll conv weights, age-mask attention,
+  canonicalize on snapshot) removes ~4.5 ms of the 9.4 — only under manual
+  capture; inductor functionalizes in-place writes back into copies, which is why
+  the earlier ring variants showed nothing.
 - `ffw+lstm` = tx_like = slippi-ai's / Phillip's architecture (LSTM recurrent core).
 - Params are totals (network + controller head + value head).
