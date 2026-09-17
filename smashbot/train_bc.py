@@ -99,6 +99,8 @@ def main(config: TrainConfig) -> None:
     # frequency-assigned, so recomputing on changed data would permute them.
     restored_name_map = None
     start_replay = 0
+    start_test_replay = 0
+    restored_eval_state = (None, None)
     if rt.restore:
         restore_path = (
             os.path.join(run_dir, "latest.pt") if rt.restore == "auto" else rt.restore
@@ -106,12 +108,15 @@ def main(config: TrainConfig) -> None:
         _rs = saving.load_checkpoint(restore_path)["state"]
         restored_name_map = _rs.get("name_map")
         start_replay = _rs.get("replay_counter", 0)
+        start_test_replay = _rs.get("test_replay_counter", 0)
+        restored_eval_state = (_rs.get("eval_hidden"), _rs.get("eval_value_hidden"))
 
     sources = loader.make_sources(
         config.data,
         extra_frames=config.policy.delay + 1,
         name_map=restored_name_map,
         start_replay=start_replay,
+        start_test_replay=start_test_replay,
     )
     print(f"name_map: {sources.name_map}")
 
@@ -202,6 +207,9 @@ def main(config: TrainConfig) -> None:
     value_hidden = value_fn.initial_state(B, device)
     eval_hidden = policy.initial_state(B, device)
     eval_value_hidden = value_fn.initial_state(B, device)
+    if restored_eval_state[0] is not None:   # evals carry state across calls; restore it too
+        eval_hidden, eval_value_hidden = tree.map_structure(
+            lambda t: t.to(device) if isinstance(t, torch.Tensor) else t, restored_eval_state)
 
     train_stream = loader.TorchBatchStream(
         sources.train, config.data, encode_network=policy.network
@@ -228,6 +236,9 @@ def main(config: TrainConfig) -> None:
                 "step": step,
                 "name_map": sources.name_map,
                 "replay_counter": sources.train.replay_counter,
+                "test_replay_counter": sources.test.replay_counter,
+                "eval_hidden": tree.map_structure(lambda t: t.cpu() if isinstance(t, torch.Tensor) else t, eval_hidden),
+                "eval_value_hidden": tree.map_structure(lambda t: t.cpu() if isinstance(t, torch.Tensor) else t, eval_value_hidden),
             },
             best_eval_loss,
         )
@@ -249,6 +260,7 @@ def main(config: TrainConfig) -> None:
                 losses.append(m["policy_loss"])
                 value_metrics_acc.append(vm)
         policy.train()
+        print(f"eval @ {step}: policy_loss {sum(losses) / len(losses):.6f}", flush=True)
         return {
             "policy_loss": float(np.mean(losses)),
             "value_uev": float(np.mean([m["uev"] for m in value_metrics_acc])),

@@ -78,15 +78,19 @@ def make_sources(
     extra_frames: int,
     name_map: tp.Optional[dict[str, int]] = None,
     start_replay: int = 0,
+    start_test_replay: int = 0,
 ) -> Sources:
     """Build train/test DataSources. extra_frames must be policy.delay + 1.
 
     name_map: pass the checkpoint's map when resuming — indices are assigned
     by frequency, so recomputing on changed data would silently permute them.
-    start_replay: the checkpoint's train replay_counter. The train source
-    cycles its (seeded-shuffle) replay list in a fixed order, so resuming
-    is exactly "continue from replay N": rotate the list to N and carry the
-    counter, instead of replaying the epoch from its start.
+    start_replay / start_test_replay: the checkpoint's replay counters. Each
+    source cycles its replay list, so resuming rotates the list to N and
+    carries the counter: no data is re-seen. It is NOT bit-identical to an
+    uninterrupted run — every row's partially consumed replay and the
+    prefetched batches are dropped and the shuffle buffer restarts — so
+    metrics have a small seam at a resume (evals especially: their carried
+    state is restored but scores a different slice of the split).
     """
     train_replays, test_replays = data_lib.train_test_split(config.dataset)
     if name_map is None:
@@ -97,6 +101,9 @@ def make_sources(
                   "interleaved order is not a plain cycle; resume is approximate")
         n = start_replay % len(train_replays)
         train_replays = train_replays[n:] + train_replays[:n]
+    if start_test_replay:   # the eval stream continues too, so evals stay comparable across a resume
+        n = start_test_replay % len(test_replays)
+        test_replays = test_replays[n:] + test_replays[:n]
 
     def make(replays: list[data_lib.ReplayInfo]) -> data_lib.DataSource:
         return data_lib.DataSource(
@@ -113,7 +120,9 @@ def make_sources(
 
     train = make(train_replays)
     train.replay_counter = start_replay   # epoch counter continues
-    return Sources(train=train, test=make(test_replays), name_map=name_map)
+    test = make(test_replays)
+    test.replay_counter = start_test_replay
+    return Sources(train=train, test=test, name_map=name_map)
 
 
 def batch_to_frames(batch: data_lib.Batch, network, pin: bool = False):
