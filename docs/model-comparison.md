@@ -72,6 +72,12 @@ cumulative-since-boot at step 25 and warmup-limited.
   repeating data. The scaled runs at 100k steps have seen only ~0.20 of one
   epoch of the full set. Bake-off eval numbers are subset-limited and the two
   tables' absolute losses should not be read against each other.
+- **SGU precision check (2026-09-18):** `sgu576w256-fp32-b512x2-12char-100k` (fp32,
+  batch 512 as 2x256 via grad accumulation) tracked the bf16 mega run within 0.002
+  at every matched eval from 20k on (best 0.8282 @91k vs bf16 0.829 @100k) and was
+  stopped at 94k as settled: precision is irrelevant for SGU (it is not for the LSTM).
+  The direct shape comparison now runs on the box: SGU 3/768 bf16 (23.1M) vs Phillip
+  3/768 fp32 (23.7M), both 0->250k.
 - **At 100k: fp32 ffw+lstm 0.826 vs bf16 SGU 0.829 vs bf16 Transformer 0.867.**
   The LSTM's earlier 0.904 was a precision artifact (bf16 training hurts LSTM
   recurrence); in fp32 it matches SGU on loss while serving ~1.8x faster. SGU and
