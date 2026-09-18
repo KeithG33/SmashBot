@@ -4,12 +4,18 @@ Imitation-learning (behavior-cloning) architecture comparison. Metric is
 `eval/best_policy_loss` (policy cross-entropy, lower = better). Inference latency
 measured with cudagraph compilation (the setting we run) on GPU, in ms per call.
 
+### Small-scale bake-off (20k replays, 30k steps)
+
 | Architecture            | Steps         | L / H  | Batch | Params | Precision | Eval Ploss        | ms @1 | ms @32 | ms @128 | ms @256 | ms @400 |
 |-------------------------|--------------:|:------:|------:|-------:|:---------:|:-----------------:|------:|-------:|--------:|--------:|--------:|
 | Transformer             | 30k           | 4/512  | 512   | 14.3M  | bf16      | 0.907             | —†    | —†     | —†      | —†      | —†      |
 | SGU                     | 30k           | 4/512  | 512   | 14.3M  | bf16      | 0.909             | 1.63   | 1.87   | 2.27   | 2.87   | 3.81   |
 | ffw+lstm                | 30k           | 3/512  | 512   | 11.3M  | fp32      | 0.923             | —†    | —†     | —†      | —†      | —†      |
-|                         |               |        |       |        |           |                   |       |        |         |         |         |
+
+### Scaled networks + Phillip (full 841,682-replay dataset)
+
+| Architecture            | Steps         | L / H  | Batch | Params | Precision | Eval Ploss        | ms @1 | ms @32 | ms @128 | ms @256 | ms @400 |
+|-------------------------|--------------:|:------:|------:|-------:|:---------:|:-----------------:|------:|-------:|--------:|--------:|--------:|
 | SGU (scaled)            | 30k/100k      | 6/576  | 512   | 25.7M  | bf16      | 0.873/0.829       | 1.88   | 2.04   | 2.70   | 3.68   | 4.85   |
 | Transformer (scaled)    | 30k/100k      | 6/576  | 352*   | 25.9M  | bf16      | 0.887/0.867       | 1.81   | 2.98   | 6.49   | 11.4   | 16.8   |
 | ffw+lstm (Phillip)      | 30k/100k      | 3/768  | 512   | 23.9M  | bf16      | 0.936/0.904       | —     | —      | —       | —       | —       |
@@ -24,10 +30,10 @@ identical data, fp32 is 0.884 vs bf16 0.9365.
   SGU/Transformer (what the rollout runs), fp32 for the LSTM (it needs it).
 - † small-model rows not re-measured on the fixed benchmark; their earlier numbers were fp32
   on a non-production code path and are not comparable — see the latency note.
-- Both blocks train on the **same 12 characters** (fox, falco, marth, sheik,
+- Both tables train on the **same 12 characters** (fox, falco, marth, sheik,
 jigglypuff, cptfalcon, peach, yoshi, popo, luigi, pikachu, samus).
-- Top block is a small-scale experiment with 20k replays and smaller networks (under 5ms)
-- Bottom block is scaled up nets (and actual Phillip) using full 841,682 replay dataset
+- The first table is a small-scale experiment with 20k replays and smaller networks
+- The second table is the scaled-up nets (and actual Phillip) on the full 841,682-replay dataset
 ## SGU depth/width at ~25M params (2026-09-17)
 
 The 6/576 shape was chosen under conditions that no longer hold (cudagraph
@@ -61,11 +67,11 @@ cumulative-since-boot at step 25 and warmup-limited.
 
 ## Notes
 
-- **The two blocks see data very differently.** At 30k steps the bake-off had
+- **The two tables see data very differently.** At 30k steps the bake-off had
   already made ~3.6 passes over its 20k-replay subset, so it was well into
   repeating data. The scaled runs at 100k steps have seen only ~0.20 of one
   epoch of the full set. Bake-off eval numbers are subset-limited and the two
-  blocks' absolute losses should not be read against each other.
+  tables' absolute losses should not be read against each other.
 - **At 100k: fp32 ffw+lstm 0.826 vs bf16 SGU 0.829 vs bf16 Transformer 0.867.**
   The LSTM's earlier 0.904 was a precision artifact (bf16 training hurts LSTM
   recurrence); in fp32 it matches SGU on loss while serving ~1.8x faster. SGU and
