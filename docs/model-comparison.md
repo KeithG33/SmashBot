@@ -43,14 +43,14 @@ batch-1 cost is a chain of per-layer kernels — so shallower-and-wider should b
 faster. Measured, SGU only, one method (compile + manual capture + fp16 static
 state + flat inputs, no-snapshot, idle 3090):
 
-| shape | params | state/row | ms @400 | @128 | @1 | serving VRAM @400 | learner peak* | fps @25* |
-|-------|-------:|----------:|--------:|-----:|---:|------------------:|--------------:|---------:|
-| 3/768 | 23.1M  | 1.36 MB   | **3.67** | 2.31 | **1.64** | **2.23 GiB** | **12.42 GiB** | **5472** |
-| 3/832 | 26.4M  | 1.47 MB   | 3.82    | 2.28 | 1.69 | 2.39 GiB | 13.35 GiB | 5365 |
-| 4/704 | 25.4M  | 1.70 MB   | 4.20    | 2.48 | 1.72 | 2.75 GiB | — | — |
-| 5/640 | 25.9M  | 1.96 MB   | 4.58    | 2.55 | 1.79 | 3.17 GiB | — | — |
-| 6/576 (current) | 25.7M | 2.15 MB | 5.01 | 2.74 | 1.91 | 3.48 GiB | 15.53 GiB | 4914 |
-| 8/512 | 26.7M  | 2.61 MB   | 5.84    | 3.07 | 1.92 | 4.23 GiB | — | — |
+| shape | params | state/row | ms @1 | ms @128 | ms @400 | serving VRAM @400 | learner peak* | fps @25* |
+|-------|-------:|----------:|------:|--------:|--------:|------------------:|--------------:|---------:|
+| 3/768 | 23.1M | 1.37 MB | **1.64** | 2.31 | **3.67** | **2.23 GiB** | **12.42 GiB** | **5472** |
+| 3/832 | 26.4M | 1.47 MB | 1.69 | 2.28 | 3.82 | 2.39 GiB | 13.35 GiB | 5365 |
+| 4/704 | 25.4M | 1.70 MB | 1.72 | 2.48 | 4.20 | 2.75 GiB | — | — |
+| 5/640 | 25.9M | 1.96 MB | 1.79 | 2.55 | 4.58 | 3.17 GiB | — | — |
+| 6/576 (current) | 25.7M | 2.15 MB | 1.91 | 2.74 | 5.01 | 3.48 GiB | 15.53 GiB | 4914 |
+| 8/512 | 26.7M | 2.61 MB | 1.92 | 3.07 | 5.84 | 4.23 GiB | — | — |
 
 \* real entrypoint (`train_rl --backend sim`), 400 rows / 40 slices / mb 12,
 fresh start from a random-init checkpoint of the shape, empty league, no
