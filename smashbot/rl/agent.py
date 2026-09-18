@@ -106,15 +106,15 @@ class BatchedPolicyAgent:
         # initial zeros fp16 keeps the KV cat in fp16 (fp32 zeros would
         # promote it back). Bit-identical vs fp32 storage:
         # scripts/check_fp16_state.py.
-        assert state_dtype is None or precision == "fp16", (
-            "state_dtype override requires the fp16 autocast forward"
+        assert state_dtype is None or precision in ("fp16", "bf16"), (
+            "state_dtype override requires a half-precision autocast forward"
         )
         self.state_dtype = state_dtype
         # "fp16": the network runs under fp16 autocast (sampling math stays
         # fp32 — embed.py casts logits up); logits are stored fp16. Gated by
         # the precision probe (docs/precision): the learner's ratio
         # invariant must hold on batches captured this way.
-        assert precision in ("fp32", "fp16"), precision
+        assert precision in ("fp32", "fp16", "bf16"), precision
         self.precision = precision
         self.delay = policy.delay
         self._embed_controller = policy.controller_head.controller_embedding
@@ -382,8 +382,8 @@ class BatchedPolicyAgent:
 
     def _autocast(self):
         dev = torch.device(self.device).type
-        return torch.autocast(dev, dtype=torch.float16,
-                              enabled=self.precision == "fp16" and dev == "cuda")
+        return torch.autocast(dev, dtype=torch.bfloat16 if self.precision == "bf16" else torch.float16,
+                              enabled=self.precision in ("fp16", "bf16") and dev == "cuda")
 
     def set_flat_inputs(self, view_fn) -> None:
         """view_fn(flats) -> state struct (FlatFrames.view); pass flats= to infer."""

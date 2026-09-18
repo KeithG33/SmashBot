@@ -40,7 +40,7 @@ def main():
     ap.add_argument("--compile", action="store_true")
     ap.add_argument("--compile-mode", default="reduce-overhead",
                     help="torch.compile mode (reduce-overhead = cudagraph trees; max-autotune adds Triton autotuning)")
-    ap.add_argument("--precision", default="fp32", choices=["fp32", "fp16"],
+    ap.add_argument("--precision", default="fp32", choices=["fp32", "fp16", "bf16"],
                     help="agent forward precision (production serves fp16)")
     ap.add_argument("--flats", action="store_true",
                     help="feed the worker's three typed flats (FlatFrames) instead of a leaf struct")
