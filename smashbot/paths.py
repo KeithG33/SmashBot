@@ -1,4 +1,4 @@
-"""Canonical filesystem locations for ShineBot.
+"""Canonical filesystem locations for SmashBot.
 
 Everything heavy (datasets, checkpoints, caches) lives on drive2; the repo
 holds only code. Override any location with the corresponding env var.
@@ -10,21 +10,21 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR_SLIPPI_AI = REPO_ROOT / "vendor" / "slippi-ai"
 
-DRIVE2 = Path(os.environ.get("SHINEBOT_DRIVE2", "/home/kage/drive2/ShineBot"))
+DRIVE2 = Path(os.environ.get("SMASHBOT_DRIVE2", "/home/kage/drive2/ShineBot"))
 DATA_DIR = DRIVE2 / "data"
 RUNS_DIR = DRIVE2 / "runs"
 MODELS_DIR = DRIVE2 / "models"
 
 MELEE_ISO = Path(
     os.environ.get(
-        "SHINEBOT_ISO",
+        "SMASHBOT_ISO",
         "/home/kage/slippi/Super Smash Bros. Melee (USA) (En,Ja) (v1.02).iso",
     )
 )
 # Mainline ExiAI "NoLeak" build (2026-03): headless + fast-forward support.
 EXIAI_APPIMAGE = Path(
     os.environ.get(
-        "SHINEBOT_DOLPHIN",
+        "SMASHBOT_DOLPHIN",
         str(DRIVE2 / "dolphin" / "Slippi_Netplay_Mainline_ExiAI_NoLeak-x86_64.AppImage"),
     )
 )
@@ -35,7 +35,7 @@ EXIAI_ISHIIRUKA_APPIMAGE = DRIVE2 / "dolphin" / "Slippi_Online-x86_64-ExiAI.AppI
 # so visible play uses the Launcher-maintained build (auto-updated, currently 3.6.4).
 NETPLAY_APPIMAGE = Path(
     os.environ.get(
-        "SHINEBOT_NETPLAY_DOLPHIN",
+        "SMASHBOT_NETPLAY_DOLPHIN",
         "/home/kage/.config/Slippi Launcher/netplay/Slippi_Online-x86_64.AppImage",
     )
 )

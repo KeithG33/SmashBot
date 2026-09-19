@@ -1,4 +1,4 @@
-# ShineBot
+# SmashBot
 
 A Super Smash Bros. Melee AI, written in PyTorch. It learns to play by watching
 hundreds of thousands of human games, then improves by playing against itself.

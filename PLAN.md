@@ -1,4 +1,4 @@
-# ShineBot: Replicate slippi-ai in PyTorch (imitation → RL)
+# SmashBot: Replicate slippi-ai in PyTorch (imitation → RL)
 
 ## Context
 
@@ -18,7 +18,7 @@ Fresh start on the SSBM bot. The old undergrad-era attempt (`SmashBot/`, custom 
 
 ## Top-level structure
 
-- **Repo**: `/home/kage/smashbot_workspace/ShineBot/` (code is small; fine on root disk). Heavy stuff at `/home/kage/drive2/ShineBot/{venv, venv-ref, data, runs, models, hf-cache, uv}` with a `scripts/env.sh` exporting `UV_PYTHON_INSTALL_DIR, UV_CACHE_DIR, HF_HOME, WANDB_DIR, PIP_CACHE_DIR` → drive2, so no tool silently fills the nearly-full home drive with caches. Confirm with `df` after setup.
+- **Repo**: `/home/kage/smashbot_workspace/SmashBot/` (code is small; fine on root disk). Heavy stuff at `/home/kage/drive2/ShineBot/{venv, venv-ref, data, runs, models, hf-cache, uv}` with a `scripts/env.sh` exporting `UV_PYTHON_INSTALL_DIR, UV_CACHE_DIR, HF_HOME, WANDB_DIR, PIP_CACHE_DIR` → drive2, so no tool silently fills the nearly-full home drive with caches. Confirm with `df` after setup.
 - **slippi-ai consumption**: git **submodule** at `vendor/slippi-ai`, pinned commit, installed `pip install --no-deps -e` so its TF/JAX deps never enter our training venv. Explicitly install only what the reused modules need (`peppi-py-vladfi>=0.9.2`, vladfi1's `melee` fork from his git, `pyarrow`, `dm-tree`, `absl-py`, `portpicker`, `py7zr`, …) — determined empirically at M0 by import-auditing `slippi_db.*`, `slippi_ai.{types,reward,dolphin,envs}`. Any shared module that drags in TF gets ported into our repo instead of reused (candidates: `observations.py`, `envs.py`).
 - **Second "reference" venv** (`venv-ref`) with slippi-ai's full TF stack (use `tensorflow-cpu`): used only for parse cross-validation, dumping golden batches from their loader, and running their pretrained **medium-v2** model as an opponent.
 - **Reuse as-is**: `slippi_db/*` (parsing), `slippi_ai/types.py` (schema), `slippi_ai/dolphin.py` (process mgmt, ExiAI/gecko/ffw — model-agnostic), `slippi_ai/reward.py`, `parse_libmelee` (inference-time encoding guarantee). **Reimplement in PyTorch**: data loader, embeddings, network, controller head, policy/value/losses, delay logic, DelayedAgent, BC + RL training loops.
@@ -29,7 +29,7 @@ Fresh start on the SSBM bot. The old undergrad-era attempt (`SmashBot/`, custom 
 ### Repo layout (new code)
 
 ```
-shinebot/               # Python package (lowercase by import convention; repo dir is ShineBot/)
+smashbot/               # Python package (lowercase by import convention; repo dir is SmashBot/)
   paths.py configs.py types_bridge.py
   embed.py            # composable Embedding classes (port of tf/embed.py semantics)
   observations.py     # tech-animation masking (ported if theirs is TF-entangled)

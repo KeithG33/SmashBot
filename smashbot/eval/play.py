@@ -1,4 +1,4 @@
-"""Play a trained ShineBot checkpoint in Dolphin.
+"""Play a trained SmashBot checkpoint in Dolphin.
 
 Bot (Fox) on port 1; opponent on port 2 is an in-game CPU by default, or a
 human with --opponent human (plug in a controller / configure inputs in the

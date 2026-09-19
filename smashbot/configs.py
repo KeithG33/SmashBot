@@ -1,4 +1,4 @@
-"""Typed configs for ShineBot. Mirrors slippi-ai's nested flag structure."""
+"""Typed configs for SmashBot. Mirrors slippi-ai's nested flag structure."""
 
 import dataclasses
 

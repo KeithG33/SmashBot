@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "smashbot"
 version = "0.1.0"
-description = "ShineBot: a PyTorch replication of slippi-ai (SSBM imitation learning + RL)"
+description = "SmashBot: a PyTorch replication of slippi-ai (SSBM imitation learning + RL)"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]

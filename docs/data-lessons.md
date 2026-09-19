@@ -1,7 +1,7 @@
 # Data Lessons: Where the 2024 Attempt Went Wrong (Parsing & Embedding)
 
 A post-mortem comparison of the old SmashBot data pipeline (`SmashBot/smashbot/data/extract_dataset_sequence.py`)
-against slippi-ai's approach — written after replicating the latter in ShineBot (M0–M3).
+against slippi-ai's approach — written after replicating the latter in SmashBot (M0–M3).
 Companion to [previous-attempt.md](previous-attempt.md). Ranked by how fatal each issue was.
 
 ## 1. Categorical IDs fed as raw numbers (the big one)
