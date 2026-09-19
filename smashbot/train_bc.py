@@ -86,6 +86,21 @@ def _state_cat(parts, batch):
 
 
 
+def _check_architecture(saved: dict, config: "TrainConfig") -> None:
+    """Weights load into any model of the same shapes, so settings that change
+    behavior without changing shapes (attn_rope) are only caught by value.
+    Keys a checkpoint predates take their defaults."""
+    for section, cls in (
+        ("network", configs.NetworkConfig),
+        ("head", configs.ControllerHeadConfig),
+        ("policy", configs.PolicyConfig),
+        ("value", configs.ValueConfig),
+    ):
+        then, now = cls(**saved[section]), getattr(config, section)
+        if then != now:
+            raise ValueError(f"--{section}.* differs from the checkpoint:\n  saved   {then}\n  current {now}")
+
+
 def main(config: TrainConfig) -> None:
     rt = config.runtime
     run_dir = os.path.join(rt.run_dir, rt.tag)
@@ -105,7 +120,9 @@ def main(config: TrainConfig) -> None:
         restore_path = (
             os.path.join(run_dir, "latest.pt") if rt.restore == "auto" else rt.restore
         )
-        _rs = saving.load_checkpoint(restore_path)["state"]
+        _restored = saving.load_checkpoint(restore_path)
+        _check_architecture(_restored["config"], config)
+        _rs = _restored["state"]
         restored_name_map = _rs.get("name_map")
         start_replay = _rs.get("replay_counter", 0)
         start_test_replay = _rs.get("test_replay_counter", 0)

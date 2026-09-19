@@ -47,6 +47,11 @@ class NetworkConfig:
     # sgu only: rotary position on the tiny attention's queries and keys
     attn_rope: bool = False
 
+    def weightless_settings(self) -> list[str]:
+        """Enabled settings that change behavior but no parameter shape: a bare
+        state_dict cannot reveal whether its model was trained with them."""
+        return [name for name in ("attn_rope",) if getattr(self, name)]
+
 
 @dataclasses.dataclass
 class ControllerHeadConfig:
