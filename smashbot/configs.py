@@ -44,6 +44,8 @@ class NetworkConfig:
     # transformer only:
     num_heads: int = 8
     window: int = 256  # KV-cache length (frames of memory carried at play time)
+    # sgu only: RMS-normalize the value branch before the temporal conv (gMLP's SGU)
+    v_norm: bool = False
 
 
 @dataclasses.dataclass

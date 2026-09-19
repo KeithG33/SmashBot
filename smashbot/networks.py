@@ -456,11 +456,13 @@ class SGUBlock(nn.Module):
 
     ATTN_DK = 64
 
-    def __init__(self, d: int, window: int):
+    def __init__(self, d: int, window: int, v_norm: bool = False):
         super().__init__()
         self.window = window
         self.mix_norm = RMSNorm(d)
         self.uv = nn.Linear(d, 2 * d, bias=False)
+        # no gain: a per-channel scale folds into the depthwise filter
+        self.v_norm = RMSNorm(d, elementwise_affine=False) if v_norm else nn.Identity()
         self.spatial = nn.Conv1d(d, d, kernel_size=window, groups=d)
         nn.init.zeros_(self.spatial.weight)
         nn.init.ones_(self.spatial.bias)
@@ -478,6 +480,10 @@ class SGUBlock(nn.Module):
         _accept_renamed(self, _FFW_IN_RENAMES)
         self.down = nn.Linear(hidden, d, bias=False)
         nn.init.zeros_(self.down.weight)
+
+    def _gate_value(self, xn):
+        u, v = self.uv(xn).chunk(2, dim=-1)
+        return u, self.v_norm(v)
 
     def _spatial(self, v, v_cache):
         W = self.window
@@ -525,7 +531,7 @@ class SGUBlock(nn.Module):
         """Serving with the v-cache as a ring: returns the NEW slot [B, d]
         instead of a shifted cache; the caller writes it in place."""
         xn = self.mix_norm(x)
-        u, v = self.uv(xn).chunk(2, dim=-1)
+        u, v = self._gate_value(xn)
         v_mixed, v_new = self._spatial_ring(v, v_ring, idx, valid)
         attn, new_kv = self._attend(xn, kv_cache, attn_mask)
         x = x + self.mix_out(u * (v_mixed + attn))
@@ -537,7 +543,7 @@ class SGUBlock(nn.Module):
 
     def mix(self, x, v_cache, kv_cache, attn_mask):
         xn = self.mix_norm(x)
-        u, v = self.uv(xn).chunk(2, dim=-1)
+        u, v = self._gate_value(xn)
         v_mixed, new_v = self._spatial(v, v_cache)
         attn, new_kv = self._attend(xn, kv_cache, attn_mask)
         x = x + self.mix_out(u * (v_mixed + attn))
@@ -559,13 +565,14 @@ class SGUCore(Network):
         hidden_size: int = 512,
         num_layers: int = 4,
         window: int = 8,
+        v_norm: bool = False,
     ):
         super().__init__()
         self.d = hidden_size
         self.window = window
         self.encoder = nn.Linear(input_size, hidden_size)
         self.blocks = nn.ModuleList(
-            [SGUBlock(hidden_size, window) for _ in range(num_layers)]
+            [SGUBlock(hidden_size, window, v_norm) for _ in range(num_layers)]
         )
         self.final_norm = RMSNorm(hidden_size)
         self.output_size = hidden_size
@@ -763,6 +770,7 @@ def build_embed_network(
             hidden_size=network_config.hidden_size,
             num_layers=network_config.num_layers,
             window=network_config.window,
+            v_norm=network_config.v_norm,
         )
     else:
         raise ValueError(f"unknown network name: {name}")
