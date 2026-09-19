@@ -456,9 +456,10 @@ class SGUBlock(nn.Module):
 
     ATTN_DK = 64
 
-    def __init__(self, d: int, window: int):
+    def __init__(self, d: int, window: int, attn_rope: bool = False):
         super().__init__()
         self.window = window
+        self.attn_rope = attn_rope
         self.mix_norm = RMSNorm(d)
         self.uv = nn.Linear(d, 2 * d, bias=False)
         self.spatial = nn.Conv1d(d, d, kernel_size=window, groups=d)
@@ -496,9 +497,12 @@ class SGUBlock(nn.Module):
         v_mixed = self.spatial(v_full.transpose(1, 2)).transpose(1, 2)
         return v_mixed, v_full[:, -(W - 1):].contiguous()
 
-    def _attend(self, xn, kv_cache, attn_mask):
+    def _attend(self, xn, kv_cache, attn_mask, positions):
         W = self.window
         q, k_new, va_new = self.attn_qkv(xn).chunk(3, dim=-1)
+        if self.attn_rope:   # the cache holds rotated keys, so ages come out relative
+            q = _rope(q.unsqueeze(2), positions).squeeze(2)
+            k_new = _rope(k_new.unsqueeze(2), positions).squeeze(2)
         kv_new = torch.cat([k_new, va_new], dim=-1)
         kv_full = torch.cat([kv_cache.to(kv_new.dtype), kv_new], dim=1)
         keys, vals = kv_full.chunk(2, dim=-1)
@@ -521,13 +525,13 @@ class SGUBlock(nn.Module):
         ).unsqueeze(1)
         return v_mixed, v[:, 0]
 
-    def mix_ring(self, x, v_ring, kv_cache, attn_mask, idx, valid):
+    def mix_ring(self, x, v_ring, kv_cache, attn_mask, idx, valid, positions):
         """Serving with the v-cache as a ring: returns the NEW slot [B, d]
         instead of a shifted cache; the caller writes it in place."""
         xn = self.mix_norm(x)
         u, v = self.uv(xn).chunk(2, dim=-1)
         v_mixed, v_new = self._spatial_ring(v, v_ring, idx, valid)
-        attn, new_kv = self._attend(xn, kv_cache, attn_mask)
+        attn, new_kv = self._attend(xn, kv_cache, attn_mask, positions)
         x = x + self.mix_out(u * (v_mixed + attn))
 
         gate, up = self.ffw_in(x).chunk(2, dim=-1)
@@ -535,11 +539,11 @@ class SGUBlock(nn.Module):
 
         return x, v_new, new_kv
 
-    def mix(self, x, v_cache, kv_cache, attn_mask):
+    def mix(self, x, v_cache, kv_cache, attn_mask, positions):
         xn = self.mix_norm(x)
         u, v = self.uv(xn).chunk(2, dim=-1)
         v_mixed, new_v = self._spatial(v, v_cache)
-        attn, new_kv = self._attend(xn, kv_cache, attn_mask)
+        attn, new_kv = self._attend(xn, kv_cache, attn_mask, positions)
         x = x + self.mix_out(u * (v_mixed + attn))
 
         gate, up = self.ffw_in(x).chunk(2, dim=-1)
@@ -559,13 +563,15 @@ class SGUCore(Network):
         hidden_size: int = 512,
         num_layers: int = 4,
         window: int = 8,
+        attn_rope: bool = False,
     ):
         super().__init__()
         self.d = hidden_size
         self.window = window
+        self.attn_rope = attn_rope
         self.encoder = nn.Linear(input_size, hidden_size)
         self.blocks = nn.ModuleList(
-            [SGUBlock(hidden_size, window) for _ in range(num_layers)]
+            [SGUBlock(hidden_size, window, attn_rope) for _ in range(num_layers)]
         )
         self.final_norm = RMSNorm(hidden_size)
         self.output_size = hidden_size
@@ -641,6 +647,7 @@ class SGUCore(Network):
         T = inputs.shape[1]
         x = self.encoder(inputs)
         mask = self._attn_mask(T, state["cache_len"], inputs.shape[0], inputs.device)
+        positions = state["cache_len"][:, None] + torch.arange(T, device=inputs.device)[None]
         ring = "ptr" in state
         if ring:
             assert T == 1, "ring mode is the serving path"
@@ -648,15 +655,17 @@ class SGUCore(Network):
         new_layers = []
         for block, (v_cache, kv_cache) in zip(self.blocks, state["layers"]):
             if ring:
-                x, v_new, nkv = block.mix_ring(x, v_cache, kv_cache, mask, idx, valid)
+                x, v_new, nkv = block.mix_ring(x, v_cache, kv_cache, mask, idx, valid, positions)
                 new_layers.append((v_new, nkv))
             else:
-                x, nv, nkv = block.mix(x, v_cache, kv_cache, mask)
+                x, nv, nkv = block.mix(x, v_cache, kv_cache, mask, positions)
                 new_layers.append((nv, nkv))
-        next_state = {
-            "cache_len": torch.clamp(state["cache_len"] + T, max=self.window - 1),
-            "layers": new_layers,
-        }
+        # with rope, cache_len is also the row's frame counter: it keeps growing
+        # (every validity test is `slot >= W-1-cache_len`, true for all slots past W-1)
+        cache_len = state["cache_len"] + T
+        if not self.attn_rope:
+            cache_len = torch.clamp(cache_len, max=self.window - 1)
+        next_state = {"cache_len": cache_len, "layers": new_layers}
         if ring:
             next_state["ptr"] = state["ptr"]      # advanced by the agent after the write
         return self.final_norm(x), next_state
@@ -763,6 +772,7 @@ def build_embed_network(
             hidden_size=network_config.hidden_size,
             num_layers=network_config.num_layers,
             window=network_config.window,
+            attn_rope=network_config.attn_rope,
         )
     else:
         raise ValueError(f"unknown network name: {name}")

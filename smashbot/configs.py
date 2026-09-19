@@ -44,6 +44,8 @@ class NetworkConfig:
     # transformer only:
     num_heads: int = 8
     window: int = 256  # KV-cache length (frames of memory carried at play time)
+    # sgu only: rotary position on the tiny attention's queries and keys
+    attn_rope: bool = False
 
 
 @dataclasses.dataclass
