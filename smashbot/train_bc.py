@@ -127,16 +127,17 @@ def _resume_state(ckpt: tp.Optional[dict]) -> dict:
 _RESUME_FREE = {"runtime", "data.num_workers", "data.prefetch", "data.pin_memory"}
 
 
-def _check_config(saved: dict, current: dict, prefix: str = "") -> None:
+def _check_config(saved: dict, current: dict, defaults: dict, prefix: str = "") -> None:
     """A resumed run must be the same experiment; the runtime block and
-    host-only data options are the only fields free to change."""
+    host-only data options are the only fields free to change. A setting the
+    checkpoint predates ran at its default, so that is what it is held to."""
     for key in sorted(set(saved) | set(current)):
         path = f"{prefix}{key}"
         if path in _RESUME_FREE or path.split(".")[0] in _RESUME_FREE:
             continue
-        a, b = saved.get(key), current.get(key)
+        a, b = saved.get(key, defaults.get(key)), current.get(key)
         if isinstance(a, dict) and isinstance(b, dict):
-            _check_config(a, b, prefix=f"{path}.")
+            _check_config(a, b, defaults.get(key) or {}, prefix=f"{path}.")
         elif a != b:
             raise ValueError(f"config.{path} differs from the checkpoint: {a!r} -> {b!r}")
 
@@ -178,7 +179,7 @@ def main(config: TrainConfig) -> None:
         )
         ckpt = saving.load_checkpoint(restore_path)
         config.data.dataset.validate()
-        _check_config(ckpt["config"], dataclasses.asdict(config))
+        _check_config(ckpt["config"], dataclasses.asdict(config), dataclasses.asdict(TrainConfig()))
     resume = _resume_state(ckpt)
 
     sources = loader.make_sources(

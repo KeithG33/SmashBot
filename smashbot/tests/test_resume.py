@@ -85,3 +85,19 @@ def test_resume_refuses_a_different_experiment(tmp_path):
         assert "learner.learning_rate" in str(e)
     else:
         raise AssertionError("resumed with a changed learning rate")
+
+
+def test_a_setting_the_checkpoint_predates_is_held_to_its_default():
+    import copy
+    defaults = dataclasses.asdict(train_bc.TrainConfig())
+    current = copy.deepcopy(defaults)
+    saved = copy.deepcopy(defaults)
+    del saved["network"]["window"]                     # an old checkpoint without this key
+    train_bc._check_config(saved, current, defaults)
+    current["network"]["window"] = defaults["network"]["window"] + 1
+    try:
+        train_bc._check_config(saved, current, defaults)
+    except ValueError as e:
+        assert "network.window" in str(e)
+    else:
+        raise AssertionError("a new setting was switched on over an old checkpoint")
