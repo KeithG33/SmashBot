@@ -14,6 +14,8 @@ import contextlib
 import dataclasses
 import math
 import os
+import random
+import signal
 import time
 import typing as tp
 
@@ -86,6 +88,80 @@ def _state_cat(parts, batch):
 
 
 
+def _to(state, device):
+    return tree.map_structure(
+        lambda t: t.to(device) if isinstance(t, torch.Tensor) else t, state)
+
+
+def _get_rng() -> dict:
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def _set_rng(rng: dict) -> None:
+    random.setstate(rng["python"])
+    np.random.set_state(rng["numpy"])
+    torch.set_rng_state(rng["torch"])
+    if rng["cuda"] is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(rng["cuda"])
+
+
+def _resume_state(ckpt: tp.Optional[dict]) -> dict:
+    """The checkpoint's state, with pre-row-tracking checkpoints mapped onto
+    the same keys (cycle position only; rows restart fresh)."""
+    if ckpt is None:
+        return {}
+    state = dict(ckpt["state"])
+    if "train_data" not in state:
+        print("WARNING: checkpoint predates exact resume; data rows restart at "
+              "fresh replays and the run is not a bit-identical continuation")
+        state["train_data"] = {"consumed": state.get("replay_counter", 0), "rows": None}
+        state["test_data"] = {"consumed": state.get("test_replay_counter", 0), "rows": None}
+    return state
+
+
+_RESUME_FREE = {"runtime", "data.num_workers", "data.prefetch", "data.pin_memory"}
+
+
+def _check_config(saved: dict, current: dict, prefix: str = "") -> None:
+    """A resumed run must be the same experiment; the runtime block and
+    host-only data options are the only fields free to change."""
+    for key in sorted(set(saved) | set(current)):
+        path = f"{prefix}{key}"
+        if path in _RESUME_FREE or path.split(".")[0] in _RESUME_FREE:
+            continue
+        a, b = saved.get(key), current.get(key)
+        if isinstance(a, dict) and isinstance(b, dict):
+            _check_config(a, b, prefix=f"{path}.")
+        elif a != b:
+            raise ValueError(f"config.{path} differs from the checkpoint: {a!r} -> {b!r}")
+
+
+class _StopRequest:
+    """First SIGINT/SIGTERM finishes the current step and checkpoints;
+    a second one interrupts immediately."""
+
+    def __init__(self):
+        self.requested = False
+        self.previous = {
+            sig: signal.signal(sig, self._handle) for sig in (signal.SIGINT, signal.SIGTERM)
+        }
+
+    def restore(self):
+        for sig, handler in self.previous.items():
+            signal.signal(sig, handler)
+
+    def _handle(self, signum, frame):
+        if self.requested:
+            raise KeyboardInterrupt
+        self.requested = True
+        print(f"stop requested (signal {signum}); finishing the current step", flush=True)
+
+
 def main(config: TrainConfig) -> None:
     rt = config.runtime
     run_dir = os.path.join(rt.run_dir, rt.tag)
@@ -95,28 +171,22 @@ def main(config: TrainConfig) -> None:
     np.random.seed(rt.seed)
     discount = 0.5 ** (1 / (config.value.reward_halflife * 60))
 
-    # On resume, the checkpoint's name_map is authoritative: indices are
-    # frequency-assigned, so recomputing on changed data would permute them.
-    restored_name_map = None
-    start_replay = 0
-    start_test_replay = 0
-    restored_eval_state = (None, None)
+    ckpt = None
     if rt.restore:
         restore_path = (
             os.path.join(run_dir, "latest.pt") if rt.restore == "auto" else rt.restore
         )
-        _rs = saving.load_checkpoint(restore_path)["state"]
-        restored_name_map = _rs.get("name_map")
-        start_replay = _rs.get("replay_counter", 0)
-        start_test_replay = _rs.get("test_replay_counter", 0)
-        restored_eval_state = (_rs.get("eval_hidden"), _rs.get("eval_value_hidden"))
+        ckpt = saving.load_checkpoint(restore_path)
+        config.data.dataset.validate()
+        _check_config(ckpt["config"], dataclasses.asdict(config))
+    resume = _resume_state(ckpt)
 
     sources = loader.make_sources(
         config.data,
         extra_frames=config.policy.delay + 1,
-        name_map=restored_name_map,
-        start_replay=start_replay,
-        start_test_replay=start_test_replay,
+        name_map=resume.get("name_map"),
+        train_state=resume.get("train_data"),
+        test_state=resume.get("test_data"),
     )
     print(f"name_map: {sources.name_map}")
 
@@ -179,16 +249,14 @@ def main(config: TrainConfig) -> None:
 
     step = 0
     best_eval_loss = math.inf
-    if rt.restore:
-        path = restore_path
-        ckpt = saving.load_checkpoint(path)
-        policy.load_state_dict(ckpt["state"]["policy"])
-        value_fn.load_state_dict(ckpt["state"]["value"])
-        policy_opt.load_state_dict(ckpt["state"]["policy_opt"])
-        value_opt.load_state_dict(ckpt["state"]["value_opt"])
-        step = ckpt["state"]["step"]
+    if ckpt is not None:
+        policy.load_state_dict(resume["policy"])
+        value_fn.load_state_dict(resume["value"])
+        policy_opt.load_state_dict(resume["policy_opt"])
+        value_opt.load_state_dict(resume["value_opt"])
+        step = resume["step"]
         best_eval_loss = ckpt["best_eval_loss"]
-        print(f"restored from {path} at step {step} (best eval {best_eval_loss:.4f})")
+        print(f"restored from {restore_path} at step {step} (best eval {best_eval_loss:.4f})")
 
     import wandb
 
@@ -203,13 +271,21 @@ def main(config: TrainConfig) -> None:
     )
 
     B = config.data.batch_size
-    train_hidden = policy.initial_state(B, device)
-    value_hidden = value_fn.initial_state(B, device)
-    eval_hidden = policy.initial_state(B, device)
-    eval_value_hidden = value_fn.initial_state(B, device)
-    if restored_eval_state[0] is not None:   # evals carry state across calls; restore it too
-        eval_hidden, eval_value_hidden = tree.map_structure(
-            lambda t: t.to(device) if isinstance(t, torch.Tensor) else t, restored_eval_state)
+    hidden = {
+        "train_hidden": policy.initial_state(B, device),
+        "value_hidden": value_fn.initial_state(B, device),
+        "eval_hidden": policy.initial_state(B, device),
+        "eval_value_hidden": value_fn.initial_state(B, device),
+    }
+    for key in hidden:
+        if resume.get(key) is not None:
+            hidden[key] = _to(resume[key], device)
+    train_hidden, value_hidden = hidden["train_hidden"], hidden["value_hidden"]
+    eval_hidden, eval_value_hidden = hidden["eval_hidden"], hidden["eval_value_hidden"]
+    if resume.get("rng") is not None:
+        _set_rng(resume["rng"])
+    train_data_state = resume.get("train_data")
+    test_data_state = resume.get("test_data")
 
     train_stream = loader.TorchBatchStream(
         sources.train, config.data, encode_network=policy.network
@@ -235,21 +311,24 @@ def main(config: TrainConfig) -> None:
                 "value_opt": value_opt.state_dict(),
                 "step": step,
                 "name_map": sources.name_map,
-                "replay_counter": sources.train.replay_counter,
-                "test_replay_counter": sources.test.replay_counter,
-                "eval_hidden": tree.map_structure(lambda t: t.cpu() if isinstance(t, torch.Tensor) else t, eval_hidden),
-                "eval_value_hidden": tree.map_structure(lambda t: t.cpu() if isinstance(t, torch.Tensor) else t, eval_value_hidden),
+                "train_data": train_data_state,
+                "test_data": test_data_state,
+                "train_hidden": _to(train_hidden, "cpu"),
+                "value_hidden": _to(value_hidden, "cpu"),
+                "eval_hidden": _to(eval_hidden, "cpu"),
+                "eval_value_hidden": _to(eval_value_hidden, "cpu"),
+                "rng": _get_rng(),
             },
             best_eval_loss,
         )
 
     def run_eval() -> dict:
-        nonlocal eval_hidden, eval_value_hidden
+        nonlocal eval_hidden, eval_value_hidden, test_data_state
         policy.eval()
         losses, value_metrics_acc = [], []
         with torch.no_grad():
             for _ in range(rt.eval_batches):
-                frames, _ = next(eval_stream)
+                frames, _, test_data_state = next(eval_stream)
                 frames = to_device(frames)
                 with autocast():
                     loss, eval_hidden, m = policy.imitation_loss(frames, eval_hidden)
@@ -274,10 +353,13 @@ def main(config: TrainConfig) -> None:
     )
     t_window = time.perf_counter()
     step_window = step
+    stop = _StopRequest()
+    at_boundary = True
     try:
-        while step < rt.steps:
+        while step < rt.steps and not stop.requested:
+            at_boundary = False
             step += 1
-            frames, epoch = next(train_stream)
+            frames, epoch, train_data_state = next(train_stream)
             frames = to_device(frames)
 
             k = config.learner.grad_accum
@@ -370,9 +452,14 @@ def main(config: TrainConfig) -> None:
             if step % rt.checkpoint_interval == 0:
                 save("latest.pt")
             pbar.update(1)
+            at_boundary = True
     finally:
+        stop.restore()
         pbar.close()
-        save("latest.pt")
+        if at_boundary:
+            save("latest.pt")
+        else:
+            print(f"interrupted mid-step {step}; latest.pt left as it was")
         train_stream.stop()
         eval_stream.stop()
         wandb.finish()

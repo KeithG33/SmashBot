@@ -10,10 +10,12 @@ This module adds the only missing pieces:
   * name_map construction (ported from tf/train_lib.create_name_map)
   * numpy -> torch conversion (with copies: the accumulator reuses buffers)
   * a background prefetch thread producing pinned-memory batches
+  * exact stream position (per-row replay + frame) for checkpoint resume
 """
 
 import collections
 import dataclasses
+import multiprocessing as mp
 import queue
 import threading
 import typing as tp
@@ -66,63 +68,143 @@ def create_name_map(
     return name_map
 
 
+class _Cursor:
+    """Count of replays handed to managers, in the split's cycle order."""
+
+    def __init__(self, count: int = 0):
+        self.count = count
+
+
+class _Feed:
+    """One manager's view of the shared decoded-replay iterator.
+
+    `index` is the cycle position of the replay the manager currently holds,
+    which is all a resume needs to re-decode it.
+    """
+
+    def __init__(self, inner, cursor: _Cursor):
+        self.inner = inner
+        self.cursor = cursor
+        self.index = -1
+
+    def __next__(self):
+        self.index = self.cursor.count
+        self.cursor.count += 1
+        return next(self.inner)
+
+
+@dataclasses.dataclass
+class Split:
+    """A DataSource plus what it takes to rebuild it mid-stream.
+
+    state() after a batch is the exact position of the stream: which replay
+    each row holds and its frame within it, plus how many replays the cycle
+    has handed out. make_sources(..., state=) resumes from it bit-identically.
+    """
+
+    source: data_lib.DataSource
+    replays: list[data_lib.ReplayInfo]
+    cursor: _Cursor
+    feeds: list[_Feed]
+
+    def __next__(self):
+        return next(self.source)
+
+    def shutdown(self):
+        self.source.shutdown()
+
+    @property
+    def batch_size(self) -> int:
+        return self.source.batch_size
+
+    @property
+    def replay_counter(self) -> int:
+        return self.source.replay_counter
+
+    def state(self) -> dict:
+        rows = [(feed.index, m.frame) for feed, m in zip(self.feeds, self.source.managers)]
+        return {"consumed": self.cursor.count, "rows": rows}
+
+    def load_rows(self, rows: list[tuple[int, int]], num_workers: int) -> None:
+        infos = [self.replays[index % len(self.replays)] for index, _ in rows]
+        if num_workers > 0:
+            with mp.get_context("forkserver").Pool(num_workers) as pool:
+                decoded = pool.map(data_lib.ReplayInfo.to_replay, infos)
+        else:
+            decoded = [info.to_replay() for info in infos]
+        for manager, feed, replay, (index, frame) in zip(
+            self.source.managers, self.feeds, decoded, rows
+        ):
+            manager.source = iter([replay])
+            manager.find_game()
+            manager.frame = frame
+            manager.source = feed
+            feed.index = index
+
+
 @dataclasses.dataclass
 class Sources:
-    train: data_lib.DataSource
-    test: data_lib.DataSource
+    train: Split
+    test: Split
     name_map: dict[str, int]
+
+
+def _make_split(
+    replays: list[data_lib.ReplayInfo],
+    config: DataConfig,
+    extra_frames: int,
+    name_map: dict[str, int],
+    state: tp.Optional[dict],
+) -> Split:
+    consumed = state["consumed"] if state else 0
+    if consumed and config.balance_characters:
+        raise ValueError("resume needs a plain replay cycle; balance_characters interleaves")
+    offset = consumed % len(replays)
+    source = data_lib.DataSource(
+        replays=replays[offset:] + replays[:offset],
+        batch_size=config.batch_size,
+        unroll_length=config.unroll_length,
+        extra_frames=extra_frames,
+        random_offset=config.random_offset,
+        damage_ratio=config.damage_ratio,
+        balance_characters=config.balance_characters,
+        name_map=name_map,
+        num_workers=config.num_workers,
+    )
+    source.replay_counter += consumed
+    cursor = _Cursor(consumed)
+    feeds = [_Feed(source.replay_ds, cursor) for _ in source.managers]
+    for manager, feed in zip(source.managers, feeds):
+        manager.source = feed
+    split = Split(source=source, replays=replays, cursor=cursor, feeds=feeds)
+    if state and state.get("rows"):
+        split.load_rows(state["rows"], config.num_workers)
+    return split
 
 
 def make_sources(
     config: DataConfig,
     extra_frames: int,
     name_map: tp.Optional[dict[str, int]] = None,
-    start_replay: int = 0,
-    start_test_replay: int = 0,
+    train_state: tp.Optional[dict] = None,
+    test_state: tp.Optional[dict] = None,
 ) -> Sources:
-    """Build train/test DataSources. extra_frames must be policy.delay + 1.
+    """Build train/test splits. extra_frames must be policy.delay + 1.
 
-    name_map: pass the checkpoint's map when resuming — indices are assigned
+    name_map: pass the checkpoint's map when resuming; indices are assigned
     by frequency, so recomputing on changed data would silently permute them.
-    start_replay / start_test_replay: the checkpoint's replay counters. Each
-    source cycles its replay list, so resuming rotates the list to N and
-    carries the counter: no data is re-seen. It is NOT bit-identical to an
-    uninterrupted run — every row's partially consumed replay and the
-    prefetched batches are dropped and the shuffle buffer restarts — so
-    metrics have a small seam at a resume (evals especially: their carried
-    state is restored but scores a different slice of the split).
+    train_state / test_state: Split.state() snapshots to resume from. A
+    snapshot without rows (checkpoints that predate row tracking) only
+    rotates the cycle; every row then restarts at frame 0 of a fresh replay.
     """
     train_replays, test_replays = data_lib.train_test_split(config.dataset)
     if name_map is None:
         name_map = create_name_map(train_replays, config.max_names)
-    if start_replay:
-        if config.balance_characters:
-            print("WARNING: start_replay with balance_characters — the "
-                  "interleaved order is not a plain cycle; resume is approximate")
-        n = start_replay % len(train_replays)
-        train_replays = train_replays[n:] + train_replays[:n]
-    if start_test_replay:   # the eval stream continues too, so evals stay comparable across a resume
-        n = start_test_replay % len(test_replays)
-        test_replays = test_replays[n:] + test_replays[:n]
-
-    def make(replays: list[data_lib.ReplayInfo]) -> data_lib.DataSource:
-        return data_lib.DataSource(
-            replays=replays,
-            batch_size=config.batch_size,
-            unroll_length=config.unroll_length,
-            extra_frames=extra_frames,
-            random_offset=config.random_offset,
-            damage_ratio=config.damage_ratio,
-            balance_characters=config.balance_characters,
-            name_map=name_map,
-            num_workers=config.num_workers,
-        )
-
-    train = make(train_replays)
-    train.replay_counter = start_replay   # epoch counter continues
-    test = make(test_replays)
-    test.replay_counter = start_test_replay
-    return Sources(train=train, test=test, name_map=name_map)
+    return Sources(
+        train=_make_split(train_replays, config, extra_frames, name_map, train_state),
+        test=_make_split(test_replays, config, extra_frames, name_map, test_state),
+        name_map=name_map,
+    )
 
 
 def batch_to_frames(batch: data_lib.Batch, network, pin: bool = False):
@@ -155,11 +237,14 @@ class TorchBatchStream:
 
     With `encode_network` set, instead yields encoded, time-major Frames ready
     for Policy.imitation_loss (mirrors slippi-ai's TrainManager.produce_frames).
+    Each item carries the Split.state() it was produced from, so a checkpoint
+    can record the stream position of the batch the learner actually consumed
+    rather than whatever the prefetch thread has run ahead to.
     """
 
     def __init__(
         self,
-        source: data_lib.AbstractDataSource,
+        source: Split,
         config: DataConfig,
         encode_network=None,
     ):
@@ -176,6 +261,7 @@ class TorchBatchStream:
         try:
             while not self._stop.is_set():
                 batch_with_meta, epoch = next(self._source)
+                state = self._source.state()
                 if self._network is not None:
                     item = batch_to_frames(
                         batch_with_meta.batch, self._network, pin=self._pin
@@ -184,7 +270,7 @@ class TorchBatchStream:
                     item = batch_to_torch(batch_with_meta.batch, self._pin)
                 while not self._stop.is_set():
                     try:
-                        self._queue.put((item, epoch), timeout=1.0)
+                        self._queue.put((item, epoch, state), timeout=1.0)
                         break
                     except queue.Full:
                         continue
@@ -194,7 +280,7 @@ class TorchBatchStream:
     def __iter__(self):
         return self
 
-    def __next__(self) -> tuple[data_lib.Batch, float]:
+    def __next__(self) -> tuple[data_lib.Batch, float, dict]:
         while True:
             try:
                 return self._queue.get(timeout=1.0)
