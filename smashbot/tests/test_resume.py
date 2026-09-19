@@ -4,6 +4,8 @@ One run of 2N steps must equal a run of N steps resumed for N more: same
 weights, same optimizer moments, same recurrent states, same position in
 both data streams. Reaching --runtime.steps IS a stop, so run B's first
 half simply ends at N and its second half restores 'auto' with steps=2N.
+The chunk is sized so rows exhaust their game after the resume point: the
+next replay must come from the right place in the (mirror-doubled) cycle.
 """
 
 import dataclasses
@@ -15,14 +17,15 @@ from slippi_ai.paths import TOY_DATASET
 
 from smashbot import configs, saving, train_bc
 
-N = 3
+N = 4
+UNROLL = 1024  # toy game is 6402 frames: rows roll over at step 7
 
 
 def _config(run_dir: str, tag: str, steps: int) -> train_bc.TrainConfig:
     return train_bc.TrainConfig(
         data=configs.DataConfig(
-            dataset=data_lib.DatasetConfig(dataset_path=str(TOY_DATASET)),
-            batch_size=2, unroll_length=16, num_workers=0, prefetch=2, pin_memory=False,
+            dataset=data_lib.DatasetConfig(dataset_path=str(TOY_DATASET), mirror=True),
+            batch_size=2, unroll_length=UNROLL, num_workers=0, prefetch=2, pin_memory=False,
         ),
         network=configs.NetworkConfig(name="tx_like", hidden_size=32, num_layers=1),
         value=configs.ValueConfig(hidden_size=32, num_layers=1),
