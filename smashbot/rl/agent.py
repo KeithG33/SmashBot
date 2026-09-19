@@ -22,7 +22,7 @@ import tree
 from slippi_ai.types import Controller, StateAction
 
 from smashbot.eval.agent import _neutral_controller
-from smashbot.networks import _mask_state
+from smashbot.networks import _mask_state, current_names
 from smashbot.policy import Policy
 
 
@@ -605,6 +605,7 @@ class LeagueAgent:
     def load_slice(self, s: int, state_dict: dict) -> None:
         """Copy a member's weights (any device) into slice s, in place —
         captured replays read the stack by pointer, so they see it."""
+        state_dict = current_names(state_dict)
         for name, t in self._stacked_params.items():
             t[s].copy_(state_dict[name])
         for name, t in self._stacked_buffers.items():

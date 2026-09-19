@@ -203,6 +203,30 @@ class Sequential(Network):
         return inputs, final_states
 
 
+_FFW_IN_RENAMES = {"ffw_norm.weight": "ffw_in.0.weight", "gate_up.weight": "ffw_in.1.weight"}
+
+
+def current_names(state_dict: dict) -> dict:
+    """A state dict saved under older submodule names, under today's names."""
+    def rename(key: str) -> str:
+        for old, new in _FFW_IN_RENAMES.items():
+            if key.endswith("." + old):
+                return key[: -len(old)] + new
+        return key
+    return {rename(k): v for k, v in state_dict.items()}
+
+
+def _accept_renamed(module: nn.Module, renames: dict[str, str]) -> None:
+    """load_state_dict keeps accepting checkpoints saved under the old names."""
+
+    def rename(module, state_dict, prefix, *_):
+        for old, new in renames.items():
+            if prefix + old in state_dict:
+                state_dict[prefix + new] = state_dict.pop(prefix + old)
+
+    module.register_load_state_dict_pre_hook(rename)
+
+
 class ResBlock(nn.Module):
     """Pre-LayerNorm residual FFW block with zero-initialized output."""
 
@@ -300,9 +324,9 @@ class TransformerBlock(nn.Module):
         self.attn_out = nn.Linear(d, d, bias=False)
         nn.init.zeros_(self.attn_out.weight)
 
-        self.ffw_norm = RMSNorm(d)
         hidden = int(8 * d / 3 / 64) * 64  # SwiGLU sizing, 64-aligned
-        self.gate_up = nn.Linear(d, 2 * hidden, bias=False)
+        self.ffw_in = nn.Sequential(RMSNorm(d), nn.Linear(d, 2 * hidden, bias=False))
+        _accept_renamed(self, _FFW_IN_RENAMES)
         self.down = nn.Linear(hidden, d, bias=False)
         nn.init.zeros_(self.down.weight)
 
@@ -326,7 +350,7 @@ class TransformerBlock(nn.Module):
     def attend(self, x, positions, k_cache, v_cache, mask):
         attn, new_k, new_v = self._attend(x, positions, k_cache, v_cache, mask)
         x = x + attn
-        gate, up = self.gate_up(self.ffw_norm(x)).chunk(2, dim=-1)
+        gate, up = self.ffw_in(x).chunk(2, dim=-1)
         x = x + self.down(torch.nn.functional.silu(gate) * up)
         return x, new_k, new_v
 
@@ -449,9 +473,9 @@ class SGUBlock(nn.Module):
         self.mix_out = nn.Linear(d, d, bias=False)
         nn.init.zeros_(self.mix_out.weight)
 
-        self.ffw_norm = RMSNorm(d)
         hidden = int(8 * d / 3 / 64) * 64
-        self.gate_up = nn.Linear(d, 2 * hidden, bias=False)
+        self.ffw_in = nn.Sequential(RMSNorm(d), nn.Linear(d, 2 * hidden, bias=False))
+        _accept_renamed(self, _FFW_IN_RENAMES)
         self.down = nn.Linear(hidden, d, bias=False)
         nn.init.zeros_(self.down.weight)
 
@@ -506,7 +530,7 @@ class SGUBlock(nn.Module):
         attn, new_kv = self._attend(xn, kv_cache, attn_mask)
         x = x + self.mix_out(u * (v_mixed + attn))
 
-        gate, up = self.gate_up(self.ffw_norm(x)).chunk(2, dim=-1)
+        gate, up = self.ffw_in(x).chunk(2, dim=-1)
         x = x + self.down(torch.nn.functional.silu(gate) * up)
 
         return x, v_new, new_kv
@@ -518,7 +542,7 @@ class SGUBlock(nn.Module):
         attn, new_kv = self._attend(xn, kv_cache, attn_mask)
         x = x + self.mix_out(u * (v_mixed + attn))
 
-        gate, up = self.gate_up(self.ffw_norm(x)).chunk(2, dim=-1)
+        gate, up = self.ffw_in(x).chunk(2, dim=-1)
         x = x + self.down(torch.nn.functional.silu(gate) * up)
 
         return x, new_v, new_kv
