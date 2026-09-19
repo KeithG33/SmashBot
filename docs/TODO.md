@@ -277,3 +277,18 @@ that the latency table inverted; delay 18 vs 21).
   `check_fp16_state.py` does NOT cover this — it compared fp16 vs fp32 STATE
   STORAGE with the forward in fp16 both times. Test = lockstep fp32 vs fp16
   forward for one phillip, compare action agreement.
+
+## Read / try: GradientStabilizer as a replacement for gradient clipping (Keith, 2026-09-19)
+- Paper: "GradientStabilizer: Fix the Norm, Not the Gradient" (Huang et al.)
+  https://arxiv.org/abs/2502.17055 (HTML: https://arxiv.org/html/2502.17055v4)
+- Idea: keep the gradient's direction, replace its norm with a running
+  statistical estimate, so a spike is bounded no matter how large it is and
+  never poisons Adam's moment estimates. Claims better stability and a wider
+  safe learning-rate range than clipping (LLM pre-training, QAT, others).
+- Why it is relevant here: the BC mega run trained with `max_grad_norm 1.0`
+  and that clipping is worth ~0.007 train loss early, fading to ~0.001 by 40k
+  (measured 2026-09-19 against the unclipped fp32 6/576 run). Clipping is doing
+  real work for us, so a better norm control may be worth more. The RL learner
+  clips too.
+- Test: 6/576 bf16, same seed/data, stabilizer vs `max_grad_norm 1.0` vs none;
+  the clipping effect is readable by 10k steps.
