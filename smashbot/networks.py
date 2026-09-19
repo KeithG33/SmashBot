@@ -479,6 +479,18 @@ class SGUBlock(nn.Module):
         self.down = nn.Linear(hidden, d, bias=False)
         nn.init.zeros_(self.down.weight)
 
+    def _attend(self, xn, kv_cache, attn_mask):
+        W = self.window
+        q, k_new, va_new = self.attn_qkv(xn).chunk(3, dim=-1)
+        kv_new = torch.cat([k_new, va_new], dim=-1)
+        kv_full = torch.cat([kv_cache.to(kv_new.dtype), kv_new], dim=1)
+        keys, vals = kv_full.chunk(2, dim=-1)
+        a = torch.nn.functional.scaled_dot_product_attention(
+            q.unsqueeze(1), keys.unsqueeze(1), vals.unsqueeze(1),
+            attn_mask=attn_mask,
+        ).squeeze(1)
+        return self.attn_out(a), kv_full[:, -(W - 1):].contiguous()
+
     def _spatial(self, v, v_cache):
         W = self.window
         v_cache = v_cache.to(v.dtype)
@@ -495,18 +507,6 @@ class SGUBlock(nn.Module):
         v_full = torch.cat([v_cache, v], dim=1)
         v_mixed = self.spatial(v_full.transpose(1, 2)).transpose(1, 2)
         return v_mixed, v_full[:, -(W - 1):].contiguous()
-
-    def _attend(self, xn, kv_cache, attn_mask):
-        W = self.window
-        q, k_new, va_new = self.attn_qkv(xn).chunk(3, dim=-1)
-        kv_new = torch.cat([k_new, va_new], dim=-1)
-        kv_full = torch.cat([kv_cache.to(kv_new.dtype), kv_new], dim=1)
-        keys, vals = kv_full.chunk(2, dim=-1)
-        a = torch.nn.functional.scaled_dot_product_attention(
-            q.unsqueeze(1), keys.unsqueeze(1), vals.unsqueeze(1),
-            attn_mask=attn_mask,
-        ).squeeze(1)
-        return self.attn_out(a), kv_full[:, -(W - 1):].contiguous()
 
     def _spatial_ring(self, v, v_ring, idx, valid):
         # gather-by-age is fused into the reduction by inductor (no window
