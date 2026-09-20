@@ -292,3 +292,19 @@ that the latency table inverted; delay 18 vs 21).
   clips too.
 - Test: 6/576 bf16, same seed/data, stabilizer vs `max_grad_norm 1.0` vs none;
   the clipping effect is readable by 10k steps.
+
+## Try a standard FFN in place of the SwiGLU FFN in SGUBlock (Keith, 2026-09-20)
+- Equal params: SwiGLU has three d x h matrices (h = 1536 at d = 576), a standard
+  FFN has two, so equal params means h' = 1.5 h = 2304 = exactly 4d. Same FLOPs.
+- Training memory, activations kept for backward per token per layer: SwiGLU keeps
+  gate+up (2h), silu(gate) (h) and the product (h) = 4h = 6144 floats; standard keeps
+  pre- and post-activation = 2h' = 4608. 25% less; ~0.93 GB at 6/576, batch 512,
+  T = 99, bf16, 6 layers (arithmetic from shapes, not measured). Serving unaffected.
+- Prior on quality: Shazeer's "GLU Variants Improve Transformer" found SwiGLU slightly
+  better than GELU/ReLU FFNs at equal params in LMs, so expect a small loss, if any.
+- Test: 6/576, 2x64 heads, gate_gelu + v_norm (the paper block, the current best:
+  ~0.0035 better than plain two-head and the gap grows with training), standard GELU
+  FFN at h' = 2304, same seed/data, compare paired train loss and eval step for step.
+- Related, further toward the paper: the published gMLP block has NO separate FFN; the
+  channel expansion lives inside the gating block (d_ffn = 4d to 6d before the u/v
+  split, vs our 2d followed by a SwiGLU FFN). Worth a variant once the above is read.
