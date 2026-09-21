@@ -88,8 +88,8 @@ def _state_cat(parts, batch):
 
 def _check_architecture(saved: dict, config: "TrainConfig") -> None:
     """Weights load into any model of the same shapes, so settings that change
-    behavior without changing shapes (gate_gelu, v_norm) are only caught by
-    value. Keys a checkpoint predates take their defaults."""
+    behavior without changing shapes (value.reward_halflife, network.ln_eps)
+    are only caught by value. Keys a checkpoint predates take their defaults."""
     for section, cls in (
         ("network", configs.NetworkConfig),
         ("head", configs.ControllerHeadConfig),

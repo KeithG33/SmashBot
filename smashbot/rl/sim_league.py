@@ -481,13 +481,6 @@ class SimLeague:
         if self._cfg is None:
             raise RuntimeError("SimLeague needs config_from to load bare-state members")
         cfg = self._cfg
-        weightless = configs.NetworkConfig(**cfg["network"]).weightless_settings()
-        if weightless:
-            raise NotImplementedError(
-                f"league members are bare state_dicts with no record of {weightless}; every "
-                "member would silently run with the student's setting. Members need to carry "
-                "their own network config before a student with these settings can use a league."
-            )
         pol = build_policy(
             embed_config=embed_lib.EmbedConfig(),
             controller_config=embed_lib.ControllerConfig(
