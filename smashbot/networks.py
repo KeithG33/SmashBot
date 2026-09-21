@@ -474,7 +474,10 @@ class SGUBlock(nn.Module):
         nn.init.zeros_(self.mix_out.weight)
 
         hidden = int(8 * d / 3 / 64) * 64
-        self.ffw_in = nn.Sequential(RMSNorm(d), nn.Linear(d, 2 * hidden, bias=False))
+        self.ffw_in = nn.Sequential(
+            RMSNorm(d),
+            nn.Linear(d, 2 * hidden, bias=False)
+        )
         _accept_renamed(self, _FFW_IN_RENAMES)
         self.down = nn.Linear(hidden, d, bias=False)
         nn.init.zeros_(self.down.weight)
