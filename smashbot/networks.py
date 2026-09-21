@@ -447,27 +447,27 @@ class TransformerCore(Network):
 class SGUBlock(nn.Module):
     """aMLP-style causal Spatial Gating Unit (right-aligned window / Toeplitz):
     norm -> project to (gate u, value v); v mixed by causal depthwise conv over
-    the last `window` frames; a causal windowed TINY ATTENTION (single head,
-    dk=64) feeds the gate per the aMLP variant: out = u * (v_mixed + attn).
+    the last `window` frames; a causal windowed TINY ATTENTION (attn_heads x attn_head_dim;
+    aMLP's is one head of 64) feeds the gate per the aMLP variant: out = u * (v_mixed + attn).
 
     Identity at init: conv weights 0 with bias 1 (v_mixed==1), attention output
     projection zero-init (a==0), sublayer out-projection zero-init.
     """
 
-    ATTN_DK = 64
-
-    def __init__(self, d: int, window: int):
+    def __init__(self, d: int, window: int, attn_heads: int = 1, attn_head_dim: int = 64):
         super().__init__()
         self.window = window
+        self.attn_heads = attn_heads
+        self.attn_width = attn_heads * attn_head_dim
         self.mix_norm = RMSNorm(d)
         self.uv = nn.Linear(d, 2 * d, bias=False)
         self.spatial = nn.Conv1d(d, d, kernel_size=window, groups=d)
         nn.init.zeros_(self.spatial.weight)
         nn.init.ones_(self.spatial.bias)
 
-        # tiny attention (aMLP): single head over the same causal window
-        self.attn_qkv = nn.Linear(d, 3 * self.ATTN_DK, bias=False)
-        self.attn_out = nn.Linear(self.ATTN_DK, d, bias=False)
+        # tiny attention (aMLP) over the same causal window
+        self.attn_qkv = nn.Linear(d, 3 * self.attn_width, bias=False)
+        self.attn_out = nn.Linear(self.attn_width, d, bias=False)
         nn.init.zeros_(self.attn_out.weight)
 
         self.mix_out = nn.Linear(d, d, bias=False)
@@ -488,10 +488,10 @@ class SGUBlock(nn.Module):
         kv_new = torch.cat([k_new, va_new], dim=-1)
         kv_full = torch.cat([kv_cache.to(kv_new.dtype), kv_new], dim=1)
         keys, vals = kv_full.chunk(2, dim=-1)
+        heads = lambda t: t.unflatten(-1, (self.attn_heads, -1)).transpose(1, 2)   # [B, h, T, dk]
         a = torch.nn.functional.scaled_dot_product_attention(
-            q.unsqueeze(1), keys.unsqueeze(1), vals.unsqueeze(1),
-            attn_mask=attn_mask,
-        ).squeeze(1)
+            heads(q), heads(keys), heads(vals), attn_mask=attn_mask,
+        ).transpose(1, 2).flatten(-2)
         return self.attn_out(a), kv_full[:, -(W - 1):].contiguous()
 
     def _spatial(self, v, v_cache):
@@ -562,13 +562,16 @@ class SGUCore(Network):
         hidden_size: int = 512,
         num_layers: int = 4,
         window: int = 8,
+        attn_heads: int = 1,
+        attn_head_dim: int = 64,
     ):
         super().__init__()
         self.d = hidden_size
         self.window = window
+        self.attn_width = attn_heads * attn_head_dim
         self.encoder = nn.Linear(input_size, hidden_size)
         self.blocks = nn.ModuleList(
-            [SGUBlock(hidden_size, window) for _ in range(num_layers)]
+            [SGUBlock(hidden_size, window, attn_heads, attn_head_dim) for _ in range(num_layers)]
         )
         self.final_norm = RMSNorm(hidden_size)
         self.output_size = hidden_size
@@ -580,7 +583,7 @@ class SGUCore(Network):
             "layers": [
                 (
                     z(batch_size, self.window - 1, self.d),
-                    z(batch_size, self.window - 1, 2 * SGUBlock.ATTN_DK),
+                    z(batch_size, self.window - 1, 2 * self.attn_width),
                 )
                 for _ in self.blocks
             ],
@@ -766,6 +769,8 @@ def build_embed_network(
             hidden_size=network_config.hidden_size,
             num_layers=network_config.num_layers,
             window=network_config.window,
+            attn_heads=network_config.attn_heads,
+            attn_head_dim=network_config.attn_head_dim,
         )
     else:
         raise ValueError(f"unknown network name: {name}")

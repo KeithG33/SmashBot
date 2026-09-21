@@ -44,6 +44,9 @@ class NetworkConfig:
     # transformer only:
     num_heads: int = 8
     window: int = 256  # KV-cache length (frames of memory carried at play time)
+    # sgu only: the tiny attention's shape (aMLP's is one head of 64)
+    attn_heads: int = 1
+    attn_head_dim: int = 64
 
 
 @dataclasses.dataclass
