@@ -445,6 +445,15 @@ class TransformerCore(Network):
 
 
 
+def _recomputed_in_backward(fn, *args):
+    """fn(*args) without keeping fn's activations for backward: they are
+    recomputed there. Worth it for cheap ops with large outputs (the SGU's
+    GELU and v norm hold +1.3 GiB at 6/576, batch 512; recomputing costs 1.4%)."""
+    if torch.is_grad_enabled():
+        return torch.utils.checkpoint.checkpoint(fn, *args, use_reentrant=False)
+    return fn(*args)
+
+
 class SGUBlock(nn.Module):
     """aMLP-style causal Spatial Gating Unit (right-aligned window / Toeplitz):
     norm -> project to (gate u, value v); v mixed by causal depthwise conv over
@@ -491,14 +500,7 @@ class SGUBlock(nn.Module):
         self.down = nn.Linear(hidden, d, bias=False)
         nn.init.zeros_(self.down.weight)
 
-    def _gate_value(self, xn):
-        if torch.is_grad_enabled():
-            # the GELU and the norm each keep a [B, T, 2d]-sized activation per
-            # layer for backward (+1.3 GiB at 6/576, batch 512); recompute instead
-            return torch.utils.checkpoint.checkpoint(self._gate_value_now, xn, use_reentrant=False)
-        return self._gate_value_now(xn)
-
-    def _gate_value_now(self, xn):
+    def _uv(self, xn):
         u, v = self.uv(xn).chunk(2, dim=-1)
         return u, self.v_norm(v)
 
@@ -548,7 +550,7 @@ class SGUBlock(nn.Module):
         """Serving with the v-cache as a ring: returns the NEW slot [B, d]
         instead of a shifted cache; the caller writes it in place."""
         xn = self.mix_norm(x)
-        u, v = self._gate_value(xn)
+        u, v = _recomputed_in_backward(self._uv, xn)
         v_mixed, v_new = self._spatial_ring(v, v_ring, idx, valid)
         attn, new_kv = self._attend(xn, kv_cache, attn_mask)
         x = x + self.mix_out(u * (v_mixed + attn))
@@ -560,7 +562,7 @@ class SGUBlock(nn.Module):
 
     def mix(self, x, v_cache, kv_cache, attn_mask):
         xn = self.mix_norm(x)
-        u, v = self._gate_value(xn)
+        u, v = _recomputed_in_backward(self._uv, xn)
         v_mixed, new_v = self._spatial(v, v_cache)
         attn, new_kv = self._attend(xn, kv_cache, attn_mask)
         x = x + self.mix_out(u * (v_mixed + attn))
