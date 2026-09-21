@@ -11,6 +11,7 @@ import abc
 import typing as tp
 
 import torch
+import torch.utils.checkpoint
 from torch import nn
 
 RecurrentState = tp.Any
@@ -452,15 +453,25 @@ class SGUBlock(nn.Module):
 
     Identity at init: conv weights 0 with bias 1 (v_mixed==1), attention output
     projection zero-init (a==0), sublayer out-projection zero-init.
+
+    gate_gelu and v_norm are the two steps of the published gMLP block this
+    one otherwise omits: GELU on the (u, v) projection, and a norm on v.
     """
 
-    def __init__(self, d: int, window: int, attn_heads: int = 1, attn_head_dim: int = 64):
+    def __init__(
+        self, d: int, window: int, attn_heads: int = 1, attn_head_dim: int = 64,
+        gate_gelu: bool = False, v_norm: bool = False,
+    ):
         super().__init__()
         self.window = window
         self.attn_heads = attn_heads
         self.attn_width = attn_heads * attn_head_dim
         self.mix_norm = RMSNorm(d)
         self.uv = nn.Linear(d, 2 * d, bias=False)
+        self.uv_act = nn.GELU() if gate_gelu else nn.Identity()
+        self.recompute_gate = gate_gelu or v_norm
+        # no gain: a per-channel scale folds into the depthwise filter
+        self.v_norm = RMSNorm(d, elementwise_affine=False) if v_norm else nn.Identity()
         self.spatial = nn.Conv1d(d, d, kernel_size=window, groups=d)
         nn.init.zeros_(self.spatial.weight)
         nn.init.ones_(self.spatial.bias)
@@ -481,6 +492,17 @@ class SGUBlock(nn.Module):
         _accept_renamed(self, _FFW_IN_RENAMES)
         self.down = nn.Linear(hidden, d, bias=False)
         nn.init.zeros_(self.down.weight)
+
+    def _gate_value(self, xn):
+        if self.recompute_gate and torch.is_grad_enabled():
+            # the GELU and the norm each keep a [B, T, 2d]-sized activation per
+            # layer for backward (+1.3 GiB at 6/576, batch 512); recompute instead
+            return torch.utils.checkpoint.checkpoint(self._gate_value_now, xn, use_reentrant=False)
+        return self._gate_value_now(xn)
+
+    def _gate_value_now(self, xn):
+        u, v = self.uv_act(self.uv(xn)).chunk(2, dim=-1)
+        return u, self.v_norm(v)
 
     def _attend(self, xn, kv_cache, attn_mask):
         W = self.window
@@ -528,7 +550,7 @@ class SGUBlock(nn.Module):
         """Serving with the v-cache as a ring: returns the NEW slot [B, d]
         instead of a shifted cache; the caller writes it in place."""
         xn = self.mix_norm(x)
-        u, v = self.uv(xn).chunk(2, dim=-1)
+        u, v = self._gate_value(xn)
         v_mixed, v_new = self._spatial_ring(v, v_ring, idx, valid)
         attn, new_kv = self._attend(xn, kv_cache, attn_mask)
         x = x + self.mix_out(u * (v_mixed + attn))
@@ -540,7 +562,7 @@ class SGUBlock(nn.Module):
 
     def mix(self, x, v_cache, kv_cache, attn_mask):
         xn = self.mix_norm(x)
-        u, v = self.uv(xn).chunk(2, dim=-1)
+        u, v = self._gate_value(xn)
         v_mixed, new_v = self._spatial(v, v_cache)
         attn, new_kv = self._attend(xn, kv_cache, attn_mask)
         x = x + self.mix_out(u * (v_mixed + attn))
@@ -564,6 +586,8 @@ class SGUCore(Network):
         window: int = 8,
         attn_heads: int = 1,
         attn_head_dim: int = 64,
+        gate_gelu: bool = False,
+        v_norm: bool = False,
     ):
         super().__init__()
         self.d = hidden_size
@@ -571,7 +595,8 @@ class SGUCore(Network):
         self.attn_width = attn_heads * attn_head_dim
         self.encoder = nn.Linear(input_size, hidden_size)
         self.blocks = nn.ModuleList(
-            [SGUBlock(hidden_size, window, attn_heads, attn_head_dim) for _ in range(num_layers)]
+            [SGUBlock(hidden_size, window, attn_heads, attn_head_dim, gate_gelu, v_norm)
+             for _ in range(num_layers)]
         )
         self.final_norm = RMSNorm(hidden_size)
         self.output_size = hidden_size
@@ -771,6 +796,8 @@ def build_embed_network(
             window=network_config.window,
             attn_heads=network_config.attn_heads,
             attn_head_dim=network_config.attn_head_dim,
+            gate_gelu=network_config.gate_gelu,
+            v_norm=network_config.v_norm,
         )
     else:
         raise ValueError(f"unknown network name: {name}")

@@ -47,6 +47,15 @@ class NetworkConfig:
     # sgu only: the tiny attention's shape (aMLP's is one head of 64)
     attn_heads: int = 1
     attn_head_dim: int = 64
+    # sgu only, both from the gMLP block as published: GELU on the (u, v)
+    # projection before the split, and a norm on v before the temporal mix
+    gate_gelu: bool = False
+    v_norm: bool = False
+
+    def weightless_settings(self) -> list[str]:
+        """Enabled settings that change behavior but no parameter shape: a bare
+        state_dict cannot reveal whether its model was trained with them."""
+        return [name for name in ("gate_gelu", "v_norm") if getattr(self, name)]
 
 
 @dataclasses.dataclass
