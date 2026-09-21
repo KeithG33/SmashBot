@@ -580,14 +580,12 @@ class GRUBlock(nn.Module):
     """An SGUBlock with its conv + attention mixing replaced by a residual
     GRU, as in slippi-ai's tx_like layers: game-long memory in one vector per
     row instead of a window cache. The GRU runs in fp32 whatever the autocast
-    (recurrent state loses too much in half precision); `gain` starts at zero
-    so the block is an identity at init like its siblings."""
+    (recurrent state loses too much in half precision)."""
 
     def __init__(self, d: int):
         super().__init__()
         self.norm = RMSNorm(d)
         self.gru = nn.GRU(d, d, batch_first=True)
-        self.gain = nn.Parameter(torch.zeros(d))
 
         hidden = int(8 * d / 3 / 64) * 64
         self.ffw_in = nn.Sequential(
@@ -602,7 +600,7 @@ class GRUBlock(nn.Module):
         xn = self.norm(x)
         with torch.autocast(x.device.type, enabled=False):
             out, h = self.gru(xn.float(), h.float()[None].contiguous())
-        return _swiglu(self, x + self.gain * out.to(x.dtype)), h[0]
+        return _swiglu(self, x + out.to(x.dtype)), h[0]
 
 
 class SGUCore(Network):
