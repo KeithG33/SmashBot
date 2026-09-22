@@ -159,6 +159,7 @@ def main(config: TrainConfig) -> None:
         num_layers=config.value.num_layers,
         num_heads=config.network.num_heads,
         window=config.value.window or config.network.window,
+        layout=config.value.layout,
     )
     value_fn = ValueFunction(
         build_embed_network(
