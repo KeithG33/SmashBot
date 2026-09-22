@@ -278,21 +278,6 @@ that the latency table inverted; delay 18 vs 21).
   STORAGE with the forward in fp16 both times. Test = lockstep fp32 vs fp16
   forward for one phillip, compare action agreement.
 
-## Read / try: GradientStabilizer as a replacement for gradient clipping (Keith, 2026-09-19)
-- Paper: "GradientStabilizer: Fix the Norm, Not the Gradient" (Huang et al.)
-  https://arxiv.org/abs/2502.17055 (HTML: https://arxiv.org/html/2502.17055v4)
-- Idea: keep the gradient's direction, replace its norm with a running
-  statistical estimate, so a spike is bounded no matter how large it is and
-  never poisons Adam's moment estimates. Claims better stability and a wider
-  safe learning-rate range than clipping (LLM pre-training, QAT, others).
-- Why it is relevant here: the BC mega run trained with `max_grad_norm 1.0`
-  and that clipping is worth ~0.007 train loss early, fading to ~0.001 by 40k
-  (measured 2026-09-19 against the unclipped fp32 6/576 run). Clipping is doing
-  real work for us, so a better norm control may be worth more. The RL learner
-  clips too.
-- Test: 6/576 bf16, same seed/data, stabilizer vs `max_grad_norm 1.0` vs none;
-  the clipping effect is readable by 10k steps.
-
 ## Try AutoClip in place of a fixed clip norm for the next mega run (Keith, 2026-09-22)
 - Code: https://github.com/pseeth/autoclip (Seetharaman et al., "AutoClip: Adaptive
   Gradient Clipping for Source Separation Networks", MLSP 2020, arXiv 2007.14469).
@@ -302,11 +287,14 @@ that the latency table inverted; delay 18 vs 21).
   later when they settle, so no single constant has to fit the whole run. A few
   lines: record `total_norm` each step, `clip_grad_norm_(params, np.percentile(history, p))`.
 - Why here: `max_grad_norm 1.0` was a guess, and a constant threshold can only be
-  right for one phase of a 1M+ step run. Same motivation as the GradientStabilizer
-  entry above; AutoClip is the simpler of the two and reuses `clip_grad_norm_`.
-- Test: same 6/576 bf16 seed/data comparison as the GradientStabilizer entry:
-  AutoClip (p = 10) vs `max_grad_norm 1.0` vs none; readable by 10k steps. If it
-  holds, use it for the next SGU mega run.
+  right for one phase of a 1M+ step run. Clipping does real work for us early
+  (~0.013 eval at 2.5k vs the unclipped fp32 6/576 run, gone by ~55k).
+- Test: 6/576 bf16, same seed/data: AutoClip (p = 10) vs `max_grad_norm 1.0` vs
+  none; readable by 10k steps. If it holds, use it for the next SGU mega run.
+- If adaptive clipping helps and we want to go further: GradientStabilizer
+  (Huang et al., arXiv 2502.17055) keeps the gradient direction and replaces its
+  norm with a running estimate, so a spike never reaches Adam's moments. Aimed at
+  LLM pre-training spikes, which our runs do not show, so AutoClip first.
 
 ## Try a standard FFN in place of the SwiGLU FFN in SGUBlock (Keith, 2026-09-20)
 - Equal params: SwiGLU has three d x h matrices (h = 1536 at d = 576), a standard
