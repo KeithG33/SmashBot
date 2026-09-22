@@ -62,6 +62,7 @@ def build_value_function(cfg: dict, device: str):
         num_layers=cfg["value"]["num_layers"],
         num_heads=cfg["network"]["num_heads"],
         window=cfg["value"].get("window", 0) or cfg["network"]["window"],
+        layout=cfg["value"].get("layout", ""),
     )
     return ValueFunction(
         build_embed_network(

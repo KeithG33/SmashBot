@@ -71,6 +71,8 @@ class ValueConfig:
     # Long windows mildly hurt value estimation (uev 0.337 @W256 vs 0.325
     # @W64), so big trains pass an explicit smaller window here.
     window: int = 0
+    # sgu only: one letter per layer as network.layout; empty = all SGU
+    layout: str = ""
     reward_halflife: float = 4.0  # seconds; discount = 0.5 ** (1 / (halflife * 60))
 
 
