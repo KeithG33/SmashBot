@@ -293,6 +293,21 @@ that the latency table inverted; delay 18 vs 21).
 - Test: 6/576 bf16, same seed/data, stabilizer vs `max_grad_norm 1.0` vs none;
   the clipping effect is readable by 10k steps.
 
+## Try AutoClip in place of a fixed clip norm for the next mega run (Keith, 2026-09-22)
+- Code: https://github.com/pseeth/autoclip (Seetharaman et al., "AutoClip: Adaptive
+  Gradient Clipping for Source Separation Networks", MLSP 2020, arXiv 2007.14469).
+- Idea: keep a history of every step's gradient norm and clip to a percentile of
+  it (the repo's default is the 10th) instead of a hand-picked constant. The
+  threshold follows the run: tight early when norms are large and falling, loose
+  later when they settle, so no single constant has to fit the whole run. A few
+  lines: record `total_norm` each step, `clip_grad_norm_(params, np.percentile(history, p))`.
+- Why here: `max_grad_norm 1.0` was a guess, and a constant threshold can only be
+  right for one phase of a 1M+ step run. Same motivation as the GradientStabilizer
+  entry above; AutoClip is the simpler of the two and reuses `clip_grad_norm_`.
+- Test: same 6/576 bf16 seed/data comparison as the GradientStabilizer entry:
+  AutoClip (p = 10) vs `max_grad_norm 1.0` vs none; readable by 10k steps. If it
+  holds, use it for the next SGU mega run.
+
 ## Try a standard FFN in place of the SwiGLU FFN in SGUBlock (Keith, 2026-09-20)
 - Equal params: SwiGLU has three d x h matrices (h = 1536 at d = 576), a standard
   FFN has two, so equal params means h' = 1.5 h = 2304 = exactly 4d. Same FLOPs.
