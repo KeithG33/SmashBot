@@ -451,7 +451,11 @@ class BatchedPolicyAgent:
 
     def _ring_carry(self, new_hidden):
         ptr = self.hidden["ptr"]
-        for (v_ring, kv), (v_new, kv_new) in zip(self.hidden["layers"], new_hidden["layers"]):
+        for layer, new in zip(self.hidden["layers"], new_hidden["layers"]):
+            if not isinstance(layer, tuple):   # recurrent layer: one state tensor
+                layer.copy_(new)
+                continue
+            (v_ring, kv), (v_new, kv_new) = layer, new
             assert v_new.dim() == 2 and v_ring.dim() == 3, "ring carry takes a [B, d] slot, never a cache"
             v_ring.index_copy_(1, ptr.view(1), v_new.unsqueeze(1).to(v_ring.dtype))
             kv.copy_(kv_new)

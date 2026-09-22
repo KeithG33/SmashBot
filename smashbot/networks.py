@@ -576,16 +576,18 @@ def _swiglu(block, x):
     return x + block.down(torch.nn.functional.silu(gate) * up)
 
 
-class GRUBlock(nn.Module):
+class RecurrentBlock(nn.Module):
     """An SGUBlock with its conv + attention mixing replaced by a residual
-    GRU, as in slippi-ai's tx_like layers: game-long memory in one vector per
-    row instead of a window cache. The GRU runs in fp32 whatever the autocast
-    (recurrent state loses too much in half precision)."""
+    GRU or LSTM, as in slippi-ai's tx_like layers: game-long memory in one
+    fp32 tensor per row ([d], or [2, d] = (h, c) for the LSTM) instead of a
+    window cache. The cell runs in fp32 whatever the autocast (recurrent
+    state loses too much in half precision)."""
 
-    def __init__(self, d: int):
+    def __init__(self, d: int, cell: str):
         super().__init__()
         self.norm = RMSNorm(d)
-        self.gru = nn.GRU(d, d, batch_first=True)
+        self.rnn = {"gru": nn.GRU, "lstm": nn.LSTM}[cell](d, d, batch_first=True)
+        self.state_shape = (d,) if cell == "gru" else (2, d)
 
         hidden = int(8 * d / 3 / 64) * 64
         self.ffw_in = nn.Sequential(
@@ -596,16 +598,23 @@ class GRUBlock(nn.Module):
         nn.init.zeros_(self.down.weight)
 
     def mix(self, x, h):
-        """x [B, T, d], h [B, d] fp32 -> (x, h)."""
+        """x [B, T, d], h [B, *state_shape] fp32 -> (x, h)."""
         xn = self.norm(x)
         with torch.autocast(x.device.type, enabled=False):
-            out, h = self.gru(xn.float(), h.float()[None].contiguous())
-        return _swiglu(self, x + out.to(x.dtype)), h[0]
+            h = h.float()
+            if isinstance(self.rnn, nn.LSTM):
+                out, (hn, cn) = self.rnn(xn.float(), tuple(t[None].contiguous() for t in h.unbind(1)))
+                h = torch.stack([hn[0], cn[0]], dim=1)
+            else:
+                out, hn = self.rnn(xn.float(), h[None].contiguous())
+                h = hn[0]
+        return _swiglu(self, x + out.to(x.dtype)), h
 
 
 class SGUCore(Network):
-    """Stack of aMLP/SGU blocks, optionally interleaved with GRU blocks
-    (`layout`; a GRU layer's state is one fp32 [B, d] vector). SGU layer state = ring of last window-1
+    """Stack of aMLP/SGU blocks, optionally interleaved with recurrent blocks
+    (`layout`, one letter per layer: s = SGU, g = GRU, l = LSTM; a recurrent
+    layer's state is one fp32 tensor). SGU layer state = ring of last window-1
     v-vectors (conv) + kv pairs (tiny attention), plus a shared cache_len.
     Hard per-layer horizon of `window` frames."""
 
@@ -621,14 +630,15 @@ class SGUCore(Network):
     ):
         super().__init__()
         layout = layout or "s" * num_layers
-        assert len(layout) == num_layers and set(layout) <= {"s", "g"}, layout
+        assert len(layout) == num_layers and set(layout) <= {"s", "g", "l"}, layout
         self.d = hidden_size
         self.window = window
         self.attn_width = attn_heads * attn_head_dim
         self.encoder = nn.Linear(input_size, hidden_size)
         self.blocks = nn.ModuleList(
             [SGUBlock(hidden_size, window, attn_heads, attn_head_dim) if kind == "s"
-             else GRUBlock(hidden_size) for kind in layout]
+             else RecurrentBlock(hidden_size, {"g": "gru", "l": "lstm"}[kind])
+             for kind in layout]
         )
         self.final_norm = RMSNorm(hidden_size)
         self.output_size = hidden_size
@@ -641,7 +651,7 @@ class SGUCore(Network):
                 (
                     z(batch_size, self.window - 1, self.d),
                     z(batch_size, self.window - 1, 2 * self.attn_width),
-                ) if isinstance(block, SGUBlock) else z(batch_size, self.d)
+                ) if isinstance(block, SGUBlock) else z(batch_size, *block.state_shape)
                 for block in self.blocks
             ],
         }
@@ -712,7 +722,7 @@ class SGUCore(Network):
             idx, valid = self._ring_index(state["ptr"], state["cache_len"], inputs.device)
         new_layers = []
         for block, layer in zip(self.blocks, state["layers"]):
-            if isinstance(block, GRUBlock):
+            if isinstance(block, RecurrentBlock):
                 x, h = block.mix(x, layer)
                 new_layers.append(h)
                 continue
