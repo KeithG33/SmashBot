@@ -87,7 +87,6 @@ class ValueConfig:
 @dataclasses.dataclass
 class LearnerConfig:
     learning_rate: float = 1e-4
-    value_cost: float = 0.5
     # Faithful slippi-ai defaults: fp32, no clipping.
     max_grad_norm: float = 0.0
     # AutoClip (Seetharaman et al. 2020): clip each network to this percentile
@@ -95,6 +94,3 @@ class LearnerConfig:
     autoclip_percentile: float = 0.0
     precision: str = "fp32"  # bf16 | fp32
     compile: bool = False
-    # BC: micro-batches per optimizer step (batch_size stays the logical batch;
-    # each micro-batch is batch_size/grad_accum rows, loss scaled by 1/grad_accum)
-    grad_accum: int = 1

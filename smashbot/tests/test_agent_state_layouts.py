@@ -28,7 +28,6 @@ def _policy(name, layout="", seed=0):
         policy_config=configs.PolicyConfig(delay=1),
         num_names=2,
     )
-    policy.train_value_head = False
     return policy.eval()
 
 

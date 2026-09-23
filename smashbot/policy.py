@@ -21,8 +21,6 @@ from smashbot.networks import RecurrentState, StateActionNetwork
 class UnrollOutputs(tp.NamedTuple):
     log_probs: torch.Tensor  # [B, T]
     distances: tp.Any  # controller struct of [B, T]
-    value_loss: tp.Optional[torch.Tensor]  # [B, T]; None when value head disabled
-    value_metrics: dict
     final_state: RecurrentState
     logits: tp.Any = None  # controller struct of [B, T, ...]; used by RL
 
@@ -33,60 +31,28 @@ class Policy(nn.Module):
         network: StateActionNetwork,
         controller_head: ControllerHead,
         delay: int = 0,
-        train_value_head: bool = True,
     ):
         super().__init__()
         self.network = network
         self.controller_head = controller_head
         self.delay = delay
-        self.train_value_head = train_value_head
-        self.value_head = nn.Linear(network.core.output_size, 1)
+        # value is a separate network; checkpoints from the built-in head's era
+        # (and the ported Phillips) still carry its two tensors
+        self.register_load_state_dict_pre_hook(
+            lambda module, state, prefix, *_: [
+                state.pop(k) for k in list(state) if k.startswith(prefix + "value_head.")])
 
     def initial_state(self, batch_size: int, device=None) -> RecurrentState:
         return self.network.initial_state(batch_size, device)
-
-    def _value_outputs(
-        self,
-        outputs: torch.Tensor,  # [B, T, H], t in [0, T-1]
-        last_input: StateAction,  # t = T
-        is_resetting: torch.Tensor,  # [B, T+1]
-        final_state: RecurrentState,
-        rewards: torch.Tensor,  # [B, T]
-        discount: float,
-    ) -> tuple[torch.Tensor, dict]:
-        if not self.train_value_head:
-            outputs = outputs.detach()
-        values = self.value_head(outputs).squeeze(-1)
-        last_output, _ = self.network.step_with_reset(
-            last_input, is_resetting[:, -1], final_state
-        )
-        last_value = self.value_head(last_output).squeeze(-1)
-
-        discounts = torch.where(
-            is_resetting[:, 1:], 0.0, torch.as_tensor(discount, device=rewards.device)
-        )
-        value_targets = delay_lib.discounted_returns(
-            rewards=rewards, discounts=discounts, bootstrap=last_value
-        ).detach()
-        value_loss = torch.square(value_targets - values)
-
-        uev = value_loss.mean() / (value_targets.var() + 1e-8)
-        metrics = {
-            "loss": value_loss.mean().item(),
-            "uev": uev.item(),  # unexplained variance
-        }
-        return value_loss, metrics
 
     def unroll(
         self,
         frames: Frames,
         initial_state: RecurrentState,
-        discount: float = 0.99,
     ) -> UnrollOutputs:
         """Frames must already be delay-aligned (see delay.slice_delayed_frames)
         and include one extra overlap frame at the end."""
         inputs = tree.map_structure(lambda t: t[:, :-1], frames.state_action)
-        last_input = tree.map_structure(lambda t: t[:, -1], frames.state_action)
         outputs, final_state = self.network.unroll(
             inputs, frames.is_resetting[:, :-1], initial_state
         )
@@ -97,22 +63,9 @@ class Policy(nn.Module):
 
         distance_outputs = self.controller_head.distance(outputs, prev_action, next_action)
         policy_loss = sum(tree.flatten(distance_outputs.distance))
-        log_probs = -policy_loss
-
-        # With a separate value network (production config), skip the built-in head.
-        if self.train_value_head:
-            value_loss, value_metrics = self._value_outputs(
-                outputs, last_input, frames.is_resetting, final_state,
-                frames.reward, discount,
-            )
-        else:
-            value_loss, value_metrics = None, {}
-
         return UnrollOutputs(
-            log_probs=log_probs,
+            log_probs=-policy_loss,
             distances=distance_outputs.distance,
-            value_loss=value_loss,
-            value_metrics=value_metrics,
             final_state=final_state,
             logits=distance_outputs.logits,
         )
@@ -121,26 +74,20 @@ class Policy(nn.Module):
         self,
         frames: Frames,
         initial_state: RecurrentState,
-        discount: float = 0.99,
-        value_cost: float = 0.5,
     ) -> tuple[torch.Tensor, RecurrentState, dict]:
         """frames: [B, U + D + 1] raw (not yet delay-aligned)."""
         delayed = delay_lib.slice_delayed_frames(frames, self.delay)
-        outputs = self.unroll(delayed, initial_state, discount=discount)
+        outputs = self.unroll(delayed, initial_state)
 
         total_loss = -outputs.log_probs.mean()
         metrics = {
             "policy_loss": total_loss.item(),
-            "value": outputs.value_metrics,
             "controller": tree.map_structure(
                 lambda d: d.mean().item(), outputs.distances._asdict()
             ),
         }
-        if self.train_value_head:
-            total_loss = total_loss + value_cost * outputs.value_loss.mean()
-        metrics["total_loss"] = total_loss.item()
         metrics["controller_flat"] = {
-            "buttons": sum(metrics["controller"]["buttons"]) / 8,
+            "buttons": sum(metrics["controller"]["buttons"]) / len(metrics["controller"]["buttons"]),
             "main_x": metrics["controller"]["main_stick"].x,
             "main_y": metrics["controller"]["main_stick"].y,
             "c_x": metrics["controller"]["c_stick"].x,
@@ -149,49 +96,6 @@ class Policy(nn.Module):
         }
 
         return total_loss, outputs.final_state, metrics
-
-    @torch.no_grad()
-    def sample_n(
-        self,
-        states: tp.Any,  # encoded Game struct, [B, S]
-        names: torch.Tensor,  # [B, S]
-        prev_action: tp.Any,  # controller struct [B] — action before frame 0
-        neutral_action: tp.Any,  # controller struct [B] — reset substitute
-        initial_state: RecurrentState,
-        is_resetting: torch.Tensor,  # [B, S]
-        temperature: tp.Optional[float] = None,
-    ) -> tuple[list, RecurrentState, list]:
-        """Sample S consecutive frames in one call (batch_steps): the
-        autoregressive prev-action feedback stays inside, so a torch.compile
-        of this method amortizes launch overhead over S frames. Mid-buffer
-        resets substitute the neutral prev-action and zero the recurrent
-        state (via sample's is_resetting)."""
-        S = names.shape[1]
-        hidden = initial_state
-        outs, used_prevs = [], []
-        for t in range(S):
-            reset_t = is_resetting[:, t]
-            prev_action = tree.map_structure(
-                lambda p, n: torch.where(
-                    reset_t.view(-1, *([1] * (p.dim() - 1))), n, p
-                ),
-                prev_action, neutral_action,
-            )
-            used_prevs.append(prev_action)
-            sa = StateAction(
-                state=tree.map_structure(lambda x: x[:, t], states),
-                action=prev_action,
-                name=names[:, t],
-            )
-            out, hidden = self.sample(
-                sa, hidden, is_resetting=reset_t, temperature=temperature
-            )
-            outs.append(out)
-            prev_action = tree.map_structure(
-                lambda x: x.clone() if x.dtype == torch.bool else x.long().clone(),
-                out.controller_state,
-            )
-        return outs, hidden, used_prevs
 
     @torch.no_grad()
     def forward(

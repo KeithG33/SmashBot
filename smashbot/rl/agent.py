@@ -5,9 +5,6 @@ keeps this module Dolphin-free and unit-testable. Per-env delay queues and
 recurrent-state resets are handled here; every step also emits the streams
 the PPO Trajectory needs (prev-action inputs, sample-time logits).
 
-batch_steps > 1 (amortizing multiple frames per forward via delay slack, as
-slippi-ai does in RL) is a planned optimization; the env-batching here is
-the dominant win (N thin forwards -> one wide one).
 """
 
 from __future__ import annotations
@@ -90,7 +87,6 @@ class BatchedPolicyAgent:
         name_code: int = 0,
         temperature: float | None = None,
         device: str = "cpu",
-        batch_steps: int = 1,
         precision: str = "fp32",
         state_dtype: torch.dtype | None = None,
         capture: bool = False,
@@ -141,14 +137,7 @@ class BatchedPolicyAgent:
             collections.deque([_neutral_controller()] * self.delay)
             for _ in range(num_envs)
         ]
-        assert self.delay >= batch_steps, (
-            "delay must cover batch_steps (queue runs batch_steps-1 short "
-            "between flushes)"
-        )
-        self.batch_steps = batch_steps
-        self._buf_states: list = []
-        self._buf_resets: list[torch.Tensor] = []
-        # manual CUDA-graph capture with STATIC buffers (batch_steps == 1).
+        # manual CUDA-graph capture with STATIC buffers.
         # torch.compile's cudagraph trees hand back outputs that the next
         # replay overwrites, forcing a full clone of the carried state every
         # frame (3.4 ms at 400 rows for the windowed cores). Owning the
@@ -163,9 +152,6 @@ class BatchedPolicyAgent:
                       and ring is not False)
         if self._ring:   # the ring state exists from the start: snapshots precede the first replay
             self.hidden = self._cast_state(self._core.initial_ring_state(num_envs, device))
-        assert not self._use_capture or batch_steps == 1, (
-            "capture is for the batch_steps==1 serving path"
-        )
         self._graph = None
         # flat inputs (capture): the static inputs are the worker's three typed
         # flats and the struct the forward reads is a view of them, built once —
@@ -245,116 +231,51 @@ class BatchedPolicyAgent:
     ) -> tuple[list[FrameRecord], tp.Any]:
         """states: encoded Game struct batched [N, ...]; resets: [N] bool.
 
-        Buffers the frame; every `batch_steps` frames one sample_n call
-        processes the buffer (amortizing launch overhead) and appends the
-        sampled controllers to the delay queues. Returns the flushed
-        FrameRecords ([] between flushes) and the recurrent snapshot from
-        just before the flush (None between flushes) for chunk-boundary
-        bookkeeping."""
-        self._buf_states.append(states)
-        self._buf_resets.append(resets)
-
-        records: list[FrameRecord] = []
-        hidden_before = None
-        if self.batch_steps == 1:
-            # fast path: skip the sample_n wrapper (measured ~20% faster
-            # under reduce-overhead compile at S=1)
-            hidden_before = self.hidden_snapshot() if want_snapshot else None
-            reset_t = resets
-            prev = tree.map_structure(
-                lambda pv, n: torch.where(
-                    reset_t.view(-1, *([1] * (pv.dim() - 1))), n, pv
-                ),
-                self._prev_action, self._neutral_encoded,
-            )
-            if self._use_capture:
-                ctrl, logits = self._graph_step(states, prev, reset_t, flats)
-            else:
-                with self._autocast():
-                    out, hidden = self.policy.sample(
-                        StateAction(state=states, action=prev, name=self._name),
-                        self.hidden, is_resetting=reset_t, temperature=self.temperature,
-                    )
-                ctrl, logits = out.controller_state, out.logits
-                # carried state MUST be cloned on this path: with cudagraph
-                # trees the forward's output lives in the graph's pool and the
-                # next replay overwrites it (torch raises "accessing tensor
-                # output of CUDAGraphs that has been overwritten"). Measured
-                # 3.4 ms/frame at 400 rows for the windowed cores, 0 for the
-                # LSTM. The capture path above avoids it entirely.
-                self.hidden = tree.map_structure(
-                    lambda t: t.clone() if isinstance(t, torch.Tensor) else t, hidden
-                )
-            self._prev_action = tree.map_structure(
-                lambda t: t.clone() if t.dtype == torch.bool else t.long().clone(),
-                ctrl,
-            )
-            records.append(FrameRecord(
-                state=states,
-                prev_action=tree.map_structure(
-                    lambda x: x.clone() if x.dtype == torch.bool else x.long().clone(),
-                    prev,
-                ),
-                logits=tree.map_structure(lambda x: x.clone(), logits),
-                name=self._name.clone(),
-            ))
-            encoded_np = _controller_to_host(ctrl)
-            decoded = self._embed_controller.decode(encoded_np)
-            self._enqueue(decoded)
-            self._buf_states, self._buf_resets = [], []
-            return records, hidden_before
-
-        if len(self._buf_states) == self.batch_steps:
-            hidden_before = self.hidden_snapshot() if want_snapshot else None
-            stack = lambda seq: tree.map_structure(
-                lambda *xs: torch.stack(xs, dim=1), *seq
-            )
+        One forward; the sampled controllers are appended to the delay
+        queues. Returns [FrameRecord] and the recurrent snapshot from just
+        before the forward (None unless wanted) for chunk-boundary bookkeeping."""
+        hidden_before = self.hidden_snapshot() if want_snapshot else None
+        prev = tree.map_structure(
+            lambda pv, n: torch.where(
+                resets.view(-1, *([1] * (pv.dim() - 1))), n, pv
+            ),
+            self._prev_action, self._neutral_encoded,
+        )
+        if self._use_capture:
+            ctrl, logits = self._graph_step(states, prev, resets, flats)
+        else:
             with self._autocast():
-                outs, hidden, used_prevs = self.policy.sample_n(
-                    states=stack(self._buf_states),
-                    names=self._name[:, None].expand(-1, self.batch_steps),
-                    prev_action=self._prev_action,
-                    neutral_action=self._neutral_encoded,
-                    initial_state=self.hidden,
-                    is_resetting=torch.stack(self._buf_resets, dim=1),
-                    temperature=self.temperature,
+                out, hidden = self.policy.sample(
+                    StateAction(state=states, action=prev, name=self._name),
+                    self.hidden, is_resetting=resets, temperature=self.temperature,
                 )
-            # clones: retained across flushes / fed back next flush, and
-            # compiled (cudagraph) replay reuses output buffers
-            # carried state MUST be cloned: with cudagraph trees the
-            # forward's output lives in the graph's pool and the next replay
-            # overwrites it (torch raises "accessing tensor output of
-            # CUDAGraphs that has been overwritten by a subsequent run" if
-            # you feed it straight back). Measured cost: 3.4 ms/frame at 400
-            # rows for the windowed cores, 0 for the LSTM. Removing it needs
-            # a manual static-buffer capture, as LeagueAgent does.
+            ctrl, logits = out.controller_state, out.logits
+            # carried state MUST be cloned on this path: with cudagraph
+            # trees the forward's output lives in the graph's pool and the
+            # next replay overwrites it (torch raises "accessing tensor
+            # output of CUDAGraphs that has been overwritten"). Measured
+            # 3.4 ms/frame at 400 rows for the windowed cores, 0 for the
+            # LSTM. The capture path above avoids it entirely.
             self.hidden = tree.map_structure(
                 lambda t: t.clone() if isinstance(t, torch.Tensor) else t, hidden
             )
-            self._prev_action = tree.map_structure(
-                lambda t: t.clone() if t.dtype == torch.bool else t.long().clone(),
-                outs[-1].controller_state,
-            )
-            for t, out in enumerate(outs):
-                records.append(
-                    FrameRecord(
-                        state=self._buf_states[t],
-                        prev_action=tree.map_structure(
-                            lambda x: x.clone() if x.dtype == torch.bool
-                            else x.long().clone(),
-                            used_prevs[t],
-                        ),
-                        logits=tree.map_structure(lambda x: x.clone(), out.logits),
-                        name=self._name.clone(),
-                    )
-                )
-                encoded_np = tree.map_structure(
-                    lambda x: x.cpu().numpy(), out.controller_state
-                )
-                decoded = self._embed_controller.decode(encoded_np)
-                self._enqueue(decoded)
-            self._buf_states, self._buf_resets = [], []
-        return records, hidden_before
+        self._prev_action = tree.map_structure(
+            lambda t: t.clone() if t.dtype == torch.bool else t.long().clone(),
+            ctrl,
+        )
+        record = FrameRecord(
+            state=states,
+            prev_action=tree.map_structure(
+                lambda x: x.clone() if x.dtype == torch.bool else x.long().clone(),
+                prev,
+            ),
+            logits=tree.map_structure(lambda x: x.clone(), logits),
+            name=self._name.clone(),
+        )
+        encoded_np = _controller_to_host(ctrl)
+        decoded = self._embed_controller.decode(encoded_np)
+        self._enqueue(decoded)
+        return [record], hidden_before
 
     def _autocast(self):
         dev = torch.device(self.device).type

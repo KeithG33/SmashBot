@@ -113,14 +113,6 @@ class Split:
     def shutdown(self):
         self.source.shutdown()
 
-    @property
-    def batch_size(self) -> int:
-        return self.source.batch_size
-
-    @property
-    def replay_counter(self) -> int:
-        return self.source.replay_counter
-
     def state(self) -> dict:
         rows = [(feed.index, m.frame) for feed, m in zip(self.feeds, self.source.managers)]
         return {"consumed": self.cursor.count, "rows": rows}

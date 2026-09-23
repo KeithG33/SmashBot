@@ -305,9 +305,7 @@ def run(args) -> None:
         torch.cuda.memory._record_memory_history(max_entries=200000)
 
     policy, name_map, step = load_policy(args.ckpt, device)
-    policy.train_value_head = False
     teacher, _, _ = load_policy(args.ckpt, device)
-    teacher.train_value_head = False
     ckpt = saving.load_checkpoint(args.ckpt)
     value_fn = build_value_function(ckpt["config"], device)
     value_fn.load_state_dict(ckpt["state"]["value"])
@@ -348,7 +346,6 @@ def run(args) -> None:
     import copy as _copy
     serving_policy = _copy.deepcopy(policy)
     serving_policy.requires_grad_(False).eval()
-    serving_policy.train_value_head = False
     use_manual_recurrent_step(serving_policy)   # capturable and fp16-faithful one-frame cells
     print("learner overlap: ON — student serves a published weight copy; "
           "rollouts are one update stale", flush=True)
@@ -372,7 +369,6 @@ def run(args) -> None:
         fname = "medium-v2-torch.pt" if tier == "medium" else f"{tier}-torch.pt"
         path = f"{MODELS}/{fname}"
         pol, pnm, _ = load_policy(path, device)
-        pol.train_value_head = False
         pol.requires_grad_(False)
         pol.eval()
         # all tiers serve from the phillip grid (one stacked forward)

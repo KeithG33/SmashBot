@@ -322,8 +322,10 @@ def convert(args):
         set_linear(lin1, "ResBlock/linear")
         set_linear(lin2, "ResBlock/linear")
 
-    # --- value head (untrained here; policy config used a separate value net) ---
-    set_linear(policy.value_head, "value_head")
+    # --- the reference's value head (untrained: it used a separate value net) is skipped ---
+    H = policy.network.core.output_size
+    take("value_head/b:0", (1,))
+    take("value_head/w:0", (H, 1))
 
     assert cursor[0] == 141, cursor[0]
     missing = [n for n, p in policy.named_parameters() if id(p) not in assigned]

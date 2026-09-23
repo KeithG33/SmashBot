@@ -195,7 +195,6 @@ class Learner:
         teacher: Policy,
         value_function: ValueFunction,
     ):
-        assert not policy.train_value_head, "RL uses the separate value network"
         self.config = config
         self.policy = policy
         self.teacher = teacher
@@ -409,7 +408,6 @@ class Learner:
                 teacher_out = self.teacher.unroll(
                     cframes,
                     self._rows_take(state.teacher, lo, hi, batch_size),
-                    discount=self.config.discount,
                 )
             # VALUE island: everything from here through the value
             # optimizer step stays entirely fp32 — deliberately OUTSIDE
@@ -528,7 +526,7 @@ class Learner:
             self.policy.initial_state(rows, fixed.valid.device),
             fixed.initial_policy_state,
         )
-        out = self.policy.unroll(fixed.frames, init, discount=cfg.discount)
+        out = self.policy.unroll(fixed.frames, init)
         # Probe: pre-clamp max |logit| split by validity (NaN counted as
         # inf so it can't hide from max()).
         with torch.no_grad():
@@ -791,7 +789,6 @@ class Learner:
             out = self.policy.unroll(
                 imf.frames,
                 self.policy.initial_state(batch_size, imf.valid.device),
-                discount=self.config.discount,
             )
             # masked-position NaN-grad armor (see _policy_loss_inner)
             logp = out.log_probs.clamp(-1e4, 0.0)

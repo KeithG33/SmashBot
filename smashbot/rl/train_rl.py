@@ -34,7 +34,7 @@ class RuntimeConfig:
     # deleted on the server — deleted ids are tombstoned and unreusable.
     wandb_id: str = ""
     name: str = "Master Player"
-    compile: bool = True  # compile sample_n (the batched flush)
+    compile: bool = True  # compile the serving copy's sample and the learner cores
     restore: str = ""  # RL checkpoint path, or "auto" for <run_dir>/<tag>/latest.pt
     device: str = "cpu"  # rollouts are CPU-bound; learner device
 

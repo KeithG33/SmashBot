@@ -85,7 +85,6 @@ def _tiny_policy(seed=0):
         policy_config=configs.PolicyConfig(delay=2),
         num_names=4,
     )
-    policy.train_value_head = False  # separate value net, as in production
     return policy
 
 

@@ -70,25 +70,6 @@ class TrainConfig:
             self.data.dataset.meta_path = f"{root}/meta-20k.json"
 
 
-def _state_rows(state, lo, hi, batch):
-    """Rows [lo, hi) of a recurrent state; leaves are [B, ...] or torch-RNN [layers, B, H]."""
-    def take(t):
-        if not isinstance(t, torch.Tensor):
-            return t
-        return t[lo:hi] if t.dim() >= 1 and t.shape[0] == batch else t[:, lo:hi]
-    return tree.map_structure(take, state)
-
-
-def _state_cat(parts, batch):
-    def cat(*ts):
-        if not isinstance(ts[0], torch.Tensor):
-            return ts[0]
-        dim = 0 if ts[0].dim() >= 1 and sum(t.shape[0] for t in ts) == batch else 1
-        return torch.cat(ts, dim=dim)
-    return tree.map_structure(cat, *parts)
-
-
-
 def _to(state, device):
     return tree.map_structure(
         lambda t: t.to(device) if isinstance(t, torch.Tensor) else t, state)
@@ -206,7 +187,6 @@ def main(config: TrainConfig) -> None:
         policy_config=config.policy,
         num_names=config.data.max_names,
     ).to(device)
-    policy.train_value_head = False  # separate value network (production config)
 
     value_name = config.value.name
     if value_name == "match":
@@ -373,37 +353,20 @@ def main(config: TrainConfig) -> None:
             frames, epoch, train_data_state = next(train_stream)
             frames = to_device(frames)
 
-            k = config.learner.grad_accum
-            bounds = [(i * B // k, (i + 1) * B // k) for i in range(k)]
-            mean = lambda ms: tree.map_structure(lambda *xs: sum(xs) / len(xs), *ms)
-
             policy_opt.zero_grad(set_to_none=True)
-            hids, ms = [], []
-            for lo, hi in bounds:
-                fr = frames if k == 1 else tree.map_structure(lambda t: t[lo:hi], frames)
-                hid = train_hidden if k == 1 else _state_rows(train_hidden, lo, hi, B)
-                with autocast():
-                    policy_loss, hid, m = policy_loss_fn(fr, hid)
-                (policy_loss / k).backward()
-                hids.append(detach(hid)); ms.append(m)
-            train_hidden = hids[0] if k == 1 else _state_cat(hids, B)
-            metrics = mean(ms)
+            with autocast():
+                policy_loss, train_hidden, metrics = policy_loss_fn(frames, train_hidden)
+            policy_loss.backward()
+            train_hidden = detach(train_hidden)
             clip_metrics = clip_policy()
             policy_opt.step()
 
             value_opt.zero_grad(set_to_none=True)
-            hids, ms = [], []
-            for lo, hi in bounds:
-                fr = frames if k == 1 else tree.map_structure(lambda t: t[lo:hi], frames)
-                sliced = slice_delayed_frames(fr, config.policy.delay)
-                sliced = tree.map_structure(lambda t: t.detach(), sliced)
-                hid = value_hidden if k == 1 else _state_rows(value_hidden, lo, hi, B)
-                with autocast():
-                    value_loss, hid, m = value_loss_fn(sliced, hid, discount)
-                (value_loss / k).backward()
-                hids.append(detach(hid)); ms.append(m)
-            value_hidden = hids[0] if k == 1 else _state_cat(hids, B)
-            value_metrics = mean(ms)
+            sliced = slice_delayed_frames(frames, config.policy.delay)
+            with autocast():
+                value_loss, value_hidden, value_metrics = value_loss_fn(sliced, value_hidden, discount)
+            value_loss.backward()
+            value_hidden = detach(value_hidden)
             value_clip_metrics = clip_value()
             value_opt.step()
 

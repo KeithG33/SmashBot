@@ -31,7 +31,6 @@ def _lstm_policy(seed=0):
         policy_config=configs.PolicyConfig(delay=2),
         num_names=4,
     )
-    p.train_value_head = False
     return p
 
 

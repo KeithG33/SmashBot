@@ -480,7 +480,6 @@ class SimLeague:
         if self._cfg is None:
             raise RuntimeError("SimLeague needs config_from to load bare-state members")
         pol = build_policy_from_config(self._cfg).to(self.device)
-        pol.train_value_head = False
         pol.requires_grad_(False)
         pol.eval()
         return pol
