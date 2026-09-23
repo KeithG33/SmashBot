@@ -14,6 +14,8 @@ import contextlib
 import dataclasses
 import math
 import os
+import random
+import signal
 import time
 import typing as tp
 
@@ -101,6 +103,106 @@ def _check_architecture(saved: dict, config: "TrainConfig") -> None:
             raise ValueError(f"--{section}.* differs from the checkpoint:\n  saved   {then}\n  current {now}")
 
 
+def _to(state, device):
+    return tree.map_structure(
+        lambda t: t.to(device) if isinstance(t, torch.Tensor) else t, state)
+
+
+def _get_rng() -> dict:
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def _set_rng(rng: dict) -> None:
+    random.setstate(rng["python"])
+    np.random.set_state(rng["numpy"])
+    torch.set_rng_state(rng["torch"])
+    if rng["cuda"] is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(rng["cuda"])
+
+
+class GradClipper:
+    """Clips a network's gradient to `max_norm`, or with AutoClip
+    (Seetharaman et al. 2020) to a percentile of the run's own gradient-norm
+    history, which is checkpointed so a resume clips exactly as the
+    uninterrupted run would."""
+
+    def __init__(self, params, max_norm: float, percentile: float, history=None):
+        assert not (max_norm > 0 and percentile > 0), "one clipping rule at a time"
+        self.params = list(params)
+        self.max_norm, self.percentile = max_norm, percentile
+        self.history = list(history or [])
+
+    def __call__(self) -> dict:
+        if self.percentile > 0:
+            norm = torch.nn.utils.clip_grad_norm_(self.params, math.inf).item()
+            self.history.append(norm)
+            clip = float(np.percentile(self.history, self.percentile))
+            torch.nn.utils.clip_grad_norm_(self.params, clip)
+            return {"grad_norm": norm, "clip_norm": clip}
+        if self.max_norm > 0:
+            norm = torch.nn.utils.clip_grad_norm_(self.params, self.max_norm).item()
+            return {"grad_norm": norm, "clip_norm": self.max_norm}
+        return {}
+
+
+def _resume_state(ckpt: tp.Optional[dict]) -> dict:
+    """The checkpoint's state, with pre-row-tracking checkpoints mapped onto
+    the same keys (cycle position only; rows restart fresh)."""
+    if ckpt is None:
+        return {}
+    state = dict(ckpt["state"])
+    if "train_data" not in state:
+        print("WARNING: checkpoint predates exact resume; data rows restart at "
+              "fresh replays and the run is not a bit-identical continuation")
+        state["train_data"] = {"consumed": state.get("replay_counter", 0), "rows": None}
+        state["test_data"] = {"consumed": state.get("test_replay_counter", 0), "rows": None}
+    return state
+
+
+_RESUME_FREE = {"runtime", "data.num_workers", "data.prefetch", "data.pin_memory"}
+
+
+def _check_config(saved: dict, current: dict, defaults: dict, prefix: str = "") -> None:
+    """A resumed run must be the same experiment; the runtime block and
+    host-only data options are the only fields free to change. A setting the
+    checkpoint predates ran at its default, so that is what it is held to."""
+    for key in sorted(set(saved) | set(current)):
+        path = f"{prefix}{key}"
+        if path in _RESUME_FREE or path.split(".")[0] in _RESUME_FREE:
+            continue
+        a, b = saved.get(key, defaults.get(key)), current.get(key)
+        if isinstance(a, dict) and isinstance(b, dict):
+            _check_config(a, b, defaults.get(key) or {}, prefix=f"{path}.")
+        elif a != b:
+            raise ValueError(f"config.{path} differs from the checkpoint: {a!r} -> {b!r}")
+
+
+class _StopRequest:
+    """First SIGINT/SIGTERM finishes the current step and checkpoints;
+    a second one interrupts immediately."""
+
+    def __init__(self):
+        self.requested = False
+        self.previous = {
+            sig: signal.signal(sig, self._handle) for sig in (signal.SIGINT, signal.SIGTERM)
+        }
+
+    def restore(self):
+        for sig, handler in self.previous.items():
+            signal.signal(sig, handler)
+
+    def _handle(self, signum, frame):
+        if self.requested:
+            raise KeyboardInterrupt
+        self.requested = True
+        print(f"stop requested (signal {signum}); finishing the current step", flush=True)
+
+
 def main(config: TrainConfig) -> None:
     rt = config.runtime
     run_dir = os.path.join(rt.run_dir, rt.tag)
@@ -110,30 +212,23 @@ def main(config: TrainConfig) -> None:
     np.random.seed(rt.seed)
     discount = 0.5 ** (1 / (config.value.reward_halflife * 60))
 
-    # On resume, the checkpoint's name_map is authoritative: indices are
-    # frequency-assigned, so recomputing on changed data would permute them.
-    restored_name_map = None
-    start_replay = 0
-    start_test_replay = 0
-    restored_eval_state = (None, None)
+    ckpt = None
     if rt.restore:
         restore_path = (
             os.path.join(run_dir, "latest.pt") if rt.restore == "auto" else rt.restore
         )
-        _restored = saving.load_checkpoint(restore_path)
-        _check_architecture(_restored["config"], config)
-        _rs = _restored["state"]
-        restored_name_map = _rs.get("name_map")
-        start_replay = _rs.get("replay_counter", 0)
-        start_test_replay = _rs.get("test_replay_counter", 0)
-        restored_eval_state = (_rs.get("eval_hidden"), _rs.get("eval_value_hidden"))
+        ckpt = saving.load_checkpoint(restore_path)
+        _check_architecture(ckpt["config"], config)
+        config.data.dataset.validate()
+        _check_config(ckpt["config"], dataclasses.asdict(config), dataclasses.asdict(TrainConfig()))
+    resume = _resume_state(ckpt)
 
     sources = loader.make_sources(
         config.data,
         extra_frames=config.policy.delay + 1,
-        name_map=restored_name_map,
-        start_replay=start_replay,
-        start_test_replay=start_test_replay,
+        name_map=resume.get("name_map"),
+        train_state=resume.get("train_data"),
+        test_state=resume.get("test_data"),
     )
     print(f"name_map: {sources.name_map}")
 
@@ -159,6 +254,7 @@ def main(config: TrainConfig) -> None:
         num_layers=config.value.num_layers,
         num_heads=config.network.num_heads,
         window=config.value.window or config.network.window,
+        layout=config.value.layout,
     )
     value_fn = ValueFunction(
         build_embed_network(
@@ -174,6 +270,11 @@ def main(config: TrainConfig) -> None:
 
     policy_opt = torch.optim.Adam(policy.parameters(), lr=config.learner.learning_rate)
     value_opt = torch.optim.Adam(value_fn.parameters(), lr=config.learner.learning_rate)
+    clip_history = resume.get("clip_history") or {}
+    clip_policy = GradClipper(policy.parameters(), config.learner.max_grad_norm,
+                              config.learner.autoclip_percentile, clip_history.get("policy"))
+    clip_value = GradClipper(value_fn.parameters(), config.learner.max_grad_norm,
+                             config.learner.autoclip_percentile, clip_history.get("value"))
 
     if config.learner.precision == "bf16" and device == "cuda":
         autocast = lambda: torch.autocast("cuda", dtype=torch.bfloat16)
@@ -183,10 +284,14 @@ def main(config: TrainConfig) -> None:
     policy_loss_fn = policy.imitation_loss
     value_loss_fn = value_fn.loss
     if config.learner.compile and device == "cuda":
-        # Whole-loss compile: dynamo graph-breaks around the cuDNN LSTM (fine)
-        # and fuses the embedding/head/return math around it.
-        policy_loss_fn = torch.compile(policy_loss_fn)
-        value_loss_fn = torch.compile(value_loss_fn)
+        # Compile the pieces with a fixed structure: each core's per-chunk
+        # forward (dynamic over the chunk length; cuDNN recurrent layers stay
+        # eager inside it) and the controller head. The reset chunking, tree
+        # maps and metric .item()s around them stay in Python.
+        torch._dynamo.config.cache_size_limit = 64  # two cores x chunk shapes x cache dtypes
+        for net in (policy.network, value_fn.network):
+            net.core._forward = torch.compile(net.core._forward, dynamic=True)
+        policy.controller_head.distance = torch.compile(policy.controller_head.distance, dynamic=True)
         print("torch.compile enabled (first steps will be slow while compiling)")
 
     n_params = sum(p.numel() for p in policy.parameters())
@@ -196,16 +301,14 @@ def main(config: TrainConfig) -> None:
 
     step = 0
     best_eval_loss = math.inf
-    if rt.restore:
-        path = restore_path
-        ckpt = saving.load_checkpoint(path)
-        policy.load_state_dict(ckpt["state"]["policy"])
-        value_fn.load_state_dict(ckpt["state"]["value"])
-        policy_opt.load_state_dict(ckpt["state"]["policy_opt"])
-        value_opt.load_state_dict(ckpt["state"]["value_opt"])
-        step = ckpt["state"]["step"]
+    if ckpt is not None:
+        policy.load_state_dict(resume["policy"])
+        value_fn.load_state_dict(resume["value"])
+        policy_opt.load_state_dict(resume["policy_opt"])
+        value_opt.load_state_dict(resume["value_opt"])
+        step = resume["step"]
         best_eval_loss = ckpt["best_eval_loss"]
-        print(f"restored from {path} at step {step} (best eval {best_eval_loss:.4f})")
+        print(f"restored from {restore_path} at step {step} (best eval {best_eval_loss:.4f})")
 
     import wandb
 
@@ -220,13 +323,21 @@ def main(config: TrainConfig) -> None:
     )
 
     B = config.data.batch_size
-    train_hidden = policy.initial_state(B, device)
-    value_hidden = value_fn.initial_state(B, device)
-    eval_hidden = policy.initial_state(B, device)
-    eval_value_hidden = value_fn.initial_state(B, device)
-    if restored_eval_state[0] is not None:   # evals carry state across calls; restore it too
-        eval_hidden, eval_value_hidden = tree.map_structure(
-            lambda t: t.to(device) if isinstance(t, torch.Tensor) else t, restored_eval_state)
+    hidden = {
+        "train_hidden": policy.initial_state(B, device),
+        "value_hidden": value_fn.initial_state(B, device),
+        "eval_hidden": policy.initial_state(B, device),
+        "eval_value_hidden": value_fn.initial_state(B, device),
+    }
+    for key in hidden:
+        if resume.get(key) is not None:
+            hidden[key] = _to(resume[key], device)
+    train_hidden, value_hidden = hidden["train_hidden"], hidden["value_hidden"]
+    eval_hidden, eval_value_hidden = hidden["eval_hidden"], hidden["eval_value_hidden"]
+    if resume.get("rng") is not None:
+        _set_rng(resume["rng"])
+    train_data_state = resume.get("train_data")
+    test_data_state = resume.get("test_data")
 
     train_stream = loader.TorchBatchStream(
         sources.train, config.data, encode_network=policy.network
@@ -252,21 +363,25 @@ def main(config: TrainConfig) -> None:
                 "value_opt": value_opt.state_dict(),
                 "step": step,
                 "name_map": sources.name_map,
-                "replay_counter": sources.train.replay_counter,
-                "test_replay_counter": sources.test.replay_counter,
-                "eval_hidden": tree.map_structure(lambda t: t.cpu() if isinstance(t, torch.Tensor) else t, eval_hidden),
-                "eval_value_hidden": tree.map_structure(lambda t: t.cpu() if isinstance(t, torch.Tensor) else t, eval_value_hidden),
+                "train_data": train_data_state,
+                "test_data": test_data_state,
+                "train_hidden": _to(train_hidden, "cpu"),
+                "value_hidden": _to(value_hidden, "cpu"),
+                "eval_hidden": _to(eval_hidden, "cpu"),
+                "eval_value_hidden": _to(eval_value_hidden, "cpu"),
+                "rng": _get_rng(),
+                "clip_history": {"policy": clip_policy.history, "value": clip_value.history},
             },
             best_eval_loss,
         )
 
     def run_eval() -> dict:
-        nonlocal eval_hidden, eval_value_hidden
+        nonlocal eval_hidden, eval_value_hidden, test_data_state
         policy.eval()
         losses, value_metrics_acc = [], []
         with torch.no_grad():
             for _ in range(rt.eval_batches):
-                frames, _ = next(eval_stream)
+                frames, _, test_data_state = next(eval_stream)
                 frames = to_device(frames)
                 with autocast():
                     loss, eval_hidden, m = policy.imitation_loss(frames, eval_hidden)
@@ -291,10 +406,13 @@ def main(config: TrainConfig) -> None:
     )
     t_window = time.perf_counter()
     step_window = step
+    stop = _StopRequest()
+    at_boundary = True
     try:
-        while step < rt.steps:
+        while step < rt.steps and not stop.requested:
+            at_boundary = False
             step += 1
-            frames, epoch = next(train_stream)
+            frames, epoch, train_data_state = next(train_stream)
             frames = to_device(frames)
 
             k = config.learner.grad_accum
@@ -312,10 +430,7 @@ def main(config: TrainConfig) -> None:
                 hids.append(detach(hid)); ms.append(m)
             train_hidden = hids[0] if k == 1 else _state_cat(hids, B)
             metrics = mean(ms)
-            if config.learner.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    policy.parameters(), config.learner.max_grad_norm
-                )
+            clip_metrics = clip_policy()
             policy_opt.step()
 
             value_opt.zero_grad(set_to_none=True)
@@ -331,10 +446,7 @@ def main(config: TrainConfig) -> None:
                 hids.append(detach(hid)); ms.append(m)
             value_hidden = hids[0] if k == 1 else _state_cat(hids, B)
             value_metrics = mean(ms)
-            if config.learner.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    value_fn.parameters(), config.learner.max_grad_norm
-                )
+            value_clip_metrics = clip_value()
             value_opt.step()
 
             if step % rt.log_interval == 0:
@@ -352,6 +464,8 @@ def main(config: TrainConfig) -> None:
                            for k, v in metrics["controller_flat"].items()},
                         "train/value/loss": value_metrics["loss"],
                         "train/value/uev": value_metrics["uev"],
+                        **{f"train/{k}": v for k, v in clip_metrics.items()},
+                        **{f"train/value/{k}": v for k, v in value_clip_metrics.items()},
                     },
                     step=step,
                 )
@@ -387,9 +501,14 @@ def main(config: TrainConfig) -> None:
             if step % rt.checkpoint_interval == 0:
                 save("latest.pt")
             pbar.update(1)
+            at_boundary = True
     finally:
+        stop.restore()
         pbar.close()
-        save("latest.pt")
+        if at_boundary:
+            save("latest.pt")
+        else:
+            print(f"interrupted mid-step {step}; latest.pt left as it was")
         train_stream.stop()
         eval_stream.stop()
         wandb.finish()

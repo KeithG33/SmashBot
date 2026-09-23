@@ -101,8 +101,9 @@ def test_prefetch_stream():
     stream = loader.TorchBatchStream(sources.train, cfg)
     try:
         for _ in range(5):
-            batch, epoch = next(stream)
+            batch, epoch, state = next(stream)
             assert batch.game.stage.shape == (2, 16 + EXTRA_FRAMES)
             assert isinstance(epoch, float)
+            assert len(state["rows"]) == 2
     finally:
         stream.stop()

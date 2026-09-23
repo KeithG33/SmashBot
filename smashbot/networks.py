@@ -555,8 +555,7 @@ class SGUBlock(nn.Module):
         attn, new_kv = self._attend(xn, kv_cache, attn_mask)
         x = x + self.mix_out(u * (v_mixed + attn))
 
-        gate, up = self.ffw_in(x).chunk(2, dim=-1)
-        x = x + self.down(torch.nn.functional.silu(gate) * up)
+        x = _swiglu(self, x)
 
         return x, v_new, new_kv
 
@@ -567,14 +566,55 @@ class SGUBlock(nn.Module):
         attn, new_kv = self._attend(xn, kv_cache, attn_mask)
         x = x + self.mix_out(u * (v_mixed + attn))
 
-        gate, up = self.ffw_in(x).chunk(2, dim=-1)
-        x = x + self.down(torch.nn.functional.silu(gate) * up)
+        x = _swiglu(self, x)
 
         return x, new_v, new_kv
 
 
+def _swiglu(block, x):
+    gate, up = block.ffw_in(x).chunk(2, dim=-1)
+    return x + block.down(torch.nn.functional.silu(gate) * up)
+
+
+class RecurrentBlock(nn.Module):
+    """An SGUBlock with its conv + attention mixing replaced by a residual
+    GRU or LSTM, as in slippi-ai's tx_like layers: game-long memory in one
+    fp32 tensor per row ([d], or [2, d] = (h, c) for the LSTM) instead of a
+    window cache. The cell runs in fp32 whatever the autocast (recurrent
+    state loses too much in half precision)."""
+
+    def __init__(self, d: int, cell: str):
+        super().__init__()
+        self.norm = RMSNorm(d)
+        self.rnn = {"gru": nn.GRU, "lstm": nn.LSTM}[cell](d, d, batch_first=True)
+        self.state_shape = (d,) if cell == "gru" else (2, d)
+
+        hidden = int(8 * d / 3 / 64) * 64
+        self.ffw_in = nn.Sequential(
+            RMSNorm(d),
+            nn.Linear(d, 2 * hidden, bias=False)
+        )
+        self.down = nn.Linear(hidden, d, bias=False)
+        nn.init.zeros_(self.down.weight)
+
+    def mix(self, x, h):
+        """x [B, T, d], h [B, *state_shape] fp32 -> (x, h)."""
+        xn = self.norm(x)
+        with torch.autocast(x.device.type, enabled=False):
+            h = h.float()
+            if isinstance(self.rnn, nn.LSTM):
+                out, (hn, cn) = self.rnn(xn.float(), tuple(t[None].contiguous() for t in h.unbind(1)))
+                h = torch.stack([hn[0], cn[0]], dim=1)
+            else:
+                out, hn = self.rnn(xn.float(), h[None].contiguous())
+                h = hn[0]
+        return _swiglu(self, x + out.to(x.dtype)), h
+
+
 class SGUCore(Network):
-    """Stack of aMLP/SGU blocks. State per layer = ring of last window-1
+    """Stack of aMLP/SGU blocks, optionally interleaved with recurrent blocks
+    (`layout`, one letter per layer: s = SGU, g = GRU, l = LSTM; a recurrent
+    layer's state is one fp32 tensor). SGU layer state = ring of last window-1
     v-vectors (conv) + kv pairs (tiny attention), plus a shared cache_len.
     Hard per-layer horizon of `window` frames."""
 
@@ -586,14 +626,19 @@ class SGUCore(Network):
         window: int = 8,
         attn_heads: int = 1,
         attn_head_dim: int = 64,
+        layout: str = "",
     ):
         super().__init__()
+        layout = layout or "s" * num_layers
+        assert len(layout) == num_layers and set(layout) <= {"s", "g", "l"}, layout
         self.d = hidden_size
         self.window = window
         self.attn_width = attn_heads * attn_head_dim
         self.encoder = nn.Linear(input_size, hidden_size)
         self.blocks = nn.ModuleList(
-            [SGUBlock(hidden_size, window, attn_heads, attn_head_dim) for _ in range(num_layers)]
+            [SGUBlock(hidden_size, window, attn_heads, attn_head_dim) if kind == "s"
+             else RecurrentBlock(hidden_size, {"g": "gru", "l": "lstm"}[kind])
+             for kind in layout]
         )
         self.final_norm = RMSNorm(hidden_size)
         self.output_size = hidden_size
@@ -606,8 +651,8 @@ class SGUCore(Network):
                 (
                     z(batch_size, self.window - 1, self.d),
                     z(batch_size, self.window - 1, 2 * self.attn_width),
-                )
-                for _ in self.blocks
+                ) if isinstance(block, SGUBlock) else z(batch_size, *block.state_shape)
+                for block in self.blocks
             ],
         }
 
@@ -647,8 +692,9 @@ class SGUCore(Network):
         """Ring state -> the chronological state the learner expects."""
         idx, valid = self._ring_index(state["ptr"], state["cache_len"], state["cache_len"].device)
         layers = [
-            (torch.where(valid[:, :, None], v_ring.index_select(1, idx), 0.0), kv)
-            for v_ring, kv in state["layers"]
+            (torch.where(valid[:, :, None], layer[0].index_select(1, idx), 0.0), layer[1])
+            if isinstance(layer, tuple) else layer
+            for layer in state["layers"]
         ]
         return {"cache_len": state["cache_len"], "layers": layers}
 
@@ -660,8 +706,9 @@ class SGUCore(Network):
         state = {
             "cache_len": torch.where(reset, 0, prev_state["cache_len"]),
             "ptr": prev_state["ptr"],
-            "layers": [(v_ring, _mask_state(reset, ikv, kv))
-                       for (v_ring, kv), (_, ikv) in zip(prev_state["layers"], initial["layers"])],
+            "layers": [(layer[0], _mask_state(reset, init[1], layer[1])) if isinstance(layer, tuple)
+                       else _mask_state(reset, init, layer)
+                       for layer, init in zip(prev_state["layers"], initial["layers"])],
         }
         return self.step(inputs, state)
 
@@ -674,7 +721,12 @@ class SGUCore(Network):
             assert T == 1, "ring mode is the serving path"
             idx, valid = self._ring_index(state["ptr"], state["cache_len"], inputs.device)
         new_layers = []
-        for block, (v_cache, kv_cache) in zip(self.blocks, state["layers"]):
+        for block, layer in zip(self.blocks, state["layers"]):
+            if isinstance(block, RecurrentBlock):
+                x, h = block.mix(x, layer)
+                new_layers.append(h)
+                continue
+            v_cache, kv_cache = layer
             if ring:
                 x, v_new, nkv = block.mix_ring(x, v_cache, kv_cache, mask, idx, valid)
                 new_layers.append((v_new, nkv))
@@ -793,6 +845,7 @@ def build_embed_network(
             window=network_config.window,
             attn_heads=network_config.attn_heads,
             attn_head_dim=network_config.attn_head_dim,
+            layout=network_config.layout,
         )
     else:
         raise ValueError(f"unknown network name: {name}")

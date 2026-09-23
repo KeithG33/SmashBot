@@ -47,6 +47,9 @@ class NetworkConfig:
     # sgu only: the tiny attention's shape (aMLP's is one head of 64)
     attn_heads: int = 1
     attn_head_dim: int = 64
+    # sgu only: one letter per layer, s = SGU block, g = GRU, l = LSTM (a
+    # residual fp32 cell in place of the conv + attention mixing); empty = all SGU
+    layout: str = ""
 
 
 @dataclasses.dataclass
@@ -68,6 +71,8 @@ class ValueConfig:
     # Long windows mildly hurt value estimation (uev 0.337 @W256 vs 0.325
     # @W64), so big trains pass an explicit smaller window here.
     window: int = 0
+    # sgu only: one letter per layer as network.layout; empty = all SGU
+    layout: str = ""
     reward_halflife: float = 4.0  # seconds; discount = 0.5 ** (1 / (halflife * 60))
 
 
@@ -77,6 +82,9 @@ class LearnerConfig:
     value_cost: float = 0.5
     # Faithful slippi-ai defaults: fp32, no clipping.
     max_grad_norm: float = 0.0
+    # AutoClip (Seetharaman et al. 2020): clip each network to this percentile
+    # of its own gradient-norm history instead of a constant; 0 = off
+    autoclip_percentile: float = 0.0
     precision: str = "fp32"  # bf16 | fp32
     compile: bool = False
     # BC: micro-batches per optimizer step (batch_size stays the logical batch;
