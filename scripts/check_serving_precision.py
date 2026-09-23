@@ -37,7 +37,9 @@ NENV = 8
 
 def record_stream(frames):
     """Drive player 0 with a Phillip tier; record player 1's view (the
-    seat a Phillip would sit in) and the reset masks."""
+    seat a Phillip would sit in) and the reset masks. Seeded: the driver
+    samples, and agreement counts depend on which near-ties a stream hits."""
+    torch.manual_seed(0)
     policy, nm, _ = load_policy(DRIVER, DEV)
     policy.eval()
     agent = BatchedPolicyAgent(policy, NENV, name_code=resolve_name_code(nm, "Master Player"),
@@ -88,12 +90,13 @@ def batched_arm(policy, name_code, precision, state_dtype, manual):
 
 
 def compare(name, ref_logits, arm_logits, stats):
-    s = stats.setdefault(name, {"agree": 0, "total": 0, "max_rel": 0.0, "frames_diff": 0, "l1": 0.0, "n": 0})
+    s = stats.setdefault(name, {"agree": 0, "total": 0, "kl": 0.0, "frames_diff": 0, "l1": 0.0, "n": 0})
     frame_diff = False
     for lr, la in zip(tree.flatten(ref_logits), tree.flatten(arm_logits)):
         lr, la = lr.float(), la.float()
         d = (lr - la).abs()
-        s["max_rel"] = max(s["max_rel"], (d.max() / (lr.abs().max() + 1e-6)).item())
+        p = torch.softmax(lr, -1)
+        s["kl"] += (p * (torch.log_softmax(lr, -1) - torch.log_softmax(la, -1))).sum(-1).mean().item()
         s["l1"] += d.mean().item(); s["n"] += 1
         agree = (lr.argmax(-1) == la.argmax(-1)).sum().item()
         total = lr.argmax(-1).numel()
@@ -135,9 +138,9 @@ def main():
             compare(name, lref, arm(st, r), stats)
 
     print(f"\nvs fp32 reference (league path, fp32 weights, manual cells), {frames} frames x {NENV} envs, argmax actions")
-    print(f"{'arm':52s} {'component agreement':>20s} {'frames w/ any diff':>19s} {'max rel logit d':>16s} {'mean |d|':>9s}")
+    print(f"{'arm':52s} {'component agreement':>20s} {'frames w/ any diff':>19s} {'mean KL(ref|arm)':>17s} {'mean |d|':>9s}")
     for name, s in stats.items():
-        print(f"{name:52s} {100 * s['agree'] / s['total']:19.3f}% {s['frames_diff']:19d} {s['max_rel']:16.2e} {s['l1'] / s['n']:9.4f}")
+        print(f"{name:52s} {100 * s['agree'] / s['total']:19.3f}% {s['frames_diff']:19d} {s['kl'] / s['n']:17.2e} {s['l1'] / s['n']:9.4f}")
     print("SERVING_PRECISION_CHECK_DONE")
 
 
