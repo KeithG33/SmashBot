@@ -296,7 +296,10 @@ that the latency table inverted; delay 18 vs 21).
   norm with a running estimate, so a spike never reaches Adam's moments. Aimed at
   LLM pre-training spikes, which our runs do not show, so AutoClip first.
 
-## Try a standard FFN in place of the SwiGLU FFN in SGUBlock (Keith, 2026-09-20)
+## DONE, keep SwiGLU: standard FFN in place of the SwiGLU FFN in SGUBlock (Keith, 2026-09-20)
+- Result (2026-09-22, 6/576 paper block, equal params, 72k steps, same seed/data): the
+  4x GELU MLP was ~0.003 WORSE on eval throughout, for 0.86 GiB less memory and 1%
+  more speed. Not worth it. Original sizing notes kept below.
 - Equal params: SwiGLU has three d x h matrices (h = 1536 at d = 576), a standard
   FFN has two, so equal params means h' = 1.5 h = 2304 = exactly 4d. Same FLOPs.
 - Training memory, activations kept for backward per token per layer: SwiGLU keeps
