@@ -49,3 +49,27 @@ def test_checkpoints_that_predate_a_setting_take_its_default():
     current.network.attn_heads = 2
     with pytest.raises(ValueError, match="network.attn_heads"):
         train_bc._check_config(saved, dataclasses.asdict(current), defaults)
+
+
+def test_a_removed_setting_in_a_saved_config_is_ignored():
+    """gate_gelu / v_norm became unconditional; checkpoints that carry them
+    must still build and resume."""
+    saved = dataclasses.asdict(configs.NetworkConfig(name="sgu", hidden_size=32, num_layers=1, window=8))
+    saved["gate_gelu"] = True
+    assert configs.from_dict(configs.NetworkConfig, saved).hidden_size == 32
+    cfg = train_bc.TrainConfig(network=configs.NetworkConfig(name="sgu", hidden_size=32, num_layers=1, window=8))
+    whole = dataclasses.asdict(cfg)
+    whole["network"]["gate_gelu"] = True
+    train_bc._check_config(whole, dataclasses.asdict(cfg), dataclasses.asdict(train_bc.TrainConfig()))
+
+
+def test_pre_paper_block_weights_are_refused_and_paper_block_weights_renamed():
+    from smashbot import networks
+    old_names = {"network.core.blocks.0.uv.weight": None}
+    with pytest.raises(ValueError, match="paper block"):
+        networks.check_loadable({"gate_gelu": False, "v_norm": True}, old_names)
+    with pytest.raises(ValueError, match="paper block"):
+        networks.check_loadable({}, old_names)
+    networks.check_loadable({"gate_gelu": True, "v_norm": True}, old_names)
+    assert networks.current_names(old_names) == {"network.core.blocks.0.uv.0.weight": None}
+    networks.check_loadable({}, {"network.core.blocks.0.uv.0.weight": None})   # today's names need no flags

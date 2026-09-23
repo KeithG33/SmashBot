@@ -239,16 +239,30 @@ class Sequential(Network):
 
 
 _FFW_IN_RENAMES = {"ffw_norm.weight": "ffw_in.0.weight", "gate_up.weight": "ffw_in.1.weight"}
+# the (u, v) projection became Sequential(Linear, GELU) when the paper block
+# went unconditional; only a checkpoint trained WITH that GELU may take the rename
+_UV_RENAMES = {"uv.weight": "uv.0.weight"}
+_RENAMES = {**_FFW_IN_RENAMES, **_UV_RENAMES}
 
 
 def current_names(state_dict: dict) -> dict:
     """A state dict saved under older submodule names, under today's names."""
     def rename(key: str) -> str:
-        for old, new in _FFW_IN_RENAMES.items():
+        for old, new in _RENAMES.items():
             if key.endswith("." + old):
                 return key[: -len(old)] + new
         return key
     return {rename(k): v for k, v in state_dict.items()}
+
+
+def check_loadable(network_cfg: dict, state_dict: dict) -> None:
+    """A SGU checkpoint saved before the GELU on (u, v) and the norm on v
+    became unconditional computes a different network: refuse it rather than
+    load its weights into today's block."""
+    if any(k.endswith(".uv.weight") for k in state_dict) and not (
+            network_cfg.get("gate_gelu") and network_cfg.get("v_norm")):
+        raise ValueError("checkpoint predates the unconditional paper block (no GELU on uv "
+                         "/ no v norm); current code cannot run it")
 
 
 def _accept_renamed(module: nn.Module, renames: dict[str, str]) -> None:
@@ -361,7 +375,7 @@ class TransformerBlock(nn.Module):
 
         hidden = int(8 * d / 3 / 64) * 64  # SwiGLU sizing, 64-aligned
         self.ffw_in = nn.Sequential(RMSNorm(d), nn.Linear(d, 2 * hidden, bias=False))
-        _accept_renamed(self, _FFW_IN_RENAMES)
+        _accept_renamed(self, _RENAMES)
         self.down = nn.Linear(hidden, d, bias=False)
         nn.init.zeros_(self.down.weight)
 
@@ -533,7 +547,7 @@ class SGUBlock(nn.Module):
             RMSNorm(d),
             nn.Linear(d, 2 * hidden, bias=False)
         )
-        _accept_renamed(self, _FFW_IN_RENAMES)
+        _accept_renamed(self, _RENAMES)
         self.down = nn.Linear(hidden, d, bias=False)
         nn.init.zeros_(self.down.weight)
 

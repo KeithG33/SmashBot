@@ -476,22 +476,10 @@ class SimLeague:
     def _make_skeleton(self):
         """Empty policy built from config_from (snapshots + fox imports are
         bare state_dicts, no config of their own)."""
-        from smashbot import configs, embed as embed_lib
-        from smashbot.policy import build_policy
+        from smashbot.policy import build_policy_from_config
         if self._cfg is None:
             raise RuntimeError("SimLeague needs config_from to load bare-state members")
-        cfg = self._cfg
-        pol = build_policy(
-            embed_config=embed_lib.EmbedConfig(),
-            controller_config=embed_lib.ControllerConfig(
-                axis_spacing=cfg["head"]["axis_spacing"],
-                shoulder_spacing=cfg["head"]["shoulder_spacing"],
-            ),
-            network_config=configs.NetworkConfig(**cfg["network"]),
-            head_config=configs.ControllerHeadConfig(**cfg["head"]),
-            policy_config=configs.PolicyConfig(**cfg["policy"]),
-            num_names=cfg["data"]["max_names"],
-        ).to(self.device)
+        pol = build_policy_from_config(self._cfg).to(self.device)
         pol.train_value_head = False
         pol.requires_grad_(False)
         pol.eval()
@@ -499,7 +487,9 @@ class SimLeague:
 
     def _load_into(self, skeleton, path):
         import torch as _torch
+        from smashbot.networks import check_loadable
         state = _torch.load(path, map_location=self.device, weights_only=True)
+        check_loadable(self._cfg["network"], state)
         with _torch.no_grad():
             return skeleton.load_state_dict(state, strict=True)
 

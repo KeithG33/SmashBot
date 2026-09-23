@@ -27,7 +27,7 @@ import tyro
 from smashbot import configs, embed as embed_lib, saving
 from smashbot.data import loader
 from smashbot.delay import slice_delayed_frames
-from smashbot.networks import build_embed_network
+from smashbot.networks import build_embed_network, check_loadable
 from smashbot.policy import build_policy
 from smashbot.training import GradClipper, compile_cores
 from smashbot.value import ValueFunction
@@ -131,11 +131,14 @@ _RESUME_FREE = {"runtime", "data.num_workers", "data.prefetch", "data.pin_memory
 def _check_config(saved: dict, current: dict, defaults: dict, prefix: str = "") -> None:
     """A resumed run must be the same experiment; the runtime block and
     host-only data options are the only fields free to change. A setting the
-    checkpoint predates ran at its default, so that is what it is held to."""
+    checkpoint predates ran at its default, so that is what it is held to;
+    a setting the code no longer has is ignored (see configs.from_dict)."""
     for key in sorted(set(saved) | set(current)):
         path = f"{prefix}{key}"
         if path in _RESUME_FREE or path.split(".")[0] in _RESUME_FREE:
             continue
+        if key not in current and key not in defaults:
+            continue   # a removed setting: its behaviour became unconditional
         a, b = saved.get(key, defaults.get(key)), current.get(key)
         if isinstance(a, dict) and isinstance(b, dict):
             _check_config(a, b, defaults.get(key) or {}, prefix=f"{path}.")
@@ -256,6 +259,7 @@ def main(config: TrainConfig) -> None:
     step = 0
     best_eval_loss = math.inf
     if ckpt is not None:
+        check_loadable(ckpt["config"]["network"], resume["policy"])
         policy.load_state_dict(resume["policy"])
         value_fn.load_state_dict(resume["value"])
         policy_opt.load_state_dict(resume["policy_opt"])

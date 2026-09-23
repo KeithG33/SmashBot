@@ -5,6 +5,14 @@ import dataclasses
 from slippi_ai.data import DatasetConfig
 
 
+def from_dict(cls, saved: dict):
+    """A config from a checkpoint's saved dict. A key the class no longer
+    has is a setting whose behaviour became unconditional (gate_gelu, v_norm)
+    and is dropped; a key the checkpoint predates takes its default."""
+    fields = {f.name for f in dataclasses.fields(cls)}
+    return cls(**{k: v for k, v in saved.items() if k in fields})
+
+
 @dataclasses.dataclass
 class DataConfig:
     """Wraps slippi-ai's DatasetConfig plus DataSource/bridge options."""

@@ -20,27 +20,18 @@ import torch
 from slippi_ai import controller_lib
 from slippi_ai import dolphin as dolphin_lib
 
-from smashbot import configs, embed as embed_lib, saving
+from smashbot import saving
 from smashbot.eval.agent import DelayedAgent
 from smashbot.eval.report import GameRecord
 from smashbot.eval.dolphin_setup import make_dolphin  # noqa: F401  (re-export)
-from smashbot.policy import build_policy
+from smashbot.networks import check_loadable
+from smashbot.policy import build_policy_from_config
 
 
 def load_policy(ckpt_path: str, device: str):
     ckpt = saving.load_checkpoint(ckpt_path)
-    cfg = ckpt["config"]
-    policy = build_policy(
-        embed_config=embed_lib.EmbedConfig(),
-        controller_config=embed_lib.ControllerConfig(
-            axis_spacing=cfg["head"]["axis_spacing"],
-            shoulder_spacing=cfg["head"]["shoulder_spacing"],
-        ),
-        network_config=configs.NetworkConfig(**cfg["network"]),
-        head_config=configs.ControllerHeadConfig(**cfg["head"]),
-        policy_config=configs.PolicyConfig(**cfg["policy"]),
-        num_names=cfg["data"]["max_names"],
-    ).to(device)
+    check_loadable(ckpt["config"]["network"], ckpt["state"]["policy"])
+    policy = build_policy_from_config(ckpt["config"]).to(device)
     policy.load_state_dict(ckpt["state"]["policy"])
     policy.eval()
     name_map = ckpt["state"].get("name_map", {})

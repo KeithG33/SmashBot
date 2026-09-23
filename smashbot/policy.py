@@ -232,6 +232,23 @@ class Policy(nn.Module):
         return next_action, final_state
 
 
+def build_policy_from_config(cfg: dict) -> Policy:
+    """A policy from a checkpoint's saved config dict."""
+    from smashbot import configs, embed as embed_lib
+
+    return build_policy(
+        embed_config=embed_lib.EmbedConfig(),
+        controller_config=embed_lib.ControllerConfig(
+            axis_spacing=cfg["head"]["axis_spacing"],
+            shoulder_spacing=cfg["head"]["shoulder_spacing"],
+        ),
+        network_config=configs.from_dict(configs.NetworkConfig, cfg["network"]),
+        head_config=configs.from_dict(configs.ControllerHeadConfig, cfg["head"]),
+        policy_config=configs.from_dict(configs.PolicyConfig, cfg["policy"]),
+        num_names=cfg["data"]["max_names"],
+    )
+
+
 def build_policy(
     embed_config,
     controller_config,
