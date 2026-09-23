@@ -179,31 +179,6 @@ class BatchedPolicyAgent:
             return state
         return self.policy.network.cache_state(state, self.state_dtype)
 
-    def reset_env(self, i: int) -> None:
-        """Fresh game in env i: zero its recurrent state, queue, and prev action."""
-        mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self._name.device)
-        mask[i] = True
-        if self._ring:   # stale ring slots are masked by cache_len at read time
-            self.hidden["cache_len"][i] = 0
-            for layer in self.hidden["layers"]:
-                (layer[1] if isinstance(layer, tuple) else layer)[i].zero_()
-        else:
-            # in place: a captured graph holds pointers to these buffers
-            fresh = _mask_state(
-                mask,
-                self._cast_state(self.policy.initial_state(self.num_envs, self.device)),
-                self.hidden,
-            )
-            tree.map_structure(
-                lambda dst, src: dst.copy_(src) if isinstance(dst, torch.Tensor) else None,
-                self.hidden, fresh,
-            )
-        self._queues[i] = collections.deque([self._neutral()] * self.delay)
-        tree.map_structure(
-            lambda dst, src: dst[i].copy_(src[i]),
-            self._prev_action, self._neutral_encoded,
-        )
-
     @torch.no_grad()
     def set_flat_controllers(self, flat: bool = True) -> None:
         """Switch the controller output format (rows vs structs); the

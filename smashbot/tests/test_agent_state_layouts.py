@@ -5,7 +5,6 @@ caches, hybrid (SGU + recurrent) and torch-RNN (tx_like) state.
   (LSTM h/c, GRU h) stays fp32.
 - LeagueAgent.move_cell moves one seat for every layout (torch RNN state is
   [layers, N, H], not batch-first).
-- BatchedPolicyAgent.reset_env resets one env in place for every layout.
 """
 import numpy as np
 import pytest
@@ -80,31 +79,3 @@ def test_move_cell_moves_one_seat(name, layout):
     for n in (0, 2):   # the other seats of the destination slice are untouched
         for a, b in zip(seat(after, 1, n), seat(before, 1, n)):
             assert torch.equal(a, b)
-
-
-@pytest.mark.parametrize("name,layout", LAYOUTS)
-def test_reset_env_resets_one_env_in_place(name, layout):
-    policy = _policy(name, layout)
-    N = 3
-    agent = BatchedPolicyAgent(policy, N, name_code=1, device="cpu")
-    rng = np.random.default_rng(0)
-    game_embed = dict(policy.network.embed_state_action.embedding)["state"]
-    st = _rand_states(game_embed, (N,), rng)
-    for _ in range(3):
-        agent.infer(st, torch.zeros(N, dtype=torch.bool), want_snapshot=False)
-    ids = [t.data_ptr() for t in tree.flatten(agent.hidden) if isinstance(t, torch.Tensor)]
-    before = tree.map_structure(lambda t: t.clone() if isinstance(t, torch.Tensor) else t, agent.hidden)
-    agent.reset_env(1)
-    fresh = policy.initial_state(N)
-    for t_after, t_before, t_fresh in zip(*(
-            [t for t in tree.flatten(x) if isinstance(t, torch.Tensor)] for x in (agent.hidden, before, fresh))):
-        if t_after.dim() >= 1 and t_after.shape[0] == N:
-            row = lambda t, i: t[i]
-        else:   # torch RNN state [layers, N, H]
-            row = lambda t, i: t[:, i]
-        if t_after.is_floating_point():
-            assert torch.equal(row(t_after, 1), row(t_fresh, 1).to(t_after.dtype))
-        for i in (0, 2):
-            assert torch.equal(row(t_after, i), row(t_before, i))
-    assert [t.data_ptr() for t in tree.flatten(agent.hidden) if isinstance(t, torch.Tensor)] == ids, \
-        "reset must reuse the buffers a captured graph points at"

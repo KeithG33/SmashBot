@@ -87,9 +87,11 @@ def test_batched_agent_matches_independent_runs(monkeypatch):
     game_embed = dict(sae.embedding)["state"]
 
     agent = BatchedPolicyAgent(policy, num_envs=2, name_code=1)
+    history = []
     for t in range(6):
         state1 = _rand_states(game_embed, (1,), rng)
         both = tree.map_structure(lambda x: torch.cat([x, x], dim=0), state1)
+        history.append(both)
         controllers, records, _ = agent.step(both)
         (record,) = records  # batch_steps=1: one record per step
         # ...but the two identical envs see identical logits every frame
@@ -103,19 +105,19 @@ def test_batched_agent_matches_independent_runs(monkeypatch):
             record.prev_action,
         )
 
-    # resetting env 0 must not disturb env 1's recurrent state
-    before = tree.map_structure(
-        lambda t_: t_.clone() if isinstance(t_, torch.Tensor) else t_,
-        agent.hidden,
-    )
-    agent.reset_env(0)
+    # a reset flagged for env 0 must not disturb env 1: a twin agent with the
+    # same history but no reset sees the same logits for env 1
+    twin = BatchedPolicyAgent(policy, num_envs=2, name_code=1)
+    for both in history:
+        twin.step(both)
+    both = tree.map_structure(lambda x: torch.cat([x, x], dim=0), _rand_states(game_embed, (1,), rng))
+    _, records, _ = agent.step(both, resets=torch.tensor([True, False]))
+    _, plain, _ = twin.step(both, resets=torch.tensor([False, False]))
     tree.map_structure(
-        lambda a, b: torch.testing.assert_close(a[1], b[1])
-        if isinstance(a, torch.Tensor) and a.shape and a.shape[0] == 2
-        else None,
-        before,
-        agent.hidden,
-    )
+        lambda a, b: torch.testing.assert_close(a[1], b[1]), records[0].logits, plain[0].logits)
+    with pytest.raises(AssertionError):   # and env 0 did reset
+        tree.map_structure(
+            lambda a, b: torch.testing.assert_close(a[0], b[0]), records[0].logits, plain[0].logits)
 
 
 def test_assembled_trajectory_feeds_learner():
