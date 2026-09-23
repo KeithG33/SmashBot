@@ -89,21 +89,6 @@ def _state_cat(parts, batch):
 
 
 
-def _check_architecture(saved: dict, config: "TrainConfig") -> None:
-    """Weights load into any model of the same shapes, so settings that change
-    behavior without changing shapes (value.reward_halflife, network.ln_eps)
-    are only caught by value. Keys a checkpoint predates take their defaults."""
-    for section, cls in (
-        ("network", configs.NetworkConfig),
-        ("head", configs.ControllerHeadConfig),
-        ("policy", configs.PolicyConfig),
-        ("value", configs.ValueConfig),
-    ):
-        then, now = cls(**saved[section]), getattr(config, section)
-        if then != now:
-            raise ValueError(f"--{section}.* differs from the checkpoint:\n  saved   {then}\n  current {now}")
-
-
 def _to(state, device):
     return tree.map_structure(
         lambda t: t.to(device) if isinstance(t, torch.Tensor) else t, state)
@@ -194,7 +179,6 @@ def main(config: TrainConfig) -> None:
             os.path.join(run_dir, "latest.pt") if rt.restore == "auto" else rt.restore
         )
         ckpt = saving.load_checkpoint(restore_path)
-        _check_architecture(ckpt["config"], config)
         config.data.dataset.validate()
         _check_config(ckpt["config"], dataclasses.asdict(config), dataclasses.asdict(TrainConfig()))
     resume = _resume_state(ckpt)
@@ -434,8 +418,8 @@ def main(config: TrainConfig) -> None:
                            for k, v in metrics["controller_flat"].items()},
                         "train/value/loss": value_metrics["loss"],
                         "train/value/uev": value_metrics["uev"],
-                        **{f"train/{k}": v for k, v in clip_metrics.items()},
-                        **{f"train/value/{k}": v for k, v in value_clip_metrics.items()},
+                        **{f"train/{k}": v for k, v in clip_metrics.items() if math.isfinite(v)},
+                        **{f"train/value/{k}": v for k, v in value_clip_metrics.items() if math.isfinite(v)},
                     },
                     step=step,
                 )

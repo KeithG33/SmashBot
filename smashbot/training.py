@@ -53,7 +53,7 @@ def compile_cores(policy, value_fn) -> None:
     inside it) and the controller head. The reset chunking, tree maps and
     metric .item()s around them stay in Python. For the learner's copies
     only: a serving copy has its own compile inside its CUDA-graph capture."""
-    torch._dynamo.config.cache_size_limit = 64  # two cores x chunk shapes x cache dtypes
+    torch._dynamo.config.recompile_limit = 64  # two cores x chunk shapes x cache dtypes
     for net in (policy.network, value_fn.network):
         net.core._forward = torch.compile(net.core._forward, dynamic=True)
     policy.controller_head.distance = torch.compile(policy.controller_head.distance, dynamic=True)

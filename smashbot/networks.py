@@ -98,6 +98,34 @@ class FFWWrapper(Network):
         return self._module(inputs), ()
 
 
+def _gates(rnn, x, h):
+    """x @ W_ih^T + b_ih and h @ W_hh^T + b_hh in fp32, with the matmuls in
+    the weights' dtype: stacked fp16 grid weights are used as stored (fp32
+    accumulation inside the GEMM) instead of being cast every frame."""
+    gi = (x.to(rnn.weight_ih_l0.dtype) @ rnn.weight_ih_l0.t()).float() + rnn.bias_ih_l0.float()
+    gh = (h.to(rnn.weight_hh_l0.dtype) @ rnn.weight_hh_l0.t()).float() + rnn.bias_hh_l0.float()
+    return gi, gh
+
+
+def _lstm_cell(rnn: nn.LSTM, x, h, c):
+    """nn.LSTM's equations for one frame (gate order i, f, g, o)."""
+    gi, gh = _gates(rnn, x, h)
+    i, f, g, o = (gi + gh).chunk(4, -1)
+    c = torch.sigmoid(f) * c.float() + torch.sigmoid(i) * torch.tanh(g)
+    return torch.sigmoid(o) * torch.tanh(c), c
+
+
+def _gru_cell(rnn: nn.GRU, x, h):
+    """nn.GRU's equations for one frame (gate order r, z, n)."""
+    gi, gh = _gates(rnn, x, h)
+    i_r, i_z, i_n = gi.chunk(3, -1)
+    h_r, h_z, h_n = gh.chunk(3, -1)
+    r = torch.sigmoid(i_r + h_r)
+    z = torch.sigmoid(i_z + h_z)
+    n = torch.tanh(i_n + r * h_n)
+    return (1 - z) * n + z * h.float()
+
+
 class RecurrentWrapper(Network):
     """Wraps nn.LSTM / nn.GRU (single layer, batch_first)."""
 
@@ -113,22 +141,21 @@ class RecurrentWrapper(Network):
             return (h, h.clone())
         return h
 
+    # Serving: the one-frame step written out from the cell's weights. cuDNN's
+    # fused step has no vmap rule (the stacked-weights grids need one) and its
+    # fp16 path drifts from fp32 (97.6% action agreement vs 99.996% for the
+    # written-out cell; scripts/check_serving_precision.py). Training unrolls
+    # never take this path.
+    manual_step: bool = False
+
     def step(self, inputs, prev_state):
-        if getattr(self, "manual_step", False):
-            # Hand-rolled LSTM cell (cuDNN's fused step has no vmap rule;
-            # the stacked-weights phillip grid needs one). Same parameters
-            # and equations as nn.LSTM (gate order i,f,g,o); ~5e-5 off
-            # cuDNN (fusion order). Training unrolls never take this path.
-            assert isinstance(self._core, nn.LSTM), "manual_step is LSTM-only"
-            h, c = prev_state                       # each [1, B, H]
-            gates = (
-                inputs @ self._core.weight_ih_l0.t() + self._core.bias_ih_l0
-                + h[0] @ self._core.weight_hh_l0.t() + self._core.bias_hh_l0
-            )
-            i, f, g, o = gates.chunk(4, -1)
-            c2 = torch.sigmoid(f) * c[0] + torch.sigmoid(i) * torch.tanh(g)
-            h2 = torch.sigmoid(o) * torch.tanh(c2)
-            return h2, (h2.unsqueeze(0), c2.unsqueeze(0))
+        if self.manual_step:
+            if isinstance(self._core, nn.LSTM):
+                h, c = prev_state                       # each [1, B, H]
+                h2, c2 = _lstm_cell(self._core, inputs, h[0], c[0])
+                return h2, (h2.unsqueeze(0), c2.unsqueeze(0))
+            h2 = _gru_cell(self._core, inputs, prev_state[0])
+            return h2, h2.unsqueeze(0)
         out, next_state = self._core(inputs.unsqueeze(1), prev_state)
         return out.squeeze(1), next_state
 
@@ -605,11 +632,7 @@ class RecurrentBlock(nn.Module):
         self.down = nn.Linear(hidden, d, bias=False)
         nn.init.zeros_(self.down.weight)
 
-    # Serving: the one-frame step written out from the cell's weights, like
-    # RecurrentWrapper.manual_step. cuDNN's fused step has no vmap rule (the
-    # stacked-weights grids) and its fp16 path drifts from fp32 (97.6% action
-    # agreement vs 99.996% for the hand-rolled cell, scripts/check_serving_precision.py).
-    manual_step: bool = False
+    manual_step: bool = False   # serving: see RecurrentWrapper.manual_step
 
     def mix(self, x, h):
         """x [B, T, d], h [B, *state_shape] fp32 -> (x, h)."""
@@ -617,8 +640,12 @@ class RecurrentBlock(nn.Module):
         with torch.autocast(x.device.type, enabled=False):
             h = h.float()
             if self.manual_step and x.shape[1] == 1:
-                out, h = self._cell(xn[:, 0].float(), h)
-                out = out[:, None]
+                if isinstance(self.rnn, nn.LSTM):
+                    hn, cn = _lstm_cell(self.rnn, xn[:, 0], *h.unbind(1))
+                    out, h = hn[:, None], torch.stack([hn, cn], dim=1)
+                else:
+                    h = _gru_cell(self.rnn, xn[:, 0], h)
+                    out = h[:, None]
             elif isinstance(self.rnn, nn.LSTM):
                 out, (hn, cn) = self.rnn(xn.float(), tuple(t[None].contiguous() for t in h.unbind(1)))
                 h = torch.stack([hn[0], cn[0]], dim=1)
@@ -626,26 +653,6 @@ class RecurrentBlock(nn.Module):
                 out, hn = self.rnn(xn.float(), h[None].contiguous())
                 h = hn[0]
         return _swiglu(self, x + out.to(x.dtype)), h
-
-    def _cell(self, x, h):
-        """One step in fp32 from the cell's own weights (nn.LSTM / nn.GRU
-        gate order and equations); weights may be stored in half precision."""
-        r = self.rnn
-        w_ih, w_hh = r.weight_ih_l0.float(), r.weight_hh_l0.float()
-        b_ih, b_hh = r.bias_ih_l0.float(), r.bias_hh_l0.float()
-        if isinstance(r, nn.LSTM):
-            hp, cp = h.unbind(1)
-            i, f, g, o = (x @ w_ih.t() + b_ih + hp @ w_hh.t() + b_hh).chunk(4, -1)
-            c = torch.sigmoid(f) * cp + torch.sigmoid(i) * torch.tanh(g)
-            hn = torch.sigmoid(o) * torch.tanh(c)
-            return hn, torch.stack([hn, c], dim=1)
-        i_r, i_z, i_n = (x @ w_ih.t() + b_ih).chunk(3, -1)
-        h_r, h_z, h_n = (h @ w_hh.t() + b_hh).chunk(3, -1)
-        rg = torch.sigmoid(i_r + h_r)
-        z = torch.sigmoid(i_z + h_z)
-        n = torch.tanh(i_n + rg * h_n)
-        hn = (1 - z) * n + z * h
-        return hn, hn
 
 
 class SGUCore(Network):

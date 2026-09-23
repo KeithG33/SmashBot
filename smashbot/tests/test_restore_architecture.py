@@ -2,6 +2,8 @@
 loudly: some settings change behavior but no parameter shape, so the weights
 would load without complaint."""
 
+import dataclasses
+
 import pytest
 from slippi_ai import data as data_lib
 from slippi_ai.paths import TOY_DATASET
@@ -31,7 +33,7 @@ def test_restore_under_a_changed_shape_free_setting_is_refused(tmp_path):
     train_bc.main(_config(str(tmp_path), 1, reward_halflife=4.0))
     changed = _config(str(tmp_path), 2, reward_halflife=2.0)
     changed.runtime.restore = "auto"
-    with pytest.raises(ValueError, match="reward_halflife=4.0"):
+    with pytest.raises(ValueError, match="value.reward_halflife differs"):
         train_bc.main(changed)
     same = _config(str(tmp_path), 2, reward_halflife=4.0)
     same.runtime.restore = "auto"
@@ -39,12 +41,11 @@ def test_restore_under_a_changed_shape_free_setting_is_refused(tmp_path):
 
 
 def test_checkpoints_that_predate_a_setting_take_its_default():
-    saved = {
-        "network": {"name": "sgu", "hidden_size": 32, "num_layers": 1, "window": 8},
-        "head": {}, "policy": {}, "value": {},
-    }
     current = train_bc.TrainConfig(network=configs.NetworkConfig(name="sgu", hidden_size=32, num_layers=1, window=8))
-    train_bc._check_architecture(saved, current)
+    saved = dataclasses.asdict(current)
+    del saved["network"]["attn_heads"]
+    defaults = dataclasses.asdict(train_bc.TrainConfig())
+    train_bc._check_config(saved, dataclasses.asdict(current), defaults)
     current.network.attn_heads = 2
-    with pytest.raises(ValueError):
-        train_bc._check_architecture(saved, current)
+    with pytest.raises(ValueError, match="network.attn_heads"):
+        train_bc._check_config(saved, dataclasses.asdict(current), defaults)
