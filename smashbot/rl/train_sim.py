@@ -202,9 +202,6 @@ class SimLeagueWorker:
         tiers = list(cfg.phillip_tiers)
         rows = [self.part[f"phillip:{t}"] for t in tiers]
         tmpl = self.lg.phillips[tiers[0]][0]
-        for m in tmpl.modules():
-            if type(m).__name__ == "RecurrentWrapper":
-                m.manual_step = True
         self._phillip_grid = PfspGrid(
             tmpl, len(tiers), max(len(r) for r in rows), self.name_code,
             cfg.unroll_length, self.device,
@@ -297,6 +294,7 @@ def run(args) -> None:
     from smashbot.rl.sim_league import SimLeague
     from smashbot.rl.train_rl import build_value_function, _save_rl_checkpoint
     from smashbot.training import compile_cores
+    from smashbot.networks import use_manual_recurrent_step
 
     scfg: SimRolloutConfig = args.sim
     device = args.runtime.device
@@ -351,6 +349,7 @@ def run(args) -> None:
     serving_policy = _copy.deepcopy(policy)
     serving_policy.requires_grad_(False).eval()
     serving_policy.train_value_head = False
+    use_manual_recurrent_step(serving_policy)   # capturable and fp16-faithful one-frame cells
     print("learner overlap: ON — student serves a published weight copy; "
           "rollouts are one update stale", flush=True)
     if args.runtime.compile:

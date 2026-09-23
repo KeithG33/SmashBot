@@ -576,6 +576,14 @@ def _swiglu(block, x):
     return x + block.down(torch.nn.functional.silu(gate) * up)
 
 
+def use_manual_recurrent_step(module: nn.Module) -> None:
+    """Serve every LSTM/GRU in `module` through its hand-rolled one-frame
+    step (vmap-able, fp16-faithful) instead of cuDNN."""
+    for m in module.modules():
+        if isinstance(m, (RecurrentWrapper, RecurrentBlock)):
+            m.manual_step = True
+
+
 class RecurrentBlock(nn.Module):
     """An SGUBlock with its conv + attention mixing replaced by a residual
     GRU or LSTM, as in slippi-ai's tx_like layers: game-long memory in one
@@ -597,18 +605,47 @@ class RecurrentBlock(nn.Module):
         self.down = nn.Linear(hidden, d, bias=False)
         nn.init.zeros_(self.down.weight)
 
+    # Serving: the one-frame step written out from the cell's weights, like
+    # RecurrentWrapper.manual_step. cuDNN's fused step has no vmap rule (the
+    # stacked-weights grids) and its fp16 path drifts from fp32 (97.6% action
+    # agreement vs 99.996% for the hand-rolled cell, scripts/check_serving_precision.py).
+    manual_step: bool = False
+
     def mix(self, x, h):
         """x [B, T, d], h [B, *state_shape] fp32 -> (x, h)."""
         xn = self.norm(x)
         with torch.autocast(x.device.type, enabled=False):
             h = h.float()
-            if isinstance(self.rnn, nn.LSTM):
+            if self.manual_step and x.shape[1] == 1:
+                out, h = self._cell(xn[:, 0].float(), h)
+                out = out[:, None]
+            elif isinstance(self.rnn, nn.LSTM):
                 out, (hn, cn) = self.rnn(xn.float(), tuple(t[None].contiguous() for t in h.unbind(1)))
                 h = torch.stack([hn[0], cn[0]], dim=1)
             else:
                 out, hn = self.rnn(xn.float(), h[None].contiguous())
                 h = hn[0]
         return _swiglu(self, x + out.to(x.dtype)), h
+
+    def _cell(self, x, h):
+        """One step in fp32 from the cell's own weights (nn.LSTM / nn.GRU
+        gate order and equations); weights may be stored in half precision."""
+        r = self.rnn
+        w_ih, w_hh = r.weight_ih_l0.float(), r.weight_hh_l0.float()
+        b_ih, b_hh = r.bias_ih_l0.float(), r.bias_hh_l0.float()
+        if isinstance(r, nn.LSTM):
+            hp, cp = h.unbind(1)
+            i, f, g, o = (x @ w_ih.t() + b_ih + hp @ w_hh.t() + b_hh).chunk(4, -1)
+            c = torch.sigmoid(f) * cp + torch.sigmoid(i) * torch.tanh(g)
+            hn = torch.sigmoid(o) * torch.tanh(c)
+            return hn, torch.stack([hn, c], dim=1)
+        i_r, i_z, i_n = (x @ w_ih.t() + b_ih).chunk(3, -1)
+        h_r, h_z, h_n = (h @ w_hh.t() + b_hh).chunk(3, -1)
+        rg = torch.sigmoid(i_r + h_r)
+        z = torch.sigmoid(i_z + h_z)
+        n = torch.tanh(i_n + rg * h_n)
+        hn = (1 - z) * n + z * h
+        return hn, hn
 
 
 class SGUCore(Network):

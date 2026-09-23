@@ -22,7 +22,7 @@ import tree
 from slippi_ai.types import Controller, StateAction
 
 from smashbot.eval.agent import _neutral_controller
-from smashbot.networks import _mask_state, current_names
+from smashbot.networks import _mask_state, current_names, use_manual_recurrent_step
 from smashbot.policy import Policy
 
 
@@ -533,6 +533,7 @@ class LeagueAgent:
         self._template = copy.deepcopy(template).to("cpu")
         self._template.__dict__.pop("sample", None)  # any compiled wrapper
         self._template.requires_grad_(False).eval()
+        use_manual_recurrent_step(self._template)   # cuDNN steps have no vmap rule
         # stacked weights [S, ...]: slice s serves cells (s, 0..N-1)
         with torch.no_grad():
             params = dict(self._template.named_parameters())
