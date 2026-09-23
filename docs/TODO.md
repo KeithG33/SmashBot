@@ -278,6 +278,38 @@ that the latency table inverted; delay 18 vs 21).
   STORAGE with the forward in fp16 both times. Test = lockstep fp32 vs fp16
   forward for one phillip, compare action agreement.
 
+## Try the Kron (Kronecker-factored) optimizer in the RL learner (Keith, 2026-09-23)
+- Paper: "Stable Gradients for Stable Learning at Scale in Deep Reinforcement Learning",
+  Creus Castanyer, Obando-Ceron, Li, Bacon, Berseth, Courville, Castro (Mila / DeepMind),
+  NeurIPS 2025. https://papers.neurips.cc/paper_files/paper/2025/file/32375260090404f907ceae19f3564a7e-Paper-Conference.pdf
+- Diagnosis: under non-stationarity (RL's moving data and targets) gradient norms
+  collapse with depth and width, and deeper nets stop learning; stationary
+  supervised training of the same nets is fine. Two interventions fix it:
+  1. Multi-skip residuals: the encoder's features are fed directly into every
+     later layer (the D2RL idea; see the value-net notes). Our blocks are
+     pre-norm residual already, so this would be the encoder output added or
+     concatenated at each block, not a new residual stream.
+  2. Kron: Kronecker-factored preconditioning of the gradient (curvature-aware,
+     like K-FAC / PSGD Kron) in place of Adam's diagonal scaling. Alone it keeps
+     deep MLPs learning under PQN; with (1) PQN gains a median +83% over 57 ALE
+     games and PPO +31% (better in 84% of games), stable across depths/widths;
+     also helps Simba on DMC. They found alternative stabilizers (Sec. 4.4) did not.
+- Relevance: the argument is about the non-stationary regime, i.e. our PPO
+  learner, whose 6-block student is deeper than anything in the paper's
+  baselines. BC is stationary; Adam is fine there and this is not a BC change.
+- Cost: Kron keeps two preconditioner factors per weight matrix (m x m and n x n
+  for an m x n weight), so for our shapes (576 x 1536 FFN, 2304 x 576 LSTM,
+  128 x 576 attention) roughly 1-2x the parameter count extra, ~100-250 MB for a
+  30M policy: nothing next to the learner's activations and recurrent state.
+  Compute: preconditioner updates are amortised (every few steps); expect
+  ~10-30% learner-step overhead. Implementation: PSGD Kron (`kron_torch`, or
+  heavyball's Kron), as a drop-in for the policy optimizer only; keep Adam for
+  the value net until measured.
+- Test: a short league run, Kron vs Adam for the policy optimizer, same seed and
+  opponent pool; compare learner loss curves, actor KL, and winrate vs the Phillip
+  tiers at matched steps. Learning rate must be retuned (Kron's effective step
+  differs from Adam's); start from the paper's / kron_torch defaults.
+
 ## Try AutoClip in place of a fixed clip norm for the next mega run (Keith, 2026-09-22)
 - Code: https://github.com/pseeth/autoclip (Seetharaman et al., "AutoClip: Adaptive
   Gradient Clipping for Source Separation Networks", MLSP 2020, arXiv 2007.14469).
