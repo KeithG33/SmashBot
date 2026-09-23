@@ -294,7 +294,7 @@ def run(args) -> None:
     from smashbot.rl.sim_league import SimLeague
     from smashbot.rl.train_rl import build_value_function, _save_rl_checkpoint
     from smashbot.training import compile_cores
-    from smashbot.networks import use_manual_recurrent_step
+    from smashbot.networks import check_loadable, use_manual_recurrent_step
 
     scfg: SimRolloutConfig = args.sim
     device = args.runtime.device
@@ -308,6 +308,7 @@ def run(args) -> None:
     teacher, _, _ = load_policy(args.ckpt, device)
     ckpt = saving.load_checkpoint(args.ckpt)
     value_fn = build_value_function(ckpt["config"], device)
+    check_loadable({}, ckpt["state"]["value"])
     value_fn.load_state_dict(ckpt["state"]["value"])
     name_code = resolve_name_code(name_map, args.runtime.name)
     print(f"teacher/init: {args.ckpt} (BC step {step}); conditioning code {name_code}")
@@ -328,10 +329,12 @@ def run(args) -> None:
                 print("restore auto: no checkpoint yet, starting fresh")
         if rpath:
             rl_ckpt = saving.load_checkpoint(rpath)
+            check_loadable(rl_ckpt["config"]["network"], rl_ckpt["state"]["policy"])
+            check_loadable({}, rl_ckpt["state"]["value"])
             policy.load_state_dict(rl_ckpt["state"]["policy"])
             value_fn.load_state_dict(rl_ckpt["state"]["value"])
             if "policy_opt" in rl_ckpt["state"]:
-                learner.policy_optimizer.load_state_dict(rl_ckpt["state"]["policy_opt"])
+                saving.load_optimizer(learner.policy_optimizer, rl_ckpt["state"]["policy_opt"], rl_ckpt["state"]["policy"])
                 learner.value_optimizer.load_state_dict(rl_ckpt["state"]["value_opt"])
             start_step = rl_ckpt["state"]["step"] + 1
             restored_trackers = rl_ckpt["state"].get("trackers")

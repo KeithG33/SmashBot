@@ -52,3 +52,21 @@ def save_checkpoint(
 def load_checkpoint(path: str) -> dict:
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     return upgrade_checkpoint(ckpt)
+
+
+def load_optimizer(optimizer, saved_optimizer: dict, saved_module_state: dict, prefix: str = "value_head.") -> None:
+    """Restore an optimizer whose module may have lost parameters since the
+    checkpoint: the built-in value head's two tensors registered last, so a
+    checkpoint that still carries them has two trailing parameter ids to drop."""
+    dropped = sum(k.startswith(prefix) for k in saved_module_state)
+    if dropped:
+        saved_optimizer = {
+            "state": dict(saved_optimizer["state"]),
+            "param_groups": [dict(g) for g in saved_optimizer["param_groups"]],
+        }
+        group = saved_optimizer["param_groups"][-1]
+        stale, group["params"] = group["params"][-dropped:], group["params"][:-dropped]
+        for i in stale:
+            saved_optimizer["state"].pop(i, None)
+    optimizer.load_state_dict(saved_optimizer)
+

@@ -73,3 +73,27 @@ def test_pre_paper_block_weights_are_refused_and_paper_block_weights_renamed():
     networks.check_loadable({"gate_gelu": True, "v_norm": True}, old_names)
     assert networks.current_names(old_names) == {"network.core.blocks.0.uv.0.weight": None}
     networks.check_loadable({}, {"network.core.blocks.0.uv.0.weight": None})   # today's names need no flags
+
+
+def test_optimizer_restores_past_a_removed_trailing_parameter():
+    """Checkpoints from the built-in value head's era hold two more optimizer
+    parameter ids than today's Policy has; they were registered last."""
+    import torch
+    from smashbot import saving
+    torch.manual_seed(0)
+    net = torch.nn.Linear(4, 3)
+    old_head = torch.nn.Linear(3, 1)
+    old_opt = torch.optim.Adam(list(net.parameters()) + list(old_head.parameters()), lr=1e-3)
+    (net(torch.randn(2, 4)).sum() + old_head(torch.randn(2, 3)).sum()).backward()
+    old_opt.step()
+    saved_opt = old_opt.state_dict()
+    saved_module = {**{k: v for k, v in net.state_dict().items()},
+                    **{"value_head." + k: v for k, v in old_head.state_dict().items()}}
+    new_opt = torch.optim.Adam(net.parameters(), lr=1e-3)
+    saving.load_optimizer(new_opt, saved_opt, saved_module)
+    assert len(new_opt.state_dict()["param_groups"][0]["params"]) == 2
+    for i, p in enumerate(net.parameters()):
+        assert torch.equal(new_opt.state[p]["exp_avg"], old_opt.state[list(old_opt.param_groups[0]["params"])[i]]["exp_avg"])
+    assert saved_opt["param_groups"][0]["params"] == [0, 1, 2, 3], "the saved dict is not mutated"
+    plain = torch.optim.Adam(net.parameters(), lr=1e-3)
+    saving.load_optimizer(plain, plain.state_dict(), net.state_dict())   # nothing to drop

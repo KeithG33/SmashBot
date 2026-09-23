@@ -22,6 +22,7 @@ import numpy as np
 import torch
 
 from smashbot.rl.agent import BatchedPolicyAgent
+from smashbot.networks import check_loadable
 from smashbot.rl.league import League, LeagueSeats, MemberWeights
 from smashbot.rl.pool import SnapshotPool
 from smashbot.rl.rollouts import ChunkAssembler, compute_reward
@@ -480,14 +481,15 @@ class SimLeague:
 
     def _load_into(self, skeleton, path):
         import torch as _torch
-        from smashbot.networks import check_loadable
         state = _torch.load(path, map_location=self.device, weights_only=True)
         check_loadable(self._cfg["network"], state)
         with _torch.no_grad():
             return skeleton.load_state_dict(state, strict=True)
 
     def get_state(self, key):
-        return self.weights.get(key)
+        state = self.weights.get(key)
+        check_loadable(self._cfg["network"] if self._cfg else {}, state)
+        return state
 
     def make_grid_template(self):
         return self._make_skeleton()

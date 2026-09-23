@@ -240,9 +240,10 @@ def main(config: TrainConfig) -> None:
     best_eval_loss = math.inf
     if ckpt is not None:
         check_loadable(ckpt["config"]["network"], resume["policy"])
+        check_loadable({}, resume["value"])   # value nets never had the flags: uv.weight means pre-paper
         policy.load_state_dict(resume["policy"])
         value_fn.load_state_dict(resume["value"])
-        policy_opt.load_state_dict(resume["policy_opt"])
+        saving.load_optimizer(policy_opt, resume["policy_opt"], resume["policy"])
         value_opt.load_state_dict(resume["value_opt"])
         step = resume["step"]
         best_eval_loss = ckpt["best_eval_loss"]

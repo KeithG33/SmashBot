@@ -88,7 +88,7 @@ def main():
         policy.sample = torch.compile(
             policy.sample, mode=None if args.capture else args.compile_mode)
     agent = BatchedPolicyAgent(policy, args.n, name_code=1, device=device,
-                               batch_steps=1, capture=args.capture,
+                               capture=args.capture,
                                precision=args.precision,
                                state_dtype=torch.float16 if args.state_fp16 else None)
     agent.set_flat_controllers(True)
