@@ -296,6 +296,7 @@ def run(args) -> None:
     from smashbot.rl.ppo import Learner
     from smashbot.rl.sim_league import SimLeague
     from smashbot.rl.train_rl import build_value_function, _save_rl_checkpoint
+    from smashbot.training import compile_cores
 
     scfg: SimRolloutConfig = args.sim
     device = args.runtime.device
@@ -338,9 +339,12 @@ def run(args) -> None:
                 learner.value_optimizer.load_state_dict(rl_ckpt["state"]["value_opt"])
             start_step = rl_ckpt["state"]["step"] + 1
             restored_trackers = rl_ckpt["state"].get("trackers")
+            learner.policy_clipper.history = list(
+                (rl_ckpt["state"].get("clip_history") or {}).get("policy", []))
             print(f"restored RL run from {rpath} at step {start_step}")
     _save_rl_checkpoint.policy_opt = learner.policy_optimizer
     _save_rl_checkpoint.value_opt = learner.value_optimizer
+    _save_rl_checkpoint.clip_history = lambda: learner.policy_clipper.history
 
     # ---- serving copy + compile (train_rl's overlap pattern) ----
     import copy as _copy
@@ -357,6 +361,7 @@ def run(args) -> None:
         serving_policy.sample = torch.compile(
             serving_policy.sample,
             mode=None if scfg.capture_serving else "reduce-overhead")
+        compile_cores(policy, value_fn)   # the learner's copies, after the serving deepcopy
 
     # ---- league ----
     snap_dir = f"{run_dir}/snapshots"

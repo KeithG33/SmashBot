@@ -29,6 +29,7 @@ from smashbot.data import loader
 from smashbot.delay import slice_delayed_frames
 from smashbot.networks import build_embed_network
 from smashbot.policy import build_policy
+from smashbot.training import GradClipper, compile_cores
 from smashbot.value import ValueFunction
 
 
@@ -123,31 +124,6 @@ def _set_rng(rng: dict) -> None:
     torch.set_rng_state(rng["torch"])
     if rng["cuda"] is not None and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(rng["cuda"])
-
-
-class GradClipper:
-    """Clips a network's gradient to `max_norm`, or with AutoClip
-    (Seetharaman et al. 2020) to a percentile of the run's own gradient-norm
-    history, which is checkpointed so a resume clips exactly as the
-    uninterrupted run would."""
-
-    def __init__(self, params, max_norm: float, percentile: float, history=None):
-        assert not (max_norm > 0 and percentile > 0), "one clipping rule at a time"
-        self.params = list(params)
-        self.max_norm, self.percentile = max_norm, percentile
-        self.history = list(history or [])
-
-    def __call__(self) -> dict:
-        if self.percentile > 0:
-            norm = torch.nn.utils.clip_grad_norm_(self.params, math.inf).item()
-            self.history.append(norm)
-            clip = float(np.percentile(self.history, self.percentile))
-            torch.nn.utils.clip_grad_norm_(self.params, clip)
-            return {"grad_norm": norm, "clip_norm": clip}
-        if self.max_norm > 0:
-            norm = torch.nn.utils.clip_grad_norm_(self.params, self.max_norm).item()
-            return {"grad_norm": norm, "clip_norm": self.max_norm}
-        return {}
 
 
 def _resume_state(ckpt: tp.Optional[dict]) -> dict:
@@ -270,11 +246,12 @@ def main(config: TrainConfig) -> None:
 
     policy_opt = torch.optim.Adam(policy.parameters(), lr=config.learner.learning_rate)
     value_opt = torch.optim.Adam(value_fn.parameters(), lr=config.learner.learning_rate)
-    clip_history = resume.get("clip_history") or {}
+    # AutoClip is for the policy only: the value net's step-to-step norms swing
+    # 4x, so a percentile threshold throttles its typical step (uev +3%, measured)
     clip_policy = GradClipper(policy.parameters(), config.learner.max_grad_norm,
-                              config.learner.autoclip_percentile, clip_history.get("policy"))
-    clip_value = GradClipper(value_fn.parameters(), config.learner.max_grad_norm,
-                             config.learner.autoclip_percentile, clip_history.get("value"))
+                              config.learner.autoclip_percentile,
+                              (resume.get("clip_history") or {}).get("policy"))
+    clip_value = GradClipper(value_fn.parameters(), config.learner.max_grad_norm)
 
     if config.learner.precision == "bf16" and device == "cuda":
         autocast = lambda: torch.autocast("cuda", dtype=torch.bfloat16)
@@ -284,14 +261,7 @@ def main(config: TrainConfig) -> None:
     policy_loss_fn = policy.imitation_loss
     value_loss_fn = value_fn.loss
     if config.learner.compile and device == "cuda":
-        # Compile the pieces with a fixed structure: each core's per-chunk
-        # forward (dynamic over the chunk length; cuDNN recurrent layers stay
-        # eager inside it) and the controller head. The reset chunking, tree
-        # maps and metric .item()s around them stay in Python.
-        torch._dynamo.config.cache_size_limit = 64  # two cores x chunk shapes x cache dtypes
-        for net in (policy.network, value_fn.network):
-            net.core._forward = torch.compile(net.core._forward, dynamic=True)
-        policy.controller_head.distance = torch.compile(policy.controller_head.distance, dynamic=True)
+        compile_cores(policy, value_fn)
         print("torch.compile enabled (first steps will be slow while compiling)")
 
     n_params = sum(p.numel() for p in policy.parameters())
@@ -370,7 +340,7 @@ def main(config: TrainConfig) -> None:
                 "eval_hidden": _to(eval_hidden, "cpu"),
                 "eval_value_hidden": _to(eval_value_hidden, "cpu"),
                 "rng": _get_rng(),
-                "clip_history": {"policy": clip_policy.history, "value": clip_value.history},
+                "clip_history": {"policy": clip_policy.history},
             },
             best_eval_loss,
         )

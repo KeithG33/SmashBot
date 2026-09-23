@@ -102,6 +102,7 @@ def _save_rl_checkpoint(
                 "step": step,
                 "teacher_ckpt": teacher,
                 "trackers": _save_rl_checkpoint.tracker_states(),
+                "clip_history": {"policy": _save_rl_checkpoint.clip_history()},
             },
             "best_eval_loss": None,
             "version": saving.VERSION,

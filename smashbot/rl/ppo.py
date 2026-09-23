@@ -39,6 +39,7 @@ from slippi_ai.types import Frames, StateAction
 from smashbot.networks import RecurrentState, _mask_state
 from smashbot.rl.config import PPOConfig, RLConfig  # noqa: F401  (re-export)
 from smashbot.policy import Policy
+from smashbot.training import GradClipper
 from smashbot.value import ValueFunction
 
 
@@ -231,6 +232,9 @@ class Learner:
 
         self.policy_optimizer = torch.optim.Adam(
             policy.parameters(), lr=config.learning_rate
+        )
+        self.policy_clipper = GradClipper(
+            policy.parameters(), config.max_grad_norm, config.autoclip_percentile
         )
         self.value_optimizer = torch.optim.Adam(
             value_function.parameters(), lr=config.learning_rate
@@ -1020,11 +1024,8 @@ class Learner:
                 # (a) clip_grad_norm_ operates on true magnitudes and (b)
                 # the nonfinite guard below reads honest numbers.
                 self.grad_scaler.unscale_(self.policy_optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.policy.parameters(),
-                cfg.max_grad_norm if cfg.max_grad_norm > 0 else float("inf"),
-            )
-            if not torch.isfinite(grad_norm):
+            grad_norm = self.policy_clipper.measure()
+            if not math.isfinite(grad_norm):
                 # A finite loss can still yield nonfinite gradients;
                 # clip_grad_norm_ does not sanitize NaN. Skip the update.
                 # inf vs nan discriminates the cause: fp16 OVERFLOW at this
@@ -1051,21 +1052,28 @@ class Learner:
                       f"(inf {n_inf} nan {n_nan} first={first} "
                       f"stage={stage})", flush=True)
                 self.policy_optimizer.zero_grad(set_to_none=True)
+                for m in batch_metrics:
+                    m.update(grad_norm=grad_norm, clip_norm=self.policy_clipper.threshold)
                 if use_scaler:
                     # unscale_ already recorded found_inf, so update() halves
                     # the scale — the right response whether the cause was
                     # fp16 overflow at this scale or genuinely bad math.
                     self.grad_scaler.update()
-            elif use_scaler:
-                # Two layers of skip, same semantics: our guard above catches
-                # every nonfinite gradient FIRST (any inf/NaN element makes
-                # the global norm nonfinite), and scaler.step's own internal
-                # found_inf skip backstops it. Either way weights only move
-                # on finite, unscaled, clipped gradients.
-                self.grad_scaler.step(self.policy_optimizer)
-                self.grad_scaler.update()
             else:
-                self.policy_optimizer.step()
+                clip = self.policy_clipper.clip(grad_norm)
+                for m in batch_metrics:
+                    m.update(clip)
+                if use_scaler:
+                    # Two layers of skip, same semantics: our guard above
+                    # catches every nonfinite gradient FIRST (any inf/NaN
+                    # element makes the global norm nonfinite), and
+                    # scaler.step's own internal found_inf skip backstops
+                    # it. Either way weights only move on finite, unscaled,
+                    # clipped gradients.
+                    self.grad_scaler.step(self.policy_optimizer)
+                    self.grad_scaler.update()
+                else:
+                    self.policy_optimizer.step()
             epoch_metrics.append(_mean_dicts(batch_metrics))
 
         # Post-update measurement (and trust-region backstop).

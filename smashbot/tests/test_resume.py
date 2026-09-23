@@ -86,6 +86,7 @@ def test_autoclip_history_resumes(tmp_path):
 
     whole, halves = _latest(run_dir, "whole"), _latest(run_dir, "halves")
     assert len(whole["clip_history"]["policy"]) == 2 * N
+    assert "value" not in whole["clip_history"], "AutoClip is policy-only"
     for key in ("policy", "value", "policy_opt", "value_opt", "clip_history"):
         _assert_same(whole[key], halves[key], key)
 

@@ -46,6 +46,9 @@ class RLConfig:
     entropy_weight: float = 0.0
     reward_halflife: float = 4.0  # seconds
     max_grad_norm: float = 1.0  # 0 = no clipping
+    # AutoClip for the policy: clip to this percentile of the run's own
+    # (unscaled) gradient norms instead of max_grad_norm; 0 = off
+    autoclip_percentile: float = 0.0
     # Learner numeric precision: "fp32" (exact current behavior — no autocast
     # objects, no scaler) or "fp16" (cuda-only production path; cpu falls back
     # to fp32 with a loud warning). fp16 = torch.autocast(float16) around the
