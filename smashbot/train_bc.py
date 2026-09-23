@@ -284,10 +284,14 @@ def main(config: TrainConfig) -> None:
     policy_loss_fn = policy.imitation_loss
     value_loss_fn = value_fn.loss
     if config.learner.compile and device == "cuda":
-        # Whole-loss compile: dynamo graph-breaks around the cuDNN LSTM (fine)
-        # and fuses the embedding/head/return math around it.
-        policy_loss_fn = torch.compile(policy_loss_fn)
-        value_loss_fn = torch.compile(value_loss_fn)
+        # Compile the pieces with a fixed structure: each core's per-chunk
+        # forward (dynamic over the chunk length; cuDNN recurrent layers stay
+        # eager inside it) and the controller head. The reset chunking, tree
+        # maps and metric .item()s around them stay in Python.
+        torch._dynamo.config.cache_size_limit = 64  # two cores x chunk shapes x cache dtypes
+        for net in (policy.network, value_fn.network):
+            net.core._forward = torch.compile(net.core._forward, dynamic=True)
+        policy.controller_head.distance = torch.compile(policy.controller_head.distance, dynamic=True)
         print("torch.compile enabled (first steps will be slow while compiling)")
 
     n_params = sum(p.numel() for p in policy.parameters())
