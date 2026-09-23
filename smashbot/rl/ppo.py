@@ -1109,17 +1109,6 @@ class Learner:
         return state, metrics
 
 
-def _to_cpu(obj):
-    """Deep copy of a state dict with every tensor moved off the device."""
-    if isinstance(obj, torch.Tensor):
-        return obj.detach().to("cpu", copy=True)
-    if isinstance(obj, dict):
-        return {k: _to_cpu(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return type(obj)(_to_cpu(v) for v in obj)
-    return copy.deepcopy(obj)
-
-
 def _mean_dicts(dicts: tp.Sequence[dict]) -> dict:
     out = {}
     for key in dicts[0]:

@@ -1,5 +1,5 @@
 """Core game engine shared by live play (play.py) and eval batteries
-(evaluate.py): one implementation of policy loading, Dolphin setup, and the
+one implementation of policy loading, Dolphin setup, and the
 gamestate -> agent -> controller loop, so eval measures exactly the bot that
 plays.
 
@@ -22,10 +22,25 @@ from slippi_ai import dolphin as dolphin_lib
 
 from smashbot import saving
 from smashbot.eval.agent import DelayedAgent
-from smashbot.eval.report import GameRecord
 from smashbot.eval.dolphin_setup import make_dolphin  # noqa: F401  (re-export)
 from smashbot.networks import check_loadable
 from smashbot.policy import build_policy_from_config
+
+
+@dataclasses.dataclass
+class GameRecord:
+    """One game, from the bot's perspective (bot on port 1)."""
+
+    winner: str | None  # "bot" | "opp" | None (draw/timeout)
+    bot_stocks: int
+    opp_stocks: int
+    bot_damage_dealt: float  # sum of opponent percent gains
+    bot_damage_taken: float
+    frames: int
+    timeout: bool = False
+
+    def to_dict(self) -> dict:
+        return dataclasses.asdict(self)
 
 
 def load_policy(ckpt_path: str, device: str):

@@ -19,7 +19,7 @@ import tree
 from slippi_ai.types import Controller, StateAction
 
 from smashbot.eval.agent import _neutral_controller
-from smashbot.networks import _mask_state, current_names, use_manual_recurrent_step
+from smashbot.networks import current_names, use_manual_recurrent_step
 from smashbot.policy import Policy
 
 

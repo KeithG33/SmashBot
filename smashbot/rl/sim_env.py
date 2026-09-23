@@ -8,7 +8,6 @@ vectorized loop and the GPU is the bottleneck.
 This module is the seam between the sim and our stack:
   * obs_to_game / encode_obs : MslObservation (numpy struct) -> our encoded
     Game struct, the exact input BatchedPolicyAgent.step expects.
-  * write_controllers        : decoded controller struct -> MslInput.
 Both use GALE01 ids directly (sim and slippi-ai share them), so it is field
 renaming, not value translation.
 
@@ -171,34 +170,8 @@ class FlatFrames:
 _BUTTONS = ("A", "B", "X", "Y", "Z", "L", "R", "D_UP")
 
 
-def write_controllers(env, controllers, player: int) -> None:
-    """Write BatchedPolicyAgent.execute()'s output -- a list of N decoded
-    Controller structs (sticks in [0,1] centered at 0.5, buttons bool) -- into
-    the sim's controller buffer for `player` at the current step row. Sticks
-    pass through unchanged (both use the [0,1] convention); buttons map by name.
-    """
-    import melee_sim as msl
-
-    N = env.batch_size
-    ctrl = msl.neutral_controller((env.length, N))
-    t = env.t
-    ctrl.main_stick.x[t] = np.fromiter((c.main_stick.x for c in controllers), np.float32, N)
-    ctrl.main_stick.y[t] = np.fromiter((c.main_stick.y for c in controllers), np.float32, N)
-    ctrl.c_stick.x[t] = np.fromiter((c.c_stick.x for c in controllers), np.float32, N)
-    ctrl.c_stick.y[t] = np.fromiter((c.c_stick.y for c in controllers), np.float32, N)
-    ctrl.shoulder[t] = np.fromiter((c.shoulder for c in controllers), np.float32, N)
-    b0 = controllers[0].buttons
-    for name in _BUTTONS:
-        if hasattr(b0, name) and hasattr(ctrl.buttons, name):
-            getattr(ctrl.buttons, name)[t] = np.fromiter(
-                (bool(getattr(c.buttons, name)) for c in controllers), bool, N)
-    msl.write_controller(env.controller_action_view, ctrl, player=player)
-
-
-# controller_rows column order = tree.flatten(Controller):
-#   0 main_x  1 main_y  2 c_x  3 c_y  4 shoulder  5..12 buttons A B X Y Z L R D_UP
 def write_controller_rows(env, rows: np.ndarray, player: int) -> None:
-    """Vectorized twin of write_controllers for the flat [N, 13] row format
+    """Flat [N, 13] controller rows -> MslInputat
     (encode.controller_rows / BatchedPolicyAgent flat_controllers /
     LeagueAgent.execute). Writes ONLY the current step's row of the action
     ring via env.current_action_frame -- the previous version built a full

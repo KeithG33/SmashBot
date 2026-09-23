@@ -137,7 +137,6 @@ def main():
     print(f"recorded {len(stream)} frames x {NENV} envs")
 
     pol, pnm, _ = load_policy(path, DEV)
-    pol.train_value_head = False
     pol.requires_grad_(False).eval()
     nc = resolve_name_code(pnm, "Master Player")
     layout = getattr(pol.network.core, "blocks", None)

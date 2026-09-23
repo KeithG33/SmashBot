@@ -153,7 +153,6 @@ def build_learner(
         step = int(
             os.path.basename(snapshot).split("-")[1].split(".")[0]
         )
-    policy.train_value_head = False
 
     full = saving.load_checkpoint(src)
     teacher_path = full["state"].get("teacher_ckpt", "")
@@ -164,7 +163,6 @@ def build_learner(
             print(f"warning: recorded teacher {teacher_path} missing; "
                   f"using {src} as the teacher", flush=True)
         teacher, _, _ = load_policy(src, device)
-    teacher.train_value_head = False
 
     value_fn = build_value_function(full["config"], device)
     if "value" in full["state"]:

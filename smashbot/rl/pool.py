@@ -55,10 +55,9 @@ class SnapshotPool:
 
     save() freezes the current policy every snapshot_interval learner steps
     (a new league member); draw_member() picks one opponent for one match
-    — with pfsp=True (default) weighted by AlphaStar's f_hard / f_var over
-    the student's estimated win rate per member (payoff table persisted as
-    pfsp.json in the snapshot directory); pfsp=False keeps the original
-    exponential recency bias."""
+    weighted by AlphaStar's f_hard / f_var over the student's estimated win
+    rate per member (payoff table persisted as pfsp.json in the snapshot
+    directory)."""
 
     PRIOR_GAMES = 5  # below this, a snapshot's win rate is the 0.5 prior
 
@@ -66,7 +65,6 @@ class SnapshotPool:
         self,
         directory: str,
         keep: int = 30,
-        pfsp: bool = True,
         pfsp_p: float = 2.0,  # exponent on f_hard / f_var (AlphaStar: 2)
         # fraction of weighted draws using f_hard (rest f_var): 1.0 = pure
         # f_hard (AlphaStar mains), 0.0 = pure f_var (their catch-up mode)
@@ -83,13 +81,9 @@ class SnapshotPool:
         # folded into the candidate set for non-latest slots; empty =
         # snapshots only (today's league).
         league_members: tp.Sequence[str] = (),
-        # import keys that should surface in METRICS even when not league
-        # members (dedicated imports, v9): their rows are fed by the worker
-        metric_imports: tp.Sequence[str] = (),
     ):
         self.dir = directory
         self.keep = keep
-        self.pfsp = pfsp
         self.pfsp_p = pfsp_p
         assert 0.0 <= pfsp_hard_frac <= 1.0, pfsp_hard_frac
         self.pfsp_hard_frac = pfsp_hard_frac
@@ -102,13 +96,7 @@ class SnapshotPool:
             f"unknown league members {list(league_members)}; "
             f"valid: {LEAGUE_MEMBER_KEYS} or '{IMPORT_KEY_PREFIX}NAME'"
         )
-        assert pfsp or not league_members, (
-            "league members (teacher/cpu) need PFSP win-rate prioritization "
-            "to earn/lose serving time — enable pfsp=True (the recency "
-            "sampler has no notion of them)"
-        )
         self.league_members = list(league_members)
-        self.metric_imports = tuple(metric_imports)
         os.makedirs(directory, exist_ok=True)
         # Adopt snapshots already on disk (restarts must not amnesia the
         # league: without this, every resume served only its own boot's
@@ -187,58 +175,6 @@ class SnapshotPool:
     # ~100-game effective recency window at large n; exact mean at small n
     PAYOFF_DECAY = 0.99
 
-    def category_estimates(self) -> dict[str, tuple[float, float] | None]:
-        """Ticker-facing (decayed_rate, raw_lifetime_rate) pairs from the
-        SAME ledger the per-match draw uses. 'ghosts' pools across all archive
-        rows (a rate over the league's actual serving mix); members with
-        no games -> None."""
-        out: dict[str, tuple[float, float] | None] = {}
-
-        def pair(e):
-            raw = e["wins"] / e["games"]
-            if e.get("games_d"):
-                return (e["wins_d"] / e["games_d"], raw)
-            return (raw, raw)
-
-        for m in LEAGUE_MEMBER_KEYS:
-            e = self.payoff.get(m)
-            out[m] = pair(e) if e and e.get("games") else None
-        # imported members (cross-generation benchmark rows): league-drawn
-        # OR dedicated (v9, metric_imports) — but never decommissioned rows
-        imp_keys = sorted(
-            {m for m in self.league_members if _is_import_key(m)}
-            | set(self.metric_imports)
-        )
-        for m in imp_keys:
-            e = self.payoff.get(m)
-            out[m] = pair(e) if e and e.get("games") else None
-        wd = gd = 0.0
-        rw = rg = 0
-        for g in self.archive:
-            e = self.payoff.get(g)
-            if not e or not e.get("games"):
-                continue
-            rw += e["wins"]; rg += e["games"]
-            if e.get("games_d"):
-                wd += e["wins_d"]; gd += e["games_d"]
-            else:
-                wd += e["wins"]; gd += e["games"]
-        out["ghosts"] = (wd / gd, rw / rg) if rg else None
-        # pooled imports row (ticker "I:"), same math as "ghosts"
-        wd = gd = 0.0
-        rw = rg = 0
-        for m in imp_keys:
-            e = self.payoff.get(m)
-            if not e or not e.get("games"):
-                continue
-            rw += e["wins"]; rg += e["games"]
-            if e.get("games_d"):
-                wd += e["wins_d"]; gd += e["games_d"]
-            else:
-                wd += e["wins"]; gd += e["games"]
-        out["imports"] = (wd / gd, rw / rg) if rg else None
-        return out
-
     def win_estimate(self, path: str) -> float:
         """Student's estimated win rate vs this snapshot; 0.5 prior below
         PRIOR_GAMES decided games. Legacy rate-EMA rows (no decayed counts)
@@ -299,22 +235,6 @@ class SnapshotPool:
                 del self.payoff[victim]
                 self._save_payoff()
 
-    def class_hardness(self) -> dict[str, float]:
-        """Per-class student win estimate for the two-stage PFSP sampler
-        (and wandb): "ghosts" = mean win estimate over the whole archive
-        (0.5 prior for unmeasured members), each league
-        member ("phillip"/"teacher"/"cpu"/"import:NAME") a singleton class
-        = its own row. Only nonempty/enabled classes appear."""
-        out: dict[str, float] = {}
-        ghosts = self.archive
-        if ghosts:
-            out["ghosts"] = (
-                sum(self.win_estimate(g) for g in ghosts) / len(ghosts)
-            )
-        for m in self.league_members:
-            out[m] = self.win_estimate(m)
-        return out
-
     def _draw_weight_fn(self, rng: random.Random):
         """f_hard with prob pfsp_hard_frac, else f_var (one draw)."""
         fn = f_hard if rng.random() < self.pfsp_hard_frac else f_var
@@ -341,14 +261,6 @@ class SnapshotPool:
         members = [
             m for m in self.league_members if allowed is None or m in allowed
         ]
-        if not self.pfsp:
-            # legacy recency bias over the archive (no league members)
-            if not ghosts:
-                return None
-            weights = [
-                2.0 ** (i / max(1, len(ghosts) / 3)) for i in range(len(ghosts))
-            ]
-            return ghosts[rng.choices(range(len(ghosts)), weights=weights)[0]]
         classes: dict[str, float] = {}
         if ghosts:
             classes["ghosts"] = sum(self.win_estimate(g) for g in ghosts) / len(ghosts)

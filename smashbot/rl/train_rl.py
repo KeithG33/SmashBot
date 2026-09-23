@@ -44,7 +44,6 @@ class Config:
     ckpt: str = "/home/kage/drive2/ShineBot/models/mega-best-epoch1.8.pt"
     learner: RLConfig = dataclasses.field(default_factory=RLConfig)
     runtime: RuntimeConfig = dataclasses.field(default_factory=RuntimeConfig)
-    backend: str = "sim"  # melee-sim-light rollouts; options under --sim
     sim: SimRolloutConfig = dataclasses.field(default_factory=SimRolloutConfig)
 
 
@@ -117,9 +116,6 @@ def main() -> None:
     was removed after the sim backend validated; Dolphin remains for
     watch/play/eval (smashbot/eval/)."""
     args = tyro.cli(Config)
-    assert args.backend == "sim", (
-        f"backend {args.backend!r} removed; only 'sim' trains now"
-    )
     from smashbot.rl import train_sim
     return train_sim.run(args)
 

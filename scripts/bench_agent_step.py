@@ -81,7 +81,6 @@ def main():
     else:
         policy, _, _ = load_policy(args.ckpt, device)
         label = args.ckpt.split("/")[-1]
-    policy.train_value_head = False
     policy.requires_grad_(False)
     policy.eval()
     if args.compile:

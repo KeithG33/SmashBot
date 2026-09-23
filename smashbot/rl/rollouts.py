@@ -20,7 +20,7 @@ import torch
 import tree
 
 from smashbot.rl.agent import FrameRecord  # noqa: F401  (typing)
-from smashbot.rl.ppo import ActionData, Trajectory, slice_trajectory_rows
+from smashbot.rl.ppo import ActionData, Trajectory
 
 
 class ChunkAssembler:

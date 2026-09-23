@@ -3,10 +3,12 @@ content to a fresh _to_cpu every step, tensor storages actually reused,
 and the revert path restores the CURRENT step's start (a stale-buffer bug
 would restore an older step)."""
 
+import copy
+
 import torch
 
 from smashbot.rl.config import RLConfig, PPOConfig
-from smashbot.rl.ppo import Learner, _to_cpu
+from smashbot.rl.ppo import Learner
 from smashbot.tests.test_ppo import _rollout, _tiny_policy, _tiny_value
 
 
@@ -35,6 +37,17 @@ def _assert_same(a, b):
             _assert_same(x, y)
     else:
         assert a == b
+
+
+def _to_cpu(obj):
+    """Deep copy of a state dict with every tensor moved off the device."""
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().to("cpu", copy=True)
+    if isinstance(obj, dict):
+        return {k: _to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_to_cpu(v) for v in obj)
+    return copy.deepcopy(obj)
 
 
 def test_snap_into_matches_fresh_copy_and_reuses_storage():

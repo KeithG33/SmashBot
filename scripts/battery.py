@@ -45,7 +45,7 @@ def load_opponent(name: str, path: str, device: str, config_from: str):
         code = resolve_name_code(nm, "Master Player", verbose=False)
     except Exception:
         from smashbot.rl.sim_league import SimLeague
-        lg = SimLeague(None, os.path.dirname(path), phillips={},
+        lg = SimLeague(os.path.dirname(path), phillips={},
                        fox_imports={}, config_from=config_from,
                        device=device)
         pol = lg._make_skeleton()
@@ -92,7 +92,7 @@ def main():
     except Exception:
         assert args.config_from, "bare student ckpt needs --config-from"
         from smashbot.rl.sim_league import SimLeague
-        lg = SimLeague(None, os.path.dirname(args.ckpt), phillips={},
+        lg = SimLeague(os.path.dirname(args.ckpt), phillips={},
                        fox_imports={}, config_from=args.config_from,
                        device=args.device)
         student = lg._make_skeleton()

@@ -27,7 +27,7 @@ def load_any(path: str, device: str, config_from: str):
         code = resolve_name_code(nm, "Master Player", verbose=False)
     except Exception:
         from smashbot.rl.sim_league import SimLeague
-        lg = SimLeague(None, os.path.dirname(path), phillips={},
+        lg = SimLeague(os.path.dirname(path), phillips={},
                        fox_imports={}, config_from=config_from, device=device)
         pol = lg._make_skeleton()
         lg._load_into(pol, path)

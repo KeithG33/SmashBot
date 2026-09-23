@@ -16,7 +16,6 @@ non-self seat is harvested as a kind="imitation" Trajectory.
 """
 from __future__ import annotations
 
-import math
 import random as _random
 
 import numpy as np
@@ -144,9 +143,6 @@ class PfspGrid:
             self.valid_t = torch.as_tensor(np.nonzero(self.valid)[0],
                                            device=self.device)
             self._dirty = False
-
-    def occupied(self):
-        return int(self.valid.sum())
 
 
 class _Group:
@@ -449,22 +445,20 @@ class SimLeague:
     pfsp.json — a resume loads v10's archive and table straight from the
     snapshot dir). layout() fixes the env rows once per run."""
 
-    def __init__(self, current_policy, snapshot_dir, phillips, fox_imports,
+    def __init__(self, snapshot_dir, phillips, fox_imports,
                  self_frac=0.30, device="cpu", pfsp_hard_frac=0.25, pfsp_explore=0.075,
-                 config_from=None, self_name_code=1):
+                 config_from=None):
         # phillips: {tier: (policy, frac, name_code)}; fox_imports: {"import:NAME": path}
-        self.current = current_policy
         self.device = device
         self.self_frac = self_frac
         self.phillips = phillips
         self.fox_paths = dict(fox_imports)
         self.league = SnapshotPool(
-            snapshot_dir, keep=0, pfsp=True,
+            snapshot_dir, keep=0,
             pfsp_hard_frac=pfsp_hard_frac, pfsp_explore=pfsp_explore,
             league_members=list(fox_imports.keys()),
         )
         self.weights = MemberWeights(self._path_of)
-        self._sc = self_name_code
         self._cfg = None
         if config_from is not None:
             from smashbot import saving

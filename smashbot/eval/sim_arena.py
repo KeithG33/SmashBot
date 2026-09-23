@@ -12,9 +12,7 @@ exactly reproducible replays.
 from __future__ import annotations
 
 import random
-import typing as tp
 
-import numpy as np
 
 from smashbot.rl.rollouts import GameTracker
 

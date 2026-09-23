@@ -100,7 +100,7 @@ def _seed_snapshots(dst_dir: str, src_dir: str, min_step: int = 0,
     if any(f.endswith(".pt") for f in os.listdir(dst_dir)):
         return  # already populated (resumed run)
     src_dir = os.path.abspath(src_dir)
-    src = SnapshotPool(src_dir, keep=0, pfsp=True)
+    src = SnapshotPool(src_dir, keep=0)
     src.payoff_autosave = False
     cands = [g for g in src.archive if src._step_of(g) >= min_step]
     cands.sort(key=src.win_estimate)          # hardest (lowest student winrate) first
@@ -381,10 +381,10 @@ def run(args) -> None:
         fox[f"import:{name}"] = path
         print(f"import:{name} <- {path} (FOX lock)")
     league = SimLeague(
-        serving_policy, snap_dir, phillips=phillips, fox_imports=fox,
+        snap_dir, phillips=phillips, fox_imports=fox,
         self_frac=scfg.self_frac, device=device,
         pfsp_hard_frac=scfg.pfsp_hard_frac, pfsp_explore=scfg.pfsp_explore,
-        config_from=args.ckpt, self_name_code=name_code,
+        config_from=args.ckpt,
     )
     if not league.league.archive:
         league.league.save(policy, start_step)
