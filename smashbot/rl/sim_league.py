@@ -482,13 +482,13 @@ class SimLeague:
     def _load_into(self, skeleton, path):
         import torch as _torch
         state = _torch.load(path, map_location=self.device, weights_only=True)
-        check_loadable(self._cfg["network"], state)
+        check_loadable({}, state)   # bare weights carry no config: only today's names pass
         with _torch.no_grad():
             return skeleton.load_state_dict(state, strict=True)
 
     def get_state(self, key):
         state = self.weights.get(key)
-        check_loadable(self._cfg["network"] if self._cfg else {}, state)
+        check_loadable({}, state)   # bare weights carry no config: only today's names pass
         return state
 
     def make_grid_template(self):

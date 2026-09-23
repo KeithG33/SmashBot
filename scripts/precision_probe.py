@@ -141,6 +141,7 @@ def build_learner(
     allocation profile, critic Adam moments included."""
     from smashbot import saving
     from smashbot.eval.game import load_policy
+    from smashbot.networks import check_loadable
     from smashbot.rl.ppo import Learner, RLConfig
     from smashbot.rl.train_rl import build_value_function
 
@@ -149,6 +150,7 @@ def build_learner(
     policy, _, step = load_policy(src, device)
     if snapshot:
         state = torch.load(snapshot, map_location=device, weights_only=True)
+        check_loadable({}, state)   # a bare snapshot has no config: only today's names pass
         policy.load_state_dict(state)
         step = int(
             os.path.basename(snapshot).split("-")[1].split(".")[0]
@@ -166,6 +168,7 @@ def build_learner(
 
     value_fn = build_value_function(full["config"], device)
     if "value" in full["state"]:
+        check_loadable({}, full["state"]["value"])
         value_fn.load_state_dict(full["state"]["value"])
 
     learner = Learner(RLConfig(), policy, teacher, value_fn)

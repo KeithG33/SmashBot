@@ -258,7 +258,8 @@ def current_names(state_dict: dict) -> dict:
 def check_loadable(network_cfg: dict, state_dict: dict) -> None:
     """A SGU checkpoint saved before the GELU on (u, v) and the norm on v
     became unconditional computes a different network: refuse it rather than
-    load its weights into today's block."""
+    load its weights into today's block. Only a full checkpoint's own saved
+    config can vouch for old names; for bare weights pass {}."""
     if any(k.endswith(".uv.weight") for k in state_dict) and not (
             network_cfg.get("gate_gelu") and network_cfg.get("v_norm")):
         raise ValueError("checkpoint predates the unconditional paper block (no GELU on uv "
