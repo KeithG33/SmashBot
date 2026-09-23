@@ -125,6 +125,31 @@ def _set_rng(rng: dict) -> None:
         torch.cuda.set_rng_state_all(rng["cuda"])
 
 
+class GradClipper:
+    """Clips a network's gradient to `max_norm`, or with AutoClip
+    (Seetharaman et al. 2020) to a percentile of the run's own gradient-norm
+    history, which is checkpointed so a resume clips exactly as the
+    uninterrupted run would."""
+
+    def __init__(self, params, max_norm: float, percentile: float, history=None):
+        assert not (max_norm > 0 and percentile > 0), "one clipping rule at a time"
+        self.params = list(params)
+        self.max_norm, self.percentile = max_norm, percentile
+        self.history = list(history or [])
+
+    def __call__(self) -> dict:
+        if self.percentile > 0:
+            norm = torch.nn.utils.clip_grad_norm_(self.params, math.inf).item()
+            self.history.append(norm)
+            clip = float(np.percentile(self.history, self.percentile))
+            torch.nn.utils.clip_grad_norm_(self.params, clip)
+            return {"grad_norm": norm, "clip_norm": clip}
+        if self.max_norm > 0:
+            norm = torch.nn.utils.clip_grad_norm_(self.params, self.max_norm).item()
+            return {"grad_norm": norm, "clip_norm": self.max_norm}
+        return {}
+
+
 def _resume_state(ckpt: tp.Optional[dict]) -> dict:
     """The checkpoint's state, with pre-row-tracking checkpoints mapped onto
     the same keys (cycle position only; rows restart fresh)."""
@@ -245,6 +270,11 @@ def main(config: TrainConfig) -> None:
 
     policy_opt = torch.optim.Adam(policy.parameters(), lr=config.learner.learning_rate)
     value_opt = torch.optim.Adam(value_fn.parameters(), lr=config.learner.learning_rate)
+    clip_history = resume.get("clip_history") or {}
+    clip_policy = GradClipper(policy.parameters(), config.learner.max_grad_norm,
+                              config.learner.autoclip_percentile, clip_history.get("policy"))
+    clip_value = GradClipper(value_fn.parameters(), config.learner.max_grad_norm,
+                             config.learner.autoclip_percentile, clip_history.get("value"))
 
     if config.learner.precision == "bf16" and device == "cuda":
         autocast = lambda: torch.autocast("cuda", dtype=torch.bfloat16)
@@ -336,6 +366,7 @@ def main(config: TrainConfig) -> None:
                 "eval_hidden": _to(eval_hidden, "cpu"),
                 "eval_value_hidden": _to(eval_value_hidden, "cpu"),
                 "rng": _get_rng(),
+                "clip_history": {"policy": clip_policy.history, "value": clip_value.history},
             },
             best_eval_loss,
         )
@@ -395,10 +426,7 @@ def main(config: TrainConfig) -> None:
                 hids.append(detach(hid)); ms.append(m)
             train_hidden = hids[0] if k == 1 else _state_cat(hids, B)
             metrics = mean(ms)
-            if config.learner.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    policy.parameters(), config.learner.max_grad_norm
-                )
+            clip_metrics = clip_policy()
             policy_opt.step()
 
             value_opt.zero_grad(set_to_none=True)
@@ -414,10 +442,7 @@ def main(config: TrainConfig) -> None:
                 hids.append(detach(hid)); ms.append(m)
             value_hidden = hids[0] if k == 1 else _state_cat(hids, B)
             value_metrics = mean(ms)
-            if config.learner.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    value_fn.parameters(), config.learner.max_grad_norm
-                )
+            value_clip_metrics = clip_value()
             value_opt.step()
 
             if step % rt.log_interval == 0:
@@ -435,6 +460,8 @@ def main(config: TrainConfig) -> None:
                            for k, v in metrics["controller_flat"].items()},
                         "train/value/loss": value_metrics["loss"],
                         "train/value/uev": value_metrics["uev"],
+                        **{f"train/{k}": v for k, v in clip_metrics.items()},
+                        **{f"train/value/{k}": v for k, v in value_clip_metrics.items()},
                     },
                     step=step,
                 )

@@ -21,8 +21,9 @@ N = 4
 UNROLL = 1024  # toy game is 6402 frames: rows roll over at step 7
 
 
-def _config(run_dir: str, tag: str, steps: int) -> train_bc.TrainConfig:
+def _config(run_dir: str, tag: str, steps: int, autoclip: float = 0.0) -> train_bc.TrainConfig:
     return train_bc.TrainConfig(
+        learner=configs.LearnerConfig(autoclip_percentile=autoclip),
         data=configs.DataConfig(
             dataset=data_lib.DatasetConfig(dataset_path=str(TOY_DATASET), mirror=True),
             batch_size=2, unroll_length=UNROLL, num_workers=0, prefetch=2, pin_memory=False,
@@ -70,6 +71,22 @@ def test_resume_equals_uninterrupted(tmp_path):
     assert whole["train_data"]["rows"] == halves["train_data"]["rows"]
     for key in ("policy", "value", "policy_opt", "value_opt", "train_data", "test_data",
                 "train_hidden", "value_hidden", "eval_hidden", "eval_value_hidden"):
+        _assert_same(whole[key], halves[key], key)
+
+
+def test_autoclip_history_resumes(tmp_path):
+    """AutoClip's threshold is a percentile of every step so far, so the
+    history must be restored or the resumed run clips differently."""
+    run_dir = str(tmp_path)
+    train_bc.main(_config(run_dir, "whole", 2 * N, autoclip=50.0))
+    train_bc.main(_config(run_dir, "halves", N, autoclip=50.0))
+    cfg = _config(run_dir, "halves", 2 * N, autoclip=50.0)
+    cfg.runtime.restore = "auto"
+    train_bc.main(cfg)
+
+    whole, halves = _latest(run_dir, "whole"), _latest(run_dir, "halves")
+    assert len(whole["clip_history"]["policy"]) == 2 * N
+    for key in ("policy", "value", "policy_opt", "value_opt", "clip_history"):
         _assert_same(whole[key], halves[key], key)
 
 
