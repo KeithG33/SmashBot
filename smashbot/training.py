@@ -48,12 +48,22 @@ class GradClipper:
 
 
 def compile_cores(policy, value_fn) -> None:
-    """Compile the pieces with a fixed structure: each core's per-chunk
-    forward (dynamic over the chunk length; cuDNN recurrent layers stay eager
-    inside it) and the controller head. The reset chunking, tree maps and
-    metric .item()s around them stay in Python. For the learner's copies
-    only: a serving copy has its own compile inside its CUDA-graph capture."""
+    """Compile the pieces with a fixed structure, dynamic over the chunk
+    length: an SGU core's per-chunk forward (cuDNN recurrent layers stay
+    eager inside it), a tx_like core's stateless layers (the encoder and the
+    FFW blocks between its LSTMs), and the controller head. The reset
+    chunking, tree maps and metric .item()s around them stay in Python. For
+    the learner's copies only: a serving copy has its own compile inside its
+    CUDA-graph capture."""
+    from smashbot.networks import FFWWrapper
+
     torch._dynamo.config.recompile_limit = 64  # two cores x chunk shapes x cache dtypes
     for net in (policy.network, value_fn.network):
-        net.core._forward = torch.compile(net.core._forward, dynamic=True)
+        core = net.core
+        if hasattr(core, "_forward"):
+            core._forward = torch.compile(core._forward, dynamic=True)
+        else:
+            for layer in core.modules():
+                if isinstance(layer, FFWWrapper):
+                    layer._module.forward = torch.compile(layer._module.forward, dynamic=True)
     policy.controller_head.distance = torch.compile(policy.controller_head.distance, dynamic=True)
