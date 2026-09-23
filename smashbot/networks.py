@@ -64,6 +64,13 @@ class Network(nn.Module, abc.ABC):
         initial = self.initial_state(reset.shape[0], device=reset.device)
         return self.step(inputs, _mask_state(reset, initial, prev_state))
 
+    def cache_state(self, state, dtype):
+        """`state` with its window caches stored in `dtype` (serving keeps
+        them half precision: they are the resident term). Recurrent memory
+        (LSTM h/c, GRU h) stays fp32: it is tiny, and rounding it every
+        frame is what drifts (scripts/check_serving_precision.py)."""
+        return state
+
     def unroll(self, inputs, reset, initial_state):
         """inputs: [B, T, D], reset: [B, T] -> (outputs [B, T, D'], final_state).
 
@@ -418,6 +425,9 @@ class TransformerCore(Network):
             ],
         }
 
+    def cache_state(self, state, dtype):
+        return {**state, "kv": [(k.to(dtype), v.to(dtype)) for k, v in state["kv"]]}
+
     def _attn_mask(self, T, cache_len, B, device):
         # a key is attendable iff causal and at most W frames older than the
         # query; cache slot w holds the frame W-w steps before the chunk
@@ -717,6 +727,13 @@ class SGUCore(Network):
              causal_window[None].expand(B, T, T)], dim=2,
         ).unsqueeze(1)  # [B, 1, T, W-1+T]
 
+    def cache_state(self, state, dtype):
+        return {
+            **state,
+            "layers": [tuple(t.to(dtype) for t in layer) if isinstance(layer, tuple) else layer
+                       for layer in state["layers"]],
+        }
+
     # ---- serving ring: the v-cache is a ring written in place by the agent
     # (kv stays canonical — small, and cat+SDPA beats a ring read for it).
     # Ring mode is keyed by "ptr" in the state; the learner never sees it. ----
@@ -836,6 +853,9 @@ class StateActionNetwork(Network):
 
     def initial_state(self, batch_size, device=None):
         return self.core.initial_state(batch_size, device)
+
+    def cache_state(self, state, dtype):
+        return self.core.cache_state(state, dtype)
 
     def step(self, state_action, prev_state):
         return self.core.step(self.embed_sa(state_action), prev_state)

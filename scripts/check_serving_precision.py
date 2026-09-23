@@ -2,11 +2,15 @@
 its play?
 
 Feeds the IDENTICAL recorded observation stream (open loop, argmax actions)
-to an fp32 reference and to each serving path we use, and reports logit
-deltas and action agreement over whole games so recurrent drift has time to
-build. Paths: the league grid (fp16 stacked weights + fp16 state, hand-rolled
-recurrent cells), the student's BatchedPolicyAgent in fp16 with and without
-the hand-rolled cells, and bf16. scripts/check_fp16_state.py compared fp16
+to an fp32 reference and to each serving path we use, and reports greedy
+action agreement (Bernoulli for buttons, argmax for bins) and KL to the
+reference over whole games so recurrent drift has time to build. Paths: the
+league grid (3 stacked fp16 slices, fp16 window caches, hand-rolled cells),
+the production student (CUDA-graph capture, fp16 static buffers), the eager
+student with and without the hand-rolled cells, and bf16. Each arm samples
+its own actions (temperature 1e-3), so after a near-tie flip an arm's later
+inputs differ from the reference's: agreement measures play, not numerics
+alone. The fp32 cuDNN arm is the floor for that effect. scripts/check_fp16_state.py compared fp16
 vs fp32 STATE with the forward in fp16 both times; this compares against a
 true fp32 forward.
 
@@ -70,23 +74,44 @@ def record_stream(frames):
     return stream, resets
 
 
-def league_arm(policy, name_code, weights_dtype, state_dtype):
-    """The league grid's serving path (its template gets the hand-rolled cells)."""
-    a = LeagueAgent(policy, 1, NENV, name_code, DEV, temperature=1e-3,
+def league_arm(policy, name_code, weights_dtype, state_dtype, slices=1):
+    """The league grid's serving path (its template gets the hand-rolled
+    cells); `slices` > 1 exercises the vmap over stacked weights, with the
+    member loaded in every slice and slice 0 compared."""
+    a = LeagueAgent(policy, slices, NENV, name_code, DEV, temperature=1e-3,
                     weights_dtype=weights_dtype, state_dtype=state_dtype)
-    a.load_slice(0, policy.state_dict())
-    return lambda st, r: a.infer(tree.map_structure(lambda t: t[None], st), r[None]).logits
+    for s in range(slices):
+        a.load_slice(s, policy.state_dict())
+    return lambda st, r: tree.map_structure(
+        lambda t: t[:NENV],
+        a.infer(tree.map_structure(lambda t: t[None].expand(slices, *t.shape).contiguous(), st),
+                r[None].expand(slices, -1).contiguous()).logits)
 
 
-def batched_arm(policy, name_code, precision, state_dtype, manual):
-    """The student's serving path; `manual` = hand-rolled recurrent cells."""
+def batched_arm(policy, name_code, precision, state_dtype, manual, capture=False):
+    """The student's serving path; `manual` = hand-rolled recurrent cells,
+    `capture` = the production CUDA-graph replay on static buffers."""
     import copy
     policy = copy.deepcopy(policy)
     if manual:
         use_manual_recurrent_step(policy)
-    a = BatchedPolicyAgent(policy, NENV, name_code=name_code, device=DEV,
-                           precision=precision, state_dtype=state_dtype, temperature=1e-3)
+    a = BatchedPolicyAgent(policy, NENV, name_code=name_code, device=DEV, precision=precision,
+                           state_dtype=state_dtype, temperature=1e-3, capture=capture)
     return lambda st, r: a.infer(st, r, want_snapshot=False)[0][0].logits
+
+
+def _greedy_and_kl(lr, la):
+    """Greedy action and KL(ref|arm) per row: Bernoulli for a button's single
+    logit, categorical over the bins otherwise."""
+    if lr.shape[-1] == 1:
+        lr, la = lr[..., 0], la[..., 0]
+        p = torch.sigmoid(lr)
+        kl = p * (torch.nn.functional.logsigmoid(lr) - torch.nn.functional.logsigmoid(la)) \
+            + (1 - p) * (torch.nn.functional.logsigmoid(-lr) - torch.nn.functional.logsigmoid(-la))
+        return lr > 0, la > 0, kl
+    p = torch.softmax(lr, -1)
+    kl = (p * (torch.log_softmax(lr, -1) - torch.log_softmax(la, -1))).sum(-1)
+    return lr.argmax(-1), la.argmax(-1), kl
 
 
 def compare(name, ref_logits, arm_logits, stats):
@@ -94,12 +119,11 @@ def compare(name, ref_logits, arm_logits, stats):
     frame_diff = False
     for lr, la in zip(tree.flatten(ref_logits), tree.flatten(arm_logits)):
         lr, la = lr.float(), la.float()
-        d = (lr - la).abs()
-        p = torch.softmax(lr, -1)
-        s["kl"] += (p * (torch.log_softmax(lr, -1) - torch.log_softmax(la, -1))).sum(-1).mean().item()
-        s["l1"] += d.mean().item(); s["n"] += 1
-        agree = (lr.argmax(-1) == la.argmax(-1)).sum().item()
-        total = lr.argmax(-1).numel()
+        s["l1"] += (lr - la).abs().mean().item(); s["n"] += 1
+        gr, ga, kl = _greedy_and_kl(lr, la)
+        s["kl"] += kl.mean().item()
+        agree = (gr == ga).sum().item()
+        total = gr.numel()
         s["agree"] += agree; s["total"] += total
         frame_diff |= agree < total
     s["frames_diff"] += frame_diff
@@ -122,10 +146,11 @@ def main():
 
     ref = league_arm(pol, nc, torch.float32, None)
     arms = {
-        "league grid: fp16 weights + fp16 state, manual cells": league_arm(pol, nc, torch.float16, torch.float16),
-        "student: fp16 autocast, manual cells": batched_arm(pol, nc, "fp16", None, True),
+        "league grid: fp16 weights + fp16 caches, 3 slices": league_arm(pol, nc, torch.float16, torch.float16, slices=3),
+        "student (production): captured, fp16, fp16 caches": batched_arm(pol, nc, "fp16", torch.float16, True, capture=True),
+        "student: fp16 autocast, manual cells, fp32 state": batched_arm(pol, nc, "fp16", None, True),
         "student: fp16 autocast, cuDNN cells": batched_arm(pol, nc, "fp16", None, False),
-        "student: bf16 autocast + bf16 state, cuDNN cells": batched_arm(pol, nc, "bf16", torch.bfloat16, False),
+        "student: bf16 autocast + bf16 caches, cuDNN cells": batched_arm(pol, nc, "bf16", torch.bfloat16, False),
         "fp32 eager cuDNN cells (harness floor)": batched_arm(pol, nc, "fp32", None, False),
     }
 

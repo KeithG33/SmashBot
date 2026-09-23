@@ -177,11 +177,7 @@ class BatchedPolicyAgent:
     def _cast_state(self, state):
         if self.state_dtype is None:
             return state
-        return tree.map_structure(
-            lambda t: t.to(self.state_dtype)
-            if isinstance(t, torch.Tensor) and t.is_floating_point() else t,
-            state,
-        )
+        return self.policy.network.cache_state(state, self.state_dtype)
 
     def reset_env(self, i: int) -> None:
         """Fresh game in env i: zero its recurrent state, queue, and prev action."""
@@ -189,13 +185,18 @@ class BatchedPolicyAgent:
         mask[i] = True
         if self._ring:   # stale ring slots are masked by cache_len at read time
             self.hidden["cache_len"][i] = 0
-            for _, kv in self.hidden["layers"]:
-                kv[i].zero_()
+            for layer in self.hidden["layers"]:
+                (layer[1] if isinstance(layer, tuple) else layer)[i].zero_()
         else:
-            self.hidden = _mask_state(
+            # in place: a captured graph holds pointers to these buffers
+            fresh = _mask_state(
                 mask,
                 self._cast_state(self.policy.initial_state(self.num_envs, self.device)),
                 self.hidden,
+            )
+            tree.map_structure(
+                lambda dst, src: dst.copy_(src) if isinstance(dst, torch.Tensor) else None,
+                self.hidden, fresh,
             )
         self._queues[i] = collections.deque([self._neutral()] * self.delay)
         tree.map_structure(
@@ -597,8 +598,13 @@ class LeagueAgent:
         if not (self._use_capture and self._graph is not None) and self._hidden is None:
             self._hidden = self._initial_hidden()   # lazy (pre-capture move)
         hidden = self._out_hidden if self._use_capture and self._graph is not None else self._hidden
+
+        def cell(t, s, n):   # state leaves are [S, N, ...], torch RNN state [S, layers, N, H]
+            x = t[s]
+            return x[n] if x.shape[0] == self.N else x[:, n]
+
         tree.map_structure(
-            lambda t: t[s1, n1].copy_(t[s0, n0]) if isinstance(t, torch.Tensor) else None,
+            lambda t: cell(t, s1, n1).copy_(cell(t, s0, n0)) if isinstance(t, torch.Tensor) else None,
             hidden,
         )
         self._queues[s1 * self.N + n1] = self._queues[s0 * self.N + n0]
@@ -696,13 +702,9 @@ class LeagueAgent:
             *h0,
         )
         if self.state_dtype is not None:
-            # fp16 carried state: computed under fp16 autocast anyway; the
-            # in/out static buffers are the grid's biggest resident term.
-            stacked = tree.map_structure(
-                lambda t: t.to(self.state_dtype)
-                if isinstance(t, torch.Tensor) and t.is_floating_point() else t,
-                stacked,
-            )
+            # fp16 window caches: the in/out static buffers are the grid's
+            # biggest resident term (recurrent memory stays fp32, see cache_state)
+            stacked = self._template.network.cache_state(stacked, self.state_dtype)
         return stacked
 
     def _make_vmap(self):
