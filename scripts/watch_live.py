@@ -34,6 +34,7 @@ import torch
 from melee.slippstream import EnetDisconnected
 
 from smashbot.eval import game as game_lib
+from smashbot.networks import check_loadable
 from smashbot.eval.agent import AsyncDelayedAgent
 from smashbot.rl.config import MAIN_12
 
@@ -134,6 +135,7 @@ def load_side(spec: SideSpec, device: str = "cpu"):
     if spec.snapshot:
         policy, name_map, _ = game_lib.load_policy(spec.config_from, device)
         state = torch.load(spec.snapshot, map_location=device, weights_only=True)
+        check_loadable({}, state)   # a bare snapshot has no config: only today's names pass
         policy.load_state_dict(state)
         policy.eval()
         return policy, name_map, None
