@@ -72,6 +72,12 @@ class ChunkAssembler:
             and len(self._rewards) >= self.T + self.delay
         )
 
+    def frames_to_ready(self, first_frame: bool) -> int:
+        """Frames still to push until ready(): each pushes a record and a
+        reward, except a collector's very first frame, which has no reward."""
+        return max(self.T + 1 - len(self._records),
+                   self.T + self.delay - len(self._rewards) + first_frame, 1)
+
     def emit(self) -> Trajectory:
         assert self.ready()
         T, D = self.T, self.delay

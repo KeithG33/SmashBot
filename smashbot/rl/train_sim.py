@@ -249,7 +249,7 @@ class SimLeagueWorker:
     def collect(self, num_trajectories: int) -> list:
         ppo, imit = [], []
         while len(ppo) < num_trajectories:
-            p, i = self._worker.collect(self.cfg.unroll_length)
+            p, i = self._worker.collect(self._worker.frames_to_ready())
             ppo += p
             imit += i
         return ppo + imit

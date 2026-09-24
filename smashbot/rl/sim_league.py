@@ -240,6 +240,11 @@ class MultiOpponentSimWorker:
     def _all_grids(self):
         return self.grids + ([self.pfsp_grid] if self.pfsp_grid is not None else [])
 
+    def frames_to_ready(self) -> int:
+        """Frames until the student's next chunk is ready: collecting exactly
+        these returns the chunk just played instead of buffering the next."""
+        return self.assembler.frames_to_ready(first_frame=self._prev is None)
+
     def collect(self, num_frames):
         ppo_out, imit_out = [], []
         env, dev, T = self.env, self.device, self.unroll

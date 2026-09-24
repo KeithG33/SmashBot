@@ -48,6 +48,30 @@ def test_assembler_chunking_and_reward_shift():
     assert second.rewards[0, 0].item() == pytest.approx(100.0 + T + D + 1)
 
 
+def test_frames_to_ready_counts_the_rewardless_first_frame():
+    """In the worker's order (frame f's reward is that of f-1 -> f, none on
+    the very first frame), the first chunk is ready after T+D+1 frames and
+    each later one after T: collecting exactly frames_to_ready() returns the
+    chunk just played, never one buffered from the collection before."""
+    T, D, N = 240, 18, 2
+    asm = ChunkAssembler(unroll_length=T, delay=D)
+    first, played = True, []
+    for chunk in range(3):
+        todo = asm.frames_to_ready(first_frame=first)
+        played.append(todo)
+        for k in range(todo):
+            assert not asm.ready()
+            if not first:
+                asm.push_reward(torch.zeros(N))
+            asm.push_frame(_fake_record(N, 0), torch.zeros(N, dtype=torch.bool),
+                           {"h": torch.zeros(())})
+            first = False
+        assert asm.ready()
+        asm.emit()
+        assert not asm.ready()
+    assert played == [T + D + 1, T, T]
+
+
 def test_compute_reward():
     prev_s = torch.tensor([[4.0, 4.0], [2.0, 3.0]])
     s = torch.tensor([[4.0, 3.0], [1.0, 3.0]])  # env0: opp died; env1: we died
