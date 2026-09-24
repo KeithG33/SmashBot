@@ -82,7 +82,8 @@ def _set_rng(rng: dict) -> None:
     np.random.set_state(rng["numpy"])
     torch.set_rng_state(rng["torch"])
     if rng["cuda"] is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(rng["cuda"])
+        for device, state in enumerate(rng["cuda"][:torch.cuda.device_count()]):   # the GPUs this machine has
+            torch.cuda.set_rng_state(state, device)
 
 
 class _FiniteWatch:

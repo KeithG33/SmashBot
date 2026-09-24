@@ -104,3 +104,32 @@ def test_member_weights_lru_and_warm(tmp_path):
     assert mw.get("a")["w"].item() == ord("a")
     mw.get("b"); mw.get("c")
     assert list(mw._cache) == ["b", "c"]        # LRU evicted a
+
+
+def test_member_weights_rewarm_after_eviction(tmp_path):
+    """A member warmed, never fetched and then evicted must load again in the
+    background when warmed again (a finished load leaves no in-flight entry
+    to make warm() a no-op)."""
+    import time
+
+    import torch
+    paths = {}
+    for k in ("a", "b", "c"):
+        p = tmp_path / f"{k}.pt"
+        torch.save({"w": torch.tensor([ord(k)])}, p)
+        paths[k] = str(p)
+    mw = MemberWeights(lambda k: paths[k], lru=2)
+
+    def settled(member):
+        for _ in range(500):
+            if mw.ready(member):
+                return True
+            time.sleep(0.01)
+        return False
+
+    mw.warm("a")
+    assert settled("a")
+    mw.get("b"); mw.get("c")
+    assert not mw.ready("a")                     # evicted without ever being fetched
+    mw.warm("a")
+    assert settled("a")

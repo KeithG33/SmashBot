@@ -44,6 +44,7 @@ class MemberWeights:
         with self._lock:
             self._cache[member] = sd
             self._cache.move_to_end(member)
+            self._inflight.pop(member, None)   # a finished load is no longer in flight
             while len(self._cache) > self.lru:
                 self._cache.popitem(last=False)
 
@@ -61,7 +62,8 @@ class MemberWeights:
             return member in self._cache
 
     def get(self, member: str) -> dict:
-        t = self._inflight.pop(member, None)
+        with self._lock:
+            t = self._inflight.get(member)
         if t is not None:
             t.join()
         with self._lock:
