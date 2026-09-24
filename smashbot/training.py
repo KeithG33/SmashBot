@@ -118,10 +118,12 @@ def compile_cores(policy, value_fn) -> None:
     """Compile the pieces with a fixed structure, dynamic over the chunk
     length: an SGU core's per-chunk forward (cuDNN recurrent layers stay
     eager inside it), a tx_like core's stateless layers (the encoder and the
-    FFW blocks between its LSTMs), and the controller head. The reset
+    FFW blocks between its LSTMs), the controller head, and the value net's
+    return recursion (tiny kernels, one per frame, in eager). The reset
     chunking, tree maps and metric .item()s around them stay in Python. For
     the learner's copies only: a serving copy has its own compile inside its
     CUDA-graph capture."""
+    from smashbot import delay as delay_lib
     from smashbot.networks import FFWWrapper
 
     torch._dynamo.config.recompile_limit = 64  # two cores x chunk shapes x cache dtypes
@@ -134,3 +136,4 @@ def compile_cores(policy, value_fn) -> None:
                 if isinstance(layer, FFWWrapper):
                     layer._module.forward = torch.compile(layer._module.forward, dynamic=True)
     policy.controller_head.distance = torch.compile(policy.controller_head.distance, dynamic=True)
+    value_fn.returns = torch.compile(delay_lib.discounted_returns)

@@ -30,6 +30,7 @@ class ValueFunction(nn.Module):
         super().__init__()
         self.network = network
         self.head = nn.Linear(network.core.output_size, 1)
+        self.returns = delay_lib.discounted_returns   # compile_cores swaps in a compiled copy
 
     def initial_state(self, batch_size: int, device=None) -> RecurrentState:
         return self.network.initial_state(batch_size, device)
@@ -59,24 +60,25 @@ class ValueFunction(nn.Module):
             inputs, frames.is_resetting[:, :-1], initial_state
         )
         values = self.head(outputs).squeeze(-1)
-        last_output, _ = self.network.step_with_reset(
-            last_input, frames.is_resetting[:, -1], final_state
-        )
-        last_value = self.head(last_output).squeeze(-1)
+        with torch.no_grad():   # the targets are constants: no graph for the bootstrap frame
+            last_output, _ = self.network.step_with_reset(
+                last_input, frames.is_resetting[:, -1], final_state
+            )
+            last_value = self.head(last_output).squeeze(-1)
 
         # Return recursion and regression in fp32 even under bf16 autocast:
         # an 80-step serial accumulation is where low precision actually hurts.
         with torch.autocast(values.device.type, enabled=False):
             values = values.float()
-            last_value = last_value.float()
             rewards = frames.reward.float()
             discounts = torch.where(
                 frames.is_resetting[:, 1:], 0.0,
                 torch.as_tensor(discount, device=values.device),
             )
-            targets = delay_lib.discounted_returns(
-                rewards=rewards, discounts=discounts, bootstrap=last_value
-            ).detach()
+            with torch.no_grad():
+                targets = self.returns(
+                    rewards=rewards, discounts=discounts, bootstrap=last_value.float()
+                )
             advantages = targets - values
             loss = torch.square(advantages).mean()
             metrics = {}
