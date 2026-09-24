@@ -301,6 +301,17 @@ that the latency table inverted; delay 18 vs 21).
   STORAGE with the forward in fp16 both times. Test = lockstep fp32 vs fp16
   forward for one phillip, compare action agreement.
 
+## A/B: residual stream in fp32 under bf16/fp16 autocast (Keith, 2026-09-24)
+- Today the encoder's output enters the core in bf16 (fp16 in RL), so every block's
+  `x = x + block(x)` accumulates the residual sum in half precision (bf16 keeps ~3
+  significant digits) and the rounding compounds over depth. Common mixed-precision
+  practice keeps the residual stream fp32 and only the matmuls in half precision.
+- Change: upcast the encoder output to fp32 once; `fp32 + bf16` then stays fp32 in every
+  residual add while the blocks' matmuls still run in bf16. Costs some memory bandwidth,
+  no extra compute. Not a bug: our runs train fine; this may buy a little loss or nothing.
+- Test: the hybrid (slslsl, sl value) to 100k with the upcast vs the existing slslsl
+  100k run, same seed and data; compare paired eval and train loss step for step.
+
 ## Controller bins aligned to Melee's thresholds, at the next from-scratch BC run (Keith, 2026-09-24)
 - The problem (inherited from slippi-ai, whose TF and JAX embeddings do the same): stick
   axes are 17 evenly spaced bins (`ControllerConfig.axis_spacing` 16, one per 10 raw
