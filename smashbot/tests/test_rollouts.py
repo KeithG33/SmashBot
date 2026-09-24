@@ -396,6 +396,35 @@ def test_async_delayed_agent_matches_sync(monkeypatch):
         )
 
 
+def test_async_agent_failure_raises_instead_of_freezing():
+    """An exception on the inference thread reaches the caller's step(): a
+    live game stops with the traceback instead of waiting forever."""
+    from smashbot import embed as embed_lib
+    from smashbot.eval.agent import AsyncDelayedAgent
+    from smashbot.tests.test_ppo import _tiny_policy
+
+    policy = _tiny_policy(seed=0)
+    policy.delay = 3
+    agent = AsyncDelayedAgent(policy, own_port=1, opponent_port=2, device="cpu")
+    embed_game = embed_lib.EmbedConfig().make_game_embedding()
+    game = _rand_raw_game(embed_game, (), np.random.default_rng(0))
+    agent.parser = type("StubParser", (), {"get_game": lambda self, _gs: game})()
+    calls = {"n": 0}
+    sample = policy.sample
+
+    def failing(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise ValueError("boom")
+        return sample(*a, **k)
+
+    policy.sample = failing
+    with pytest.raises(RuntimeError, match="inference thread failed") as err:
+        for _ in range(policy.delay + 5):
+            agent.step(None)
+    assert isinstance(err.value.__cause__, ValueError)
+
+
 def test_async_agent_absorbs_slow_samples(monkeypatch):
     """Inference spikes must neither block step() nor change the emitted
     sequence: the pipeline lags and catches up inside the delay-queue slack."""

@@ -90,23 +90,9 @@ class DelayedAgent:
             state,
         )
         t3 = time.perf_counter()
-
-        sampled, self.hidden = self.policy.sample(
-            StateAction(state=state, action=self._prev_action, name=self._name),
-            self.hidden,
-            temperature=self.temperature,
-        )
-        # clone: retained across steps, and cudagraph replay reuses output buffers.
-        # int64 keeps dtypes uniform for dynamo guards (bools stay bool).
-        self._prev_action = tree.map_structure(
-            lambda t: t.clone() if t.dtype == torch.bool else t.long().clone(),
-            sampled.controller_state,
-        )
-
+        controller = self._act(state)
         t4 = time.perf_counter()
-        encoded_np = tree.map_structure(
-            lambda t: t[0].cpu().numpy(), sampled.controller_state
-        )
+        encoded_np = tree.map_structure(lambda t: t[0].cpu().numpy(), controller)
         self._queue.append(self._embed_controller.decode(encoded_np))
         t5 = time.perf_counter()
         n = self._stage_count = getattr(self, "_stage_count", 0) + 1
@@ -118,6 +104,38 @@ class DelayedAgent:
         self._stage_acc = acc
         self.stage_ms = {k: 1e3 * v / n for k, v in acc.items()}
         return self._queue.popleft()
+
+    @torch.no_grad()
+    def _act(self, state):
+        """The live forward: one sample from the carried state; returns the
+        sampled (encoded) controller."""
+        sampled, self.hidden = self.policy.sample(
+            StateAction(state=state, action=self._prev_action, name=self._name),
+            self.hidden,
+            temperature=self.temperature,
+        )
+        # clone: retained across steps, and cudagraph replay reuses output buffers.
+        # int64 keeps dtypes uniform for dynamo guards (bools stay bool).
+        self._prev_action = tree.map_structure(
+            lambda t: t.clone() if t.dtype == torch.bool else t.long().clone(),
+            sampled.controller_state,
+        )
+        return sampled.controller_state
+
+    def warm_up(self, frames: int = 50) -> None:
+        """Compile a torch.compile'd policy through the exact call play makes
+        (grad mode, arguments, dtypes), so the first live frame never
+        recompiles; then start fresh."""
+        dummy = self.policy.network.embed_state_action.dummy((1,)).state
+        state = tree.map_structure(
+            lambda x: torch.from_numpy(np.ascontiguousarray(
+                np.asarray(x).astype(np.int64) if np.asarray(x).dtype.kind in "iu" else np.asarray(x)
+            )).to(self.device),
+            dummy,
+        )
+        for _ in range(frames):
+            self._act(state)
+        self.reset()
 
 
 class AsyncDelayedAgent(DelayedAgent):
@@ -152,6 +170,7 @@ class AsyncDelayedAgent(DelayedAgent):
         # delay-queue prefill and receives computed actions in order
         self._in_q = queue_lib.Queue()
         self._out_ready = threading.Semaphore(len(self._queue))
+        self._error = None
         self._wait_acc = 0.0
         self._wait_n = 0
         self._thread = threading.Thread(target=self._worker_loop, daemon=True)
@@ -162,9 +181,14 @@ class AsyncDelayedAgent(DelayedAgent):
             game = self._in_q.get()
             if game is None:
                 return
-            self._compute(game)
-            self._out_ready.release()
-            self._in_q.task_done()
+            try:
+                self._compute(game)
+            except BaseException as e:   # surfaces in step(), not as a silent freeze
+                self._error = e
+                return
+            finally:
+                self._out_ready.release()
+                self._in_q.task_done()
 
     def _compute(self, game) -> None:
         """encode -> sample -> enqueue; runs only on the worker thread, which
@@ -179,21 +203,7 @@ class AsyncDelayedAgent(DelayedAgent):
             ).to(self.device),
             state,
         )
-        with torch.no_grad():
-            sampled, self.hidden = self.policy.sample(
-                StateAction(
-                    state=state, action=self._prev_action, name=self._name
-                ),
-                self.hidden,
-                temperature=self.temperature,
-            )
-        self._prev_action = tree.map_structure(
-            lambda t: t.clone() if t.dtype == torch.bool else t.long().clone(),
-            sampled.controller_state,
-        )
-        encoded_np = tree.map_structure(
-            lambda t: t[0].cpu().numpy(), sampled.controller_state
-        )
+        encoded_np = tree.map_structure(lambda t: t[0].cpu().numpy(), self._act(state))
         self._queue.append(self._embed_controller.decode(encoded_np))
 
     def drain(self) -> None:
@@ -207,6 +217,8 @@ class AsyncDelayedAgent(DelayedAgent):
         # blocks ONLY if compute has lagged a full `delay` frames (~300ms)
         t0 = time.perf_counter()
         self._out_ready.acquire()
+        if self._error is not None:
+            raise RuntimeError("inference thread failed") from self._error
         self._wait_acc += time.perf_counter() - t0
         self._wait_n += 1
         self.stage_ms = {"queue_wait": 1e3 * self._wait_acc / self._wait_n}

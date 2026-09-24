@@ -147,8 +147,8 @@ def build_agents(
     """Load both policies and wrap each in an AsyncDelayedAgent. Each agent
     keeps its own delay (from its checkpoint's policy config -- Phillip 21,
     ours 18) and its own name_code (resolved in its own name_map). Compiling
-    here also WARMS each policy (game_lib.maybe_compile runs 50 dummy
-    forwards), so it must happen before Dolphin boots."""
+    here also WARMS each agent through its live call (warm_up), so it must
+    happen before Dolphin boots."""
     ports = sorted(specs)
     agents: dict[int, AsyncDelayedAgent] = {}
     infos: dict[int, SideInfo] = {}
@@ -175,7 +175,7 @@ def build_agents(
     for port in ports:
         policy, name_map, step = load_side(specs[port], device)
         if compile_policies:
-            game_lib.maybe_compile(policy, device)
+            game_lib.compile_policy(policy)
             policy.sample = _race_guarded(policy.sample)
         code = game_lib.resolve_name_code(name_map, name)
         (opponent,) = [p for p in ports if p != port]
@@ -187,6 +187,8 @@ def build_agents(
             temperature=temperature,
             device=device,
         )
+        if compile_policies:
+            agents[port].warm_up()
         infos[port] = SideInfo(
             port=port,
             label=specs[port].label,
@@ -294,14 +296,13 @@ def _winner_str(record) -> str:
 def _describe(record, index: int) -> str:
     mins, secs = divmod(record.frames // 60, 60)
     diff = abs(record.bot_stocks - record.opp_stocks)
-    tail = " [timeout]" if record.timeout else ""
     if record.winner is None:
         verdict = "draw"
     else:
         verdict = f"{_winner_str(record)} wins by {diff} stock{'s' * (diff != 1)}"
     return (f"game {index}: P1 {record.bot_stocks} - "
             f"{record.opp_stocks} P2 -> {verdict} "
-            f"({mins}:{secs:02d}){tail}")
+            f"({mins}:{secs:02d})")
 
 
 def main(argv=None) -> None:
@@ -393,8 +394,6 @@ def main(argv=None) -> None:
         ):
             records.append(record)
             print(_describe(record, len(records)))
-            if record.timeout:
-                print("frame-count timeout; stopping (restart to continue)")
     except EnetDisconnected:
         print(f"window closed, {len(records)} game"
               f"{'s' * (len(records) != 1)} recorded")

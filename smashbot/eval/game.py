@@ -14,8 +14,6 @@ import time
 import typing as tp
 
 import melee
-import numpy as np
-import torch
 
 from slippi_ai import controller_lib
 from slippi_ai import dolphin as dolphin_lib
@@ -31,13 +29,12 @@ from smashbot.policy import build_policy_from_config
 class GameRecord:
     """One game, from the bot's perspective (bot on port 1)."""
 
-    winner: str | None  # "bot" | "opp" | None (draw/timeout)
+    winner: str | None  # "bot" | "opp" | None (draw)
     bot_stocks: int
     opp_stocks: int
     bot_damage_dealt: float  # sum of opponent percent gains
     bot_damage_taken: float
     frames: int
-    timeout: bool = False
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -53,12 +50,10 @@ def load_policy(ckpt_path: str, device: str):
     return policy, name_map, ckpt["state"].get("step")
 
 
-def maybe_compile(policy, device: str, verbose: bool = True) -> None:
-    """torch.compile policy.sample in place and warm it up (~30-60s)."""
+def compile_policy(policy) -> None:
+    """torch.compile policy.sample in place; the agent's warm_up() compiles it
+    through the live call before play (~30-60s)."""
     import torch._dynamo
-    import tree
-
-    from slippi_ai.types import StateAction
 
     # "default" (inductor fusion, no cudagraphs) on both devices. cudagraphs
     # (mode="reduce-overhead") reuse output-tensor storage across runs, which
@@ -67,24 +62,6 @@ def maybe_compile(policy, device: str, verbose: bool = True) -> None:
     # been overwritten"). Fusion alone is enough for batch-1 live inference.
     policy.sample = torch.compile(policy.sample, mode="default")
     torch._dynamo.config.recompile_limit = 128
-    if verbose:
-        print("torch.compile enabled; warming up...")
-
-    def to_t(x):
-        x = np.asarray(x)
-        if x.dtype.kind in "iu":
-            x = x.astype(np.int64)
-        return torch.from_numpy(np.ascontiguousarray(x)).to(device)
-
-    dummy = tree.map_structure(to_t, policy.network.embed_state_action.dummy((1,)))
-    dummy_sa = StateAction(state=dummy.state, action=dummy.action, name=dummy.name)
-    h = policy.initial_state(1, device)
-    t0 = time.perf_counter()
-    with torch.inference_mode():
-        for _ in range(50):
-            _, h = policy.sample(dummy_sa, h)
-    if verbose:
-        print(f"warmup done in {time.perf_counter() - t0:.0f}s")
 
 
 def resolve_name_code(name_map: dict, name: str, verbose: bool = True) -> int:
@@ -143,12 +120,10 @@ def run_games(
     dolphin: dolphin_lib.Dolphin,
     agents: dict[int, DelayedAgent],
     num_games: int = 0,
-    max_frames_per_game: int = 8 * 60 * 60,
     on_frame: tp.Callable[[melee.GameState, int, float], bool | None] | None = None,
 ) -> tp.Iterator[GameRecord]:
     """Yields one GameRecord per completed game; stops after `num_games`
-    (0 = run forever, for live play). On timeout the record is yielded with
-    timeout=True and iteration stops — the caller should restart Dolphin.
+    (0 = run forever, for live play).
 
     on_frame(gamestate, frames_this_game, agent_step_seconds) is called every
     frame; returning True stops iteration immediately (mid-game, no record).
@@ -166,7 +141,7 @@ def run_games(
     dealt = taken = 0.0
     last_stocks = {bot_port: 4, opp_port: 4}
 
-    def finalize(timeout: bool = False) -> GameRecord:
+    def finalize() -> GameRecord:
         b, o = last_stocks[bot_port], last_stocks[opp_port]
         winner = None
         if b != o:
@@ -178,7 +153,6 @@ def run_games(
             bot_damage_dealt=dealt,
             bot_damage_taken=taken,
             frames=frames_this_game,
-            timeout=timeout,
         )
 
     for gamestate in dolphin.iter_gamestates(skip_menu_frames=True):
@@ -219,6 +193,3 @@ def run_games(
             if on_frame(gamestate, frames_this_game, step_seconds):
                 return
 
-        if frames_this_game >= max_frames_per_game:
-            yield finalize(timeout=True)
-            return

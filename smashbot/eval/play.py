@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+import time
 
 import melee
 import numpy as np
@@ -80,10 +81,23 @@ def main() -> None:
 
     policy, name_map, step = game_lib.load_policy(args.ckpt, args.device)
     if args.compile:
-        game_lib.maybe_compile(policy, args.device)
+        game_lib.compile_policy(policy)
     name_code = game_lib.resolve_name_code(name_map, args.name)
     print(f"loaded {args.ckpt} (train step {step}), delay={policy.delay}, "
           f"conditioning on {args.name!r} -> code {name_code} (map: {name_map})")
+
+    # Always async: inference runs on a background thread so Dolphin renders a
+    # full 60fps and the delay queue absorbs the latency (the synchronous path
+    # bottlenecked at 20-40fps — bot behavior is identical either way).
+    agent = agent_lib.AsyncDelayedAgent(
+        policy, own_port=1, opponent_port=2, name_code=name_code,
+        console_delay=args.online_delay, temperature=args.temperature,
+        device=args.device,
+    )
+    if args.compile:
+        t0 = time.perf_counter()
+        agent.warm_up()
+        print(f"compiled through the live call in {time.perf_counter() - t0:.0f}s")
 
     if args.opponent == "cpu":
         spec = f"cpu:{args.cpu_level}:{args.opponent_char}"
@@ -102,14 +116,6 @@ def main() -> None:
         gfx_backend=args.gfx_backend,
         online_delay=args.online_delay,
         mute=args.mute,
-    )
-    # Always async: inference runs on a background thread so Dolphin renders a
-    # full 60fps and the delay queue absorbs the latency (the synchronous path
-    # bottlenecked at 20-40fps — bot behavior is identical either way).
-    agent = agent_lib.AsyncDelayedAgent(
-        policy, own_port=1, opponent_port=2, name_code=name_code,
-        console_delay=args.online_delay, temperature=args.temperature,
-        device=args.device,
     )
     if args.pin_cores and args.device == "cpu":
         import os
