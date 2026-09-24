@@ -339,8 +339,11 @@ class Learner:
             loss.backward()
 
     def initial_state(self, batch_size: int, device=None) -> LearnerState:
+        teacher = self.teacher.initial_state(batch_size, device)
+        if self._amp_enabled:   # as the fp16 forward carries it: no fp32 first-step peak
+            teacher = self.teacher.network.cache_state(teacher, torch.float16)
         return LearnerState(
-            teacher=self.teacher.initial_state(batch_size, device),
+            teacher=teacher,
             value=self.value_function.initial_state(batch_size, device),
         )
 
