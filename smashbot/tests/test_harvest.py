@@ -6,7 +6,6 @@ import collections
 import typing as tp
 
 import numpy as np
-import pytest
 import torch
 import tree
 from slippi_ai.types import Frames, StateAction

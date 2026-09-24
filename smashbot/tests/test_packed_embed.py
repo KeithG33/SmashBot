@@ -11,7 +11,6 @@ import pytest
 import torch
 import tree
 
-from slippi_ai.types import StateAction
 
 from smashbot import configs, embed as embed_lib
 from smashbot.policy import build_policy

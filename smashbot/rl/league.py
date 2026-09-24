@@ -261,12 +261,10 @@ class League:
         return self.locks.get(member) if _is_import_key(member) else None
 
     def _keys(self) -> list[str]:
-        return [k for k in list(self.pool.league_members) + list(self.pool.archive)
-                if k != "cpu"]
+        return list(self.pool.league_members) + list(self.pool.archive)
 
     def _draw(self, allowed=None) -> str | None:
-        m = self.pool.draw_member(self.rng, allowed)
-        return None if m == "cpu" else m
+        return self.pool.draw_member(self.rng, allowed)
 
     def _draw_next(self, env: int) -> None:
         m = self._draw() or self.member_now[env]

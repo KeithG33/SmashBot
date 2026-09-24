@@ -332,7 +332,6 @@ def convert(args):
     assert not missing, f"unassigned parameters: {missing}"
 
     # --- save in our checkpoint format ---
-    import dataclasses
 
     from smashbot import configs, saving
     from smashbot.train_bc import TrainConfig
@@ -595,7 +594,6 @@ def check_report(diffs: dict) -> list[str]:
 
 def _build_asset(policy, golden, debug, weights):
     """Golden npz + TF embedded inputs + independent fp64 reference outputs."""
-    import tree
 
     w = {int(k[2:]): weights[k] for k in weights.files}
     asset = {k: golden[k] for k in golden.files}

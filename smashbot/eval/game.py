@@ -36,9 +36,6 @@ class GameRecord:
     bot_damage_taken: float
     frames: int
 
-    def to_dict(self) -> dict:
-        return dataclasses.asdict(self)
-
 
 def load_policy(ckpt_path: str, device: str):
     ckpt = saving.load_checkpoint(ckpt_path)

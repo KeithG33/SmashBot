@@ -206,7 +206,7 @@ def batch_to_frames(batch: data_lib.Batch, network, pin: bool = False):
     transpose — all SmashBot tensors are (batch, time, ...)): the p0 controller
     becomes the action stream and the network's embedding encodes it.
     """
-    from slippi_ai.types import Frames, StateAction
+    from slippi_ai.types import StateAction
 
     if np.any(np.asarray(batch.is_resetting)[:, 1:]):
         raise ValueError("Unexpected mid-episode reset.")

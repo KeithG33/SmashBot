@@ -39,12 +39,6 @@ class ControllerHead(nn.Module, abc.ABC):
     def controller_embedding(self) -> StructEmbedding:
         ...
 
-    def dummy_controller(self, shape):
-        return self.controller_embedding.dummy(shape)
-
-    def decode_controller(self, controller_state):
-        return self.controller_embedding.decode(controller_state)
-
 
 def _make_mlp(input_size: int, hidden_size: int, depth: int, output_size: int) -> nn.Module:
     layers: list[nn.Module] = []

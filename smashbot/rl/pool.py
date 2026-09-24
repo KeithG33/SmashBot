@@ -14,17 +14,10 @@ import typing as tp
 
 import torch
 
-# Special (non-snapshot) league members that can compete for snapshot slots
-# when the league_teacher/league_cpu/league_phillip flags fold them into the
-# PFSP league. Their payoff rows live in pfsp.json under these string keys,
-# exactly like ghost rows live under snapshot paths — and they are NEVER
-# pruned (neither by thinning, which only touches archive paths, nor by the
-# load-time prune, so toggling the flags across restarts loses no data).
-# Imported members (frozen checkpoints from a PREVIOUS run, configured via
-# RolloutConfig.league_imports) use dynamic "import:NAME" keys with the same
-# permanence guarantees — see _is_import_key.
-LEAGUE_MEMBER_KEYS = ("teacher", "cpu", "phillip")
-
+# Imported league members (frozen checkpoints from a PREVIOUS run) use
+# "import:NAME" keys. Their payoff rows live in pfsp.json like ghost rows live
+# under snapshot paths, and are NEVER pruned (neither by thinning, which only
+# touches archive paths, nor by the load-time prune) — see _is_import_key.
 IMPORT_KEY_PREFIX = "import:"
 
 
@@ -77,9 +70,8 @@ class SnapshotPool:
         # alphas track only the last minutes of a stint; slower ones lag
         # across student versions. Char mixture averages out at this horizon.
         payoff_ema_alpha: float = 0.01,
-        # Special league members ("teacher"/"cpu"/"phillip"/"import:NAME")
-        # folded into the candidate set for non-latest slots; empty =
-        # snapshots only (today's league).
+        # Imported members ("import:NAME") folded into the candidate set for
+        # non-latest slots; empty = snapshots only (today's league).
         league_members: tp.Sequence[str] = (),
     ):
         self.dir = directory
@@ -89,12 +81,9 @@ class SnapshotPool:
         self.pfsp_hard_frac = pfsp_hard_frac
         self.pfsp_explore = pfsp_explore
         self.payoff_ema_alpha = payoff_ema_alpha
-        assert all(
-            m in LEAGUE_MEMBER_KEYS or _is_import_key(m)
-            for m in league_members
-        ), (
+        assert all(_is_import_key(m) for m in league_members), (
             f"unknown league members {list(league_members)}; "
-            f"valid: {LEAGUE_MEMBER_KEYS} or '{IMPORT_KEY_PREFIX}NAME'"
+            f"valid: '{IMPORT_KEY_PREFIX}NAME'"
         )
         self.league_members = list(league_members)
         os.makedirs(directory, exist_ok=True)
@@ -123,11 +112,10 @@ class SnapshotPool:
                 table = json.load(f)
         except (OSError, ValueError):
             return
-        # keep rows for surviving snapshots AND the special league members
-        # (special rows persist regardless of the current league flags);
-        # import rows ("import:NAME") are likewise permanent — the payoff
-        # row vs a previous run's checkpoint is a cross-generation record
-        existing = set(self.archive) | set(LEAGUE_MEMBER_KEYS)
+        # keep rows for surviving snapshots; import rows ("import:NAME") are
+        # permanent — the payoff row vs a previous run's checkpoint is a
+        # cross-generation record
+        existing = set(self.archive)
         self.payoff = {
             path: entry for path, entry in table.items()
             if path in existing or _is_import_key(path)
@@ -285,9 +273,8 @@ class SnapshotPool:
     def boot_draws(self, rng: random.Random, n: int) -> list[str]:
         """First opponents for n envs at boot: every drawable member once
         (shuffled) so the payoff table gets a reading on everyone, then
-        per-match draws. "cpu" is excluded — a Dolphin boots with a policy
-        seat and adopts cpu only through a recycle (see rollouts)."""
-        members = [m for m in self.league_members if m != "cpu"] + list(self.archive)
+        per-match draws."""
+        members = list(self.league_members) + list(self.archive)
         rng.shuffle(members)
         picks = members[:n]
         while len(picks) < n:

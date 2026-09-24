@@ -15,7 +15,6 @@ are then consumed by Policy.unroll, which shifts actions by one internally
 (prev = action[:, :-1], target = action[:, 1:]).
 """
 
-import typing as tp
 
 import torch
 import tree

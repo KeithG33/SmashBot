@@ -23,11 +23,11 @@ import torch
 
 from smashbot.rl.agent import BatchedPolicyAgent
 from smashbot.networks import check_loadable
-from smashbot.rl.league import League, LeagueSeats, MemberWeights
+from smashbot.rl.league import League, MemberWeights
 from smashbot.rl.pool import SnapshotPool
 from smashbot.rl.rollouts import ChunkAssembler, HarvestAssembler, compute_reward
 from smashbot.rl import sim_env
-from smashbot.rl.sim_env import seat_stats, states_to_torch  # noqa: F401
+from smashbot.rl.sim_env import seat_stats
 
 
 class PfspGrid:
@@ -262,7 +262,6 @@ class MultiOpponentSimWorker:
                 pend = self._pending.pop(int(e), None)
                 if pend is not None:
                     self.env_opp[e], self.game_info[e] = pend
-            reset_t = torch.as_tensor(reset_np, device=dev)
             reset_rows_np = np.concatenate([reset_np, reset_np[self.self_idx]])
             reset_rows = torch.as_tensor(reset_rows_np, device=dev)
 
@@ -417,13 +416,6 @@ class SimLeague:
         pol.requires_grad_(False)
         pol.eval()
         return pol
-
-    def _load_into(self, skeleton, path):
-        import torch as _torch
-        state = _torch.load(path, map_location=self.device, weights_only=True)
-        check_loadable({}, state)   # bare weights carry no config: only today's names pass
-        with _torch.no_grad():
-            return skeleton.load_state_dict(state, strict=True)
 
     def get_state(self, key):
         state = self.weights.get(key)

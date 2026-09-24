@@ -13,7 +13,6 @@ Usage:
 
 import argparse
 import tarfile
-import tempfile
 from pathlib import Path
 
 GAMES_PER_SHARD = 50_000

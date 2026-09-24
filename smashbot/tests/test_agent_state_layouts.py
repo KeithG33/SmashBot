@@ -13,7 +13,7 @@ import tree
 
 from smashbot import configs, embed as embed_lib
 from smashbot.policy import build_policy
-from smashbot.rl.agent import BatchedPolicyAgent, LeagueAgent
+from smashbot.rl.agent import LeagueAgent
 from smashbot.tests.test_ppo import _rand_states
 
 

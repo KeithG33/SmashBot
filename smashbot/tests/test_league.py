@@ -1,7 +1,6 @@
 """Per-match league routing (rl/league.py): allocator + protocol, pure logic."""
 import random
 
-import pytest
 
 from smashbot.rl.league import League, LeagueSeats, MemberWeights
 

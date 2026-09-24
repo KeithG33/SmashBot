@@ -252,7 +252,6 @@ def _poisoned_learner(N=2, T=5) -> tuple[Learner, Trajectory]:
     param = next(policy.parameters())
     param.register_hook(lambda g: g * float("nan"))
 
-    from smashbot.tests.test_rollouts import _fake_record  # noqa: F401
     from smashbot.rl.rollouts import ChunkAssembler
     from smashbot.rl.agent import BatchedPolicyAgent
 

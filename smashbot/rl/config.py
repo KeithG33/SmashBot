@@ -5,7 +5,6 @@ env processes (which must never import torch: ~0.26 GB private RSS each).
 from __future__ import annotations
 
 import dataclasses
-import typing as tp
 
 MAIN_12 = [
     "FOX", "FALCO", "MARTH", "SHEIK", "JIGGLYPUFF", "CPTFALCON",

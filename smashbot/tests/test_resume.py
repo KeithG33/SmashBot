@@ -11,7 +11,6 @@ next replay must come from the right place in the (mirror-doubled) cycle.
 import dataclasses
 
 import torch
-import tree
 from slippi_ai import data as data_lib
 from slippi_ai.paths import TOY_DATASET
 

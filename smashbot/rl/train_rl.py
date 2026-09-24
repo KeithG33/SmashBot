@@ -12,8 +12,6 @@ and the config/name_map (RL checkpoints stay play.py-compatible).
 from __future__ import annotations
 
 import dataclasses
-import os
-import time
 
 import tyro
 
