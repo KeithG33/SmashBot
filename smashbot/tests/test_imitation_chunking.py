@@ -75,3 +75,55 @@ def test_step_budget_derivation_matches_micro_batches():
     state = learner.initial_state(5)
     learner.step([ppo, imit], state)
     assert seen["budget"] == 3  # ceil(5 / 2)
+
+
+def test_burn_in_warms_policy_and_critic_like_one_unbroken_unroll():
+    """A chunk warmed on its prefix scores exactly as if both networks had run
+    straight through prefix + chunk: the policy's log-probs (from the state
+    _imit_chunks warms once per step) and the critic's advantages behind the
+    MARWIL weights (warmed before its value pass). Resets inside the prefix
+    are honoured."""
+    from smashbot.rl.ppo import Prefix, imitation_weights
+
+    P, T, B = 7, 8, 4
+    learner = _make_learner(imitation_rows=-1)
+    with torch.no_grad():   # zero-initialised output projections would ignore history
+        for param in [*learner.policy.parameters(), *learner.value_function.parameters()]:
+            param.add_(0.3 * torch.randn_like(param))
+    full = _rollout(learner.policy, B=B, T=P + T, seed=5)
+    resets = full.is_resetting.clone()
+    resets[1, 3] = True
+    full = full._replace(is_resetting=resets)
+    at = lambda lo, hi: (lambda t: t[:, lo:hi])
+    chunk = full._replace(
+        states=tree.map_structure(at(P, None), full.states), name=full.name[:, P:],
+        actions=full.actions._replace(
+            controller_state=tree.map_structure(at(P, None), full.actions.controller_state)),
+        rewards=full.rewards[:, P:], is_resetting=full.is_resetting[:, P:],
+        kind="imitation", valid=~full.is_resetting[:, P + 1:],
+        prefix=Prefix(
+            state_action=learner._frames(full).state_action._replace(
+                state=tree.map_structure(at(0, P), full.states), name=full.name[:, :P],
+                action=tree.map_structure(at(0, P), full.actions.controller_state)),
+            is_resetting=full.is_resetting[:, :P]))
+
+    critic = copy.deepcopy(learner.value_function)
+    with torch.no_grad():
+        straight = critic.outputs(learner._frames(full), critic.initial_state(B),
+                                  discount=learner.config.discount, detail=False)
+        expected_policy = learner.policy.unroll(learner._frames(full),
+                                                learner.policy.initial_state(B))
+    valid = chunk.valid.float()
+    expected_weights = imitation_weights(straight.advantages[:, P:], valid,
+                                         learner.config.imitation_beta,
+                                         learner.config.imitation_w_cap)
+
+    imf = learner._imitation_fixed(chunk, 3)
+    assert torch.allclose(imf.weights, expected_weights, atol=1e-5)
+    (part,) = learner._imit_chunks(imf, B)
+    with torch.no_grad():
+        warmed = learner.policy.unroll(part.frames, part.initial_state)
+    assert torch.allclose(warmed.log_probs, expected_policy.log_probs[:, P:], atol=1e-5)
+    with torch.no_grad():
+        cold = learner.policy.unroll(part.frames, learner.policy.initial_state(B))
+    assert not torch.allclose(cold.log_probs, expected_policy.log_probs[:, P:], atol=1e-5)

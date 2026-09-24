@@ -39,6 +39,9 @@ class SimRolloutConfig:
     # keeps the per-match draw honest)
     num_envs: int = 345
     unroll_length: int = 240
+    # frames of each harvested seat's own history the learner runs before
+    # its imitation chunk, without gradients, so the chunk starts warm
+    imitation_burn_in: int = 256
     data_dir: str = "/home/kage/drive2/ShineBot/msl-data"
     rollout_precision: str = "fp16"
     # Manual static-buffer CUDA graph for the student forward. Its state
@@ -217,6 +220,7 @@ class SimLeagueWorker:
             self.policy, [], N, cfg.unroll_length, cfg.data_dir, None, None,
             name_code=self.name_code, device=self.device,
             record_fn=self._on_game, precision=cfg.rollout_precision,
+            burn_in=cfg.imitation_burn_in,
             grids=[self._phillip_grid], event_fn=self._on_event,
             self_idx=self.part["self"], league=self.league, pfsp_grid=self._grid,
             match_fn=self._match, max_frame=cfg.max_game_frames, seed=cfg.seed,

@@ -24,7 +24,7 @@ import tree
 
 from smashbot import encode
 from smashbot.rl.agent import FrameRecord  # noqa: F401  (typing)
-from smashbot.rl.ppo import ActionData, Trajectory
+from smashbot.rl.ppo import ActionData, Prefix, StateAction, Trajectory
 
 
 class ChunkAssembler:
@@ -118,72 +118,105 @@ class HarvestAssembler:
     pressed[t+D] as its target, and reward slot t is the transition
     t+D -> t+D+1 (ChunkAssembler's convention). A position is valid only if
     its target was pressed in its own game; invalid positions carry zero
-    reward, so no return picks up the next game's. A row enters a chunk
-    only if its seat kept one occupant through every frame the chunk reads.
+    reward, so no return picks up the next game's.
+
+    Each seat's occupant is a tenure id (-1: idle). A row enters a chunk
+    only if one tenure holds every frame the chunk reads, and its burn-in
+    prefix (up to burn_in frames before the chunk, for the learner to warm
+    its networks on) is cut to that tenure: a row never inherits another
+    occupant's history.
     """
 
-    def __init__(self, unroll_length: int, delay: int, controller_embedding, name_code: int):
+    def __init__(self, unroll_length: int, delay: int, controller_embedding, name_code: int,
+                 burn_in: int = 0):
         assert delay >= 1, delay
-        self.T, self.D = unroll_length, delay
+        self.T, self.D, self.burn_in = unroll_length, delay, burn_in
         self._embed = controller_embedding
         self._name_code = name_code
+        self._history = 0   # frames buffered before the chunk's first
         self._states: list = []
         self._pressed: list[np.ndarray] = []
         self._resets: list[torch.Tensor] = []
-        self._kept: list[np.ndarray] = []
+        self._tenure: list[np.ndarray] = []
         self._rewards: list[torch.Tensor] = []
 
     def push_frame(self, state, pressed: np.ndarray, is_resetting: torch.Tensor,
-                   kept: np.ndarray) -> None:
-        """pressed: [N, 13] controller rows sent this frame; kept: [N] seats
-        whose occupant is the previous frame's."""
+                   tenure: np.ndarray) -> None:
+        """pressed: [N, 13] controller rows sent this frame; tenure: [N] ids."""
         self._states.append(state)
         self._pressed.append(pressed)
         self._resets.append(is_resetting)
-        self._kept.append(kept)
+        self._tenure.append(tenure)
 
     def push_reward(self, reward: torch.Tensor) -> None:  # [N], transition f -> f+1
         self._rewards.append(reward)
 
     def ready(self) -> bool:
-        return len(self._states) > self.T + self.D and len(self._rewards) >= self.T + self.D
+        return (len(self._states) - self._history > self.T + self.D
+                and len(self._rewards) >= self.T + self.D)
 
     def emit(self) -> tp.Optional[Trajectory]:
-        """The chunk of frames [0, T], reading ahead to T+D; None when no seat
-        kept its occupant throughout. The next chunk starts at frame T."""
+        """The chunk of frames [0, T], reading ahead to T+D, with its burn-in
+        prefix; None when no seat kept one tenure throughout. The next chunk
+        starts at frame T."""
         assert self.ready()
-        T, D = self.T, self.D
-        rows = np.nonzero(np.logical_and.reduce(self._kept[:T + D + 1]))[0]
-        states, pressed = self._states[:T + 1], self._pressed[D - 1:T + D]
-        resets = torch.stack(self._resets[:T + D + 1], dim=1)
+        T, D, h = self.T, self.D, self._history
+        tenure = np.stack(self._tenure[:h + T + D + 1], axis=1)
+        own = tenure[:, h]
+        rows = np.nonzero((own >= 0) & (tenure[:, h:] == own[:, None]).all(1))[0]
+        states, pressed = self._states[:h + T + 1], self._pressed[:h + T + D]
+        resets = torch.stack(self._resets[:h + T + D + 1], dim=1)
         rewards = torch.stack(self._rewards[D:T + D], dim=1)
-        self._states, self._pressed = self._states[T:], self._pressed[T:]
-        self._resets, self._kept, self._rewards = self._resets[T:], self._kept[T:], self._rewards[T:]
+        keep = min(self.burn_in, h + T)
+        drop = h + T - keep
+        self._states, self._pressed = self._states[drop:], self._pressed[drop:]
+        self._resets, self._tenure = self._resets[drop:], self._tenure[drop:]
+        self._rewards, self._history = self._rewards[T:], keep
         if len(rows) == 0:
             return None
 
-        idx = torch.as_tensor(rows, device=resets.device)
+        device = resets.device
+        idx = torch.as_tensor(rows, device=device)
         resets = resets.index_select(0, idx)
-        valid = ~resets[:, 1:].unfold(1, D + 1, 1).any(-1)   # no reset in frames t+1 .. t+D+1
-        encoded = self._embed.from_state(encode.controller_from_rows(np.stack(pressed, axis=1)[rows]))
+        pressed = np.stack(pressed, axis=1)[rows]
+        stack = lambda frames: tree.map_structure(
+            lambda *xs: torch.stack(xs, dim=1).index_select(0, idx), *frames)
+        name = lambda n: torch.full((len(rows), n), self._name_code, dtype=torch.int64, device=device)
+        chunk_resets = resets[:, h:h + T + 1].clone()
+        prefix = None
+        if h > 0:
+            # the prefix starts after the last frame another tenure held
+            other = tenure[rows, :h] != own[rows, None]
+            first = np.where(other.any(1), h - np.argmax(other[:, ::-1], axis=1), 0)
+            prefix_resets = resets[:, :h].clone()
+            cut = np.nonzero((first > 0) & (first < h))[0]
+            prefix_resets[torch.as_tensor(cut), torch.as_tensor(first[cut])] = True
+            chunk_resets[torch.as_tensor(first == h), 0] = True   # no history of its own: start cold
+            prefix = Prefix(
+                state_action=StateAction(state=stack(states[:h]),
+                                         action=self._encoded(pressed[:, D - 1:h + D - 1], device),
+                                         name=name(h)),
+                is_resetting=prefix_resets)
+        valid = ~resets[:, h + 1:].unfold(1, D + 1, 1).any(-1)   # no reset in frames t+1 .. t+D+1
         return Trajectory(
-            states=tree.map_structure(
-                lambda *xs: torch.stack(xs, dim=1).index_select(0, idx), *states),
-            name=torch.full((len(rows), T + 1), self._name_code, dtype=torch.int64,
-                            device=resets.device),
-            actions=ActionData(
-                controller_state=tree.map_structure(
-                    lambda x: torch.from_numpy(np.ascontiguousarray(
-                        x.astype(np.int64) if x.dtype.kind in "iu" else x)).to(resets.device),
-                    encoded),
-                logits=None,
-            ),
+            states=stack(states[h:]),
+            name=name(T + 1),
+            actions=ActionData(controller_state=self._encoded(pressed[:, h + D - 1:], device),
+                               logits=None),
             rewards=rewards.index_select(0, idx) * valid,
-            is_resetting=resets[:, :T + 1],
+            is_resetting=chunk_resets,
             initial_state=None,
             kind="imitation",
             valid=valid,
+            prefix=prefix,
         )
+
+    def _encoded(self, rows: np.ndarray, device):
+        """Pressed rows [R, F, 13] -> the student's encoded controller."""
+        return tree.map_structure(
+            lambda x: torch.from_numpy(np.ascontiguousarray(
+                x.astype(np.int64) if x.dtype.kind in "iu" else x)).to(device),
+            self._embed.from_state(encode.controller_from_rows(rows)))
 
 
 def compute_reward(

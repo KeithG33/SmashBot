@@ -35,9 +35,9 @@ class PfspGrid:
     forward per frame). Cells are seats: `seat`/`unseat`/`move` keep the
     cell->env map that the per-frame gather uses; idle cells forward
     garbage against env 0 with reset held high and their rows are sliced
-    out of every emitted chunk. kept() tells the harvest which cells held
-    one occupant since the last frame (v10: a cell's rows enter a chunk only
-    if it was occupied for the WHOLE chunk).
+    out of every emitted chunk. Each seating starts a new tenure id
+    (-1: idle), which the harvest reads every frame (v10: a cell's rows
+    enter a chunk only if it was occupied for the WHOLE chunk).
 
     Static use (the phillip tiers): assign_static() seats contiguous env
     rows once. Dynamic use (PFSP): rl/league.League drives seat changes at
@@ -56,7 +56,8 @@ class PfspGrid:
         n = slices * cells
         self.cell_env = np.zeros(n, dtype=np.int64)
         self.valid = np.zeros(n, dtype=bool)
-        self.changed = np.zeros(n, dtype=bool)
+        self.tenure = np.full(n, -1, dtype=np.int64)
+        self._tenures = 0
         self._cell_of: dict[int, int] = {}
         self._dirty = True
         self.idx_t = self.valid_t = None
@@ -79,6 +80,7 @@ class PfspGrid:
         assert not self.valid[cell], f"cell {cell} occupied"
         self.cell_env[cell] = env
         self.valid[cell] = True
+        self._new_tenure(cell)
         self._cell_of[env] = cell
         self.agent.reset_cell(s, n)
         self._dirty = True
@@ -86,7 +88,7 @@ class PfspGrid:
     def unseat(self, env):
         cell = self._cell_of.pop(env)
         self.valid[cell] = False
-        self.changed[cell] = True
+        self.tenure[cell] = -1
         self._dirty = True
 
     def move(self, src, dst):
@@ -98,15 +100,14 @@ class PfspGrid:
         env = int(self.cell_env[a])
         self.cell_env[b] = env
         self.valid[b], self.valid[a] = True, False
-        self.changed[a] = self.changed[b] = True
+        self.tenure[a] = -1
+        self._new_tenure(b)
         self._cell_of[env] = b
         self._dirty = True
 
-    def kept(self) -> np.ndarray:
-        """Cells whose occupant is the previous frame's; read once per frame."""
-        kept = self.valid & ~self.changed
-        self.changed[:] = False
-        return kept
+    def _new_tenure(self, cell):
+        self.tenure[cell] = self._tenures
+        self._tenures += 1
 
     def sync(self):
         if self._dirty:
@@ -137,7 +138,7 @@ class MultiOpponentSimWorker:
                  stage, char_pairs, name_code=1, device="cpu", record_fn=None,
                  precision="fp32", grids=(), event_fn=None, self_idx=(),
                  league=None, pfsp_grid=None, match_fn=None, max_frame=28800,
-                 seed=0, capture=False):
+                 seed=0, capture=False, burn_in=0):
         """opponents: [(gid, policy, env_idx, name_code)] fixed groups (eval
         arena; not harvested). grids: static PfspGrids (phillip tiers), env ->
         gid via gid_of_env below. self_idx: envs whose player-1 seat is the
@@ -183,7 +184,8 @@ class MultiOpponentSimWorker:
                        for (gid, pol, idx, nc) in opponents]
         self.harvests = [
             HarvestAssembler(unroll_length, student_policy.delay,
-                             student_policy.controller_head.controller_embedding, name_code)
+                             student_policy.controller_head.controller_embedding, name_code,
+                             burn_in)
             for _ in self._all_grids()]
         for g in self.groups:
             g.agent.set_flat_controllers(True)
@@ -308,7 +310,7 @@ class MultiOpponentSimWorker:
                     gviews, torch.as_tensor(gr_reset.reshape(gr.S, gr.Nc), device=dev),
                     flats=gflats)
                 harvest.push_frame(grec.state, rows_all, torch.as_tensor(gr_reset, device=dev),
-                                   gr.kept())
+                                   gr.tenure.copy())
             sim_env.write_controller_rows(env, p1_rows, player=1)
 
             # ---- rewards ----

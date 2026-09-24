@@ -44,17 +44,17 @@ def _equal(a, b) -> bool:
     return all(torch.equal(x, y) for x, y in zip(tree.flatten(a), tree.flatten(b)))
 
 
-def _harvest(pressed, resets, rewards, T, D, kept=None):
+def _harvest(pressed, resets, rewards, T, D, tenure=None, burn_in=0):
     """Feed a timeline through the assembler in the worker's order: frame f,
     then the reward of f-1 -> f. pressed [N, F, 13], resets [N, F], rewards
-    [N, F-1] (transition f -> f+1)."""
+    [N, F-1] (transition f -> f+1), tenure [N, F] (default: one per row)."""
     N, F = resets.shape
-    kept = np.ones((N, F), dtype=bool) if kept is None else kept
-    asm = HarvestAssembler(T, D, EMBED, name_code=3)
+    tenure = np.zeros((N, F), dtype=np.int64) if tenure is None else tenure
+    asm = HarvestAssembler(T, D, EMBED, name_code=3, burn_in=burn_in)
     chunks = []
     for f in range(F):
         asm.push_frame(State(stage=torch.arange(N) * 1000.0 + f), pressed[:, f],
-                       torch.from_numpy(resets[:, f]), kept[:, f])
+                       torch.from_numpy(resets[:, f]), tenure[:, f])
         if f > 0:
             asm.push_reward(torch.from_numpy(rewards[:, f - 1]))
         if asm.ready():
@@ -198,17 +198,55 @@ def test_rows_that_change_occupant_are_left_out():
     through T, lookahead through T+D) is dropped from that chunk only."""
     T, D, N, F = 5, 2, 3, 24
     resets = _game_starts(F, [[], [], []])
-    kept = np.ones((N, F), dtype=bool)
-    kept[1, 6] = False          # read by chunk 0 (frames 0..7) and chunk 1 (5..12)
-    kept[2, :] = False          # never kept
-    chunks = _harvest(_button_rows(N, F), resets, np.zeros((N, F - 1), np.float32), T, D, kept)
+    tenure = np.zeros((N, F), dtype=np.int64)
+    tenure[1, 6:] = 1           # reseated at 6: chunk 0 (frames 0..7) and 1 (5..12) span it
+    tenure[2, :] = -1           # idle throughout
+    chunks = _harvest(_button_rows(N, F), resets, np.zeros((N, F - 1), np.float32), T, D, tenure)
     assert [c.states.stage[:, 0].tolist() for c in chunks[:3]] == [
         [0.0], [5.0], [10.0, 1010.0]]
 
     asm = HarvestAssembler(T, D, EMBED, name_code=0)
     for f in range(T + D + 1):
         asm.push_frame(State(stage=torch.zeros(1)), NEUTRAL[None], torch.zeros(1, dtype=torch.bool),
-                       np.zeros(1, dtype=bool))
+                       np.full(1, -1))
         if f > 0:
             asm.push_reward(torch.zeros(1))
     assert asm.ready() and asm.emit() is None
+
+
+def test_burn_in_prefix_is_the_rows_own_history():
+    """Each chunk carries the frames before it (up to burn_in) with the same
+    alignment as the chunk: prefix frame f has state f and pressed[f+D-1] as
+    its previous action. A tenure change inside the prefix restarts it at
+    the new tenure's first frame; a row with no history of its own starts
+    its chunk cold."""
+    T, D, H, N, F = 6, 3, 10, 3, 40
+    resets = _game_starts(F, [[15], [], []])
+    tenure = np.zeros((N, F), dtype=np.int64)
+    tenure[1, 16:] = 1          # moved at 16: chunk 3 (18..) keeps 16, 17 as history
+    tenure[2, :18] = -1         # seated at 18 (idle before): chunk 3 has no history
+    tenure[2, 18:] = 2
+    pressed = _button_rows(N, F)
+    chunks = _harvest(pressed, resets, np.zeros((N, F - 1), np.float32), T, D, tenure, burn_in=H)
+    assert chunks[0].prefix is None
+
+    for c, chunk in enumerate(chunks[1:], start=1):
+        t0 = c * T
+        P = min(H, t0)
+        rows = [n for n in range(N) if (tenure[n, t0:t0 + T + D + 1] == tenure[n, t0]).all()
+                and tenure[n, t0] >= 0]
+        pre = chunk.prefix
+        assert torch.equal(pre.state_action.state.stage,
+                           torch.tensor([[n * 1000.0 + f for f in range(t0 - P, t0)] for n in rows]))
+        assert _equal(pre.state_action.action, _encoded(pressed[rows, t0 - P + D - 1:t0 + D - 1]))
+        for i, n in enumerate(rows):
+            own = tenure[n, t0 - P:t0] == tenure[n, t0]
+            first = P - int(np.argmin(own[::-1])) if not own.all() else 0
+            expected = resets[n, t0 - P:t0].copy()
+            if 0 < first < P:
+                expected[first] = True
+            assert pre.is_resetting[i].tolist() == expected.tolist(), (c, n)
+            assert bool(chunk.is_resetting[i, 0]) == bool(resets[n, t0] or first == P), (c, n)
+    third = chunks[3]
+    assert third.prefix.is_resetting[1].tolist() == [False] * 8 + [True, False]
+    assert bool(third.is_resetting[2, 0])

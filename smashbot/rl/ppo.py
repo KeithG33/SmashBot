@@ -53,6 +53,14 @@ class ActionData(tp.NamedTuple):
     logits: tp.Any  # controller struct, [B, T+1, ...]
 
 
+class Prefix(tp.NamedTuple):
+    """Burn-in context just before an imitation chunk: the learner runs its
+    networks over it without gradients to warm their state; never scored."""
+
+    state_action: StateAction  # [B, P, ...]
+    is_resetting: torch.Tensor  # [B, P]
+
+
 class Trajectory(tp.NamedTuple):
     """One rollout chunk, batch-first, agent-stream convention (see ActionData:
     actions.controller_state is the agent's *input* stream; actions.logits are
@@ -74,6 +82,7 @@ class Trajectory(tp.NamedTuple):
     kind: str = "ppo"
     # imitation only, [B, T]: positions whose target was pressed in their own game
     valid: tp.Optional[torch.Tensor] = None
+    prefix: tp.Optional[Prefix] = None  # imitation only
 
 
 def slice_trajectory_rows(traj: Trajectory, rows: tp.Sequence[int]) -> Trajectory:
@@ -97,6 +106,7 @@ def slice_trajectory_rows(traj: Trajectory, rows: tp.Sequence[int]) -> Trajector
         ),
         kind=traj.kind,
         valid=None if traj.valid is None else take(traj.valid),
+        prefix=None if traj.prefix is None else tree.map_structure(take, traj.prefix),
     )
 
 
@@ -187,6 +197,15 @@ class _ImitFixed(tp.NamedTuple):
     weights: torch.Tensor  # [B, T], detached
     valid: torch.Tensor  # [B, T] float
     rows: int
+    prefix: tp.Optional[Prefix] = None
+    initial_state: tp.Any = None  # the policy's warmed state; None: zeros
+
+
+def _warm(network, prefix: Prefix, initial_state):
+    """The network's recurrent state after the burn-in prefix, no gradients."""
+    with torch.no_grad():
+        _, state = network.unroll(prefix.state_action, prefix.is_resetting, initial_state)
+    return state
 
 
 class Learner:
@@ -753,9 +772,12 @@ class Learner:
                 lambda t: t[lo:hi] if isinstance(t, torch.Tensor) else t,
                 frames,
             )
+            value_state = self.value_function.initial_state(hi - lo, device)
+            if traj.prefix is not None:   # warmed by the critic as it is right now
+                value_state = _warm(self.value_function.network,
+                                    tree.map_structure(lambda t: t[lo:hi], traj.prefix), value_state)
             value_out = self.value_function.outputs(
-                cf, self.value_function.initial_state(hi - lo, device),
-                discount=self.config.discount, detail=False,
+                cf, value_state, discount=self.config.discount, detail=False,
             )
             # chunk share of the full-trajectory mean loss (a plain .mean()
             # over ALL positions — see value.py — so the share is the ROW
@@ -785,7 +807,7 @@ class Learner:
                   flush=True)
             return None
         return _ImitFixed(
-            frames=frames, weights=weights, valid=valid, rows=batch_size
+            frames=frames, weights=weights, valid=valid, rows=batch_size, prefix=traj.prefix
         )
 
     def _imitation_chunk_loss(
@@ -798,29 +820,36 @@ class Learner:
         unroll path (and, in fp16 mode, the same autocast + scaled
         backward) as PPO."""
         batch_size = imf.valid.shape[0]
+        initial_state = imf.initial_state
+        if initial_state is None:
+            initial_state = self.policy.initial_state(batch_size, imf.valid.device)
         with self._autocast():
-            out = self.policy.unroll(
-                imf.frames,
-                self.policy.initial_state(batch_size, imf.valid.device),
-            )
+            out = self.policy.unroll(imf.frames, initial_state)
             # masked-position NaN-grad armor (see _policy_loss_inner)
             logp = out.log_probs.clamp(-1e4, 0.0)
             return -(imf.weights * logp * imf.valid).sum() / total_valid
 
-    @staticmethod
-    def _imit_chunks(imf: _ImitFixed, chunk_rows: int) -> list:
+    def _imit_chunks(self, imf: _ImitFixed, chunk_rows: int) -> list:
         """Row-range VIEWS of an imitation fixed pass, each <= chunk_rows
         (the PPO chunk size) so no imitation chunk can raise the learner's
-        activation peak above what the PPO chunks already set."""
+        activation peak above what the PPO chunks already set. Each chunk's
+        policy state is warmed on its prefix once here; every epoch of the
+        step starts from it."""
         n = imf.rows
         out = []
         for lo in range(0, n, chunk_rows):
             hi = min(lo + chunk_rows, n)
             take = lambda t: t[lo:hi] if isinstance(t, torch.Tensor) else t
+            initial_state = None
+            if imf.prefix is not None:
+                with self._autocast():
+                    initial_state = _warm(
+                        self.policy.network, tree.map_structure(take, imf.prefix),
+                        self.policy.initial_state(hi - lo, imf.valid.device))
             out.append(_ImitFixed(
                 frames=tree.map_structure(take, imf.frames),
                 weights=imf.weights[lo:hi], valid=imf.valid[lo:hi],
-                rows=hi - lo,
+                rows=hi - lo, initial_state=initial_state,
             ))
         return out
 
