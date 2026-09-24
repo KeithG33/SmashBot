@@ -18,8 +18,6 @@ DATA_DIR = DRIVE2 / "data"
 RUNS_DIR = DRIVE2 / "runs"
 MODELS_DIR = DRIVE2 / "models"
 MSL_DATA_DIR = Path(os.environ.get("MSL_DATA_DIR", str(DRIVE2 / "msl-data")))
-# the checkpoint the policy tools load when given none: the best paper-block BC policy
-DEFAULT_POLICY = RUNS_DIR / "sgu576w256-h2x64-paper-slslsl-vsl-b512-12char-bf16-100k" / "best.pt"
 
 MELEE_ISO = Path(
     os.environ.get(

@@ -65,9 +65,9 @@ by porting the v5 design above.)
 
 ## Launch
 
-`scripts/launch_sim.sh` — a fresh run from the current BC policy
-(`paths.DEFAULT_POLICY`, or `TEACHER=`) to 100k under `TAG` (default
-rl-sim-v13); a relaunch resumes the tag's latest.pt. Shares of envs: self
+`scripts/launch_sim.sh` — a fresh run from the BC checkpoint `TEACHER=`
+(required) to 100k under `TAG` (default rl-sim-v13); a relaunch resumes the
+tag's latest.pt. Shares of envs: self
 30% (both seats are learner rows) / phillips 35% / PFSP 35% (the run's own
 snapshots, every 1500 steps), 40 PFSP slices. The row and slice sizes were
 fit for the pre-paper SGU: dry-run before the first launch. v10's and

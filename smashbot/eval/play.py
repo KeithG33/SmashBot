@@ -8,9 +8,9 @@ Thin wrapper over eval/game.py — live play and eval batteries share one
 gamestate -> agent -> controller path, so they can never drift apart.
 
 Usage:
-  .venv/bin/python -m smashbot.eval.play                      # vs CPU 9, visible
-  .venv/bin/python -m smashbot.eval.play --opponent human
-  .venv/bin/python -m smashbot.eval.play --headless --max-frames 3600
+  .venv/bin/python -m smashbot.eval.play --ckpt <best.pt>                  # vs CPU 9, visible
+  .venv/bin/python -m smashbot.eval.play --ckpt <best.pt> --opponent human
+  .venv/bin/python -m smashbot.eval.play --ckpt <best.pt> --headless --max-frames 3600
 """
 
 import argparse
@@ -21,7 +21,6 @@ import torch
 
 from slippi_ai import dolphin as dolphin_lib
 
-from smashbot import paths
 from smashbot.eval import game as game_lib
 from smashbot.eval import agent as agent_lib
 
@@ -32,7 +31,7 @@ load_policy = game_lib.load_policy
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument(
-        "--ckpt", default=str(paths.DEFAULT_POLICY)
+        "--ckpt", required=True
     )
     ap.add_argument("--opponent", choices=["cpu", "human"], default="cpu")
     ap.add_argument("--bot_char", default="FOX",

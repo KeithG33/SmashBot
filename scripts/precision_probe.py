@@ -52,12 +52,8 @@ import time
 import torch
 import tree
 
-from smashbot import paths
-
 ARMS = ("fp32", "bf16", "fp16", "fp16s")
 _ARM_DTYPE = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp16s": torch.float16}
-
-DEFAULT_CONFIG_FROM = str(paths.DEFAULT_POLICY)
 
 
 # --------------------------------------------------------------- primitives
@@ -595,7 +591,7 @@ def parse_args(argv=None) -> argparse.Namespace:
                      help="full RL checkpoint (config+state)")
     src.add_argument("--snapshot", default="",
                      help="bare policy state_dict; needs --config-from")
-    fid.add_argument("--config-from", default=DEFAULT_CONFIG_FROM,
+    fid.add_argument("--config-from", default="",
                      help="full checkpoint for --snapshot mode")
     fid.add_argument("--device", default="cpu", choices=("cpu", "cuda"),
                      help="cpu is safe beside the live run; cuda only in a "
@@ -614,7 +610,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     csrc = cal.add_mutually_exclusive_group(required=True)
     csrc.add_argument("--ckpt", default="")
     csrc.add_argument("--snapshot", default="")
-    cal.add_argument("--config-from", default=DEFAULT_CONFIG_FROM)
+    cal.add_argument("--config-from", default="",
+                     help="full checkpoint for --snapshot mode")
     cal.add_argument("--device", default="cpu", choices=("cpu", "cuda"))
     cal.add_argument("--out", default="")
 
@@ -623,7 +620,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="peak-memory vs learner rows under a precision (Tier 2, "
              "IDLE GPU ONLY)",
     )
-    mem.add_argument("--config-from", default=DEFAULT_CONFIG_FROM,
+    mem.add_argument("--config-from", required=True,
                      help="full checkpoint that builds the learner")
     mem.add_argument("--precision", default="bf16", choices=ARMS)
     mem.add_argument("--rows", default="120,136,152,168,184,200,224,256",

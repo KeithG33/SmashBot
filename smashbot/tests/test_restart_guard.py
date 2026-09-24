@@ -65,7 +65,7 @@ def test_best_pt_alone_also_marks_an_existing_run(tmp_path):
 
 
 def _rl_config(run_dir, restore=""):
-    cfg = train_rl.Config()
+    cfg = train_rl.Config(ckpt="bc.pt")
     cfg.runtime.run_dir, cfg.runtime.tag, cfg.runtime.restore = str(run_dir), "run", restore
     cfg.runtime.wandb_mode = "disabled"
     return cfg

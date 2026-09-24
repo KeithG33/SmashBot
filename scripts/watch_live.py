@@ -9,16 +9,16 @@ never waits on inference. Occasional slow samples are absorbed by each
 policy's delay-queue slack (18/21 frames = ~300ms of cushion), and the
 emitted action sequence is identical to the sync agent's.
 
-Defaults: the current policy (paths.DEFAULT_POLICY, as Fox) vs Phillip
-(medium-v2, random main-12 character) on Final Destination, 1 game,
+Player 1 is --p1 (or --p1-snapshot), as Fox; player 2 defaults to Phillip
+(medium-v2, random main-12 character). Final Destination, 1 game,
 replays saved, audio muted, torch.compile on (both policies warmed BEFORE
 Dolphin boots, so there is no compile stall at game start).
 
 Usage:
-  .venv/bin/python scripts/watch_live.py                     # default matchup
-  .venv/bin/python scripts/watch_live.py --games 0           # play forever
-  .venv/bin/python scripts/watch_live.py --p2-char MARTH --games 3
-  .venv/bin/python scripts/watch_live.py --dry-run           # no Dolphin
+  .venv/bin/python scripts/watch_live.py --p1 <best.pt>                  # vs Phillip medium
+  .venv/bin/python scripts/watch_live.py --p1 <best.pt> --games 0        # play forever
+  .venv/bin/python scripts/watch_live.py --p1 <best.pt> --p2-char MARTH --games 3
+  .venv/bin/python scripts/watch_live.py --p1 <best.pt> --dry-run        # no Dolphin
 """
 
 import threading
@@ -33,7 +33,6 @@ import melee
 import torch
 from melee.slippstream import EnetDisconnected
 
-from smashbot import paths
 from smashbot.eval import game as game_lib
 from smashbot.networks import check_loadable
 from smashbot.eval.agent import AsyncDelayedAgent
@@ -41,7 +40,6 @@ from smashbot.rl.config import MAIN_12
 
 from slippi_ai import dolphin as dolphin_lib
 
-DEFAULT_P1 = str(paths.DEFAULT_POLICY)
 DEFAULT_P2 = "/home/kage/drive2/ShineBot/models/medium-v2-torch.pt"
 DEFAULT_REPLAY_DIR = "/home/kage/drive2/ShineBot/replays/exhibition"
 
@@ -107,7 +105,6 @@ def resolve_specs(args) -> dict[int, SideSpec]:
     return {
         1: resolve_spec(
             args.p1, args.p1_snapshot, args.config_from,
-            default_ckpt=DEFAULT_P1,
         ),
         2: resolve_spec(
             args.p2, args.p2_snapshot, args.config_from,
@@ -225,13 +222,12 @@ def pin_cores(dolphin, n: int) -> None:
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(
         description="Watch two policies play each other live at ~60fps "
-                    "(default: the current policy vs Phillip medium-v2).",
+                    "(player 2 defaults to Phillip medium-v2).",
         epilog=_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("--p1", default="",
-                    help=f"full checkpoint for player 1 (default: {DEFAULT_P1}, "
-                         "unless --p1-snapshot is given)")
+                    help="full checkpoint for player 1 (or --p1-snapshot)")
     ap.add_argument("--p2", default="",
                     help="full checkpoint for player 2 (default: Phillip "
                          "medium-v2, unless --p2-snapshot is given)")
@@ -285,7 +281,10 @@ def parse_args(argv=None):
     ap.add_argument("--dry-run", action="store_true",
                     help="load, compile, and warm everything, print the "
                          "resolved matchup, then exit WITHOUT booting Dolphin")
-    return ap.parse_args(argv)
+    args = ap.parse_args(argv)
+    if not (args.p1 or args.p1_snapshot):
+        ap.error("player 1 needs a policy: --p1 or --p1-snapshot")
+    return args
 
 
 def _winner_str(record) -> str:

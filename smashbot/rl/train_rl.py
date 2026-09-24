@@ -17,7 +17,6 @@ import time
 
 import tyro
 
-from smashbot import paths
 from smashbot.rl.config import RLConfig
 from smashbot.rl.train_sim import SimRolloutConfig
 
@@ -42,7 +41,7 @@ class RuntimeConfig:
 
 @dataclasses.dataclass
 class Config:
-    ckpt: str = str(paths.DEFAULT_POLICY)
+    ckpt: str  # BC checkpoint: the student's initial weights and the frozen teacher
     learner: RLConfig = dataclasses.field(default_factory=RLConfig)
     runtime: RuntimeConfig = dataclasses.field(default_factory=RuntimeConfig)
     sim: SimRolloutConfig = dataclasses.field(default_factory=SimRolloutConfig)

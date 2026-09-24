@@ -149,10 +149,11 @@ def test_resolve_spec_rules():
 
 
 def test_cli_defaults_resolve():
-    args = watch.parse_args([])
+    with pytest.raises(SystemExit):
+        watch.parse_args([])   # player 1's policy is always chosen
+    args = watch.parse_args(["--p1", "/tmp/mine.pt"])
     specs = watch.resolve_specs(args)
-    assert specs[1].ckpt == watch.DEFAULT_P1
-    assert specs[1].snapshot == ""
+    assert specs[1].ckpt == "/tmp/mine.pt" and specs[1].snapshot == ""
     assert specs[2].ckpt == watch.DEFAULT_P2
     assert specs[2].snapshot == ""
     assert args.games == 1

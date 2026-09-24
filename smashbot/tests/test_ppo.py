@@ -356,9 +356,9 @@ def test_precision_flag_plumbs_through_tyro():
 
     from smashbot.rl.train_rl import Config
 
-    cfg = tyro.cli(Config, args=["--learner.precision", "fp16"])
+    cfg = tyro.cli(Config, args=["--ckpt", "bc.pt", "--learner.precision", "fp16"])
     assert cfg.learner.precision == "fp16"
-    cfg = tyro.cli(Config, args=[])
+    cfg = tyro.cli(Config, args=["--ckpt", "bc.pt"])
     assert cfg.learner.precision == "fp32"
 
 
