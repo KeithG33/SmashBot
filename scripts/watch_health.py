@@ -4,9 +4,6 @@ reasonableness bounds, print ALERT lines (or an OK digest with --digest).
 Expectations encoded (Keith, 2026-09-15):
 - phillips are much harder than v10's medium-only diet: tier winrates
   near/below 0.5 are EXPECTED; a collapse (<0.15) or a large fast drop is not.
-- fox-mclaude imports should trend UP (they were ~57% vs the student at
-  v10-end); PFSP freezes (not drops) a dominated member's estimate, so a
-  real drop from the rolling max is meaningful.
 - imitation lambda is FLAT 0.01 (v10 ended at 0.002, so ~5x stronger pull):
   tKL / imitation loss shifting regime would be the first sign of a
   learning-behavior change.
@@ -29,7 +26,6 @@ KEYS = [
     "rl/phillip/medium/win_rate_ema", "rl/phillip/plat/win_rate_ema",
     "rl/phillip/diamond/win_rate_ema", "rl/phillip/master/win_rate_ema",
     "rl/phillip/gm/win_rate_ema",
-    "rl/snapshots/imp9000", "rl/snapshots/imp10000", "rl/snapshots/imp9500",
     "rl/value_loss",
 ]
 
@@ -96,15 +92,6 @@ def main():
         if v < peak - 0.15:
             alerts.append(f"phillip:{tier} dropped {peak:.2f}->{v:.2f} (>0.15 off rolling max)")
         hi[k] = max(peak, v)
-    for imp in ("imp9000", "imp10000", "imp9500"):
-        k = f"rl/snapshots/{imp}"
-        v = recent(k, n=10)
-        if v is None:
-            continue
-        peak = hi.get(k, v)
-        if v < peak - 0.10:
-            alerts.append(f"fox {imp} dropped {peak:.2f}->{v:.2f} (expected to trend up / freeze)")
-        hi[k] = max(peak, v)
 
     fps = recent("rl/frames_per_sec", n=5)
     if fps is not None and fps < 4000:
@@ -120,11 +107,8 @@ def main():
         phil = " ".join(
             f"{t[:2]}{recent(f'rl/phillip/{t}/win_rate_ema', 5) or float('nan'):.2f}"
             for t in ("medium", "plat", "diamond", "master", "gm"))
-        fox = " ".join(
-            f"{i}:{recent(f'rl/snapshots/{i}', 5) or float('nan'):.2f}"
-            for i in ("imp9000", "imp10000", "imp9500"))
         line = (f"step {step} | tKL {tkl:.4f} aKL {akl:.1e} imit {im:.3f} "
-                f"self {sw if sw is not None else float('nan'):.2f} | {phil} | {fox} | {fps:.0f} fps")
+                f"self {sw if sw is not None else float('nan'):.2f} | {phil} | {fps:.0f} fps")
         print(("DIGEST " if args.digest else "OK ") + line)
 
 

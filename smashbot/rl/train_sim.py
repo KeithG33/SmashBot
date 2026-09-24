@@ -4,13 +4,12 @@ checkpoint schema and overlap pipeline over SimLeague + MultiOpponentSimWorker.
 
 Pool design (locked): self-play (both seats are learner rows, no harvest) /
 5 fixed phillip tiers (harvest, medium 4% < plat 6% < diamond 7% < master 8%
-< gm 10%) / PFSP pool (v10 snapshots + top-3 fox imports, harvest, drawn PER
+< gm 10%) / PFSP pool (the run's snapshots, harvest, drawn PER
 MATCH with replacement and routed on the PFSP grid at each env's own game
 boundary — rl/league.py). Env layout is static; every game runs to its end.
 
-Logging: `rl/phillip/{tier}/*` per fixed tier, fox imports under
-`rl/snapshots/{name}` (they sit in the PFSP ledger next to the ghosts),
-`rl/self/*`, per-ghost `rl/snapshots/s{step}` win estimates.
+Logging: `rl/phillip/{tier}/*` per fixed tier, `rl/self/*`, `rl/snapshots/*`
+and per-ghost `rl/snapshots/s{step}` win estimates.
 """
 from __future__ import annotations
 
@@ -52,13 +51,6 @@ class SimRolloutConfig:
     phillip_tiers: tuple[str, ...] = ("medium", "plat", "diamond", "master", "gm")
     phillip_fracs: tuple[float, ...] = (0.04, 0.06, 0.07, 0.08, 0.10)  # 35% of envs
     # everything left after self+phillips (~35%) is the PFSP pool
-    # names match v10's ledger keys (import:imp9000/imp10000/imp9500) so
-    # their payoff rows carry over on a seeded run
-    fox_imports: tuple[str, ...] = (
-        f"imp9000:{MODELS}/rl-v3-tournament1st-step0009000.pt",
-        f"imp10000:{MODELS}/rl-best-step0010000-phillip56.pt",
-        "imp9500:/home/kage/drive2/ShineBot/runs/rl-pool-v3/snapshots/snapshot-0009500.pt",
-    )
     # PFSP grid weight slices = resident members. v10 ran 36 slices x 4
     # cells so a per-match draw usually found its member resident; each
     # fp16 slice is ~54 MB; 60 slices for 120 pfsp envs = 2.0 envs/slice,
@@ -145,7 +137,6 @@ class SimLeagueWorker:
         self.trackers = {
             "self": GameTracker(),
             "snapshots": GameTracker(),
-            "imports": GameTracker(),
             **{f"phillip:{t}": GameTracker() for t in cfg.phillip_tiers},
         }
         self._build()
@@ -153,8 +144,6 @@ class SimLeagueWorker:
     def _tracker_of(self, gid: str):
         if gid == "self" or gid.startswith("phillip:"):
             return self.trackers[gid]
-        if gid.startswith("import:"):
-            return self.trackers["imports"]
         return self.trackers["snapshots"]
 
     def _on_event(self, env_i: int, gid: str, kind: str, percent: float) -> None:
@@ -164,18 +153,15 @@ class SimLeagueWorker:
     def _on_game(self, env_i: int, gid: str, s0: int, s1: int) -> None:
         if s0 != s1:  # ties never enter the PFSP ledger
             self.lg.record(gid, s0 > s1)
-        # char-locked members (fox imports) stay out of by_char: a locked
-        # member ties its character's column to its own strength
-        char = None if gid.startswith("import:") else self._worker.game_info[env_i]
-        self._tracker_of(gid).add_game((s0, s1), char)
+        self._tracker_of(gid).add_game((s0, s1), self._worker.game_info[env_i])
 
     def _match(self, env_i: int, member: str):
-        """The next match for env_i vs `member`: uniform chars (FOX lock for
-        imports), uniform stage, student on port 1 or 2 at random (v10:
-        cancels port priority in aggregate), fresh engine seed, 8-min timer."""
+        """The next match for env_i vs `member`: uniform chars, uniform stage,
+        student on port 1 or 2 at random (v10: cancels port priority in
+        aggregate), fresh engine seed, 8-min timer."""
         msl = _msl()
         student_c = self.rng.choice(self._chars)
-        opp_c = msl.Character.FOX if member.startswith("import:") else self.rng.choice(self._chars)
+        opp_c = self.rng.choice(self._chars)
         stage = self.rng.choice(self._stages)
         sp = self.rng.randrange(2)
         cfg = msl.MatchConfig(
@@ -244,12 +230,9 @@ class SimLeagueWorker:
         self.rows = self._worker.rows
 
     def env_share(self) -> dict:
-        """{logging_class: env count} (pfsp split by current seating)."""
+        """{logging_class: env count}."""
         out = {k: len(v) for k, v in self.part.items() if k != "pfsp"}
-        for e in self.part["pfsp"]:
-            m = self.league.member_now[int(e)]
-            c = "imports" if m.startswith("import:") else "snapshots"
-            out[c] = out.get(c, 0) + 1
+        out["snapshots"] = len(self.part["pfsp"])
         return out
 
     def league_stats(self) -> dict:
@@ -261,11 +244,9 @@ class SimLeagueWorker:
                 "resident_members": len({p.member for p in seats.slices if p.member})}
 
     def by_char(self) -> dict:
-        """Pooled opponent-char winrates over every unlocked class."""
+        """Pooled opponent-char winrates over every class."""
         agg: dict = {}
-        for k, tr in self.trackers.items():
-            if k == "imports":
-                continue
+        for tr in self.trackers.values():
             for c, (w, g) in tr.by_char.items():
                 pw, pg = agg.get(c, (0, 0))
                 agg[c] = (pw + w, pg + g)
@@ -376,14 +357,8 @@ def run(args) -> None:
         # all tiers serve from the phillip grid (one stacked forward)
         phillips[tier] = (pol, frac, resolve_name_code(pnm, "Master Player"))
         print(f"phillip:{tier} <- {fname} ({frac:.0%} of envs)")
-    fox = {}
-    for spec in scfg.fox_imports:
-        name, path = spec.split(":", 1)
-        assert os.path.exists(path), f"fox import {name}: {path} missing"
-        fox[f"import:{name}"] = path
-        print(f"import:{name} <- {path} (FOX lock)")
     league = SimLeague(
-        snap_dir, phillips=phillips, fox_imports=fox,
+        snap_dir, phillips=phillips,
         self_frac=scfg.self_frac, device=device,
         pfsp_hard_frac=scfg.pfsp_hard_frac, pfsp_explore=scfg.pfsp_explore,
         config_from=args.ckpt,
@@ -399,8 +374,7 @@ def run(args) -> None:
     if restored_trackers:
         # dolphin-run kinds -> sim tracker keys ("reference" was the
         # dedicated medium-v2 phillip in v10)
-        remap = {"snapshot": "snapshots", "import": "imports",
-                 "reference": "phillip:medium"}
+        remap = {"snapshot": "snapshots", "reference": "phillip:medium"}
         loaded = []
         for kind, st in restored_trackers.items():
             key = remap.get(kind, kind)
@@ -472,7 +446,7 @@ def run(args) -> None:
             if tr.wins + tr.losses + tr.draws:
                 for k, v in tr.stats().items():
                     log[f"rl/phillip/{tier}/{k}"] = v
-        for cls in ("self", "snapshots", "imports"):
+        for cls in ("self", "snapshots"):
             tr = worker.trackers[cls]
             if tr.wins + tr.losses + tr.draws:
                 for k, v in tr.stats().items():
@@ -480,10 +454,6 @@ def run(args) -> None:
         for g_path in pool.archive:                # per-ghost win estimates
             log[f"rl/snapshots/s{pool._step_of(g_path):07d}"] = (
                 pool.win_estimate(g_path))
-        for key in fox:                            # fox imports live w/ ghosts
-            row = pool.payoff.get(key)
-            if row and row.get("games"):
-                log[f"rl/snapshots/{key.split(':', 1)[1]}"] = pool.win_estimate(key)
         for k, v in worker.league_stats().items():   # routing health
             log[f"rl/league/{k}"] = v
         for c, (w, g) in worker.by_char().items():   # per-matchup weakness

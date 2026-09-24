@@ -444,35 +444,30 @@ class MultiOpponentSimWorker:
 
 class SimLeague:
     """Opponent pool for the sim league: self / phillip tiers / PFSP pool
-    (snapshots + fox imports through SnapshotPool's draw + payoff ledger,
-    pfsp.json — a resume loads v10's archive and table straight from the
-    snapshot dir). layout() fixes the env rows once per run."""
+    (snapshots through SnapshotPool's draw + payoff ledger, pfsp.json — a
+    resume loads the archive and table straight from the snapshot dir).
+    layout() fixes the env rows once per run."""
 
-    def __init__(self, snapshot_dir, phillips, fox_imports,
+    def __init__(self, snapshot_dir, phillips,
                  self_frac=0.30, device="cpu", pfsp_hard_frac=0.25, pfsp_explore=0.075,
                  config_from=None):
-        # phillips: {tier: (policy, frac, name_code)}; fox_imports: {"import:NAME": path}
+        # phillips: {tier: (policy, frac, name_code)}
         self.device = device
         self.self_frac = self_frac
         self.phillips = phillips
-        self.fox_paths = dict(fox_imports)
         self.league = SnapshotPool(
             snapshot_dir, keep=0,
             pfsp_hard_frac=pfsp_hard_frac, pfsp_explore=pfsp_explore,
-            league_members=list(fox_imports.keys()),
         )
-        self.weights = MemberWeights(self._path_of)
+        self.weights = MemberWeights(lambda path: path)   # members are snapshot paths
         self._cfg = None
         if config_from is not None:
             from smashbot import saving
             self._cfg = saving.load_checkpoint(config_from)["config"]
 
-    def _path_of(self, key):
-        return self.fox_paths[key] if key.startswith("import:") else key
-
     def _make_skeleton(self):
-        """Empty policy built from config_from (snapshots + fox imports are
-        bare state_dicts, no config of their own)."""
+        """Empty policy built from config_from (snapshots are bare
+        state_dicts, no config of their own)."""
         from smashbot.policy import build_policy_from_config
         if self._cfg is None:
             raise RuntimeError("SimLeague needs config_from to load bare-state members")
@@ -514,8 +509,7 @@ class SimLeague:
         return out
 
     def make_league(self, seats, rng):
-        locks = {k: "FOX" for k in self.fox_paths}
-        return League(self.league, seats, locks, rng,
+        return League(self.league, seats, locks={}, rng=rng,
                       warm=self.weights.warm, ready=self.weights.ready)
 
     def record(self, key, won: bool):
