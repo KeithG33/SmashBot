@@ -250,6 +250,15 @@ class Learner:
         # storages allocated once and copied into per step.
         self._snap_buffers: dict = {}
 
+    def set_learning_rate(self, lr: float) -> set:
+        """Point both optimizers at lr, leaving Adam's moments and step
+        counts as they are; returns the rates they had."""
+        groups = [g for opt in (self.policy_optimizer, self.value_optimizer) for g in opt.param_groups]
+        before = {g["lr"] for g in groups}
+        for group in groups:
+            group["lr"] = lr
+        return before
+
     def _snap_into(self, key: str, src):
         """Deep-copy `src` (a state dict) to CPU, REUSING the tensor
         storages from this key's previous snapshot wherever shapes/dtypes

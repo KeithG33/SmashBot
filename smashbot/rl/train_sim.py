@@ -293,8 +293,11 @@ def run(args) -> None:
     from smashbot.rl.ppo import Learner
     from smashbot.rl.sim_league import SimLeague
     from smashbot.rl.train_rl import build_value_function, _save_rl_checkpoint
-    from smashbot.training import compile_cores
+    from smashbot.training import compile_cores, resolve_restore
     from smashbot.networks import check_loadable, use_manual_recurrent_step
+
+    run_dir = f"{args.runtime.run_dir}/{args.runtime.tag}"
+    rpath = resolve_restore(run_dir, args.runtime.restore)
 
     scfg: SimRolloutConfig = args.sim
     device = args.runtime.device
@@ -316,31 +319,27 @@ def run(args) -> None:
     learner = Learner(args.learner, policy, teacher, value_fn)
     print(f"learner precision: {learner.precision}")
 
-    # ---- restore (same schema as the dolphin path) ----
+    # ---- restore ----
     start_step = 0
     restored_trackers = None
-    run_dir = f"{args.runtime.run_dir}/{args.runtime.tag}"
-    if args.runtime.restore:
-        rpath = args.runtime.restore
-        if rpath == "auto":
-            rpath = f"{run_dir}/latest.pt"
-            if not os.path.exists(rpath):
-                rpath = ""
-                print("restore auto: no checkpoint yet, starting fresh")
-        if rpath:
-            rl_ckpt = saving.load_checkpoint(rpath)
-            check_loadable(rl_ckpt["config"]["network"], rl_ckpt["state"]["policy"])
-            check_loadable({}, rl_ckpt["state"]["value"])
-            policy.load_state_dict(rl_ckpt["state"]["policy"])
-            value_fn.load_state_dict(rl_ckpt["state"]["value"])
-            if "policy_opt" in rl_ckpt["state"]:
-                saving.load_optimizer(learner.policy_optimizer, rl_ckpt["state"]["policy_opt"], rl_ckpt["state"]["policy"])
-                learner.value_optimizer.load_state_dict(rl_ckpt["state"]["value_opt"])
-            start_step = rl_ckpt["state"]["step"] + 1
-            restored_trackers = rl_ckpt["state"].get("trackers")
-            learner.policy_clipper.history = list(
-                (rl_ckpt["state"].get("clip_history") or {}).get("policy", []))
-            print(f"restored RL run from {rpath} at step {start_step}")
+    if rpath:
+        rl_ckpt = saving.load_checkpoint(rpath)
+        check_loadable(rl_ckpt["config"]["network"], rl_ckpt["state"]["policy"])
+        check_loadable({}, rl_ckpt["state"]["value"])
+        policy.load_state_dict(rl_ckpt["state"]["policy"])
+        value_fn.load_state_dict(rl_ckpt["state"]["value"])
+        if "policy_opt" in rl_ckpt["state"]:
+            saving.load_optimizer(learner.policy_optimizer, rl_ckpt["state"]["policy_opt"], rl_ckpt["state"]["policy"])
+            learner.value_optimizer.load_state_dict(rl_ckpt["state"]["value_opt"])
+            saved = learner.set_learning_rate(args.learner.learning_rate)
+            if saved != {args.learner.learning_rate}:
+                print(f"learning rate: checkpoint {', '.join(map(str, sorted(saved)))} -> "
+                      f"{args.learner.learning_rate} (--learner.learning-rate or its default)")
+        start_step = rl_ckpt["state"]["step"] + 1
+        restored_trackers = rl_ckpt["state"].get("trackers")
+        learner.policy_clipper.history = list(
+            (rl_ckpt["state"].get("clip_history") or {}).get("policy", []))
+        print(f"restored RL run from {rpath} at step {start_step}")
     _save_rl_checkpoint.policy_opt = learner.policy_optimizer
     _save_rl_checkpoint.value_opt = learner.value_optimizer
     _save_rl_checkpoint.clip_history = lambda: learner.policy_clipper.history
@@ -417,7 +416,8 @@ def run(args) -> None:
     wandb.init(
         project="shinebot", id=args.runtime.wandb_id or args.runtime.tag,
         name=args.runtime.tag, mode=args.runtime.wandb_mode,
-        config=dataclasses.asdict(args), resume="allow",
+        config=dataclasses.asdict(args),
+        resume="allow" if rpath else "never",   # a fresh run never lands on an old wandb run
     )
 
     state = learner.initial_state(worker.rows, device)
@@ -454,6 +454,7 @@ def run(args) -> None:
         log.update({"rl/value_" + k: v for k, v in metrics["value"].items()
                     if not _quiet(k, v)})
         log["rl/reverted"] = float(metrics["reverted"])
+        log["rl/learning_rate"] = learner.policy_optimizer.param_groups[0]["lr"]
         if learner.grad_scaler is not None:
             log["rl/grad_scaler_scale"] = learner.grad_scaler.get_scale()
         im = metrics.get("imitation")

@@ -29,7 +29,7 @@ from smashbot.data import loader
 from smashbot.delay import slice_delayed_frames
 from smashbot.networks import build_embed_network, check_loadable
 from smashbot.policy import build_policy
-from smashbot.training import GradClipper, compile_cores
+from smashbot.training import GradClipper, compile_cores, resolve_restore
 from smashbot.value import ValueFunction
 
 
@@ -168,6 +168,7 @@ class _StopRequest:
 def main(config: TrainConfig) -> None:
     rt = config.runtime
     run_dir = os.path.join(rt.run_dir, rt.tag)
+    restore_path = resolve_restore(run_dir, rt.restore)
     os.makedirs(run_dir, exist_ok=True)
     device = rt.device
     torch.manual_seed(rt.seed)
@@ -175,10 +176,7 @@ def main(config: TrainConfig) -> None:
     discount = 0.5 ** (1 / (config.value.reward_halflife * 60))
 
     ckpt = None
-    if rt.restore:
-        restore_path = (
-            os.path.join(run_dir, "latest.pt") if rt.restore == "auto" else rt.restore
-        )
+    if restore_path:
         ckpt = saving.load_checkpoint(restore_path)
         config.data.dataset.validate()
         _check_config(ckpt["config"], dataclasses.asdict(config), dataclasses.asdict(TrainConfig()))
@@ -274,7 +272,7 @@ def main(config: TrainConfig) -> None:
         name=rt.tag,
         mode=rt.wandb_mode,
         config=dataclasses.asdict(config),
-        resume="allow",
+        resume="allow" if restore_path else "never",   # a fresh run never lands on an old wandb run
         id=rt.tag,
     )
 

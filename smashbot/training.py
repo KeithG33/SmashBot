@@ -1,10 +1,30 @@
-"""Pieces shared by the BC and RL learners: gradient clipping and compile."""
+"""Pieces shared by the BC and RL learners: restore resolution, gradient
+clipping and compile."""
 from __future__ import annotations
 
 import math
+import os
 
 import numpy as np
 import torch
+
+
+def resolve_restore(run_dir: str, restore: str) -> str:
+    """The checkpoint a run resumes from, or "" for a fresh start. A fresh
+    start into a run directory that already holds checkpoints is refused, so
+    a relaunch that forgets --runtime.restore cannot overwrite them; "auto"
+    and an explicit path must name a checkpoint that exists."""
+    if not restore:
+        existing = [f for f in ("latest.pt", "best.pt") if os.path.exists(os.path.join(run_dir, f))]
+        if existing:
+            raise FileExistsError(
+                f"{run_dir} already holds {' and '.join(existing)}: resume it with "
+                "--runtime.restore auto, or start a new experiment under a new --runtime.tag")
+        return ""
+    path = os.path.join(run_dir, "latest.pt") if restore == "auto" else restore
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"--runtime.restore {restore}: no checkpoint at {path}")
+    return path
 
 
 class GradClipper:
