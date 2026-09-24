@@ -56,13 +56,15 @@ def record_stream(frames):
     env.reset_all()
     stream, resets = [], []
     reset_np = np.ones(NENV, dtype=bool)
+    item_slots = sim_env.ItemSlots(NENV)
     for _ in range(frames):
         if env.t >= env.length:
             env.reset_cursor()
         obs = env.current_frame
-        stream.append(tree.map_structure(np.copy, sim_env.encode_obs(obs, self_slot=1, opp_slot=0)))
+        items = item_slots.place(obs["items"], reset_np)
+        stream.append(tree.map_structure(np.copy, sim_env.encode_obs(obs, items, self_slot=1, opp_slot=0)))
         resets.append(reset_np.copy())
-        st = _states_to_torch(sim_env.encode_obs(obs), DEV)
+        st = _states_to_torch(sim_env.encode_obs(obs, items), DEV)
         agent.infer(st, torch.as_tensor(reset_np, device=DEV), want_snapshot=False)
         rows = np.stack(agent.execute(np.nonzero(reset_np)[0].tolist()))
         sim_env.write_controller_rows(env, rows, player=0)

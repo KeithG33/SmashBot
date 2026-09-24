@@ -205,6 +205,7 @@ class MultiOpponentSimWorker:
             state_dtype=torch.float16 if capture and precision == "fp16" else None)
         self.student.set_flat_controllers(True)
         self.ff = sim_env.FlatFrames(device)
+        self.item_slots = sim_env.ItemSlots(batch_size)
         self.student.set_flat_inputs(self.ff.view)
         for gr in self._all_grids():   # phillip grid AND the PFSP grid step through flats
             gr.agent.set_flat_inputs(self.ff.view)
@@ -303,7 +304,8 @@ class MultiOpponentSimWorker:
             # otherwise discard the fresh sample (delay-1 forever)
             rows = np.stack(self.student.execute(np.nonzero(reset_rows_np)[0].tolist()))
             sim_env.write_controller_rows(env, rows[:N], player=0)
-            flats = self.ff.to_device(sim_env.encode_flats(obs))
+            items = self.item_slots.place(obs["items"], reset_np)
+            flats = self.ff.to_device(sim_env.encode_flats(obs, items))
             opp_flats = self.ff.swap(flats)
             if len(self.self_idx):
                 row_flats = tuple(torch.cat([a, b.index_select(0, self.self_idx_t)])

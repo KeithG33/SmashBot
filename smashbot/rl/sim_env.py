@@ -19,6 +19,7 @@ import melee
 import numpy as np
 
 from slippi_ai import types
+from slippi_db.parsing_utils import ItemAssigner
 from smashbot import embed as embed_lib
 
 # Built once; pure structure (no torch state), safe to share.
@@ -81,8 +82,41 @@ def _items(items: np.ndarray) -> object:
     })
 
 
-def obs_to_game(obs: np.ndarray, self_slot: int = 0, opp_slot: int = 1) -> types.Game:
-    """MslObservation batch [N] -> our batched Game struct.
+class ItemSlots:
+    """Keeps each item in one slot for its lifetime, as the replays and Dolphin
+    do (slippi_db's ItemAssigner, one per game). The sim lists live items
+    packed, so without this an item shifts slots whenever an earlier one
+    vanishes."""
+
+    def __init__(self, num_envs: int):
+        self._assigners = [ItemAssigner() for _ in range(num_envs)]
+        self._listed = np.full((num_envs, _N_ITEMS), -1, np.int64)   # last frame's listing
+        self._slot = np.zeros((num_envs, _N_ITEMS), np.int64)        # slot of each listed item
+
+    def place(self, items: np.ndarray, new_game: np.ndarray) -> np.ndarray:
+        """items [N, 15] as the sim lists them; new_game [N] marks each game's
+        first frame. Returns [N, 15] with every item in its slot, the rest zero."""
+        live = items["exists"].astype(bool)
+        listed = np.where(live, items["spawn_id"].astype(np.int64), -1)
+        for e in np.flatnonzero(new_game):
+            self._assigners[e] = ItemAssigner()
+        # a listing changes only when an item spawns or vanishes (an emptied
+        # listing frees its slots); unchanged, the assigner would return the
+        # same slots without changing state
+        for e in np.flatnonzero(new_game | (listed != self._listed).any(axis=1)):
+            pos = np.flatnonzero(live[e])
+            self._slot[e, pos] = self._assigners[e].assign(listed[e, pos].tolist())
+        self._listed = listed
+        env, pos = np.nonzero(live)
+        placed = np.zeros_like(items)
+        placed[env, self._slot[env, pos]] = items[env, pos]
+        return placed
+
+
+def obs_to_game(obs: np.ndarray, items: np.ndarray, self_slot: int = 0,
+                opp_slot: int = 1) -> types.Game:
+    """MslObservation batch [N] -> our batched Game struct; items are the
+    frame's items in their slots (ItemSlots.place).
 
     self_slot / opp_slot pick which viewpoint-relative slots become p0 (us)
     and p1 (them). Swapping them yields the opponent's perspective for free
@@ -103,15 +137,15 @@ def obs_to_game(obs: np.ndarray, self_slot: int = 0, opp_slot: int = 1) -> types
             left=stage["fod_platforms"]["left"].astype(np.float32),
             right=stage["fod_platforms"]["right"].astype(np.float32),
         ),
-        items=_items(obs["items"]),
+        items=_items(items),
     )
 
 
-def encode_obs(obs: np.ndarray, self_slot: int = 0, opp_slot: int = 1):
+def encode_obs(obs: np.ndarray, items: np.ndarray, self_slot: int = 0, opp_slot: int = 1):
     """MslObservation batch -> encoded Game struct (numpy leaves), the input
     BatchedPolicyAgent.step / infer expects (still numpy; the agent moves it
     to torch/device)."""
-    return _EMBED.from_state(obs_to_game(obs, self_slot, opp_slot))
+    return _EMBED.from_state(obs_to_game(obs, items, self_slot, opp_slot))
 
 
 # ---- flat encoding (the dolphin worker's 3-tensor path, batched) ----
@@ -124,11 +158,11 @@ _LAYOUT = _encode.layout_of(_DUMMY)
 _SWAP_PERM_NP = _encode.swap_perm(_DUMMY, _LAYOUT)
 
 
-def encode_flats(obs: np.ndarray) -> tuple:
+def encode_flats(obs: np.ndarray, items: np.ndarray) -> tuple:
     """(bools[N,B], ints[N,I], floats[N,F]) numpy flats of the UNSWAPPED
     (player-0 view) encoded frame."""
     return _encode.flatten_typed_batched(
-        _EMBED.from_state(obs_to_game(obs)), len(obs))
+        _EMBED.from_state(obs_to_game(obs, items)), len(obs))
 
 
 class FlatFrames:
