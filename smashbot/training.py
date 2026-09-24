@@ -13,9 +13,9 @@ class GradClipper:
     history. The history is checkpointed so a resume clips exactly as the
     uninterrupted run would.
 
-    `measure` then `clip` lets a caller inspect the norm first (the RL
-    learner skips non-finite steps, which must not enter the history);
-    `__call__` does both."""
+    `measure` reads the norm without touching the gradients, so the caller
+    decides what a non-finite one means (BC stops, the RL learner skips the
+    step); `clip` then records it and clips with it."""
 
     def __init__(self, params, max_norm: float, percentile: float = 0.0, history=None):
         assert not (max_norm > 0 and percentile > 0), "one clipping rule at a time"
@@ -24,7 +24,8 @@ class GradClipper:
         self.history = list(history or [])
 
     def measure(self) -> float:
-        return torch.nn.utils.clip_grad_norm_(self.params, math.inf).item()
+        return torch.nn.utils.get_total_norm(
+            [p.grad for p in self.params if p.grad is not None]).item()
 
     @property
     def threshold(self) -> float:
@@ -37,14 +38,8 @@ class GradClipper:
             self.history.append(norm)
         clip = self.threshold
         if math.isfinite(clip):
-            torch.nn.utils.clip_grad_norm_(self.params, clip)
+            torch.nn.utils.clip_grads_with_norm_(self.params, clip, torch.tensor(norm))
         return {"grad_norm": norm, "clip_norm": clip}
-
-    def __call__(self) -> dict:
-        norm = self.measure()
-        if math.isfinite(norm):
-            return self.clip(norm)
-        return {"grad_norm": norm, "clip_norm": self.threshold}
 
 
 def compile_cores(policy, value_fn) -> None:

@@ -92,6 +92,23 @@ def _set_rng(rng: dict) -> None:
         torch.cuda.set_rng_state_all(rng["cuda"])
 
 
+def _checked_clip(clipper: GradClipper, loss: float, net: str, step: int) -> dict:
+    """BC stops on a non-finite loss or gradient rather than skipping the
+    update: the data cursor and the recurrent state have already moved on.
+    Raising before the optimizer step leaves latest.pt as it was."""
+    norm = clipper.measure()
+    if not (math.isfinite(loss) and math.isfinite(norm)):
+        raise FloatingPointError(f"step {step}: non-finite {net} update (loss {loss}, grad norm {norm})")
+    return clipper.clip(norm)
+
+
+def _nonfinite(states: dict) -> list:
+    """Names of the states holding a NaN or inf in a floating tensor."""
+    return [name for name, state in states.items()
+            if not all(bool(torch.isfinite(t).all()) for t in tree.flatten(state)
+                       if isinstance(t, torch.Tensor) and t.is_floating_point())]
+
+
 def _resume_state(ckpt: tp.Optional[dict]) -> dict:
     """The checkpoint's state, with pre-row-tracking checkpoints mapped onto
     the same keys (cycle position only; rows restart fresh)."""
@@ -292,6 +309,14 @@ def main(config: TrainConfig) -> None:
         return tree.map_structure(lambda t: t.detach(), state)
 
     def save(path_name: str):
+        bad = _nonfinite({
+            "policy weights": policy.state_dict(), "value weights": value_fn.state_dict(),
+            "policy Adam state": policy_opt.state_dict(), "value Adam state": value_opt.state_dict(),
+            "train_hidden": train_hidden, "value_hidden": value_hidden,
+            "eval_hidden": eval_hidden, "eval_value_hidden": eval_value_hidden,
+        })
+        if bad:
+            raise FloatingPointError(f"refusing to write {path_name} at step {step}: non-finite {', '.join(bad)}")
         saving.save_checkpoint(
             os.path.join(run_dir, path_name),
             config,
@@ -331,11 +356,12 @@ def main(config: TrainConfig) -> None:
                 losses.append(m["policy_loss"])
                 value_metrics_acc.append(vm)
         policy.train()
-        print(f"eval @ {step}: policy_loss {sum(losses) / len(losses):.6f}", flush=True)
-        return {
-            "policy_loss": float(np.mean(losses)),
-            "value_uev": float(np.mean([m["uev"] for m in value_metrics_acc])),
-        }
+        policy_loss = float(np.mean(losses))
+        value_uev = float(np.mean([m["uev"] for m in value_metrics_acc]))
+        if not (math.isfinite(policy_loss) and math.isfinite(value_uev)):
+            raise FloatingPointError(f"step {step}: non-finite eval (policy loss {policy_loss}, value uev {value_uev})")
+        print(f"eval @ {step}: policy_loss {policy_loss:.6f}", flush=True)
+        return {"policy_loss": policy_loss, "value_uev": value_uev}
 
     from tqdm import tqdm
 
@@ -359,7 +385,7 @@ def main(config: TrainConfig) -> None:
                 policy_loss, train_hidden, metrics = policy_loss_fn(frames, train_hidden)
             policy_loss.backward()
             train_hidden = detach(train_hidden)
-            clip_metrics = clip_policy()
+            clip_metrics = _checked_clip(clip_policy, metrics["policy_loss"], "policy", step)
             policy_opt.step()
 
             value_opt.zero_grad(set_to_none=True)
@@ -368,7 +394,7 @@ def main(config: TrainConfig) -> None:
                 value_loss, value_hidden, value_metrics = value_loss_fn(sliced, value_hidden, discount)
             value_loss.backward()
             value_hidden = detach(value_hidden)
-            value_clip_metrics = clip_value()
+            value_clip_metrics = _checked_clip(clip_value, value_metrics["loss"], "value", step)
             value_opt.step()
 
             if step % rt.log_interval == 0:
@@ -427,13 +453,15 @@ def main(config: TrainConfig) -> None:
     finally:
         stop.restore()
         pbar.close()
-        if at_boundary:
-            save("latest.pt")
-        else:
-            print(f"interrupted mid-step {step}; latest.pt left as it was")
-        train_stream.stop()
-        eval_stream.stop()
-        wandb.finish()
+        try:
+            if at_boundary:
+                save("latest.pt")
+            else:
+                print(f"interrupted mid-step {step}; latest.pt left as it was")
+        finally:
+            train_stream.stop()
+            eval_stream.stop()
+            wandb.finish()
         print(f"done at step {step}; best eval {best_eval_loss:.4f}")
 
 
