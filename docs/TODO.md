@@ -301,6 +301,23 @@ that the latency table inverted; delay 18 vs 21).
   STORAGE with the forward in fp16 both times. Test = lockstep fp32 vs fp16
   forward for one phillip, compare action agreement.
 
+## Controller bins aligned to Melee's thresholds, at the next from-scratch BC run (Keith, 2026-09-24)
+- The problem (inherited from slippi-ai, whose TF and JAX embeddings do the same): stick
+  axes are 17 evenly spaced bins (`ControllerConfig.axis_spacing` 16, one per 10 raw
+  units on the +-80 scale) and the shoulder 5 (`shoulder_spacing` 4), encoded
+  `round(x * n)` and decoded `bin / n`. The stick deadzone is ~+-22 raw, so a tilt at
+  raw 23-24 (just past it) rounds to the raw-20 bin, which decodes inside the deadzone:
+  the bot presses neutral. Light shield starts near 0.31, but presses of 0.31-0.37
+  round to the 0.25 bin, below the threshold. ~0.3-1.3% of replay frames (review count).
+- Fix: bins with explicit edges instead of a spacing, one edge on each gameplay
+  threshold (deadzone, walk/dash, tilt/smash, crouch, light shield) and each bin
+  decoded to a value inside it, so decoding never crosses a threshold. The code change
+  is small (encode/decode take edges); it changes the model's inputs and outputs, so
+  every checkpoint needs retraining: do it when a BC run starts from scratch anyway.
+- First check: Slippi may record sticks after the game's deadzone processing (in-deadzone
+  = exactly 0, real tilts >= 23). A histogram of stick and shoulder values from the parsed
+  replays settles where the edges go.
+
 ## Try the Kron (Kronecker-factored) optimizer in the RL learner (Keith, 2026-09-23)
 - Paper: "Stable Gradients for Stable Learning at Scale in Deep Reinforcement Learning",
   Creus Castanyer, Obando-Ceron, Li, Bacon, Berseth, Courville, Castro (Mila / DeepMind),
