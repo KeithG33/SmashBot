@@ -33,6 +33,9 @@ _N_ITEMS = 15
 # external stage id -> internal: the replay parser's own conversion, as a lookup
 _INTERNAL_STAGE = np.array(
     [melee.enums.to_internal_stage(i).value for i in range(256)], np.int64)
+# Yoshi's Story's cloud as the replays carry it: libmelee's height and edges
+# for the frame, on its 1200-frame cycle (slippi_db.parse_peppi)
+_RANDALL_HLR = np.array([melee.stages.randall_position(f) for f in range(1200)])
 
 
 def _empty_nana(n: int) -> types.Nana:
@@ -53,7 +56,7 @@ def _player(slot: np.ndarray) -> types.Player:
     Popo plays with nana.exists=0 -- a minor obs gap, tracked as follow-up).
     """
     return types.Player(
-        percent=slot["percent"].astype(np.float32),
+        percent=np.floor(slot["percent"]).astype(np.float32),   # replays store whole percent
         facing=slot["facing"].astype(np.bool_),        # 0 left / 1 right -> bool right
         x=slot["pos_x"].astype(np.float32),
         y=slot["pos_y"].astype(np.float32),
@@ -125,13 +128,16 @@ def obs_to_game(obs: np.ndarray, items: np.ndarray, self_slot: int = 0,
     """
     slots = obs["slots"]  # [N, 4] structured
     stage = obs["stage"]
+    stage_id = _INTERNAL_STAGE[obs["stage_id"]]
+    on_yoshis = stage_id == melee.Stage.YOSHIS_STORY.value
+    height, left, right = _RANDALL_HLR[(obs["frame_id"] + 1200) % 1200].T
     return types.Game(
         p0=_player(slots[:, self_slot]),
         p1=_player(slots[:, opp_slot]),
-        stage=_INTERNAL_STAGE[obs["stage_id"]],
+        stage=stage_id,
         randall=_RANDALL_T(
-            x=stage["randall"]["x"].astype(np.float32),
-            y=stage["randall"]["y"].astype(np.float32),
+            x=np.where(on_yoshis, (left + right) / 2, 0).astype(np.float32),
+            y=np.where(on_yoshis, height, 0).astype(np.float32),
         ),
         fod_platforms=_FOD_T(
             left=stage["fod_platforms"]["left"].astype(np.float32),
