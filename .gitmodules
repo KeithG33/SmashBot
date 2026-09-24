@@ -1,3 +1,6 @@
 [submodule "vendor/slippi-ai"]
 	path = vendor/slippi-ai
 	url = https://github.com/vladfi1/slippi-ai
+[submodule "vendor/melee-sim-light"]
+	path = vendor/melee-sim-light
+	url = git@github.com:kyhavlov/melee-sim-light.git

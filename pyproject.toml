@@ -20,8 +20,8 @@ dependencies = [
   "tqdm",
   "melee",   # libmelee: Dolphin play and the replay parser
   # slippi_ai is vendored, not on PyPI: pip install -e vendor/slippi-ai
-  # (it brings peppi-py); RL also needs vendor/melee-sim-light built
-  # (docs/sim-backend.md)
+  # (it brings peppi-py); RL also needs the vendor/melee-sim-light submodule
+  # (git submodule update --init; private repo) built (docs/sim-backend.md)
 ]
 
 [project.optional-dependencies]

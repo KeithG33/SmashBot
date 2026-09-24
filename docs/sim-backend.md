@@ -18,7 +18,7 @@ Eval tools (all sim, CPU-friendly, deterministic slates):
 ## Setup (once per machine)
 
 ```bash
-git clone https://github.com/kyhavlov/melee-sim-light vendor/melee-sim-light
+git submodule update --init vendor/melee-sim-light   # pinned upstream commit; private repo, needs access
 cd vendor/melee-sim-light
 make python-release PY=/path/to/.venv/bin/python   # NOT python-library (-O0, ~2x slower)
 cp build/melee_core/python-release/libmelee_core.so melee_sim/libmelee_core.so
@@ -26,8 +26,9 @@ cp build/melee_core/python-release/libmelee_core.so melee_sim/libmelee_core.so
 #   MSL_DATA_DIR=/home/kage/drive2/ShineBot/msl-data
 ```
 
-`vendor/` is gitignored (pristine upstream clone + 720M of build artifacts).
-Add `vendor/melee-sim-light` to `PYTHONPATH` (the launch script does).
+melee-sim-light is a submodule pinned to the commit we run (its build
+artifacts stay untracked: `vendor/` is gitignored). Add `vendor/melee-sim-light`
+to `PYTHONPATH` (the launch script does).
 
 ## Architecture
 
