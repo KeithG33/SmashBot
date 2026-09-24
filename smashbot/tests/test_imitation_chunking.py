@@ -23,7 +23,8 @@ def _make_learner(seed=0, **cfg_kwargs):
 
 
 def _imit_traj(policy, B, seed):
-    return _rollout(policy, B=B, T=8, seed=seed)._replace(kind="imitation")
+    traj = _rollout(policy, B=B, T=8, seed=seed)
+    return traj._replace(kind="imitation", valid=~traj.is_resetting[:, 1:])
 
 
 @pytest.mark.parametrize("budget", [1, 2, 3, 5])

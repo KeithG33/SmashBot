@@ -49,12 +49,15 @@ train_rl (backend sim)                         (rl/train_rl.py dispatch)
         │             bare-state member loading (config_from)
         ├─ PfspGrid: S slices x Nc cells on ONE LeagueAgent; seat/unseat/
         │            move keep the cell->env gather map; a cell harvests
-        │            only if occupied for the whole chunk
+        │            only if it kept one occupant for every frame a chunk reads
         └─ MultiOpponentSimWorker: per-frame loop — one student forward
                        over all learner rows (every env's seat A + self
                        envs' seat B), phillip grid + PFSP grid forwards,
-                       harvest of every non-self seat, rewards, events,
-                       game-end handling (_on_done: record, re-seat, redraw)
+                       harvest of every grid seat as a replay (what it
+                       pressed, sliced with the student's delay as BC
+                       slices replays: rl/rollouts.HarvestAssembler),
+                       rewards, events, game-end handling (_on_done:
+                       record, re-seat, redraw)
   rl/sim_env.py       obs -> encoded Game struct (flat 3-tensor path)
 ```
 

@@ -3,6 +3,8 @@
 - ChunkAssembler: per-frame records + transition rewards -> [N, T+1]
   Trajectory chunks with the delay-shifted reward alignment the learner
   expects (reward slot t = the game transition at sample-time t + delay).
+- HarvestAssembler: an opponent seat's pressed controllers -> imitation
+  chunks aligned exactly as BC aligns replays.
 - compute_reward: stock/percent deltas -> reward, zeroed at game boundaries.
 - GameTracker: per-opponent-class win/stock/kill-percent statistics.
 
@@ -16,9 +18,11 @@ from __future__ import annotations
 
 import typing as tp
 
+import numpy as np
 import torch
 import tree
 
+from smashbot import encode
 from smashbot.rl.agent import FrameRecord  # noqa: F401  (typing)
 from smashbot.rl.ppo import ActionData, Trajectory
 
@@ -95,6 +99,85 @@ class ChunkAssembler:
         self._initial_state = self._next_initial
         self._next_initial = None
         return traj
+
+
+class HarvestAssembler:
+    """An opponent seat as a replay: the controllers it pressed, sliced with
+    the student's delay exactly as BC slices replays, so every opponent's
+    imitation data lines up with the student's own rollouts whatever delay
+    its policy runs at.
+
+    pressed[f] is sent at frame f and drives f -> f+1, so a replay records
+    it at f+1: position t takes pressed[t+D-1] as its previous action and
+    pressed[t+D] as its target, and reward slot t is the transition
+    t+D -> t+D+1 (ChunkAssembler's convention). A position is valid only if
+    its target was pressed in its own game; invalid positions carry zero
+    reward, so no return picks up the next game's. A row enters a chunk
+    only if its seat kept one occupant through every frame the chunk reads.
+    """
+
+    def __init__(self, unroll_length: int, delay: int, controller_embedding, name_code: int):
+        assert delay >= 1, delay
+        self.T, self.D = unroll_length, delay
+        self._embed = controller_embedding
+        self._name_code = name_code
+        self._states: list = []
+        self._pressed: list[np.ndarray] = []
+        self._resets: list[torch.Tensor] = []
+        self._kept: list[np.ndarray] = []
+        self._rewards: list[torch.Tensor] = []
+
+    def push_frame(self, state, pressed: np.ndarray, is_resetting: torch.Tensor,
+                   kept: np.ndarray) -> None:
+        """pressed: [N, 13] controller rows sent this frame; kept: [N] seats
+        whose occupant is the previous frame's."""
+        self._states.append(state)
+        self._pressed.append(pressed)
+        self._resets.append(is_resetting)
+        self._kept.append(kept)
+
+    def push_reward(self, reward: torch.Tensor) -> None:  # [N], transition f -> f+1
+        self._rewards.append(reward)
+
+    def ready(self) -> bool:
+        return len(self._states) > self.T + self.D and len(self._rewards) >= self.T + self.D
+
+    def emit(self) -> tp.Optional[Trajectory]:
+        """The chunk of frames [0, T], reading ahead to T+D; None when no seat
+        kept its occupant throughout. The next chunk starts at frame T."""
+        assert self.ready()
+        T, D = self.T, self.D
+        rows = np.nonzero(np.logical_and.reduce(self._kept[:T + D + 1]))[0]
+        states, pressed = self._states[:T + 1], self._pressed[D - 1:T + D]
+        resets = torch.stack(self._resets[:T + D + 1], dim=1)
+        rewards = torch.stack(self._rewards[D:T + D], dim=1)
+        self._states, self._pressed = self._states[T:], self._pressed[T:]
+        self._resets, self._kept, self._rewards = self._resets[T:], self._kept[T:], self._rewards[T:]
+        if len(rows) == 0:
+            return None
+
+        idx = torch.as_tensor(rows, device=resets.device)
+        resets = resets.index_select(0, idx)
+        valid = ~resets[:, 1:].unfold(1, D + 1, 1).any(-1)   # no reset in frames t+1 .. t+D+1
+        encoded = self._embed.from_state(encode.controller_from_rows(np.stack(pressed, axis=1)[rows]))
+        return Trajectory(
+            states=tree.map_structure(
+                lambda *xs: torch.stack(xs, dim=1).index_select(0, idx), *states),
+            name=torch.full((len(rows), T + 1), self._name_code, dtype=torch.int64,
+                            device=resets.device),
+            actions=ActionData(
+                controller_state=tree.map_structure(
+                    lambda x: torch.from_numpy(np.ascontiguousarray(
+                        x.astype(np.int64) if x.dtype.kind in "iu" else x)).to(resets.device),
+                    encoded),
+                logits=None,
+            ),
+            rewards=rewards.index_select(0, idx) * valid,
+            is_resetting=resets[:, :T + 1],
+            initial_state=None,
+            kind="imitation",
+            valid=valid,
+        )
 
 
 def compute_reward(

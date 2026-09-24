@@ -126,7 +126,7 @@ class MatchSet:
 
         n = min(envs, len(self.slate))
         self.worker = MultiOpponentSimWorker(
-            student, [("opponent", opponent, list(range(n)), False, opp_name_code)],
+            student, [("opponent", opponent, list(range(n)), opp_name_code)],
             n, unroll, data_dir, None, None, name_code=student_name_code, device=device,
             record_fn=on_game, event_fn=on_event, match_fn=next_game, max_frame=MAX_GAME_FRAMES)
         self._unroll = unroll

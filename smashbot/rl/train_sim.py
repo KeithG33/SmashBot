@@ -179,9 +179,7 @@ class SimLeagueWorker:
         self._stages = list(msl.Stage)
         self.part = self.lg.layout(N)
         from smashbot.rl.league import LeagueSeats
-        from smashbot.rl.sim_league import (MultiOpponentSimWorker, PfspGrid,
-                                            make_reencoder)
-        stu_embed = self.policy.controller_head.controller_embedding
+        from smashbot.rl.sim_league import MultiOpponentSimWorker, PfspGrid
         # --- phillip grid: all tiers on ONE stacked forward (their LSTM
         # steps via the hand-rolled cell — cuDNN has no vmap rule); static
         # cells, slices padded to the largest tier
@@ -189,10 +187,7 @@ class SimLeagueWorker:
         rows = [self.part[f"phillip:{t}"] for t in tiers]
         tmpl = self.lg.phillips[tiers[0]][0]
         self._phillip_grid = PfspGrid(
-            tmpl, len(tiers), max(len(r) for r in rows), self.name_code,
-            cfg.unroll_length, self.device,
-            reencode=make_reencoder(tmpl.controller_head.controller_embedding,
-                                    stu_embed, self.name_code, self.device))
+            tmpl, len(tiers), max(len(r) for r in rows), self.name_code, self.device)
         for s, t in enumerate(tiers):
             self._phillip_grid.load(s, f"phillip:{t}",
                                     lambda k: self.lg.phillips[k.split(':', 1)[1]][0].state_dict())
@@ -207,8 +202,7 @@ class SimLeagueWorker:
         pfsp_envs = self.part["pfsp"]
         S = cfg.pfsp_slices
         Nc = -(-(len(pfsp_envs) + S) // S)
-        self._grid = PfspGrid(self.lg.make_grid_template(), S, Nc,
-                              self.name_code, cfg.unroll_length, self.device)
+        self._grid = PfspGrid(self.lg.make_grid_template(), S, Nc, self.name_code, self.device)
         seats = LeagueSeats(S, Nc,
                             loader=lambda s, k: self._grid.load(s, k, self.lg.get_state),
                             mover=self._grid.move, drain_slices=max(2, S // 12))

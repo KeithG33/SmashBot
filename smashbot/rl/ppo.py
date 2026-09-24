@@ -68,9 +68,12 @@ class Trajectory(tp.NamedTuple):
     is_resetting: torch.Tensor  # [B, T+1]
     initial_state: RecurrentState  # policy recurrent state at chunk start
     # Learner routing tag: "ppo" (on-policy student data, including both
-    # seats of self-play envs) or "imitation" (harvested opponent seat, e.g.
-    # Phillip's — states/actions/rewards from HIS seat, initial_state None).
+    # seats of self-play envs) or "imitation" (a harvested opponent seat as
+    # a replay, rollouts.HarvestAssembler: what it pressed, aligned to the
+    # student's delay; no logits, initial_state None).
     kind: str = "ppo"
+    # imitation only, [B, T]: positions whose target was pressed in their own game
+    valid: tp.Optional[torch.Tensor] = None
 
 
 def slice_trajectory_rows(traj: Trajectory, rows: tp.Sequence[int]) -> Trajectory:
@@ -93,6 +96,7 @@ def slice_trajectory_rows(traj: Trajectory, rows: tp.Sequence[int]) -> Trajector
             else tree.map_structure(take, traj.initial_state)
         ),
         kind=traj.kind,
+        valid=None if traj.valid is None else take(traj.valid),
     )
 
 
@@ -735,7 +739,7 @@ class Learner:
             return None
         batch_size = traj.rewards.shape[0]
         device = traj.rewards.device
-        valid = (~traj.is_resetting[:, 1:]).float()
+        valid = traj.valid.float()
         step_rows = (
             batch_size if row_budget <= 0 else min(row_budget, batch_size)
         )

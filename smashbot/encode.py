@@ -321,3 +321,16 @@ def controller_rows(decoded) -> np.ndarray:
     import tree
 
     return np.stack([np.asarray(x, dtype=np.float32) for x in tree.flatten(decoded)], axis=-1)
+
+
+def controller_from_rows(rows: np.ndarray):
+    """Batched decoded controller struct from [..., 13] rows (controller_rows' inverse)."""
+    from slippi_ai.types import Buttons, Controller, Stick
+
+    axis = lambda k: rows[..., k].astype(np.float32)
+    return Controller(
+        main_stick=Stick(x=axis(0), y=axis(1)),
+        c_stick=Stick(x=axis(2), y=axis(3)),
+        shoulder=axis(4),
+        buttons=Buttons(*(rows[..., 5 + k] > 0.5 for k in range(len(Buttons._fields)))),
+    )

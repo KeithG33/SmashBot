@@ -551,7 +551,7 @@ def run_lambda_calib(learner, trajectories, target_shares=(0.10, 0.15, 0.20)):
     learner.policy_optimizer.zero_grad(set_to_none=True)
     imit_losses = []
     for traj in ppo_trajs:
-        imf = learner._imitation_fixed(traj)
+        imf = learner._imitation_fixed(traj._replace(valid=~traj.is_resetting[:, 1:]))
         if imf is None:
             continue
         loss = learner._imitation_chunk_loss(imf, float(imf.valid.sum()))

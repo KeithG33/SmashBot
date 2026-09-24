@@ -12,7 +12,7 @@ Learner rows = every env's student seat + the second seat of each self
 env, all served by ONE student forward (v10's row layout: rows are the
 VRAM budget, envs are cheap). Opponent seats: the phillip grid (static
 cells) and the PFSP grid (dynamic cells), one stacked forward each; every
-non-self seat is harvested as a kind="imitation" Trajectory.
+grid seat is harvested as a replay (rollouts.HarvestAssembler).
 """
 from __future__ import annotations
 
@@ -25,42 +25,9 @@ from smashbot.rl.agent import BatchedPolicyAgent
 from smashbot.networks import check_loadable
 from smashbot.rl.league import League, LeagueSeats, MemberWeights
 from smashbot.rl.pool import SnapshotPool
-from smashbot.rl.rollouts import ChunkAssembler, compute_reward
-from smashbot.rl.ppo import slice_trajectory_rows
+from smashbot.rl.rollouts import ChunkAssembler, HarvestAssembler, compute_reward
 from smashbot.rl import sim_env
 from smashbot.rl.sim_env import seat_stats, states_to_torch  # noqa: F401
-
-
-def make_reencoder(opp_embed, stu_embed, student_name_code, device):
-    """Harvested-chunk fixup for an opponent with its OWN config (the
-    phillips): re-encode the controller stream through the student's
-    embedding and recondition the name — the sim twin of
-    DolphinRolloutWorker._traj_reencoder. Logits stay opponent-schema
-    (unused by the imitation loss)."""
-    import tree as _tree
-
-    def reencode(traj):
-        encoded_np = opp_embed.map(
-            lambda e, x: x.astype(getattr(e, "dtype", x.dtype)),
-            _tree.map_structure(
-                lambda x: x.cpu().numpy(), traj.actions.controller_state
-            ),
-        )
-        raw = opp_embed.decode(encoded_np)
-        prev = _tree.map_structure(
-            lambda x: torch.from_numpy(
-                np.ascontiguousarray(
-                    x.astype(np.int64) if x.dtype.kind in "iu" else x
-                )
-            ).to(device),
-            stu_embed.from_state(raw),
-        )
-        return traj._replace(
-            actions=traj.actions._replace(controller_state=prev),
-            name=torch.full_like(traj.name, student_name_code),
-        )
-
-    return reencode
 
 
 class PfspGrid:
@@ -68,15 +35,15 @@ class PfspGrid:
     forward per frame). Cells are seats: `seat`/`unseat`/`move` keep the
     cell->env map that the per-frame gather uses; idle cells forward
     garbage against env 0 with reset held high and their rows are sliced
-    out of every emitted chunk. Harvest eligibility follows v10: a cell's
-    rows enter a chunk only if it was occupied for the WHOLE chunk.
+    out of every emitted chunk. kept() tells the harvest which cells held
+    one occupant since the last frame (v10: a cell's rows enter a chunk only
+    if it was occupied for the WHOLE chunk).
 
     Static use (the phillip tiers): assign_static() seats contiguous env
     rows once. Dynamic use (PFSP): rl/league.League drives seat changes at
     game boundaries; load() is the LeagueSeats loader."""
 
-    def __init__(self, template, slices, cells, name_code, unroll, device,
-                 reencode=None):
+    def __init__(self, template, slices, cells, name_code, device):
         from smashbot.rl.agent import LeagueAgent
         self.S, self.Nc = slices, cells
         cuda = torch.device(device).type == "cuda"
@@ -84,14 +51,12 @@ class PfspGrid:
         self.agent = LeagueAgent(template, slices, cells, name_code, device,
                                  weights_dtype=dt,
                                  state_dtype=torch.float16 if cuda else None)
-        self.assembler = ChunkAssembler(unroll, template.delay)
-        self.reencode = reencode
         self.device = device
         self.members = [None] * slices
         n = slices * cells
         self.cell_env = np.zeros(n, dtype=np.int64)
         self.valid = np.zeros(n, dtype=bool)
-        self.chunk_valid = np.zeros(n, dtype=bool)
+        self.changed = np.zeros(n, dtype=bool)
         self._cell_of: dict[int, int] = {}
         self._dirty = True
         self.idx_t = self.valid_t = None
@@ -108,7 +73,6 @@ class PfspGrid:
             assert len(rows) <= self.Nc, (s, len(rows), self.Nc)
             for n, e in enumerate(rows):
                 self.seat(int(e), s, n)
-        self.chunk_valid[:] = self.valid
 
     def seat(self, env, s, n):
         cell = s * self.Nc + n
@@ -122,7 +86,7 @@ class PfspGrid:
     def unseat(self, env):
         cell = self._cell_of.pop(env)
         self.valid[cell] = False
-        self.chunk_valid[cell] = False
+        self.changed[cell] = True
         self._dirty = True
 
     def move(self, src, dst):
@@ -134,9 +98,15 @@ class PfspGrid:
         env = int(self.cell_env[a])
         self.cell_env[b] = env
         self.valid[b], self.valid[a] = True, False
-        self.chunk_valid[b] = self.chunk_valid[a] = False
+        self.changed[a] = self.changed[b] = True
         self._cell_of[env] = b
         self._dirty = True
+
+    def kept(self) -> np.ndarray:
+        """Cells whose occupant is the previous frame's; read once per frame."""
+        kept = self.valid & ~self.changed
+        self.changed[:] = False
+        return kept
 
     def sync(self):
         if self._dirty:
@@ -150,19 +120,15 @@ class _Group:
     """One opponent identity serving a fixed subset of env rows (the eval
     arena's single opponent; not used by training)."""
 
-    def __init__(self, gid, policy, env_idx, harvest, unroll, device, name_code,
-                 reencode=None, precision="fp32", state_dtype=None, capture=False):
+    def __init__(self, gid, policy, env_idx, device, name_code,
+                 precision="fp32", state_dtype=None, capture=False):
         self.gid = gid
         self.env_idx = np.asarray(env_idx, dtype=np.int64)
         self.idx_t = torch.as_tensor(self.env_idx, device=device)
-        self.harvest = harvest
         self.n = len(self.env_idx)
         self.agent = BatchedPolicyAgent(policy, self.n, name_code=name_code,
                                         device=device, precision=precision,
                                         state_dtype=state_dtype, capture=capture)
-        self.assembler = ChunkAssembler(unroll, policy.delay) if harvest else None
-        self.reencode = reencode
-        self._pushed = 0
         self._reset = np.ones(self.n, dtype=bool)
 
 
@@ -172,8 +138,8 @@ class MultiOpponentSimWorker:
                  precision="fp32", grids=(), event_fn=None, self_idx=(),
                  league=None, pfsp_grid=None, match_fn=None, max_frame=28800,
                  seed=0, capture=False):
-        """opponents: [(gid, policy, env_idx, harvest, name_code)] fixed
-        groups (eval arena). grids: static PfspGrids (phillip tiers), env ->
+        """opponents: [(gid, policy, env_idx, name_code)] fixed groups (eval
+        arena; not harvested). grids: static PfspGrids (phillip tiers), env ->
         gid via gid_of_env below. self_idx: envs whose player-1 seat is the
         student too; those seats are learner rows N.. (v10 layout).
         league/pfsp_grid: per-match PFSP routing (rl/league.League) over a
@@ -213,18 +179,12 @@ class MultiOpponentSimWorker:
         self._pushed = 0
         self._prev = None
         self._reset_mask = np.ones(batch_size, dtype=bool)
-        stu_embed = student_policy.controller_head.controller_embedding
-        self.groups = []
-        for (gid, pol, idx, harv, nc) in opponents:
-            re = None
-            if harv:
-                re = make_reencoder(pol.controller_head.controller_embedding,
-                                    stu_embed, name_code, device)
-                if pol.delay != student_policy.delay:
-                    print(f"NOTE: imitation harvest delay mismatch — {gid} "
-                          f"{pol.delay} vs student {student_policy.delay}", flush=True)
-            self.groups.append(_Group(gid, pol, idx, harv, unroll_length, device,
-                                      nc, re, precision=precision, capture=capture))
+        self.groups = [_Group(gid, pol, idx, device, nc, precision=precision, capture=capture)
+                       for (gid, pol, idx, nc) in opponents]
+        self.harvests = [
+            HarvestAssembler(unroll_length, student_policy.delay,
+                             student_policy.controller_head.controller_embedding, name_code)
+            for _ in self._all_grids()]
         for g in self.groups:
             g.agent.set_flat_controllers(True)
             g.agent.set_flat_inputs(self.ff.view)
@@ -326,15 +286,9 @@ class MultiOpponentSimWorker:
                     g.agent.execute(np.nonzero(g._reset)[0].tolist()))
                 gflats = tuple(t.index_select(0, g.idx_t) for t in opp_flats)
                 gstates = self.ff.view(gflats)
-                greset = torch.as_tensor(g._reset, device=dev)
-                gwant = g.harvest and (g._pushed % T == 0)
-                grecords, _gh = g.agent.infer(gstates, greset, want_snapshot=gwant,
-                                              flats=gflats)
-                if g.harvest:
-                    for rec in grecords:
-                        g.assembler.push_frame(rec, greset, None)
-                        g._pushed += 1
-            for gr in self._all_grids():           # each grid: ONE forward
+                g.agent.infer(gstates, torch.as_tensor(g._reset, device=dev),
+                              want_snapshot=False, flats=gflats)
+            for gr, harvest in zip(self._all_grids(), self.harvests):   # each grid: ONE forward
                 gr.sync()
                 gr_reset = reset_np[gr.cell_env]
                 gr_reset[~gr.valid] = True         # idle cells: perpetual reset
@@ -348,10 +302,8 @@ class MultiOpponentSimWorker:
                 grec = gr.agent.infer(
                     gviews, torch.as_tensor(gr_reset.reshape(gr.S, gr.Nc), device=dev),
                     flats=gflats)
-                if not gr.assembler._records:      # chunk start: eligibility window
-                    gr.chunk_valid[:] = gr.valid
-                gr.chunk_valid &= gr.valid
-                gr.assembler.push_frame(grec, torch.as_tensor(gr_reset, device=dev), None)
+                harvest.push_frame(grec.state, rows_all, torch.as_tensor(gr_reset, device=dev),
+                                   gr.kept())
             sim_env.write_controller_rows(env, p1_rows, player=1)
 
             # ---- rewards ----
@@ -373,11 +325,8 @@ class MultiOpponentSimWorker:
                         torch.cat([reward, -reward.index_select(0, self.self_idx_t)]))
                 else:
                     self.assembler.push_reward(reward)
-                for g in self.groups:
-                    if g.harvest:
-                        g.assembler.push_reward((-reward[g.idx_t]).clone())
-                for gr in self._all_grids():
-                    gr.assembler.push_reward((-reward[gr.idx_t]).clone())
+                for gr, harvest in zip(self._all_grids(), self.harvests):
+                    harvest.push_reward((-reward[gr.idx_t]).clone())
             self._prev = (stocks, percent)
 
             for rec in records:
@@ -397,25 +346,11 @@ class MultiOpponentSimWorker:
 
             if self.assembler.ready():
                 ppo_out.append(self.assembler.emit())
-            for g in self.groups:
-                if g.harvest and g.assembler.ready():
-                    traj = g.assembler.emit()._replace(kind="imitation")
-                    if g.reencode is not None:
-                        traj = g.reencode(traj)
-                    imit_out.append(traj)
-            for gr in self._all_grids():
-                if gr.assembler.ready():
-                    keep = np.nonzero(gr.chunk_valid & gr.valid)[0]
-                    traj = gr.assembler.emit()
-                    gr.chunk_valid[:] = gr.valid   # overlap frame starts the next
-                    if len(keep) == 0:
-                        continue
-                    traj = traj._replace(kind="imitation")
-                    if len(keep) < gr.S * gr.Nc:
-                        traj = slice_trajectory_rows(traj, keep.tolist())
-                    if gr.reencode is not None:
-                        traj = gr.reencode(traj)
-                    imit_out.append(traj)
+            for harvest in self.harvests:
+                if harvest.ready():
+                    traj = harvest.emit()
+                    if traj is not None:
+                        imit_out.append(traj)
         return ppo_out, imit_out
 
     def _on_done(self, e, s0, s1):
