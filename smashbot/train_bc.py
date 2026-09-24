@@ -27,7 +27,7 @@ import tyro
 from smashbot import configs, embed as embed_lib, saving
 from smashbot.data import loader
 from smashbot.delay import slice_delayed_frames
-from smashbot.networks import build_embed_network, check_loadable
+from smashbot.networks import build_embed_network, check_loadable, use_chunk_start_resets
 from smashbot.policy import build_policy, imitation_metrics
 from smashbot.training import GradClipper, compile_cores, resolve_restore
 from smashbot.value import ValueFunction
@@ -92,18 +92,40 @@ def _set_rng(rng: dict) -> None:
         torch.cuda.set_rng_state_all(rng["cuda"])
 
 
-def _checked_norms(step: int, *updates) -> list:
-    """The gradient norm of each (net, loss, clipper) update, read with the
-    losses in one host transfer. BC stops on a non-finite loss or gradient
-    rather than skipping the update: the data cursor and the recurrent state
-    have already moved on. Raising before any optimizer step leaves latest.pt
-    as it was."""
-    values = torch.stack([t for _, loss, clipper in updates
-                          for t in (loss.detach().float(), clipper.norm())]).tolist()
-    for (net, _, _), loss, norm in zip(updates, values[::2], values[1::2]):
-        if not (math.isfinite(loss) and math.isfinite(norm)):
-            raise FloatingPointError(f"step {step}: non-finite {net} update (loss {loss}, grad norm {norm})")
-    return values[1::2]
+class _FiniteWatch:
+    """Each step's losses and gradient norms, checked without making the CPU
+    wait for the GPU: fused Adam skips a non-finite step on the GPU
+    (found_inf), and the host reads the flags a step later, or before a
+    save, and stops BC, since the data cursor and the recurrent state have
+    already moved past the batch."""
+
+    def __init__(self, optimizers, device: str):
+        self.optimizers = optimizers
+        self.flags = torch.zeros(4, pin_memory=device == "cuda")   # policy loss, norm, value loss, norm
+        self.done = torch.cuda.Event() if device == "cuda" else None
+        self.step = None
+
+    def update(self, step: int, policy_loss, policy_norm, value_loss, value_norm) -> None:
+        self.check()
+        values = torch.stack([policy_loss.detach().float(), policy_norm, value_loss.detach().float(), value_norm])
+        found_inf = (~torch.isfinite(values).all()).float()
+        for opt in self.optimizers:
+            opt.found_inf = found_inf
+        self.flags.copy_(values, non_blocking=True)
+        if self.done is not None:
+            self.done.record()
+        self.step = step
+
+    def check(self) -> None:
+        if self.step is None:
+            return
+        if self.done is not None:
+            self.done.synchronize()
+        values = self.flags.tolist()
+        for net, loss, norm in zip(("policy", "value"), values[::2], values[1::2]):
+            if not (math.isfinite(loss) and math.isfinite(norm)):
+                raise FloatingPointError(f"step {self.step}: non-finite {net} update (loss {loss}, grad norm {norm})")
+        self.step = None
 
 
 def _nonfinite(states: dict) -> list:
@@ -231,8 +253,10 @@ def main(config: TrainConfig) -> None:
         )
     ).to(device)
 
-    policy_opt = torch.optim.Adam(policy.parameters(), lr=config.learner.learning_rate)
-    value_opt = torch.optim.Adam(value_fn.parameters(), lr=config.learner.learning_rate)
+    use_chunk_start_resets(policy)
+    use_chunk_start_resets(value_fn)
+    policy_opt = torch.optim.Adam(policy.parameters(), lr=config.learner.learning_rate, fused=True)
+    value_opt = torch.optim.Adam(value_fn.parameters(), lr=config.learner.learning_rate, fused=True)
     # AutoClip is for the policy only: the value net's step-to-step norms swing
     # 4x, so a percentile threshold throttles its typical step (uev +3%, measured)
     clip_policy = GradClipper(policy.parameters(), config.learner.max_grad_norm,
@@ -265,6 +289,8 @@ def main(config: TrainConfig) -> None:
         value_fn.load_state_dict(resume["value"])
         saving.load_optimizer(policy_opt, resume["policy_opt"], resume["policy"])
         value_opt.load_state_dict(resume["value_opt"])
+        for group in policy_opt.param_groups + value_opt.param_groups:
+            group["fused"], group["foreach"] = True, None   # loading restores the checkpoint's own flags
         step = resume["step"]
         best_eval_loss = ckpt["best_eval_loss"]
         print(f"restored from {restore_path} at step {step} (best eval {best_eval_loss:.4f})")
@@ -312,6 +338,7 @@ def main(config: TrainConfig) -> None:
         return tree.map_structure(lambda t: t.detach(), state)
 
     def save(path_name: str):
+        watch.check()
         bad = _nonfinite({
             "policy weights": policy.state_dict(), "value weights": value_fn.state_dict(),
             "policy Adam state": policy_opt.state_dict(), "value Adam state": value_opt.state_dict(),
@@ -374,6 +401,7 @@ def main(config: TrainConfig) -> None:
     )
     t_window = time.perf_counter()
     step_window = step
+    watch = _FiniteWatch((policy_opt, value_opt), device)
     stop = _StopRequest()
     at_boundary = True
     try:
@@ -399,8 +427,8 @@ def main(config: TrainConfig) -> None:
             value_hidden = detach(value_hidden)
 
             # the nets share no parameters, so both steps can wait for one check
-            policy_norm, value_norm = _checked_norms(
-                step, ("policy", policy_loss, clip_policy), ("value", value_loss, clip_value))
+            policy_norm, value_norm = clip_policy.norm(), clip_value.norm()
+            watch.update(step, policy_loss, policy_norm, value_loss, value_norm)
             clip_metrics = clip_policy.clip(policy_norm)
             policy_opt.step()
             value_clip_metrics = clip_value.clip(value_norm)
@@ -422,8 +450,8 @@ def main(config: TrainConfig) -> None:
                            for k, v in metrics["controller_flat"].items()},
                         "train/value/loss": value_metrics["loss"],
                         "train/value/uev": value_metrics["uev"],
-                        **{f"train/{k}": v for k, v in clip_metrics.items() if math.isfinite(v)},
-                        **{f"train/value/{k}": v for k, v in value_clip_metrics.items() if math.isfinite(v)},
+                        **{f"train/{k}": float(v) for k, v in clip_metrics.items() if math.isfinite(v)},
+                        **{f"train/value/{k}": float(v) for k, v in value_clip_metrics.items() if math.isfinite(v)},
                     },
                     step=step,
                 )

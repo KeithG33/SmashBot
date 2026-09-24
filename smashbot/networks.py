@@ -73,6 +73,28 @@ class Network(nn.Module, abc.ABC):
         frame is what drifts (scripts/check_serving_precision.py)."""
         return state
 
+    # BC's loader resets rows only at a chunk's first frame (batch_to_frames
+    # refuses anything else), so its unrolls mask the state once and run the
+    # chunk whole, without reading the reset frames back to the host
+    chunk_start_resets: bool = False
+
+    def _segmented_unroll(self, run, inputs, reset, initial_state):
+        """run(inputs, state) -> (outputs, state) over the segments between
+        reset frames; a reset at t masks the state, then t starts a segment."""
+        initial = lambda: self.initial_state(reset.shape[0], device=inputs.device)
+        if self.chunk_start_resets:
+            return run(inputs, _mask_state(reset[:, 0], initial(), initial_state))
+        boundaries = torch.nonzero(reset.any(dim=0)).squeeze(-1).tolist()
+        outputs, state, pos, T = [], initial_state, 0, inputs.shape[1]
+        for b in boundaries + [T]:
+            if pos < b:
+                out, state = run(inputs[:, pos:b], state)
+                outputs.append(out)
+                pos = b
+            if b < T:
+                state = _mask_state(reset[:, b], initial(), state)
+        return torch.cat(outputs, dim=1) if len(outputs) > 1 else outputs[0], state
+
     def unroll(self, inputs, reset, initial_state):
         """inputs: [B, T, D], reset: [B, T] -> (outputs [B, T, D'], final_state).
 
@@ -169,24 +191,7 @@ class RecurrentWrapper(Network):
         return out.squeeze(1), next_state
 
     def unroll(self, inputs, reset, initial_state):
-        # Segment at timesteps where any element resets; one cuDNN call each.
-        reset_any = reset.any(dim=0)  # [T]
-        boundaries = torch.nonzero(reset_any).squeeze(-1).tolist()
-
-        outputs = []
-        state = initial_state
-        pos = 0
-        T = inputs.shape[1]
-        for b in boundaries + [T]:
-            if pos < b:
-                out, state = self._core(inputs[:, pos:b], state)
-                outputs.append(out)
-                pos = b
-            if b < T:
-                initial = self.initial_state(reset.shape[0], device=inputs.device)
-                state = _mask_state(reset[:, b], initial, state)
-        # note: a boundary at t masks the state, then t joins the next segment
-        return torch.cat(outputs, dim=1) if len(outputs) > 1 else outputs[0], state
+        return self._segmented_unroll(self._core, inputs, reset, initial_state)   # one cuDNN call per segment
 
 
 class ResidualWrapper(Network):
@@ -480,22 +485,7 @@ class TransformerCore(Network):
         return out[:, 0], state
 
     def unroll(self, inputs, reset, initial_state):
-        reset_any = reset.any(dim=0)  # [T]
-        boundaries = torch.nonzero(reset_any).squeeze(-1).tolist()
-
-        outputs = []
-        state = initial_state
-        pos = 0
-        T = inputs.shape[1]
-        for b in boundaries + [T]:
-            if pos < b:
-                out, state = self._forward(inputs[:, pos:b], state)
-                outputs.append(out)
-                pos = b
-            if b < T:
-                initial = self.initial_state(reset.shape[0], device=inputs.device)
-                state = _mask_state(reset[:, b], initial, state)
-        return torch.cat(outputs, dim=1) if len(outputs) > 1 else outputs[0], state
+        return self._segmented_unroll(self._forward, inputs, reset, initial_state)
 
 
 
@@ -633,6 +623,13 @@ class SGUBlock(nn.Module):
 def _swiglu(block, x):
     gate, up = block.ffw_in(x).chunk(2, dim=-1)
     return x + block.down(torch.nn.functional.silu(gate) * up)
+
+
+def use_chunk_start_resets(module: nn.Module) -> None:
+    """For BC, whose chunks reset rows only at their first frame."""
+    for m in module.modules():
+        if isinstance(m, Network):
+            m.chunk_start_resets = True
 
 
 def use_manual_recurrent_step(module: nn.Module) -> None:
@@ -829,22 +826,7 @@ class SGUCore(Network):
         return out[:, 0], state
 
     def unroll(self, inputs, reset, initial_state):
-        reset_any = reset.any(dim=0)
-        boundaries = torch.nonzero(reset_any).squeeze(-1).tolist()
-
-        outputs = []
-        state = initial_state
-        pos = 0
-        T = inputs.shape[1]
-        for b in boundaries + [T]:
-            if pos < b:
-                out, state = self._forward(inputs[:, pos:b], state)
-                outputs.append(out)
-                pos = b
-            if b < T:
-                initial = self.initial_state(reset.shape[0], device=inputs.device)
-                state = _mask_state(reset[:, b], initial, state)
-        return torch.cat(outputs, dim=1) if len(outputs) > 1 else outputs[0], state
+        return self._segmented_unroll(self._forward, inputs, reset, initial_state)
 
 
 class StateActionNetwork(Network):

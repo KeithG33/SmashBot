@@ -73,9 +73,10 @@ class GradClipper:
     history. The history is checkpointed so a resume clips exactly as the
     uninterrupted run would.
 
-    `measure` reads the norm without touching the gradients, so the caller
-    decides what a non-finite one means (BC stops, the RL learner skips the
-    step); `clip` then records it and clips with it."""
+    `norm`/`measure` read the norm without touching the gradients, so the
+    caller decides what a non-finite one means (BC skips the step on the GPU
+    and stops, the RL learner skips the step); `clip` then records it and
+    clips with it."""
 
     def __init__(self, params, max_norm: float, percentile: float = 0.0, history=None):
         assert not (max_norm > 0 and percentile > 0), "one clipping rule at a time"
@@ -103,14 +104,18 @@ class GradClipper:
             return self._running.value if self._history else math.inf
         return self.max_norm if self.max_norm > 0 else math.inf
 
-    def clip(self, norm: float) -> dict:
+    def clip(self, norm) -> dict:
+        """norm: a float, or a tensor that only AutoClip reads back to the host
+        (its history needs every value); a non-finite one never enters the
+        history, since its step is skipped."""
         if self.percentile > 0:
-            assert math.isfinite(norm), "a non-finite norm must never reach the history"
-            self._history.append(norm)
-            self._running.add(norm)
+            value = float(norm)
+            if math.isfinite(value):
+                self._history.append(value)
+                self._running.add(value)
         clip = self.threshold
         if math.isfinite(clip):
-            torch.nn.utils.clip_grads_with_norm_(self.params, clip, torch.tensor(norm))
+            torch.nn.utils.clip_grads_with_norm_(self.params, clip, torch.as_tensor(norm))
         return {"grad_norm": norm, "clip_norm": clip}
 
 
