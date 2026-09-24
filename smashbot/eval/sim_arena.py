@@ -1,23 +1,24 @@
-"""Sim-backed match engine for evaluation: N parallel games between two
-policies on melee-sim-light, deterministic slates, full GameTracker stats.
+"""Sim-backed match engine for evaluation: a fixed slate of games between two
+policies on melee-sim-light, every game played to its end and counted once.
 
 This is the measurement backend for battery.py and tournament.py (the
 Dolphin fleet versions were retired once training and eval both moved to
 the sim; Dolphin remains for human play/watching via eval/game.py).
 
-Determinism: pairs/stages come from a seeded RNG, the sim itself is
-deterministic, and policy sampling uses torch's global RNG — seed it for
-exactly reproducible replays.
+Determinism: stages, ports and game seeds come from a seeded RNG, the sim
+itself is deterministic, and policy sampling uses torch's global RNG — seed
+it for exactly reproducible results.
 """
 from __future__ import annotations
 
+import os
 import random
 
-
-from smashbot.rl.rollouts import GameTracker
+import torch
 
 MAIN_12_MSL = ["FOX", "FALCO", "MARTH", "SHEIK", "JIGGLYPUFF", "FALCON",
                "PEACH", "YOSHI", "ICE_CLIMBERS", "LUIGI", "PIKACHU", "SAMUS"]
+MAX_GAME_FRAMES = 28800   # Melee's 8-minute timer, so every game ends
 
 
 def full_grid(seed: int = 3) -> list[tuple[str, str]]:
@@ -28,83 +29,126 @@ def full_grid(seed: int = 3) -> list[tuple[str, str]]:
     return pairs
 
 
-def stratified(n: int, opponent_char: str | None = None, seed: int = 3):
-    """n pairs: every student char covered once per 12, opponent uniform
-    (or locked)."""
+def stratified(n: int, seed: int = 3) -> list[tuple[str, str]]:
+    """n pairs: every student char covered once per 12, opponent uniform."""
     rng = random.Random(seed)
     pairs = []
     while len(pairs) < n:
         chars = list(MAIN_12_MSL)
         rng.shuffle(chars)
-        for a in chars:
-            b = opponent_char or rng.choice(MAIN_12_MSL)
-            pairs.append((a, b))
+        pairs += [(a, rng.choice(MAIN_12_MSL)) for a in chars]
     return pairs[:n]
 
 
-class MatchSet:
-    """Play `pairs` between student and one opponent; each env owns one pair
-    and keeps replaying it until close(). Results accumulate in a
-    GameTracker + a per-pair first-decision map."""
+def load_player(path: str, device: str, config_from: str = ""):
+    """(policy, name code, step) from a full checkpoint, or from bare policy
+    weights (a league snapshot) built with the config of the full checkpoint
+    `config_from`."""
+    from smashbot import saving
+    from smashbot.eval.game import resolve_name_code
+    from smashbot.networks import check_loadable
+    from smashbot.policy import build_policy_from_config
 
-    def __init__(self, student, opponent, pairs, data_dir, device="cpu",
-                 student_name_code=1, opp_name_code=1, unroll=240,
-                 stage_seed=11, opp_delay_note=True):
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    if "config" in ckpt:
+        ckpt = saving.upgrade_checkpoint(ckpt)
+        config, weights, network_cfg = ckpt["config"], ckpt["state"]["policy"], ckpt["config"]["network"]
+        code = resolve_name_code(ckpt["state"].get("name_map", {}), "Master Player", verbose=False)
+        step = ckpt["state"].get("step")
+    else:
+        if not config_from:
+            raise ValueError(f"{path} holds bare policy weights: give --config-from a full checkpoint")
+        source = torch.load(config_from, map_location="cpu", weights_only=False)
+        if "config" not in source:
+            raise ValueError(f"--config-from {config_from} is not a full checkpoint")
+        config, weights, network_cfg = saving.upgrade_checkpoint(source)["config"], ckpt, {}
+        code, step = 1, None
+    check_loadable(network_cfg, weights)
+    policy = build_policy_from_config(config).to(device)
+    policy.load_state_dict(weights)
+    policy.eval()
+    policy.requires_grad_(False)
+    return policy, code, step
+
+
+def unique_labels(paths: list[str]) -> list[str]:
+    """Each path's last components, as few as keep every label distinct
+    (two runs' best.pt stay apart as runA/best.pt and runB/best.pt)."""
+    parts = [os.path.normpath(os.path.abspath(p)).split(os.sep) for p in paths]
+    if len({tuple(p) for p in parts}) < len(parts):
+        raise ValueError(f"a checkpoint is listed twice: {paths}")
+    for k in range(1, max(map(len, parts)) + 1):
+        labels = [os.path.join(*p[-k:]) for p in parts]
+        if len(set(labels)) == len(labels):
+            return labels
+
+
+class MatchSet:
+    """Plays every (student char, opponent char) game of `slate` once, `envs`
+    at a time, and counts exactly those games: an env that finishes a game
+    takes the next unplayed one, so quick games can't crowd out long ones.
+    Each game draws its own stage, ports and sim seed."""
+
+    def __init__(self, student, opponent, slate, data_dir, envs, device="cpu",
+                 student_name_code=1, opp_name_code=1, unroll=240, seed=11):
         import melee_sim as msl
         from smashbot.rl.sim_league import MultiOpponentSimWorker
-        self.msl = msl
-        self.N = len(pairs)
-        self.pairs = list(pairs)
-        rng = random.Random(stage_seed)
-        stages = [rng.choice(list(msl.Stage)) for _ in range(self.N)]
-        char_pairs = [(msl.Character[a], msl.Character[b]) for a, b in pairs]
-        self.tracker = GameTracker()
-        self.first: dict[int, tuple[int, int]] = {}   # env -> first decided
-        self.per_env: dict[int, list] = {}            # env -> all decided games
-        self.games = 0
+        rng = random.Random(seed)
+        self.slate = list(slate)
+        self._configs = []
+        for a, b in self.slate:
+            port = rng.randrange(2)   # the port-priority edge goes to either side
+            self._configs.append(msl.MatchConfig(
+                stage=rng.choice(list(msl.Stage)),
+                players=(msl.PlayerConfig(msl.Character[a], controller_port=port),
+                         msl.PlayerConfig(msl.Character[b], controller_port=1 - port)),
+                seed=rng.getrandbits(31), max_frame=MAX_GAME_FRAMES))
+        self.results: list = [None] * len(self.slate)   # game -> (student stocks, opponent stocks)
+        self.kill_percents: list = [[] for _ in self.slate]    # game -> opponent % at our kills
+        self.death_percents: list = [[] for _ in self.slate]   # game -> our % at our deaths
+        unplayed = iter(range(len(self.slate)))
 
-        def on_game(i, gid, s0, s1):
-            self.games += 1
-            self.tracker.add_game((s0, s1), pairs[i][1])
-            if s0 != s1:
-                self.first.setdefault(i, (s0, s1))
-                self.per_env.setdefault(i, []).append((s0, s1))
+        def next_game(env, member):
+            game = next(unplayed, None)   # past the slate: a filler game nobody counts
+            return self._configs[0 if game is None else game], game
 
-        def on_event(i, gid, kind, pct):
-            (self.tracker.add_kill if kind == "kill"
-             else self.tracker.add_death)(pct)
+        # game_info[env]: the slate game the env's frames belong to (None for
+        # a filler), held until the next game's first frame
+        def on_game(env, gid, s0, s1):
+            game = self.worker.game_info[env]
+            if game is not None:
+                self.results[game] = (s0, s1)
 
+        def on_event(env, gid, kind, percent):
+            game = self.worker.game_info[env]
+            if game is not None:
+                (self.kill_percents if kind == "kill" else self.death_percents)[game].append(percent)
+
+        n = min(envs, len(self.slate))
         self.worker = MultiOpponentSimWorker(
-            student, [("opponent", opponent, list(range(self.N)), False,
-                       opp_name_code)],
-            self.N, unroll, data_dir, stages, char_pairs,
-            name_code=student_name_code, device=device,
-            record_fn=on_game, event_fn=on_event,
-        )
+            student, [("opponent", opponent, list(range(n)), False, opp_name_code)],
+            n, unroll, data_dir, None, None, name_code=student_name_code, device=device,
+            record_fn=on_game, event_fn=on_event, match_fn=next_game, max_frame=MAX_GAME_FRAMES)
         self._unroll = unroll
 
-    def run(self, min_games: int, max_frames: int = 200_000) -> None:
-        frames = 0
-        while self.games < min_games and frames < max_frames:
+    def run(self) -> None:
+        while None in self.results:
             self.worker.collect(self._unroll)
-            frames += self._unroll
-
-    def run_per_pair(self, games_per_pair: int, max_frames: int = 600_000) -> None:
-        """Run until EVERY env(pair) has >= games_per_pair decided games
-        (each env replays its own pair after every game end)."""
-        frames = 0
-        def done():
-            return all(len(self.per_env.get(i, [])) >= games_per_pair
-                       for i in range(self.N))
-        while not done() and frames < max_frames:
-            self.worker.collect(self._unroll)
-            frames += self._unroll
 
     def close(self):
         self.worker.close()
 
     def stats(self) -> dict:
-        s = self.tracker.stats()
-        s["games"] = self.games
-        s["pairs_decided"] = len(self.first)
-        return s
+        games = len(self.results)
+        wins = sum(s0 > s1 for s0, s1 in self.results)
+        losses = sum(s0 < s1 for s0, s1 in self.results)
+        kills = [p for game in self.kill_percents for p in game]
+        deaths = [p for game in self.death_percents for p in game]
+        mean = lambda xs: sum(xs) / len(xs) if xs else float("nan")
+        return {
+            "games": games, "wins": wins, "losses": losses, "draws": games - wins - losses,
+            "win_rate": wins / games,
+            "avg_stock_diff": sum(s0 - s1 for s0, s1 in self.results) / games,
+            "avg_percent_at_kill": mean(kills),
+            "avg_percent_at_death": mean(deaths),
+        }

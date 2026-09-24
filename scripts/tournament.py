@@ -1,98 +1,76 @@
-"""Sim round-robin tournament between checkpoints: every pair plays a
-deterministic slate to completion; standings by winrate then stock diff.
+"""Sim round-robin tournament between checkpoints: every pairing plays the
+same fixed games (--games of them, stratified over the 12 characters), each
+played to its end and counted once. Standings: mean win rate over pairings.
 
   .venv/bin/python scripts/tournament.py --ckpts a.pt b.pt c.pt \
       [--games 48] [--envs 24] [--device cpu] [--out standings.json]
 
-Bare state_dicts (snapshots) are built from --config-from (default: the
-first full checkpoint given). Runs on CPU alongside GPU training; the sim
-is deterministic and pairs are seeded, so results replay exactly.
+Entries are labelled by as many trailing path components as keep them
+distinct, so two runs' best.pt stay two entries. Bare weights (league
+snapshots) are built from --config-from (default: the first --ckpts entry,
+which must then be a full checkpoint). Runs on CPU alongside GPU training;
+the sim is deterministic and the games are seeded, so results replay.
 """
 from __future__ import annotations
 
 import argparse
 import itertools
 import json
-import os
 
 import torch
 
-from smashbot.eval.game import load_policy, resolve_name_code
-from smashbot.eval.sim_arena import MatchSet, stratified
-
-
-def load_any(path: str, device: str, config_from: str):
-    try:
-        pol, nm, step = load_policy(path, device)
-        code = resolve_name_code(nm, "Master Player", verbose=False)
-    except Exception:
-        from smashbot.rl.sim_league import SimLeague
-        lg = SimLeague(os.path.dirname(path), phillips={},
-                       fox_imports={}, config_from=config_from, device=device)
-        pol = lg._make_skeleton()
-        lg._load_into(pol, path)
-        code, step = 1, None
-    pol.eval()
-    pol.requires_grad_(False)
-    return pol, code, step
+from smashbot import paths
+from smashbot.eval.sim_arena import MatchSet, load_player, stratified, unique_labels
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpts", nargs="+", required=True)
     ap.add_argument("--games", type=int, default=48,
-                    help="min decided games per pairing")
-    ap.add_argument("--envs", type=int, default=24)
+                    help="games per pairing, stratified over the 12 characters")
+    ap.add_argument("--envs", type=int, default=24, help="games played at once")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--threads", type=int, default=16)
     ap.add_argument("--config-from", default="",
-                    help="full ckpt whose config builds bare state_dicts "
-                         "(default: first --ckpts entry)")
-    ap.add_argument("--data-dir",
-                    default=os.environ.get("MSL_DATA_DIR",
-                                           "/home/kage/drive2/ShineBot/msl-data"))
+                    help="full checkpoint whose config builds bare weights "
+                         "(default: the first --ckpts entry)")
+    ap.add_argument("--data-dir", default=str(paths.MSL_DATA_DIR))
     ap.add_argument("--seed", type=int, default=5)
     ap.add_argument("--out", default="")
     args = ap.parse_args()
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
-    cfg_from = args.config_from or args.ckpts[0]
 
-    entries = {}
-    for p in args.ckpts:
-        pol, code, step = load_any(p, args.device, cfg_from)
-        entries[os.path.basename(p)] = (pol, code)
-        print(f"loaded {os.path.basename(p)}"
-              + (f" (step {step})" if step is not None else ""), flush=True)
+    labels = unique_labels(args.ckpts)
+    players = {}
+    for label, path in zip(labels, args.ckpts):
+        policy, code, step = load_player(path, args.device, args.config_from or args.ckpts[0])
+        players[label] = (policy, code)
+        print(f"loaded {label}" + (f" (step {step})" if step is not None else ""), flush=True)
 
-    results = {}      # (a, b) -> stats for a-as-student vs b
-    for a, b in itertools.combinations(entries, 2):
-        pa, ca = entries[a]
-        pb, cb = entries[b]
-        pairs = stratified(args.envs, seed=args.seed)
-        ms = MatchSet(pa, pb, pairs, args.data_dir, args.device,
-                      student_name_code=ca, opp_name_code=cb)
-        ms.run(min_games=args.games)
-        st = ms.stats()
+    slate = stratified(args.games, args.seed)
+    results = {}
+    win_rates = {label: [] for label in players}
+    for a, b in itertools.combinations(players, 2):
+        ms = MatchSet(players[a][0], players[b][0], slate, args.data_dir, args.envs, args.device,
+                      student_name_code=players[a][1], opp_name_code=players[b][1])
+        ms.run()
         ms.close()
+        st = ms.stats()
         results[f"{a}|{b}"] = st
-        print(f"  {a} vs {b}: {st['win_rate_recent']:.3f} over "
-              f"{st['games']}g (stockdiff {st['avg_stock_diff']:+.2f})",
-              flush=True)
+        win_rates[a].append(st["wins"] / st["games"])
+        win_rates[b].append(st["losses"] / st["games"])
+        print(f"  {a} vs {b}: {st['wins']}-{st['losses']}-{st['draws']} of {st['games']} "
+              f"(stockdiff {st['avg_stock_diff']:+.2f})", flush=True)
 
-    # standings: mean winrate across pairings (a's wins vs b, 1-b's vs a)
-    score = {k: [] for k in entries}
-    for key, st in results.items():
-        a, b = key.split("|")
-        score[a].append(st["win_rate_recent"])
-        score[b].append(1.0 - st["win_rate_recent"])
-    print("\nstandings:")
-    for k, xs in sorted(score.items(), key=lambda kv: -sum(kv[1]) / max(1, len(kv[1]))):
-        print(f"  {k:40s} {sum(xs)/max(1,len(xs)):.3f}")
+    standings = {label: sum(v) / len(v) for label, v in win_rates.items()}
+    print("\nstandings (mean win rate over pairings):")
+    for label, rate in sorted(standings.items(), key=lambda kv: -kv[1]):
+        print(f"  {label:48s} {rate:.3f}")
     if args.out:
-        json.dump({"results": results,
-                   "standings": {k: sum(v)/max(1,len(v)) for k, v in score.items()}},
-                  open(args.out, "w"), indent=1)
+        with open(args.out, "w") as f:
+            json.dump({"paths": dict(zip(labels, args.ckpts)), "results": results,
+                       "standings": standings}, f, indent=1)
         print(f"report -> {args.out}")
 
 
