@@ -8,14 +8,14 @@ vectorized loop and the GPU is the bottleneck.
 This module is the seam between the sim and our stack:
   * obs_to_game / encode_obs : MslObservation (numpy struct) -> our encoded
     Game struct, the exact input BatchedPolicyAgent.step expects.
-Both use GALE01 ids directly (sim and slippi-ai share them), so it is field
-renaming, not value translation.
-
-char/action/stage ids are GALE01 in both the sim and slippi_ai.types, so no
-mapping tables are needed.
+Character and action ids are the game's internal ids in both the sim and the
+replays, so those fields are renamed, not translated. The stage is the
+exception: the sim reports Slippi's external stage id, while the replays
+(slippi_db.parse_peppi) and Dolphin (libmelee) carry the internal one.
 """
 from __future__ import annotations
 
+import melee
 import numpy as np
 
 from slippi_ai import types
@@ -29,6 +29,9 @@ _FOD_T = type(_DUMMY.fod_platforms)
 _ITEMS_T = type(_DUMMY.items)
 _ITEM_T = type(_DUMMY.items.item_0)
 _N_ITEMS = 15
+# external stage id -> internal: the replay parser's own conversion, as a lookup
+_INTERNAL_STAGE = np.array(
+    [melee.enums.to_internal_stage(i).value for i in range(256)], np.int64)
 
 
 def _empty_nana(n: int) -> types.Nana:
@@ -91,7 +94,7 @@ def obs_to_game(obs: np.ndarray, self_slot: int = 0, opp_slot: int = 1) -> types
     return types.Game(
         p0=_player(slots[:, self_slot]),
         p1=_player(slots[:, opp_slot]),
-        stage=obs["stage_id"].astype(np.int64),         # GALE01 stage id
+        stage=_INTERNAL_STAGE[obs["stage_id"]],
         randall=_RANDALL_T(
             x=stage["randall"]["x"].astype(np.float32),
             y=stage["randall"]["y"].astype(np.float32),
