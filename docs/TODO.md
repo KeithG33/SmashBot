@@ -33,7 +33,7 @@ today, ~1e-6 tolerance — acceptable for opponent seats) removes ~2.5 ms/frame:
   Nana; against Ice Climbers, Nana is invisible but still hits. The KL teacher and the
   Phillip opponents get the same blind input; a sim-trained policy meets a visible Nana
   only in Dolphin. About 1 seat in 12 per player.
-- Upstream (checked 2026-09-23, origin/main 8cf34043, 42 commits past our b7a9ed1c):
+- Upstream (checked 2026-09-24, pinned at origin/main 978598dc):
   still no follower in the observation (`melee_sim/dtypes.py` unchanged); no Python
   accessor for the core's follower lanes.
 - Patch: `src/runtime/observation.c` writes each player with `write_player(...)` into
