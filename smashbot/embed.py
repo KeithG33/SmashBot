@@ -110,13 +110,13 @@ class BoolEmbedding(Embedding[bool, np.bool_]):
         return torch.bernoulli(torch.sigmoid(logits)).bool()
 
     def logits_entropy(self, logits: torch.Tensor) -> torch.Tensor:
-        x = logits.squeeze(-1)
+        x = logits.squeeze(-1).float()   # fp32 like log_softmax under autocast
         p = torch.sigmoid(x)
         # H = -p log p - (1-p) log(1-p), via logsigmoid for stability
         return -(p * F.logsigmoid(x) + (1 - p) * F.logsigmoid(-x))
 
     def logits_kl(self, p_logits: torch.Tensor, q_logits: torch.Tensor) -> torch.Tensor:
-        x, y = p_logits.squeeze(-1), q_logits.squeeze(-1)
+        x, y = p_logits.squeeze(-1).float(), q_logits.squeeze(-1).float()
         p = torch.sigmoid(x)
         return p * (F.logsigmoid(x) - F.logsigmoid(y)) + (1 - p) * (
             F.logsigmoid(-x) - F.logsigmoid(-y)
