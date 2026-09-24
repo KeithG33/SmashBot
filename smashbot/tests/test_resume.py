@@ -68,8 +68,8 @@ def test_resume_equals_uninterrupted(tmp_path):
     whole, halves = _latest(run_dir, "whole"), _latest(run_dir, "halves")
     assert whole["step"] == halves["step"] == 2 * N
     assert whole["train_data"]["rows"] == halves["train_data"]["rows"]
-    for key in ("policy", "value", "policy_opt", "value_opt", "train_data", "test_data",
-                "train_hidden", "value_hidden", "eval_hidden", "eval_value_hidden"):
+    for key in ("policy", "value", "policy_opt", "value_opt", "train_data",
+                "train_hidden", "value_hidden"):
         _assert_same(whole[key], halves[key], key)
 
 

@@ -38,6 +38,9 @@ class RuntimeConfig:
     steps: int = 20000
     eval_interval: int = 500
     eval_batches: int = 8
+    # frames of each eval row's own history run (unscored) before its scored
+    # batches, so every eval starts from the current model's warm state
+    eval_burn_in: int = 256
     log_interval: int = 50
     checkpoint_interval: int = 1000
     tag: str = "debug"
@@ -139,7 +142,6 @@ def _resume_state(ckpt: tp.Optional[dict]) -> dict:
         print("WARNING: checkpoint predates exact resume; data rows restart at "
               "fresh replays and the run is not a bit-identical continuation")
         state["train_data"] = {"consumed": state.get("replay_counter", 0), "rows": None}
-        state["test_data"] = {"consumed": state.get("test_replay_counter", 0), "rows": None}
     return state
 
 
@@ -211,7 +213,6 @@ def main(config: TrainConfig) -> None:
         extra_frames=config.policy.delay + 1,
         name_map=resume.get("name_map"),
         train_state=resume.get("train_data"),
-        test_state=resume.get("test_data"),
     )
     print(f"name_map: {sources.name_map}")
 
@@ -313,25 +314,30 @@ def main(config: TrainConfig) -> None:
     hidden = {
         "train_hidden": policy.initial_state(B, device),
         "value_hidden": value_fn.initial_state(B, device),
-        "eval_hidden": policy.initial_state(B, device),
-        "eval_value_hidden": value_fn.initial_state(B, device),
     }
     for key in hidden:
         if resume.get(key) is not None:
             hidden[key] = _to(resume[key], device)
     train_hidden, value_hidden = hidden["train_hidden"], hidden["value_hidden"]
-    eval_hidden, eval_value_hidden = hidden["eval_hidden"], hidden["eval_value_hidden"]
     if resume.get("rng") is not None:
         _set_rng(resume["rng"])
     train_data_state = resume.get("train_data")
-    test_data_state = resume.get("test_data")
 
     train_stream = loader.TorchBatchStream(
         sources.train, config.data, encode_network=policy.network
     )
-    eval_stream = loader.TorchBatchStream(
-        sources.test, config.data, encode_network=policy.network
-    )
+    # The fixed eval set: the same frames every eval, each row a stretch of
+    # its own game from a seeded mid-game point, the first eval_burn_in
+    # frames unscored so the current model scores from its own warm state.
+    # Seeded by the split, so every run on the same split sees the same set.
+    warm_batches = -(-rt.eval_burn_in // config.data.unroll_length)
+    loader.seat_mid_game(
+        sources.test, span=(warm_batches + rt.eval_batches + 1) * (config.data.unroll_length + config.policy.delay + 1),
+        seed=config.data.dataset.seed, num_workers=config.data.num_workers)
+    eval_stream = loader.TorchBatchStream(sources.test, config.data, encode_network=policy.network)
+    eval_set = [next(eval_stream)[0] for _ in range(warm_batches + rt.eval_batches)]
+    eval_stream.stop()
+    sources.test.shutdown()
 
     def to_device(frames):
         return tree.map_structure(lambda t: t.to(device, non_blocking=True), frames)
@@ -345,7 +351,6 @@ def main(config: TrainConfig) -> None:
             "policy weights": policy.state_dict(), "value weights": value_fn.state_dict(),
             "policy Adam state": policy_opt.state_dict(), "value Adam state": value_opt.state_dict(),
             "train_hidden": train_hidden, "value_hidden": value_hidden,
-            "eval_hidden": eval_hidden, "eval_value_hidden": eval_value_hidden,
         })
         if bad:
             raise FloatingPointError(f"refusing to write {path_name} at step {step}: non-finite {', '.join(bad)}")
@@ -360,11 +365,8 @@ def main(config: TrainConfig) -> None:
                 "step": step,
                 "name_map": sources.name_map,
                 "train_data": train_data_state,
-                "test_data": test_data_state,
                 "train_hidden": _to(train_hidden, "cpu"),
                 "value_hidden": _to(value_hidden, "cpu"),
-                "eval_hidden": _to(eval_hidden, "cpu"),
-                "eval_value_hidden": _to(eval_value_hidden, "cpu"),
                 "rng": _get_rng(),
                 "clip_history": {"policy": clip_policy.history},
             },
@@ -372,12 +374,12 @@ def main(config: TrainConfig) -> None:
         )
 
     def run_eval() -> dict:
-        nonlocal eval_hidden, eval_value_hidden, test_data_state
         policy.eval()
         losses, value_metrics_acc = [], []
+        eval_hidden = policy.initial_state(B, device)
+        eval_value_hidden = value_fn.initial_state(B, device)
         with torch.no_grad():
-            for _ in range(rt.eval_batches):
-                frames, _, test_data_state = next(eval_stream)
+            for i, frames in enumerate(eval_set):
                 frames = to_device(frames)
                 with autocast():
                     loss, eval_hidden, _ = policy.imitation_loss(frames, eval_hidden)
@@ -385,8 +387,9 @@ def main(config: TrainConfig) -> None:
                     _, eval_value_hidden, vm = value_fn.loss(
                         sliced, eval_value_hidden, discount
                     )
-                losses.append(loss.item())
-                value_metrics_acc.append(vm)
+                if i >= warm_batches:
+                    losses.append(loss.item())
+                    value_metrics_acc.append(vm)
         policy.train()
         policy_loss = float(np.mean(losses))
         value_uev = float(np.mean([m["uev"] for m in value_metrics_acc]))
@@ -500,7 +503,6 @@ def main(config: TrainConfig) -> None:
                 print(f"interrupted mid-step {step}; latest.pt left as it was")
         finally:
             train_stream.stop()
-            eval_stream.stop()
             wandb.finish()
         print(f"done at step {step}; best eval {best_eval_loss:.4f}")
 

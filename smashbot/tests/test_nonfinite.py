@@ -90,9 +90,11 @@ def test_a_nonfinite_recurrent_state_is_never_written(tmp_path, monkeypatch):
 
 
 def test_a_nonfinite_eval_stops_training(tmp_path, monkeypatch):
-    _poison(monkeypatch, Policy, "imitation_loss", 1, _nan_loss, training=False)
+    config = _config(tmp_path, eval_interval=3)
+    warm_batches = -(-config.runtime.eval_burn_in // config.data.unroll_length)   # unscored
+    _poison(monkeypatch, Policy, "imitation_loss", warm_batches + 1, _nan_loss, training=False)
     with pytest.raises(FloatingPointError, match="non-finite eval"):
-        train_bc.main(_config(tmp_path, eval_interval=3))
+        train_bc.main(config)
     assert _latest_step(tmp_path) == 2
 
 

@@ -134,6 +134,16 @@ class Split:
             feed.index = index
 
 
+def seat_mid_game(split: Split, span: int, seed: int, num_workers: int) -> None:
+    """Seat row r on the split's r-th replay at a seeded random frame with at
+    least `span` frames of its game left (frame 0 when the game is shorter),
+    so a fixed eval set samples whole games rather than their openings."""
+    split.load_rows([(r, 0) for r in range(len(split.feeds))], num_workers)
+    rng = np.random.default_rng(seed)
+    for manager in split.source.managers:
+        manager.frame = int(rng.integers(0, max(1, manager.game_len - span + 1)))
+
+
 @dataclasses.dataclass
 class Sources:
     train: Split
@@ -179,22 +189,22 @@ def make_sources(
     extra_frames: int,
     name_map: tp.Optional[dict[str, int]] = None,
     train_state: tp.Optional[dict] = None,
-    test_state: tp.Optional[dict] = None,
 ) -> Sources:
     """Build train/test splits. extra_frames must be policy.delay + 1.
 
     name_map: pass the checkpoint's map when resuming; indices are assigned
     by frequency, so recomputing on changed data would silently permute them.
-    train_state / test_state: Split.state() snapshots to resume from. A
-    snapshot without rows (checkpoints that predate row tracking) only
-    rotates the cycle; every row then restarts at frame 0 of a fresh replay.
+    train_state: a Split.state() snapshot to resume from. A snapshot without
+    rows (checkpoints that predate row tracking) only rotates the cycle;
+    every row then restarts at frame 0 of a fresh replay. The test split
+    always starts fresh: it only feeds the fixed eval set (seat_mid_game).
     """
     train_replays, test_replays = data_lib.train_test_split(config.dataset)
     if name_map is None:
         name_map = create_name_map(train_replays, config.max_names)
     return Sources(
         train=_make_split(train_replays, config, extra_frames, name_map, train_state),
-        test=_make_split(test_replays, config, extra_frames, name_map, test_state),
+        test=_make_split(test_replays, config, extra_frames, name_map, None),
         name_map=name_map,
     )
 
