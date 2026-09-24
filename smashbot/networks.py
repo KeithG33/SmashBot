@@ -14,6 +14,8 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 
+from smashbot.causal_conv import causal_conv
+
 RecurrentState = tp.Any
 
 
@@ -581,6 +583,11 @@ class SGUBlock(nn.Module):
                 + self.spatial.bias
             ).unsqueeze(1)
             return v_mixed, torch.cat([v_cache[:, 1:], v], dim=1)
+        if v.is_cuda:
+            T = v.shape[1]
+            v_mixed = causal_conv(v_cache, v, self.spatial.weight, self.spatial.bias)
+            v_new = torch.cat([v_cache[:, T:], v], dim=1) if T < W - 1 else v[:, T - (W - 1):]
+            return v_mixed, v_new.contiguous()
         v_full = torch.cat([v_cache, v], dim=1)
         v_mixed = self.spatial(v_full.transpose(1, 2)).transpose(1, 2)
         return v_mixed, v_full[:, -(W - 1):].contiguous()
