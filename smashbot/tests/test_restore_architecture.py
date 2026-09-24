@@ -51,6 +51,16 @@ def test_checkpoints_that_predate_a_setting_take_its_default():
         train_bc._check_config(saved, dataclasses.asdict(current), defaults)
 
 
+def test_compile_may_change_on_resume_but_precision_may_not():
+    defaults = dataclasses.asdict(train_bc.TrainConfig())
+    current = train_bc.TrainConfig()
+    current.learner.compile = not current.learner.compile
+    train_bc._check_config(defaults, dataclasses.asdict(current), defaults)
+    current.learner.precision = "bf16" if current.learner.precision == "fp32" else "fp32"
+    with pytest.raises(ValueError, match="learner.precision differs"):
+        train_bc._check_config(defaults, dataclasses.asdict(current), defaults)
+
+
 def test_a_removed_setting_in_a_saved_config_is_ignored():
     """gate_gelu / v_norm became unconditional; checkpoints that carry them
     must still build and resume."""

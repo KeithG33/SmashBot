@@ -123,12 +123,13 @@ def _resume_state(ckpt: tp.Optional[dict]) -> dict:
     return state
 
 
-_RESUME_FREE = {"runtime", "data.num_workers", "data.prefetch", "data.pin_memory"}
+_RESUME_FREE = {"runtime", "data.num_workers", "data.prefetch", "data.pin_memory", "learner.compile"}
 
 
 def _check_config(saved: dict, current: dict, defaults: dict, prefix: str = "") -> None:
-    """A resumed run must be the same experiment; the runtime block and
-    host-only data options are the only fields free to change. A setting the
+    """A resumed run must be the same experiment; the runtime block, the
+    host-only data options and compile (kernel fusion: bf16 rounding, not
+    the math) are the only fields free to change. A setting the
     checkpoint predates ran at its default, so that is what it is held to;
     a setting the code no longer has is ignored (see configs.from_dict)."""
     for key in sorted(set(saved) | set(current)):
