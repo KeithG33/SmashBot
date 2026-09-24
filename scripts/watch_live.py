@@ -9,10 +9,10 @@ never waits on inference. Occasional slow samples are absorbed by each
 policy's delay-queue slack (18/21 frames = ~300ms of cushion), and the
 emitted action sequence is identical to the sync agent's.
 
-Defaults: McLaude (RL snapshot, Fox) vs Phillip (medium-v2, random main-12
-character) on Final Destination, 1 game, replays saved, audio muted,
-torch.compile on (both policies warmed BEFORE Dolphin boots, so there is no
-compile stall at game start).
+Defaults: the current policy (paths.DEFAULT_POLICY, as Fox) vs Phillip
+(medium-v2, random main-12 character) on Final Destination, 1 game,
+replays saved, audio muted, torch.compile on (both policies warmed BEFORE
+Dolphin boots, so there is no compile stall at game start).
 
 Usage:
   .venv/bin/python scripts/watch_live.py                     # default matchup
@@ -33,6 +33,7 @@ import melee
 import torch
 from melee.slippstream import EnetDisconnected
 
+from smashbot import paths
 from smashbot.eval import game as game_lib
 from smashbot.networks import check_loadable
 from smashbot.eval.agent import AsyncDelayedAgent
@@ -40,10 +41,7 @@ from smashbot.rl.config import MAIN_12
 
 from slippi_ai import dolphin as dolphin_lib
 
-DEFAULT_P1_SNAPSHOT = (
-    "/home/kage/drive2/ShineBot/models/rl-best-step0010000-phillip56.pt"
-)
-DEFAULT_CONFIG_FROM = "/home/kage/drive2/ShineBot/runs/rl-pool-v3/latest.pt"
+DEFAULT_P1 = str(paths.DEFAULT_POLICY)
 DEFAULT_P2 = "/home/kage/drive2/ShineBot/models/medium-v2-torch.pt"
 DEFAULT_REPLAY_DIR = "/home/kage/drive2/ShineBot/replays/exhibition"
 
@@ -109,7 +107,7 @@ def resolve_specs(args) -> dict[int, SideSpec]:
     return {
         1: resolve_spec(
             args.p1, args.p1_snapshot, args.config_from,
-            default_snapshot=DEFAULT_P1_SNAPSHOT,
+            default_ckpt=DEFAULT_P1,
         ),
         2: resolve_spec(
             args.p2, args.p2_snapshot, args.config_from,
@@ -227,13 +225,13 @@ def pin_cores(dolphin, n: int) -> None:
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(
         description="Watch two policies play each other live at ~60fps "
-                    "(default: McLaude RL snapshot vs Phillip medium-v2).",
+                    "(default: the current policy vs Phillip medium-v2).",
         epilog=_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("--p1", default="",
-                    help="full checkpoint for player 1 (default: snapshot "
-                         f"mode with {DEFAULT_P1_SNAPSHOT})")
+                    help=f"full checkpoint for player 1 (default: {DEFAULT_P1}, "
+                         "unless --p1-snapshot is given)")
     ap.add_argument("--p2", default="",
                     help="full checkpoint for player 2 (default: Phillip "
                          "medium-v2, unless --p2-snapshot is given)")
@@ -243,7 +241,7 @@ def parse_args(argv=None):
     ap.add_argument("--p2-snapshot", default="",
                     help="bare policy state_dict for player 2; config comes "
                          "from --config-from")
-    ap.add_argument("--config-from", default=DEFAULT_CONFIG_FROM,
+    ap.add_argument("--config-from", default="",
                     help="full checkpoint supplying config/name_map for "
                          "--pN-snapshot sides")
     ap.add_argument("--p1-char", default="FOX",

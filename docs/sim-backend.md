@@ -65,11 +65,13 @@ by porting the v5 design above.)
 
 ## Launch
 
-`scripts/launch_sim_v12.sh` — fresh run from v10 weights → 100k. Shares of
-envs: self 30% (both seats are learner rows) / phillips 35% / PFSP 35%
-(the 30 hardest v10 ghosts from 17k+ plus imp9000/imp10000/imp9500), 60
-PFSP slices, snapshots every 1500. Seeds the run's snapshot dir from v10
-(symlinks + pfsp.json with ghost keys rewritten).
+`scripts/launch_sim.sh` — a fresh run from the current BC policy
+(`paths.DEFAULT_POLICY`, or `TEACHER=`) to 100k under `TAG` (default
+rl-sim-v13); a relaunch resumes the tag's latest.pt. Shares of envs: self
+30% (both seats are learner rows) / phillips 35% / PFSP 35% (the run's own
+snapshots, every 1500 steps), 40 PFSP slices. The row and slice sizes were
+fit for the pre-paper SGU: dry-run before the first launch. v10's and
+v12's checkpoints and ghosts predate the paper block and no longer load.
 
 ## Memory + throughput
 

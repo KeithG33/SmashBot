@@ -151,15 +151,14 @@ def test_resolve_spec_rules():
 def test_cli_defaults_resolve():
     args = watch.parse_args([])
     specs = watch.resolve_specs(args)
-    assert specs[1].snapshot == watch.DEFAULT_P1_SNAPSHOT
-    assert specs[1].config_from == watch.DEFAULT_CONFIG_FROM
-    assert specs[1].ckpt == ""
+    assert specs[1].ckpt == watch.DEFAULT_P1
+    assert specs[1].snapshot == ""
     assert specs[2].ckpt == watch.DEFAULT_P2
     assert specs[2].snapshot == ""
     assert args.games == 1
     assert args.compile and args.mute and args.save_replays
     assert args.p1_char == "FOX" and args.p2_char == "random"
-    # explicit --p1 suppresses the default snapshot for that seat
+    # an explicit --p1 replaces the seat's default
     args = watch.parse_args(["--p1", "/tmp/other.pt"])
     specs = watch.resolve_specs(args)
     assert specs[1].ckpt == "/tmp/other.pt" and specs[1].snapshot == ""

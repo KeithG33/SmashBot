@@ -52,10 +52,12 @@ import time
 import torch
 import tree
 
+from smashbot import paths
+
 ARMS = ("fp32", "bf16", "fp16", "fp16s")
 _ARM_DTYPE = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp16s": torch.float16}
 
-DEFAULT_CONFIG_FROM = "/home/kage/drive2/ShineBot/runs/rl-pool-v3/latest.pt"
+DEFAULT_CONFIG_FROM = str(paths.DEFAULT_POLICY)
 
 
 # --------------------------------------------------------------- primitives

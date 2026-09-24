@@ -11,7 +11,7 @@ import numpy as np
 import torch
 import tree
 
-from smashbot import configs
+from smashbot import configs, paths
 from smashbot import embed as embed_lib
 from smashbot.eval.game import load_policy
 from smashbot.policy import build_policy
@@ -34,7 +34,7 @@ def _rand_raw(embedding, rng, n):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="/home/kage/drive2/ShineBot/models/rl-v4-teacher-frozen-ev07736.pt")
+    ap.add_argument("--ckpt", default=str(paths.DEFAULT_POLICY))
     ap.add_argument("--n", type=int, default=8)
     ap.add_argument("--steps", type=int, default=300)
     ap.add_argument("--compile", action="store_true")

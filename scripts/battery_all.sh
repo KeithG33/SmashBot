@@ -2,18 +2,19 @@
 # battery_all: ONE-SHOT battery runner, then exit. No daemon, no backlog
 # crawl -- the battery answers "how strong is the bot NOW".
 #
-#   DEFAULT (no args):  battery the LATEST snapshot (highest step) in the
-#                       live run's snapshot pool.
+#   DEFAULT (no args):  battery the LATEST snapshot (highest step) in
+#                       $RUN_DIR's snapshot pool.
 #   EXPLICIT (args):    battery exactly the named snapshots, sequentially.
 #                       Each arg is a snapshot path OR a bare step number
 #                       (e.g. "750" -> $RUN_DIR/snapshots/snapshot-0000750.pt).
 #
 #   cd /home/kage/smashbot_workspace/SmashBot
+#   export RUN_DIR=/home/kage/drive2/ShineBot/runs/<rl run>
 #   nohup bash scripts/battery_all.sh >> /tmp/battery_all.log 2>&1 &          # latest
 #   nohup bash scripts/battery_all.sh 500 1000 >> /tmp/battery_all.log 2>&1 & # history
 #
-# Snapshots are BARE policy state_dicts (SnapshotPool.save), so battery.py is
-# invoked in --snapshot mode with --config-from the run's latest.pt; CPU-only
+# Snapshots are BARE policy state_dicts (SnapshotPool.save), so battery.py
+# builds them with --config-from the run's latest.pt; CPU-only
 # inference protects the live train's GPU margin. Result pairing is by step
 # string: snapshot-0001250.pt <-> step-0001250.json (both zero-padded, so the
 # glob's lexical order IS step order). A snapshot whose result JSON already
@@ -22,7 +23,7 @@ set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="$ROOT/.venv/bin/python"
-RUN_DIR="${RUN_DIR:-/home/kage/drive2/ShineBot/runs/rl-pool-v10}"
+RUN_DIR="${RUN_DIR:?set RUN_DIR to an RL run directory (its snapshots/ and latest.pt)}"
 RESULTS="$ROOT/scripts/battery_results"
 
 mkdir -p "$RESULTS"

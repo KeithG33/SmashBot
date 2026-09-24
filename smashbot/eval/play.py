@@ -21,6 +21,7 @@ import torch
 
 from slippi_ai import dolphin as dolphin_lib
 
+from smashbot import paths
 from smashbot.eval import game as game_lib
 from smashbot.eval import agent as agent_lib
 
@@ -31,7 +32,7 @@ load_policy = game_lib.load_policy
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument(
-        "--ckpt", default="/home/kage/drive2/ShineBot/runs/debug-fox-v0/best.pt"
+        "--ckpt", default=str(paths.DEFAULT_POLICY)
     )
     ap.add_argument("--opponent", choices=["cpu", "human"], default="cpu")
     ap.add_argument("--bot_char", default="FOX",
