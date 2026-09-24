@@ -12,7 +12,7 @@ This is a PyTorch reimplementation of the approach pioneered by
 Behaviour cloning on a very large pile of anonymized ranked replays (thank you everyone), covering
 twelve characters. The result is a fairly capable and recognisably human model, albeit with some silly blind spots and funny mistakes.
 
-The model architecture was chosen through experiments on the imitation learning dataset, currently landing on an a-MLP architecture (6L / 576W) relying on Spatial Gating Blocks from [Pay Attention to MLPs](https://arxiv.org/abs/2105.08050).
+The model architecture was chosen through experiments on the imitation learning dataset, currently landing on a hybrid (6L / 576W) that alternates the Spatial Gating Blocks from [Pay Attention to MLPs](https://arxiv.org/abs/2105.08050) with LSTM layers.
 
 ## Stage 2: Reinforcement learning
 

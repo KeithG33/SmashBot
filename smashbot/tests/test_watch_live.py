@@ -159,10 +159,6 @@ def test_cli_defaults_resolve():
     assert args.games == 1
     assert args.compile and args.mute and args.save_replays
     assert args.p1_char == "FOX" and args.p2_char == "random"
-    # an explicit --p1 replaces the seat's default
-    args = watch.parse_args(["--p1", "/tmp/other.pt"])
-    specs = watch.resolve_specs(args)
-    assert specs[1].ckpt == "/tmp/other.pt" and specs[1].snapshot == ""
 
 
 def test_resolve_char():

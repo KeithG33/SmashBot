@@ -230,16 +230,19 @@ def test_onehot_empty_policy_zeroes_invalid():
 
 
 def test_param_count_production_size():
+    """The production hybrid (the slslsl mega's network flags) has exactly the
+    parameter count of its checkpoints: a change here changes the model."""
     policy = build_policy(
         embed_config=embed_lib.EmbedConfig(),
         controller_config=embed_lib.ControllerConfig(),
-        network_config=configs.NetworkConfig(),  # 512 x 3, production
+        network_config=configs.NetworkConfig(
+            name="sgu", hidden_size=576, num_layers=6, window=256, num_heads=8,
+            ffw_multiplier=2, attn_heads=2, attn_head_dim=64, layout="slslsl"),
         head_config=configs.ControllerHeadConfig(),
         policy_config=configs.PolicyConfig(delay=18),
         num_names=16,
     )
-    n = sum(p.numel() for p in policy.parameters())
-    assert 3e6 < n < 30e6, f"unexpected param count {n}"
+    assert sum(p.numel() for p in policy.parameters()) == 30_197_617
 
 
 def test_transformer_window_horizon():

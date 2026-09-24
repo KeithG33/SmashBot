@@ -1,5 +1,5 @@
 """Sim-backend RL training driver: melee-sim-light rollouts + the existing
-PPO learner. Reached via `train_rl --backend sim`; reuses train_rl's learner,
+PPO learner. Reached via `train_rl` (its whole body); reuses train_rl's learner,
 checkpoint schema and overlap pipeline over SimLeague + MultiOpponentSimWorker.
 
 Pool design (locked): self-play (both seats are learner rows, no harvest) /
@@ -32,12 +32,12 @@ _MSL_CHAR = {
 @dataclasses.dataclass
 class SimRolloutConfig:
     # learner rows = num_envs + self envs (each self env feeds BOTH seats,
-    # v10's layout); rows are the VRAM budget: 345 envs @ self_frac .30
-    # = 449 rows. Shares are of ENVS: self 30 / phillips 35 / pfsp 35 ->
-    # rows self 46% / phillips 27% / pfsp 27%; 120 pfsp envs over 60
-    # slices = 2.0 games per loaded brain (fewer games per slice is what
-    # keeps the per-match draw honest)
-    num_envs: int = 345
+    # v10's layout); rows are the VRAM budget: 308 envs @ self_frac .30
+    # = 400 rows (449 rows ran out of memory at the first learner step).
+    # Shares are of ENVS: self 30 / phillips 35 / pfsp 35 -> rows self 46% /
+    # phillips 27% / pfsp 27%; 108 pfsp envs over 40 slices = 2.7 games per
+    # loaded brain (fewer games per slice keeps the per-match draw honest)
+    num_envs: int = 308
     unroll_length: int = 240
     # frames of each harvested seat's own history the learner runs before
     # its imitation chunk, without gradients, so the chunk starts warm
@@ -56,10 +56,10 @@ class SimRolloutConfig:
     # everything left after self+phillips (~35%) is the PFSP pool
     # PFSP grid weight slices = resident members. v10 ran 36 slices x 4
     # cells so a per-match draw usually found its member resident; each
-    # fp16 slice is ~54 MB; 60 slices for 120 pfsp envs = 2.0 envs/slice,
-    # past the knee where per-match draws find an empty slice (v10: 2.6) —
-    # simulated 0% fallback on the curated league; watch rl/league/*
-    pfsp_slices: int = 60
+    # fp16 slice is ~54 MB; 40 slices for 108 pfsp envs = 2.7 envs/slice,
+    # about v10's 2.6, where per-match draws usually find their member
+    # resident; watch rl/league/* (fallback rate)
+    pfsp_slices: int = 40
     max_game_frames: int = 28800  # Melee's 8-minute timer (60 fps)
     # --- PFSP / snapshots (v10 values) ---
     pfsp_hard_frac: float = 0.25

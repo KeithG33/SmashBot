@@ -71,12 +71,11 @@ def resolve_name_code(name_map: dict, name: str, verbose: bool = True) -> int:
 
 @dataclasses.dataclass
 class Opponent:
-    """Parsed opponent spec: cpu:<level>[:<CHAR>] | ckpt:<path>[:<CHAR>] | human."""
+    """Parsed opponent spec: cpu:<level>[:<CHAR>] | human."""
 
-    kind: str  # "cpu" | "ckpt" | "human"
+    kind: str  # "cpu" | "human"
     level: int = 9
     character: str = "MARTH"
-    ckpt_path: str = ""
 
     @classmethod
     def parse(cls, spec: str) -> "Opponent":
@@ -88,17 +87,6 @@ class Opponent:
             if not 1 <= level <= 9:
                 raise ValueError(f"cpu level must be 1-9, got {level}")
             return cls(kind="cpu", level=level, character=char)
-        if kind == "ckpt":
-            if len(parts) < 2 or not parts[1]:
-                raise ValueError("ckpt spec needs a path: ckpt:/path/to/best.pt")
-            # windows-free luxury: path may contain no colons on linux; keep
-            # optional trailing :CHAR only if it parses as a character name
-            char = "FOX"
-            path = ":".join(parts[1:])
-            if len(parts) > 2 and parts[-1].isalpha():
-                char = parts[-1]
-                path = ":".join(parts[1:-1])
-            return cls(kind="ckpt", ckpt_path=path, character=char)
         if kind == "human":
             return cls(kind="human")
         raise ValueError(f"unknown opponent spec: {spec!r}")
@@ -108,8 +96,6 @@ class Opponent:
             return dolphin_lib.CPU(
                 character=melee.Character[self.character.upper()], level=self.level
             )
-        if self.kind == "ckpt":
-            return dolphin_lib.AI(character=melee.Character[self.character.upper()])
         return dolphin_lib.Human()
 
 

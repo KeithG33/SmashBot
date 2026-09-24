@@ -18,10 +18,15 @@ dependencies = [
   "tyro",
   "dm-tree",
   "tqdm",
+  "melee",   # libmelee: Dolphin play and the replay parser
+  # slippi_ai is vendored, not on PyPI: pip install -e vendor/slippi-ai
+  # (it brings peppi-py); RL also needs vendor/melee-sim-light built
+  # (docs/sim-backend.md)
 ]
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]
+data = ["huggingface_hub"]   # scripts/fetch_dataset.py, upload_dataset.py
 
 [tool.setuptools.packages.find]
 include = ["smashbot*"]

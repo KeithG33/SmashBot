@@ -1,6 +1,7 @@
 """Rollout machinery tests (Dolphin-free): chunk assembly alignment, reward
-delay-shifting, batched-agent equivalence with the single-env DelayedAgent
-pathway, and end-to-end assembled-trajectory -> learner compatibility."""
+delay-shifting, rows of the batched agent staying independent, the Dolphin
+agents (sync, async), and end-to-end assembled-trajectory -> learner
+compatibility."""
 
 import numpy as np
 import pytest
@@ -482,13 +483,25 @@ def test_async_agent_absorbs_slow_samples(monkeypatch):
     sync.parser = StubParser(frames)
     awa.parser = StubParser(frames)
 
+    class CountingReady:
+        """The agent's result semaphore, counting the step()s that had to wait."""
+
+        def __init__(self, sem):
+            self.sem, self.waits = sem, 0
+
+        def acquire(self):
+            if not self.sem.acquire(blocking=False):
+                self.waits += 1
+                self.sem.acquire()
+
+        def release(self):
+            self.sem.release()
+
+    ready = awa._out_ready = CountingReady(awa._out_ready)
     outs_sync = [sync.step(None) for _ in range(10)]
-    step_times = []
     outs_async = []
     for _ in range(10):
-        t0 = time_lib.perf_counter()
         outs_async.append(awa.step(None))
-        step_times.append(time_lib.perf_counter() - t0)
         time_lib.sleep(0.0167)  # real frame cadence: compute catches up here
     awa.drain()
 
@@ -500,8 +513,8 @@ def test_async_agent_absorbs_slow_samples(monkeypatch):
             ),
             a, b,
         )
-    # and step() never blocked on a spike (queue slack absorbed the lag)
-    assert max(step_times) < 0.02, f"step blocked: {max(step_times)*1e3:.1f}ms"
+    # and step() never waited on a spike (queue slack absorbed the lag)
+    assert ready.waits == 0
 
 
 def test_tracker_ema_and_persistence():

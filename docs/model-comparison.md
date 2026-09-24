@@ -52,7 +52,7 @@ state + flat inputs, no-snapshot, idle 3090):
 | 6/576 (current) | 25.7M | 2.15 MB | 1.91 | 2.74 | 5.01 | 3.48 GiB | 15.53 GiB | 4914 |
 | 8/512 | 26.7M | 2.61 MB | 1.92 | 3.07 | 5.84 | 4.23 GiB | — | — |
 
-\* real entrypoint (`train_rl --backend sim`), 400 rows / 40 slices / mb 12,
+\* real entrypoint (`train_rl`), 400 rows / 40 slices / mb 12,
 fresh start from a random-init checkpoint of the shape, empty league, no
 imports, wandb disabled, 30 steps; identical settings for the three shapes, so
 read relatively (the 6/576 peak matches the resume dry-runs' 15.51). fps is

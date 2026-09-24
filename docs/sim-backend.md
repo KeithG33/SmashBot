@@ -32,7 +32,7 @@ Add `vendor/melee-sim-light` to `PYTHONPATH` (the launch script does).
 ## Architecture
 
 ```
-train_rl (backend sim)                         (rl/train_rl.py dispatch)
+train_rl                                       (rl/train_rl.py entry)
   └─ rl/train_sim.py   run(): learner loop — Learner, overlap pipeline,
      │                 checkpoint schema; learner rows = envs + self envs
      ├─ SimLeagueWorker: STATIC env layout (self / phillip tiers / pfsp),
@@ -84,4 +84,5 @@ script with `--runtime.steps <start+6> --runtime.wandb-mode disabled` and
 read the `[vram]` lines (first sequential learner step peak, then the
 overlapped steps' peak/reserved) and the `fps` in the step ticker.
 
-v12 (345 envs = 449 rows, 48 pfsp slices, mb 24): see the launch log.
+v12 (308 envs = 400 rows, 40 pfsp slices, mb 12; 449 rows ran out of memory
+at the first learner step): see the launch log and scripts/launch_sim.sh.
