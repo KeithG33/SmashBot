@@ -751,7 +751,7 @@ class Learner:
             )
             value_out = self.value_function.outputs(
                 cf, self.value_function.initial_state(hi - lo, device),
-                discount=self.config.discount,
+                discount=self.config.discount, detail=False,
             )
             # chunk share of the full-trajectory mean loss (a plain .mean()
             # over ALL positions — see value.py — so the share is the ROW

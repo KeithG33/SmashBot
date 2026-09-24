@@ -39,8 +39,9 @@ class ValueFunction(nn.Module):
         frames: Frames,  # delay-sliced, [B, U+1]
         initial_state: RecurrentState,
         discount: float,
+        detail: bool = True,
     ) -> tuple[torch.Tensor, RecurrentState, dict]:
-        out = self.outputs(frames, initial_state, discount)
+        out = self.outputs(frames, initial_state, discount, detail)
         return out.loss, out.final_state, out.metrics
 
     def outputs(
@@ -48,7 +49,10 @@ class ValueFunction(nn.Module):
         frames: Frames,  # delay-sliced, [B, U+1]
         initial_state: RecurrentState,
         discount: float,
+        detail: bool = True,
     ) -> ValueOutputs:
+        """metrics (loss, uev, the finiteness probe, return and reward means)
+        are read in one host transfer, and only with detail."""
         inputs = tree.map_structure(lambda t: t[:, :-1], frames.state_action)
         last_input = tree.map_structure(lambda t: t[:, -1], frames.state_action)
         outputs, final_state = self.network.unroll(
@@ -75,32 +79,31 @@ class ValueFunction(nn.Module):
             ).detach()
             advantages = targets - values
             loss = torch.square(advantages).mean()
-            uev = loss / (targets.var() + 1e-8)
-            # finiteness probe, reward -> value -> target -> advantage
-            # (one sync): a nonfinite loss names its own source
-            def _mx(t):
-                return torch.nan_to_num(
-                    t.detach().abs(), nan=float("inf"), posinf=float("inf")
-                ).max()
+            metrics = {}
+            if detail:
+                # finiteness probe, reward -> value -> target -> advantage:
+                # a nonfinite loss names its own source
+                def _mx(t):
+                    return torch.nan_to_num(
+                        t.detach().abs(), nan=float("inf"), posinf=float("inf")
+                    ).max()
 
-            def _nf(t):
-                return (~torch.isfinite(t.detach())).sum().float()
+                def _nf(t):
+                    return (~torch.isfinite(t.detach())).sum().float()
 
-            chain = torch.stack([
-                _mx(rewards), _nf(rewards), _mx(values), _nf(values),
-                _mx(targets), _nf(targets), _mx(advantages), _nf(advantages),
-            ]).tolist()
-
-        metrics = {
-            "reward_absmax": chain[0], "reward_nonfinite": int(chain[1]),
-            "value_absmax": chain[2], "value_nonfinite": int(chain[3]),
-            "target_absmax": chain[4], "target_nonfinite": int(chain[5]),
-            "adv_absmax": chain[6], "adv_nonfinite": int(chain[7]),
-            "loss": loss.item(),
-            "uev": uev.item(),
-            "return_mean": targets.mean().item(),
-            "reward_mean": frames.reward.mean().item(),
-        }
+                v = torch.stack([
+                    _mx(rewards), _nf(rewards), _mx(values), _nf(values),
+                    _mx(targets), _nf(targets), _mx(advantages), _nf(advantages),
+                    loss.detach(), (loss / (targets.var() + 1e-8)).detach(),
+                    targets.mean(), frames.reward.mean().float(),
+                ]).tolist()
+                metrics = {
+                    "reward_absmax": v[0], "reward_nonfinite": int(v[1]),
+                    "value_absmax": v[2], "value_nonfinite": int(v[3]),
+                    "target_absmax": v[4], "target_nonfinite": int(v[5]),
+                    "adv_absmax": v[6], "adv_nonfinite": int(v[7]),
+                    "loss": v[8], "uev": v[9], "return_mean": v[10], "reward_mean": v[11],
+                }
         return ValueOutputs(
             loss=loss,
             advantages=advantages.detach(),

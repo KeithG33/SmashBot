@@ -34,7 +34,7 @@ def _config(run_dir, steps=5, eval_interval=1000):
 
 def _poison(monkeypatch, cls, method, at_call, spoil, training=True):
     """On the at_call-th training (or eval) call of cls.method, hand its
-    (loss, state, metrics) to spoil."""
+    (loss, state, extras) to spoil."""
     original, calls = getattr(cls, method), [0]
 
     def wrapped(self, *args, **kwargs):
@@ -54,16 +54,16 @@ def _inf_gradient(module, out):
 
 
 def _nan_loss(module, out):
-    loss, state, metrics = out
-    return loss * math.nan, state, {**metrics, "policy_loss": math.nan}
+    loss, state, extras = out
+    return loss * math.nan, state, extras
 
 
 def _nan_state(module, out):
-    loss, state, metrics = out
+    loss, state, extras = out
     leaves = tree.flatten(state)
     poisoned = [t.clone() for t in leaves]
     next(t for t in poisoned if t.is_floating_point()).view(-1)[0] = math.nan
-    return loss, tree.unflatten_as(state, poisoned), metrics
+    return loss, tree.unflatten_as(state, poisoned), extras
 
 
 def _latest_step(run_dir):

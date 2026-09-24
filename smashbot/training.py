@@ -91,9 +91,11 @@ class GradClipper:
     def history(self) -> list:
         return self._history
 
+    def norm(self) -> torch.Tensor:
+        return torch.nn.utils.get_total_norm([p.grad for p in self.params if p.grad is not None])
+
     def measure(self) -> float:
-        return torch.nn.utils.get_total_norm(
-            [p.grad for p in self.params if p.grad is not None]).item()
+        return self.norm().item()
 
     @property
     def threshold(self) -> float:

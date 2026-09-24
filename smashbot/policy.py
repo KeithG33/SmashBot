@@ -74,28 +74,13 @@ class Policy(nn.Module):
         self,
         frames: Frames,
         initial_state: RecurrentState,
-    ) -> tuple[torch.Tensor, RecurrentState, dict]:
-        """frames: [B, U + D + 1] raw (not yet delay-aligned)."""
+    ) -> tuple[torch.Tensor, RecurrentState, tp.Any]:
+        """frames: [B, U + D + 1] raw (not yet delay-aligned). The loss, the
+        final state and the per-component distances, all left on device:
+        imitation_metrics reads them out when they are wanted."""
         delayed = delay_lib.slice_delayed_frames(frames, self.delay)
         outputs = self.unroll(delayed, initial_state)
-
-        total_loss = -outputs.log_probs.mean()
-        metrics = {
-            "policy_loss": total_loss.item(),
-            "controller": tree.map_structure(
-                lambda d: d.mean().item(), outputs.distances._asdict()
-            ),
-        }
-        metrics["controller_flat"] = {
-            "buttons": sum(metrics["controller"]["buttons"]) / len(metrics["controller"]["buttons"]),
-            "main_x": metrics["controller"]["main_stick"].x,
-            "main_y": metrics["controller"]["main_stick"].y,
-            "c_x": metrics["controller"]["c_stick"].x,
-            "c_y": metrics["controller"]["c_stick"].y,
-            "shoulder": metrics["controller"]["shoulder"],
-        }
-
-        return total_loss, outputs.final_state, metrics
+        return -outputs.log_probs.mean(), outputs.final_state, outputs.distances
 
     @torch.no_grad()
     def forward(
@@ -134,6 +119,28 @@ class Policy(nn.Module):
             output, state_action.action, temperature=temperature
         )
         return next_action, final_state
+
+
+def imitation_metrics(loss: torch.Tensor, distances) -> dict:
+    """imitation_loss's loss and each controller component's mean distance as
+    floats, read in one host transfer."""
+    components = distances._asdict()
+    means = [d.mean().float() for d in tree.flatten(components)]
+    values = torch.stack([loss.detach().float()] + means).tolist()
+    controller = tree.unflatten_as(components, values[1:])
+    buttons = controller["buttons"]
+    return {
+        "policy_loss": values[0],
+        "controller": controller,
+        "controller_flat": {
+            "buttons": sum(buttons) / len(buttons),
+            "main_x": controller["main_stick"].x,
+            "main_y": controller["main_stick"].y,
+            "c_x": controller["c_stick"].x,
+            "c_y": controller["c_stick"].y,
+            "shoulder": controller["shoulder"],
+        },
+    }
 
 
 def build_policy_from_config(cfg: dict) -> Policy:

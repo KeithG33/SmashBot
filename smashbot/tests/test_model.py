@@ -13,7 +13,7 @@ from smashbot import configs, delay as delay_lib, embed as embed_lib
 from smashbot.data import loader
 from smashbot.heads import AutoRegressive
 from smashbot.networks import SGUCore, TransformerCore, TransformerLike
-from smashbot.policy import build_policy
+from smashbot.policy import build_policy, imitation_metrics
 
 DELAY = 4
 UNROLL = 12
@@ -51,7 +51,8 @@ def test_imitation_loss_smoke(toy_frames):
     B, T = frames.is_resetting.shape
     assert T == UNROLL + DELAY + 1
     initial_state = policy.initial_state(B)
-    loss, final_state, metrics = policy.imitation_loss(frames, initial_state)
+    loss, final_state, distances = policy.imitation_loss(frames, initial_state)
+    metrics = imitation_metrics(loss, distances)
     assert torch.isfinite(loss)
     loss.backward()
     grads = [p.grad for p in policy.parameters() if p.grad is not None]

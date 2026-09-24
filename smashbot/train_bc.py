@@ -28,7 +28,7 @@ from smashbot import configs, embed as embed_lib, saving
 from smashbot.data import loader
 from smashbot.delay import slice_delayed_frames
 from smashbot.networks import build_embed_network, check_loadable
-from smashbot.policy import build_policy
+from smashbot.policy import build_policy, imitation_metrics
 from smashbot.training import GradClipper, compile_cores, resolve_restore
 from smashbot.value import ValueFunction
 
@@ -92,14 +92,18 @@ def _set_rng(rng: dict) -> None:
         torch.cuda.set_rng_state_all(rng["cuda"])
 
 
-def _checked_clip(clipper: GradClipper, loss: float, net: str, step: int) -> dict:
-    """BC stops on a non-finite loss or gradient rather than skipping the
-    update: the data cursor and the recurrent state have already moved on.
-    Raising before the optimizer step leaves latest.pt as it was."""
-    norm = clipper.measure()
-    if not (math.isfinite(loss) and math.isfinite(norm)):
-        raise FloatingPointError(f"step {step}: non-finite {net} update (loss {loss}, grad norm {norm})")
-    return clipper.clip(norm)
+def _checked_norms(step: int, *updates) -> list:
+    """The gradient norm of each (net, loss, clipper) update, read with the
+    losses in one host transfer. BC stops on a non-finite loss or gradient
+    rather than skipping the update: the data cursor and the recurrent state
+    have already moved on. Raising before any optimizer step leaves latest.pt
+    as it was."""
+    values = torch.stack([t for _, loss, clipper in updates
+                          for t in (loss.detach().float(), clipper.norm())]).tolist()
+    for (net, _, _), loss, norm in zip(updates, values[::2], values[1::2]):
+        if not (math.isfinite(loss) and math.isfinite(norm)):
+            raise FloatingPointError(f"step {step}: non-finite {net} update (loss {loss}, grad norm {norm})")
+    return values[1::2]
 
 
 def _nonfinite(states: dict) -> list:
@@ -347,12 +351,12 @@ def main(config: TrainConfig) -> None:
                 frames, _, test_data_state = next(eval_stream)
                 frames = to_device(frames)
                 with autocast():
-                    loss, eval_hidden, m = policy.imitation_loss(frames, eval_hidden)
+                    loss, eval_hidden, _ = policy.imitation_loss(frames, eval_hidden)
                     sliced = slice_delayed_frames(frames, config.policy.delay)
                     _, eval_value_hidden, vm = value_fn.loss(
                         sliced, eval_value_hidden, discount
                     )
-                losses.append(m["policy_loss"])
+                losses.append(loss.item())
                 value_metrics_acc.append(vm)
         policy.train()
         policy_loss = float(np.mean(losses))
@@ -376,27 +380,34 @@ def main(config: TrainConfig) -> None:
         while step < rt.steps and not stop.requested:
             at_boundary = False
             step += 1
+            log_step = step % rt.log_interval == 0
             frames, epoch, train_data_state = next(train_stream)
             frames = to_device(frames)
 
             policy_opt.zero_grad(set_to_none=True)
             with autocast():
-                policy_loss, train_hidden, metrics = policy_loss_fn(frames, train_hidden)
+                policy_loss, train_hidden, distances = policy_loss_fn(frames, train_hidden)
             policy_loss.backward()
             train_hidden = detach(train_hidden)
-            clip_metrics = _checked_clip(clip_policy, metrics["policy_loss"], "policy", step)
-            policy_opt.step()
 
             value_opt.zero_grad(set_to_none=True)
             sliced = slice_delayed_frames(frames, config.policy.delay)
             with autocast():
-                value_loss, value_hidden, value_metrics = value_loss_fn(sliced, value_hidden, discount)
+                value_loss, value_hidden, value_metrics = value_loss_fn(
+                    sliced, value_hidden, discount, detail=log_step)
             value_loss.backward()
             value_hidden = detach(value_hidden)
-            value_clip_metrics = _checked_clip(clip_value, value_metrics["loss"], "value", step)
+
+            # the nets share no parameters, so both steps can wait for one check
+            policy_norm, value_norm = _checked_norms(
+                step, ("policy", policy_loss, clip_policy), ("value", value_loss, clip_value))
+            clip_metrics = clip_policy.clip(policy_norm)
+            policy_opt.step()
+            value_clip_metrics = clip_value.clip(value_norm)
             value_opt.step()
 
-            if step % rt.log_interval == 0:
+            if log_step:
+                metrics = imitation_metrics(policy_loss, distances)
                 now = time.perf_counter()
                 fps = (step - step_window) * B * config.data.unroll_length / (
                     now - t_window
