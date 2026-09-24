@@ -62,13 +62,6 @@ class TrainConfig:
     )
     runtime: RuntimeConfig = dataclasses.field(default_factory=RuntimeConfig)
 
-    def __post_init__(self):
-        if self.data.dataset.data_dir is None:
-            root = "/home/kage/drive2/ShineBot/data/full/Root"
-            self.data.dataset.data_dir = f"{root}/Parsed"
-            # default: the seeded 20k experiment subset; big runs use meta.json
-            self.data.dataset.meta_path = f"{root}/meta-20k.json"
-
 
 def _to(state, device):
     return tree.map_structure(
@@ -193,6 +186,10 @@ class _StopRequest:
 
 
 def main(config: TrainConfig) -> None:
+    dataset = config.data.dataset
+    if dataset.data_dir is not None and dataset.meta_path is None:   # the dataset's own full index
+        dataset.meta_path = os.path.join(os.path.dirname(dataset.data_dir.rstrip("/")), "meta.json")
+    dataset.validate()
     rt = config.runtime
     run_dir = os.path.join(rt.run_dir, rt.tag)
     restore_path = resolve_restore(run_dir, rt.restore)
@@ -205,7 +202,6 @@ def main(config: TrainConfig) -> None:
     ckpt = None
     if restore_path:
         ckpt = saving.load_checkpoint(restore_path)
-        config.data.dataset.validate()
         _check_config(ckpt["config"], dataclasses.asdict(config), dataclasses.asdict(TrainConfig()))
     resume = _resume_state(ckpt)
 
