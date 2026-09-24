@@ -289,8 +289,13 @@ def main(config: TrainConfig) -> None:
         value_fn.load_state_dict(resume["value"])
         saving.load_optimizer(policy_opt, resume["policy_opt"], resume["policy"])
         value_opt.load_state_dict(resume["value_opt"])
-        for group in policy_opt.param_groups + value_opt.param_groups:
-            group["fused"], group["foreach"] = True, None   # loading restores the checkpoint's own flags
+        # loading keeps the saved optimizer's setup: a non-fused Adam's flags and
+        # its step counts on the CPU, where fused Adam needs them on the device
+        for opt in (policy_opt, value_opt):
+            for group in opt.param_groups:
+                group["fused"], group["foreach"] = True, None
+            for param, state in opt.state.items():
+                state["step"] = state["step"].to(device=param.device, dtype=torch.float32)
         step = resume["step"]
         best_eval_loss = ckpt["best_eval_loss"]
         print(f"restored from {restore_path} at step {step} (best eval {best_eval_loss:.4f})")
