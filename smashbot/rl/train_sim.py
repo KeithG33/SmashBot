@@ -314,6 +314,8 @@ def run(args) -> None:
             if saved != {args.learner.learning_rate}:
                 print(f"learning rate: checkpoint {', '.join(map(str, sorted(saved)))} -> "
                       f"{args.learner.learning_rate} (--learner.learning-rate or its default)")
+        if learner.grad_scaler is not None and rl_ckpt["state"].get("grad_scaler"):
+            learner.grad_scaler.load_state_dict(rl_ckpt["state"]["grad_scaler"])
         start_step = rl_ckpt["state"]["step"] + 1
         restored_trackers = rl_ckpt["state"].get("trackers")
         learner.policy_clipper.restore_history(
@@ -322,6 +324,8 @@ def run(args) -> None:
     _save_rl_checkpoint.policy_opt = learner.policy_optimizer
     _save_rl_checkpoint.value_opt = learner.value_optimizer
     _save_rl_checkpoint.clip_history = lambda: learner.policy_clipper.history
+    _save_rl_checkpoint.grad_scaler = lambda: (
+        None if learner.grad_scaler is None else learner.grad_scaler.state_dict())
 
     # ---- serving copy + compile (train_rl's overlap pattern) ----
     import copy as _copy

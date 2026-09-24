@@ -97,6 +97,7 @@ def _save_rl_checkpoint(
                 "value": value_fn.state_dict(),
                 "policy_opt": _save_rl_checkpoint.policy_opt.state_dict(),
                 "value_opt": _save_rl_checkpoint.value_opt.state_dict(),
+                "grad_scaler": _save_rl_checkpoint.grad_scaler(),
                 "name_map": name_map,
                 "step": step,
                 "teacher_ckpt": teacher,
