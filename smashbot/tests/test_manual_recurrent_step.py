@@ -5,7 +5,11 @@ import torch
 
 from smashbot import networks
 
-DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])   # cuda = the cuDNN kernels
+import os
+
+# cuda = the cuDNN kernels; opt-in like every GPU test, so a routine run never
+# touches a GPU that a live training run may own
+DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() and os.environ.get("SMASHBOT_GPU_TESTS") else [])
 
 
 def _core(layout, device):
