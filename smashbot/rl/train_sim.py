@@ -337,7 +337,7 @@ def run(args) -> None:
                       f"{args.learner.learning_rate} (--learner.learning-rate or its default)")
         start_step = rl_ckpt["state"]["step"] + 1
         restored_trackers = rl_ckpt["state"].get("trackers")
-        learner.policy_clipper.history = list(
+        learner.policy_clipper.restore_history(
             (rl_ckpt["state"].get("clip_history") or {}).get("policy", []))
         print(f"restored RL run from {rpath} at step {start_step}")
     _save_rl_checkpoint.policy_opt = learner.policy_optimizer

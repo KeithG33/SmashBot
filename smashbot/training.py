@@ -2,10 +2,10 @@
 clipping and compile."""
 from __future__ import annotations
 
+import heapq
 import math
 import os
 
-import numpy as np
 import torch
 
 
@@ -27,6 +27,46 @@ def resolve_restore(run_dir: str, restore: str) -> str:
     return path
 
 
+class RunningPercentile:
+    """np.percentile (method "linear") of every value added so far, equal to
+    the bit, at O(log n) per value instead of numpy's O(n). numpy
+    interpolates between the sorted values at ranks floor(v) and floor(v)+1,
+    v = (n - 1) * q / 100; a max-heap keeps the values up to rank floor(v)
+    and a min-heap the rest, so both endpoints are heap tops."""
+
+    def __init__(self, percentile: float, values=()):
+        assert 0 <= percentile < 100
+        self.fraction = percentile / 100
+        ordered = sorted(values)
+        self.n = len(ordered)
+        split = self._split()
+        self._low = [-v for v in reversed(ordered[:split])]   # max-heap as negations
+        self._high = ordered[split:]
+
+    def _split(self) -> int:
+        return math.floor((self.n - 1) * self.fraction) + 1 if self.n else 0
+
+    def add(self, value: float) -> None:
+        if self._low and value <= -self._low[0]:
+            heapq.heappush(self._low, -value)
+        else:
+            heapq.heappush(self._high, value)
+        self.n += 1
+        while len(self._low) > self._split():
+            heapq.heappush(self._high, -heapq.heappop(self._low))
+        while len(self._low) < self._split():
+            heapq.heappush(self._low, -heapq.heappop(self._high))
+
+    @property
+    def value(self) -> float:
+        v = (self.n - 1) * self.fraction
+        t = v - math.floor(v)
+        a = -self._low[0]
+        b = self._high[0] if self._high else a
+        # numpy's _lerp works from the nearer endpoint, and so rounds differently
+        return b - (b - a) * (1 - t) if t >= 0.5 else a + (b - a) * t
+
+
 class GradClipper:
     """Clips a network's gradient to `max_norm`, or with AutoClip
     (Seetharaman et al. 2020) to a percentile of the run's own gradient-norm
@@ -41,7 +81,15 @@ class GradClipper:
         assert not (max_norm > 0 and percentile > 0), "one clipping rule at a time"
         self.params = list(params)
         self.max_norm, self.percentile = max_norm, percentile
-        self.history = list(history or [])
+        self.restore_history(history or [])
+
+    def restore_history(self, history) -> None:
+        self._history = list(history)
+        self._running = RunningPercentile(self.percentile, self._history)
+
+    @property
+    def history(self) -> list:
+        return self._history
 
     def measure(self) -> float:
         return torch.nn.utils.get_total_norm(
@@ -50,12 +98,14 @@ class GradClipper:
     @property
     def threshold(self) -> float:
         if self.percentile > 0:
-            return float(np.percentile(self.history, self.percentile)) if self.history else math.inf
+            return self._running.value if self._history else math.inf
         return self.max_norm if self.max_norm > 0 else math.inf
 
     def clip(self, norm: float) -> dict:
         if self.percentile > 0:
-            self.history.append(norm)
+            assert math.isfinite(norm), "a non-finite norm must never reach the history"
+            self._history.append(norm)
+            self._running.add(norm)
         clip = self.threshold
         if math.isfinite(clip):
             torch.nn.utils.clip_grads_with_norm_(self.params, clip, torch.tensor(norm))
