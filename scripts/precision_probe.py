@@ -284,7 +284,7 @@ def run_arm(learner, trajectories, arm: str, device_type: str) -> dict:
     return {
         "arm": arm,
         "tensors": tensors,
-        "metrics": ppo_lib._mean_dicts(metrics_list),
+        "metrics": ppo_lib._to_host(ppo_lib._mean_dicts(metrics_list)),
         "value_metrics": _mean_dicts(vmetrics_list),
         "policy_grad_norm": policy_grad_norm,
         "value_grad_norm": value_grad_norm,

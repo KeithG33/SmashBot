@@ -555,15 +555,20 @@ class Learner:
 
     LOGIT_CLAMP = 500.0  # real |logit| max ~125; kills only fp16 blowups
 
-    def _policy_loss_inner(self, fixed: _Fixed) -> tuple[torch.Tensor, dict]:
-        cfg = self.config
+    def _unroll(self, fixed: _Fixed):
         rows = fixed.valid.shape[0]
         init = _mask_state(
             fixed.reset0,
             self.policy.initial_state(rows, fixed.valid.device),
             fixed.initial_policy_state,
         )
-        out = self.policy.unroll(fixed.frames, init)
+        return self.policy.unroll(fixed.frames, init)
+
+    def _policy_loss_inner(self, fixed: _Fixed) -> tuple[torch.Tensor, dict]:
+        """(loss, metrics); the metrics are 0-dim device tensors, read to the
+        host once per step (_to_host) so the loss never waits on the GPU."""
+        cfg = self.config
+        out = self._unroll(fixed)
         # Probe: pre-clamp max |logit| split by validity (NaN counted as
         # inf so it can't hide from max()).
         with torch.no_grad():
@@ -577,14 +582,14 @@ class Learner:
                 z = torch.zeros((), dtype=a.dtype, device=a.device)
                 v_maxs.append(torch.where(v, a, z).amax())
                 m_maxs.append(torch.where(v, z, a).amax())
-            logit_absmax_valid = torch.stack(v_maxs).max().item()
-            logit_absmax_masked = torch.stack(m_maxs).max().item()
+            logit_absmax_valid = torch.stack(v_maxs).max()
+            logit_absmax_masked = torch.stack(m_maxs).max()
             # advantage stream: the one loss input with no clamp of its own
             adv = fixed.advantages.detach()
             adv_absmax = torch.nan_to_num(
                 adv.abs(), nan=float("inf"), posinf=float("inf")
-            ).max().item()
-            adv_nonfinite = int((~torch.isfinite(adv)).sum().item())
+            ).max()
+            adv_nonfinite = (~torch.isfinite(adv)).sum().float()
         # Clamp defuses inf logits at masked positions (0-cotangent x
         # inf-jacobian NaNs backward); inert for real logits.
         out = out._replace(logits=tree.map_structure(
@@ -606,19 +611,15 @@ class Learner:
                 log_rhos.detach().abs(), nan=float("inf"), posinf=float("inf")
             )
             z = torch.zeros((), dtype=_m.dtype, device=_m.device)
-            log_rho_masked_absmax = torch.where(vbool, z, _m).max().item()
+            log_rho_masked_absmax = torch.where(vbool, z, _m).max()
         log_rhos = torch.where(vbool, log_rhos, torch.zeros_like(log_rhos))
-        # Detect on every position, before clamping.
+        # Detect on every position, before clamping (the dump: _check_chunk).
         raw = log_rhos.detach()
-        nonfinite = int((~torch.isfinite(raw)).sum().item())
         raw_abs_max = torch.nan_to_num(
             raw.abs(), nan=float("inf"), posinf=float("inf")
-        ).max().item()
-        anomalies = nonfinite + int(
-            (torch.nan_to_num(raw.abs()) > cfg.ppo.log_rho_clamp).sum().item()
-        )
-        if anomalies:
-            self._dump_anomaly(log_rhos, fixed)
+        ).max()
+        anomalies = ((~torch.isfinite(raw)).sum()
+                     + (torch.nan_to_num(raw.abs()) > cfg.ppo.log_rho_clamp).sum()).float()
         # Bound unconditionally: exp() must never see an overflowable value.
         log_rhos = torch.nan_to_num(
             log_rhos, nan=0.0,
@@ -650,23 +651,23 @@ class Learner:
             if w != 0.0:
                 per_pos = per_pos + w * term
         loss = (per_pos * valid).sum() / n_valid
-        # per-term nonfinite counts over VALID positions (one sync): a
-        # nonfinite loss names the term it came from
+        # per-term nonfinite counts over VALID positions: a nonfinite loss
+        # names the term it came from
         with torch.no_grad():
             terms = (surrogate, actor_kl, teacher_kl, reverse_teacher_kl,
                      entropy)
             bad = torch.stack([
                 ((~torch.isfinite(t)) & valid.bool()).sum().float()
                 for t in terms
-            ]).tolist()
+            ])
 
-        vmean = lambda t: ((t * valid).sum() / n_valid).item()
+        vmean = lambda t: ((t * valid).sum() / n_valid).detach()
         metrics = {
-            "loss": loss.item(),
+            "loss": loss.detach(),
             "surrogate": vmean(surrogate),
             "teacher_kl": vmean(teacher_kl),
             "actor_kl_mean": vmean(actor_kl),
-            "actor_kl_max": (actor_kl * valid).max().item(),
+            "actor_kl_max": (actor_kl * valid).max().detach(),
             "entropy": vmean(entropy),
             "ratio_mean": vmean(log_rhos.exp() * valid + (1 - valid)),
             "log_rho_abs_max": raw_abs_max,
@@ -676,20 +677,34 @@ class Learner:
             "logit_absmax_masked": logit_absmax_masked,
             "adv_absmax": adv_absmax,
             "adv_nonfinite": adv_nonfinite,
-            "nf_surrogate": int(bad[0]),
-            "nf_actor_kl": int(bad[1]),
-            "nf_teacher_kl": int(bad[2]),
-            "nf_reverse_kl": int(bad[3]),
-            "nf_entropy": int(bad[4]),
+            "nf_surrogate": bad[0],
+            "nf_actor_kl": bad[1],
+            "nf_teacher_kl": bad[2],
+            "nf_reverse_kl": bad[3],
+            "nf_entropy": bad[4],
         }
         return loss, metrics
 
+    def _check_chunk(self, loss: torch.Tensor, metrics: dict, fixed: _Fixed) -> bool:
+        """A chunk's one host read: whether its loss is finite (the skip
+        decides on it) and whether any log-ratio blew up (forensics)."""
+        finite, anomalies = torch.stack(
+            [torch.isfinite(loss.detach()).float(), metrics["anomalous_samples"]]
+        ).tolist()
+        if anomalies:
+            self._dump_anomaly(fixed)
+        return bool(finite)
+
     _anomaly_dumps = 0
 
-    def _dump_anomaly(self, log_rhos: torch.Tensor, fixed: _Fixed) -> None:
+    def _dump_anomaly(self, fixed: _Fixed) -> None:
         """Forensics for corrupted samples: where in the batch/time, near
-        resets?, magnitudes. First 3 occurrences save full tensors."""
-        bad = (log_rhos.detach().abs() > self.config.ppo.log_rho_clamp)
+        resets?, magnitudes. First 3 occurrences save full tensors. Rare, so
+        it re-runs the unroll for the log-ratios."""
+        with torch.no_grad(), self._autocast():
+            out = self._unroll(fixed)
+        log_rhos = torch.where(fixed.valid.bool(), out.log_probs - fixed.actor_log_probs, 0.0)
+        bad = (log_rhos.abs() > self.config.ppo.log_rho_clamp)
         idx = bad.nonzero()[:8].tolist()
         near_reset = fixed.frames.is_resetting.any(dim=1)
         print(f"ANOMALY: {bad.sum().item()} samples |log_rho|>"
@@ -923,13 +938,10 @@ class Learner:
         w_mean = sum(
             (imf.weights * imf.valid).sum() for imf in imit_fixed
         ) / n
-        w_max = max(
-            (imf.weights * imf.valid).max().item() for imf in imit_fixed
-        )
         stats = {
             "traj_count": sum(imf.rows for imf in imit_fixed),
-            "w_mean": w_mean.item(),
-            "w_max": w_max,
+            "w_mean": w_mean.detach(),
+            "w_max": torch.stack([(imf.weights * imf.valid).max() for imf in imit_fixed]).max(),
         }
         return imit_fixed, stats
 
@@ -988,14 +1000,19 @@ class Learner:
             train_fixed = [
                 c for f in fixed_list for c in self._row_chunks(f, cfg.micro_batches)
             ]
-        # exact accumulation: each chunk's mean-over-valid loss weighted by its
-        # share of all valid positions reproduces the full-batch mean
-        total_valid = sum(float(f.valid.sum()) for f in train_fixed) or 1.0
         # imitation chunks are capped at the PPO chunk size (activation peak
         # unchanged) and share one step-wide denominator (exact mean)
         chunk_rows = max(f.valid.shape[0] for f in train_fixed) if train_fixed else 1
         imit_chunks = [c for imf in imit_fixed for c in self._imit_chunks(imf, chunk_rows)]
-        total_imit_valid = sum(float(c.valid.sum()) for c in imit_chunks) or 1.0
+        # exact accumulation: each chunk's mean-over-valid loss weighted by its
+        # share of all valid positions reproduces the full-batch mean (every
+        # chunk's valid count in one read)
+        counts = torch.stack(
+            [f.valid.sum() for f in train_fixed] + [c.valid.sum() for c in imit_chunks]
+        ).tolist() if train_fixed or imit_chunks else []
+        chunk_valid = counts[:len(train_fixed)]
+        total_valid = sum(chunk_valid) or 1.0
+        total_imit_valid = sum(counts[len(train_fixed):]) or 1.0
 
         # Trust-region snapshot: weights AND optimizer slots (weights
         # alone leave Adam's m/v carrying the rejected update). Copied into
@@ -1012,9 +1029,9 @@ class Learner:
             self.policy_optimizer.zero_grad(set_to_none=True)
             any_backward = False
             batch_metrics = []
-            for fixed in train_fixed:
+            for fixed, n_valid in zip(train_fixed, chunk_valid):
                 loss, metrics = self._policy_loss(fixed)
-                if not torch.isfinite(loss):
+                if not self._check_chunk(loss, metrics, fixed):
                     print(
                         "NONFINITE LOSS: skipping minibatch (pre-clamp "
                         f"|logit| valid {metrics['logit_absmax_valid']:.1f} "
@@ -1033,7 +1050,7 @@ class Learner:
                     # (else the live activation footprint doubles)
                     del loss
                     continue
-                self._backward(loss * (float(fixed.valid.sum()) / total_valid))
+                self._backward(loss * (n_valid / total_valid))
                 any_backward = True
                 batch_metrics.append(metrics)
             # PPO and imitation backwards accumulate into the same grads;
@@ -1045,9 +1062,7 @@ class Learner:
                     (~torch.isfinite(p_.grad)).any()
                     for p_ in self.policy.parameters() if p_.grad is not None
                 ]
-                ppo_grad_nonfinite = bool(
-                    torch.stack(flags).any().item()
-                ) if flags else False
+                ppo_grad_nonfinite = torch.stack(flags).any() if flags else False   # read if the guard trips
             if imit_chunks and lambda_t > 0.0:
                 imit_losses = []
                 for chunk in imit_chunks:
@@ -1059,9 +1074,9 @@ class Learner:
                         continue
                     self._backward(lambda_t * iloss)
                     any_backward = True
-                    imit_losses.append(iloss.item())
+                    imit_losses.append(iloss.detach())
                 if imit_losses:
-                    imit_loss_val = sum(imit_losses)  # = step-wide mean
+                    imit_loss_val = torch.stack(imit_losses).sum()  # = step-wide mean
             use_scaler = self.grad_scaler is not None and any_backward
             if use_scaler:
                 # Divide the loss scale back out BEFORE clipping/guarding so
@@ -1089,7 +1104,7 @@ class Learner:
                 # the snapshot decides; with one backward there is no
                 # ambiguity
                 if ppo_grad_nonfinite is not None:
-                    stage = "ppo" if ppo_grad_nonfinite else "imitation"
+                    stage = "ppo" if bool(ppo_grad_nonfinite) else "imitation"
                 else:
                     stage = "ppo" if ppo_had_backward else "imitation"
                 print(f"NONFINITE GRAD NORM ({grad_norm}): skipping update "
@@ -1122,10 +1137,15 @@ class Learner:
 
         # Post-update measurement (and trust-region backstop).
         with torch.no_grad():
-            post = _mean_dicts([self._policy_loss(f)[1] for f in check_fixed])
+            checked = []
+            for f in check_fixed:
+                loss, m = self._policy_loss(f)
+                self._check_chunk(loss, m, f)   # forensics; the revert reads actor KL below
+                checked.append(m)
+            post = _mean_dicts(checked)
         # FAIL CLOSED: NaN > x is False — a contaminated measurement must
         # revert, not silently keep the update.
-        post_kl = post["actor_kl_mean"]
+        post_kl = float(post["actor_kl_mean"])
         reverted = (
             not math.isfinite(post_kl) or post_kl > cfg.ppo.max_mean_actor_kl
         )
@@ -1153,23 +1173,38 @@ class Learner:
             metrics["imitation"] = dict(
                 imit_stats, loss=imit_loss_val, **{"lambda": lambda_t}
             )
-        return state, metrics
+        return state, _to_host(metrics)
+
+
+_MAX_KEYS = ("actor_kl_max", "log_rho_abs_max", "log_rho_masked_absmax",
+             "logit_absmax_valid", "logit_absmax_masked",
+             "adv_absmax", "reward_absmax", "value_absmax", "target_absmax")
+_SUM_KEYS = ("anomalous_samples", "adv_nonfinite", "nf_surrogate",
+             "nf_actor_kl", "nf_teacher_kl", "nf_reverse_kl",
+             "nf_entropy", "reward_nonfinite", "value_nonfinite",
+             "target_nonfinite")
 
 
 def _mean_dicts(dicts: tp.Sequence[dict]) -> dict:
     out = {}
     for key in dicts[0]:
         vals = [d[key] for d in dicts]
-        if key in ("actor_kl_max", "log_rho_abs_max", "log_rho_masked_absmax",
-                   "logit_absmax_valid", "logit_absmax_masked",
-                   "adv_absmax", "reward_absmax", "value_absmax",
-                   "target_absmax"):
+        if isinstance(vals[0], torch.Tensor):
+            v = torch.stack(vals)
+            out[key] = v.max() if key in _MAX_KEYS else v.sum() if key in _SUM_KEYS else v.mean()
+        elif key in _MAX_KEYS:
             out[key] = max(vals)
-        elif key in ("anomalous_samples", "adv_nonfinite", "nf_surrogate",
-                     "nf_actor_kl", "nf_teacher_kl", "nf_reverse_kl",
-                     "nf_entropy", "reward_nonfinite", "value_nonfinite",
-                     "target_nonfinite"):
+        elif key in _SUM_KEYS:
             out[key] = sum(vals)
         else:
             out[key] = sum(vals) / len(vals)
     return out
+
+
+def _to_host(metrics):
+    """Every tensor leaf of a metrics tree as a Python float, in one transfer."""
+    leaves = [t for t in tree.flatten(metrics) if isinstance(t, torch.Tensor)]
+    if not leaves:
+        return metrics
+    values = iter(torch.stack([t.detach().float().reshape(()) for t in leaves]).tolist())
+    return tree.map_structure(lambda x: next(values) if isinstance(x, torch.Tensor) else x, metrics)
