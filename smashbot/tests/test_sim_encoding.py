@@ -140,3 +140,78 @@ def test_items_keep_their_slot_for_life_as_in_replays():
             assert item.x[0] == items[0, slot]["pos_x"]
     assert any(len(s) > 1 for s in listed_at.values()), "fixture never shifted an item: it tests nothing"
     assert all(len(s) == 1 for s in placed_at.values())
+
+
+NANA = 11   # Nana's own character id, as the replays carry her (Popo is 10)
+
+
+def test_ice_climbers_follower_is_observed_as_nana():
+    """The sim observes Popo's follower beside him, as the replays carry her in
+    Player.nana; a player with no follower keeps an all-zero nana."""
+    env = _env(msl.Stage.FINAL_DESTINATION, p0=msl.Character.ICE_CLIMBERS, p1=msl.Character.FOX)
+    for _ in range(120):
+        env.step_and_reset()
+    obs = env.current_frame.copy()
+    env.close()
+    popo, nana = obs["slots"][0, 0], obs["followers"][0, 0]
+    assert (nana["present"], nana["char_id"]) == (1, NANA)
+    assert abs(float(nana["pos_x"]) - float(popo["pos_x"])) < 20
+    assert not obs["followers"][0, 1].tobytes().strip(b"\0")
+    game = sim_env.obs_to_game(obs, _first_items(obs))
+    assert bool(game.p0.nana.exists[0]) and game.p0.nana.character[0] == NANA
+    assert game.p0.nana.x[0] == nana["pos_x"]
+    assert not any(np.any(leaf) for leaf in game.p1.nana)
+
+
+ICS_DITTO = paths.MELEE_SIM_DIR / "replays/validation/icies/ics-ditto-d18-2025-05_Game_20250518T163949.slpz"
+
+
+def _lanes(post, present: np.ndarray) -> np.ndarray:
+    """A fighter's Slippi post-frame rows as the sim's observation carries them:
+    upstream's replay validator's expected lanes (tools/validation/native.c),
+    which the sim matches bit-exact, zeroed where the fighter has no row."""
+    import pyarrow.compute as pc
+    from melee_sim import dtypes
+
+    get = lambda a: pc.fill_null(a, 0).to_numpy(zero_copy_only=False)
+    lanes = np.zeros(len(present), dtypes.gamestate_player_dtype())
+    lanes["present"] = present
+    lanes["char_id"] = get(post.character)
+    lanes["pos_x"], lanes["pos_y"] = get(post.position.x), get(post.position.y)
+    lanes["facing"] = get(post.direction) > 0
+    lanes["on_ground"] = get(post.airborne) == 0
+    lanes["action_id"] = get(post.state)
+    lanes["jumps_left"] = get(post.jumps)
+    lanes["percent"] = get(post.percent)
+    lanes["shield_hp"] = get(post.shield)
+    lanes["hurtbox_state"] = get(post.hurtbox_state)
+    lanes["invulnerable"] = lanes["hurtbox_state"] != 0
+    lanes[~present] = np.zeros(1, lanes.dtype)
+    return lanes
+
+
+def test_nana_encodes_as_the_replay_parser_does():
+    """An Ice Climbers ditto, every frame: the player and Nana fields the sim
+    observes for this game (its replay rows as the sim's lanes) embed exactly
+    as parse_peppi's Game embeds for BC, Nana's absent frames included."""
+    if not ICS_DITTO.is_file() or ICS_DITTO.stat().st_size < 1024:
+        pytest.skip(f"{ICS_DITTO.name} not fetched (git lfs pull --include='replays/validation/icies/**')")
+    import tree
+    from slippi_ai import types
+    from slippi_db import parse_peppi
+    from smashbot import embed as embed_lib
+    from tools.validation.slpz import replay_path_for_peppi
+
+    with replay_path_for_peppi(ICS_DITTO) as slp:
+        peppi = parse_peppi.read_slippi(str(slp))
+    replay = types.array_to_nt(types.Game, parse_peppi.from_peppi(peppi))
+    embed = embed_lib.make_player_embedding()
+    absent = 0
+    for port, player in zip(peppi.frames.ports, (replay.p0, replay.p1)):
+        present = ~np.isnan(port.follower.post.position.x.to_numpy(zero_copy_only=False))
+        sim = sim_env._player(_lanes(port.leader.post, np.ones(len(present), bool)),
+                              _lanes(port.follower.post, present))
+        for got, want in zip(tree.flatten(embed.from_state(sim)), tree.flatten(embed.from_state(player))):
+            np.testing.assert_array_equal(got, want)
+        absent += int((~present).sum())
+    assert absent, "Nana never left: the absent frames are untested"
