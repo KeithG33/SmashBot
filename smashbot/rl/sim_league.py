@@ -17,6 +17,7 @@ forward each; every grid seat is harvested as a replay
 """
 from __future__ import annotations
 
+import concurrent.futures
 import random as _random
 
 import numpy as np
@@ -233,6 +234,7 @@ class MultiOpponentSimWorker:
         self.match_fn = match_fn
         self.env = msl.EnvBatch(batch_size=batch_size, length=max(64, unroll_length + 1),
                                 data_dir=data_dir)
+        self._stepper = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="sim")
         cfgs = []
         for e in range(batch_size):
             cfg, info = self.match_fn(e, self.env_opp[e])
@@ -305,9 +307,15 @@ class MultiOpponentSimWorker:
                 grid_seats.append((rows_all, torch.as_tensor(gr_reset, device=dev),
                                    gr.tenure.copy()))
             sim_env.write_controller_rows(env, p1_rows, player=1)
+            # the sim steps on its own thread (its C call releases the GIL)
+            # while this one launches the forwards: what it executes was
+            # decided a delay ago. Its resets rewrite finished games' rows of
+            # this frame's obs in place, so obs is read before it starts.
+            stocks, percent = seat_stats(obs)
+            followers = Followers(*map(torch.as_tensor, follower_stats(obs)))
+            stepped = self._stepper.submit(env.step_and_reset)
 
-            # ---- every seat's forward, queued back to back: the sim steps
-            # while they run (what it executes was decided a delay ago) ----
+            # ---- every seat's forward, queued back to back ----
             records, hidden_before = self.student.launch(states, reset_rows, want_snapshot=want,
                                                          flats=row_flats)
             if len(self.self_idx):
@@ -325,8 +333,6 @@ class MultiOpponentSimWorker:
 
             # ---- rewards, on the CPU: a host-to-device copy now would wait
             # for the forwards ----
-            stocks, percent = seat_stats(obs)
-            followers = Followers(*map(torch.as_tensor, follower_stats(obs)))
             if self._prev is not None and self.event_fn is not None:
                 ps, pp, _ = self._prev
                 live = ~reset_np
@@ -343,7 +349,7 @@ class MultiOpponentSimWorker:
                     followers=followers)
             self._prev = (stocks, percent, followers)
 
-            is_resetting, term = env.step_and_reset()
+            is_resetting, term = stepped.result()
             self.student.settle()
             for g in self.groups:
                 g.agent.settle()
@@ -399,6 +405,7 @@ class MultiOpponentSimWorker:
         self._pending[e] = (member, info)
 
     def close(self):
+        self._stepper.shutdown()
         self.env.close()
 
 
