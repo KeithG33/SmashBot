@@ -1,6 +1,8 @@
 """PPO learner tests: clip math, KL/entropy leaf math, and full update steps
 on synthetic trajectories rolled out by a real (tiny) policy."""
 
+import math
+
 import numpy as np
 import pytest
 import torch
@@ -73,13 +75,14 @@ def test_leaf_kl_entropy_match_torch_distributions():
 # ------------------------------------------------------- synthetic rollouts
 
 
-def _tiny_policy(seed=0):
+def _tiny_policy(seed=0, layout=""):
     torch.manual_seed(seed)
     policy = build_policy(
         embed_config=embed_lib.EmbedConfig(),
         controller_config=embed_lib.ControllerConfig(),
         network_config=configs.NetworkConfig(
-            name="sgu", num_layers=1, hidden_size=64, num_heads=1, window=4
+            name="sgu", num_layers=max(1, len(layout)), hidden_size=64, num_heads=1,
+            window=4, layout=layout,
         ),
         head_config=configs.ControllerHeadConfig(residual_size=32, component_depth=0),
         policy_config=configs.PolicyConfig(delay=2),
@@ -359,6 +362,30 @@ def test_precision_flag_plumbs_through_tyro():
     assert cfg.learner.precision == "fp16"
     cfg = tyro.cli(Config, args=["--ckpt", "bc.pt"])
     assert cfg.learner.precision == "fp32"
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and __import__("os").environ.get("SMASHBOT_GPU_TESTS")),
+    reason="cuda-only; set SMASHBOT_GPU_TESTS=1 on an IDLE gpu "
+           "(never beside a live training run)",
+)
+def test_learner_trains_a_hybrid_loaded_in_eval_mode_cuda():
+    """load_policy returns the policy in eval(); the hybrid's LSTM layers run
+    cuDNN, whose RNN backward refuses eval mode, so the learner must put the
+    policy back in training mode (as it keeps the teacher in eval)."""
+    to_cuda = lambda s: tree.map_structure(
+        lambda t: t.to("cuda") if isinstance(t, torch.Tensor) else t, s
+    )
+    policy = _tiny_policy(seed=0, layout="sl")
+    traj = to_cuda(_rollout(policy))
+    policy = policy.to("cuda").eval()
+    learner = Learner(
+        RLConfig(precision="fp16", ppo=PPOConfig(max_mean_actor_kl=1e9)),
+        policy, _tiny_policy(seed=0, layout="sl").to("cuda"), _tiny_value().to("cuda"),
+    )
+    _, metrics = learner.step([traj], learner.initial_state(3, "cuda"))
+    assert policy.training and not learner.teacher.training
+    assert all(math.isfinite(v) for v in metrics["post_update"].values() if isinstance(v, float))
 
 
 @pytest.mark.skipif(

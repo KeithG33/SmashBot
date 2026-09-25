@@ -223,6 +223,8 @@ class Learner:
         self.teacher = teacher
         self.value_function = value_function
 
+        self.policy.train()
+        self.value_function.train()
         self.teacher.requires_grad_(False)
         self.teacher.eval()
 
