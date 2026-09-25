@@ -8,11 +8,12 @@ and, for PFSP envs, re-seats the env on the grid for the opponent drawn a
 game ahead (rl/league.py: weights only ever load into EMPTY slices, so no
 seat is swapped mid-game).
 
-Learner rows = every env's student seat + the second seat of each self
-env, all served by ONE student forward (v10's row layout: rows are the
-VRAM budget, envs are cheap). Opponent seats: the phillip grid (static
-cells) and the PFSP grid (dynamic cells), one stacked forward each; every
-grid seat is harvested as a replay (rollouts.HarvestAssembler).
+Learner rows = every env's student seat, one per game (self-play games
+included). ONE student forward serves those seats plus each self env's
+second seat, which plays but is not learned from. Opponent seats: the
+phillip grid (static cells) and the PFSP grid (dynamic cells), one stacked
+forward each; every grid seat is harvested as a replay
+(rollouts.HarvestAssembler).
 """
 from __future__ import annotations
 
@@ -25,6 +26,7 @@ from smashbot.rl.agent import BatchedPolicyAgent
 from smashbot.networks import check_loadable
 from smashbot.rl.league import League, MemberWeights
 from smashbot.rl.pool import SnapshotPool
+from smashbot.rl.ppo import Learner
 from smashbot.rl.rollouts import ChunkAssembler, Followers, HarvestAssembler, compute_reward
 from smashbot.rl import sim_env
 from smashbot.rl.sim_env import follower_stats, seat_stats
@@ -142,7 +144,8 @@ class MultiOpponentSimWorker:
         """opponents: [(gid, policy, env_idx, name_code)] fixed groups (eval
         arena; not harvested). grids: static PfspGrids (phillip tiers), env ->
         gid via gid_of_env below. self_idx: envs whose player-1 seat is the
-        student too; those seats are learner rows N.. (v10 layout).
+        student too, served as rows N.. of the student forward; learner rows
+        are the first N (one per game).
         league/pfsp_grid: per-match PFSP routing (rl/league.League) over a
         dynamic PfspGrid. match_fn(env, member) -> (MatchConfig, info): the
         match for env's NEXT game (called at boot and every game end);
@@ -162,9 +165,9 @@ class MultiOpponentSimWorker:
         self.league = league
         self.self_idx = np.asarray(list(self_idx), dtype=np.int64)
         self.self_idx_t = torch.as_tensor(self.self_idx, device=device)
-        self.rows = batch_size + len(self.self_idx)
+        self.rows = batch_size
         self.student = BatchedPolicyAgent(
-            student_policy, self.rows, name_code=name_code, device=device,
+            student_policy, batch_size + len(self.self_idx), name_code=name_code, device=device,
             precision=precision, capture=capture,
             # capture's static state buffers hold fp16-computed values; fp32
             # storage costs an up/down cast per layer per frame (12.9 -> 9.4 ms
@@ -282,6 +285,9 @@ class MultiOpponentSimWorker:
             want = (self._pushed % T == 0)
             records, hidden_before = self.student.infer(states, reset_rows, want_snapshot=want,
                                                         flats=row_flats)
+            if len(self.self_idx):
+                learner_rows = lambda s: Learner._rows_take(s, 0, N, self.student.num_envs)
+                records, hidden_before = [learner_rows(r) for r in records], learner_rows(hidden_before)
 
             # ---- opponent seats (player 1) ----
             p1_rows = np.empty((N, 13), dtype=np.float32)
@@ -328,18 +334,14 @@ class MultiOpponentSimWorker:
                     torch.as_tensor(self._prev[1]), torch.as_tensor(percent),
                     torch.as_tensor(reset_np), prev_followers=self._prev[2],
                     followers=followers).to(dev)
-                if len(self.self_idx):
-                    self.assembler.push_reward(
-                        torch.cat([reward, -reward.index_select(0, self.self_idx_t)]))
-                else:
-                    self.assembler.push_reward(reward)
+                self.assembler.push_reward(reward)
                 for gr, harvest in zip(self._all_grids(), self.harvests):
                     harvest.push_reward((-reward[gr.idx_t]).clone())
             self._prev = (stocks, percent, followers)
 
             for rec in records:
                 snap = hidden_before if self._pushed % T == 0 else None
-                self.assembler.push_frame(rec, reset_rows, snap)
+                self.assembler.push_frame(rec, reset_rows[:N], snap)
                 self._pushed += 1
 
             is_resetting, term = env.step_and_reset()

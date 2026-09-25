@@ -2,11 +2,12 @@
 # Sim-backend league run from TEACHER, the BC checkpoint it starts from: a
 # fresh start, and a relaunch resumes the tag's latest.pt. TAG overrides the
 # run name.
-# The env/row/slice sizes are v12's (2026-09-15), fit for the pre-paper 6/576
-# SGU: 308 envs = 400 learner rows (self 30% of envs, both seats) / 40 pfsp
-# slices (108 pfsp envs, 2.7 per slice) / mb 12, first-step peak 18.6 GiB of
-# 21.2 reserved; 449 rows OOM'd at the first learner step. The paper block and
-# the slslsl layout change the memory: dry-run before the first launch.
+# Learner rows = envs, one per game (a self-play env's second seat is served,
+# not learned from). v12 fit 400 learner rows / 40 pfsp slices / mb 12 on the
+# pre-paper 6/576 SGU (first-step peak 18.6 GiB of 21.2 reserved; 449 rows
+# OOM'd), with self-play feeding both seats. 400 envs keeps 400 learner rows
+# and serves 520; the slslsl hybrid changes the memory: dry-run before the
+# first launch, and size the slices there (140 pfsp envs / 40 = 3.5 per slice).
 set -euo pipefail
 
 REPO=/home/kage/smashbot_workspace/SmashBot
@@ -33,7 +34,7 @@ exec $REPO/.venv/bin/python -m smashbot.rl.train_rl \
   --learner.imitation-rows -1 \
   --learner.imitation-lambda 0.01 \
   --learner.imitation-lambda-final-frac 1.0 \
-  --sim.num-envs 308 \
+  --sim.num-envs 400 \
   --sim.pfsp-slices 40 \
   --sim.unroll-length 240 \
   --sim.snapshot-interval 1500 \

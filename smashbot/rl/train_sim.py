@@ -31,13 +31,15 @@ _MSL_CHAR = {
 
 @dataclasses.dataclass
 class SimRolloutConfig:
-    # learner rows = num_envs + self envs (each self env feeds BOTH seats,
-    # v10's layout); rows are the VRAM budget: 308 envs @ self_frac .30
-    # = 400 rows (449 rows ran out of memory at the first learner step).
-    # Shares are of ENVS: self 30 / phillips 35 / pfsp 35 -> rows self 46% /
-    # phillips 27% / pfsp 27%; 108 pfsp envs over 40 slices = 2.7 games per
-    # loaded brain (fewer games per slice keeps the per-match draw honest)
-    num_envs: int = 308
+    # learner rows = num_envs, one per game (a self env's second seat is
+    # served but not learned from); rows are the VRAM budget: v12 fit 400
+    # learner rows (449 ran out of memory at the first learner step), and
+    # the student forward also serves the self envs' second seats (520 rows
+    # at 400 envs). Shares of envs = shares of rows: self 30 / phillips 35 /
+    # pfsp 35; 140 pfsp envs over 40 slices = 3.5 games per loaded brain,
+    # above v10's 2.6 (more games per slice, more fallback draws). Sized for
+    # the 6/576 SGU: the hybrid's dry run re-derives envs and slices.
+    num_envs: int = 400
     unroll_length: int = 240
     # frames of each harvested seat's own history the learner runs before
     # its imitation chunk, without gradients, so the chunk starts warm
@@ -50,7 +52,7 @@ class SimRolloutConfig:
     # (12.9 vs 12.0 ms @400 rows); with fp16 statics it wins (9.4 ms).
     capture_serving: bool = True
     # --- pool shares (fractions of num_envs) ---
-    self_frac: float = 0.30       # of envs (row share 2s/(1+s))
+    self_frac: float = 0.30       # of envs = of learner rows
     phillip_tiers: tuple[str, ...] = ("medium", "plat", "diamond", "master", "gm")
     phillip_fracs: tuple[float, ...] = (0.04, 0.06, 0.07, 0.08, 0.10)  # 35% of envs
     # everything left after self+phillips (~35%) is the PFSP pool
@@ -374,7 +376,7 @@ def run(args) -> None:
         print(f"boot snapshot: seeded empty archive at step {start_step}", flush=True)
     worker = SimLeagueWorker(scfg, league, serving_policy, name_code, device)
     print(f"sim league: {scfg.num_envs} envs -> {worker.rows} learner rows "
-          f"(self {len(worker.part['self'])} x2, phillips "
+          f"(self {len(worker.part['self'])}, phillips "
           f"{sum(len(v) for k, v in worker.part.items() if k.startswith('phillip'))}, "
           f"pfsp {len(worker.part['pfsp'])})", flush=True)
     if restored_trackers:
