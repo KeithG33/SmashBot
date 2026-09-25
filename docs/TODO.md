@@ -265,6 +265,25 @@ graph (no functionalization there, so `index_copy_` is legal). The ring's
 non-canonical state layout is acceptable for SERVING state, which is never
 compared or checkpointed — unlike the learner's.
 
+## Upstream slippi-ai: 359 commits ahead of our pin (checked 2026-09-25)
+Pinned at 51acbf3 (2026-06-08). Don't bump the submodule wholesale: StateAction.action
+became a list (native frame skip) and gained `rating`, slippi_ai.data grew ~800 lines
+(our BC loader uses it), and the venv's editable slippi_ai install points at this
+checkout, which the paused slslsl mega (wt-mega) also imports, so a bump would change its
+data pipeline on resume. parse_peppi is unchanged (our parsed dataset stays valid); no
+bug fixes in the modules we use. Neither side parses Whispy's wind (only a TODO in
+upgrade_slp.py), and slippi-ai's Game leaves out Stadium transformations, so the model
+sees neither. Worth porting selectively:
+- RL reward shaping for v13: RewardConfig.default() adds a bad-ledge-grab penalty
+  (0.02), an approach bonus (1e-3, off while the opponent is dead) and an offstage
+  stalling penalty (0.2/s past 30 units, only while the opponent is onstage). Our sim
+  reward is stocks, damage and Nana only; the stalling penalty guards against RL finding
+  degenerate offstage stalling.
+- Character balancing for the next BC run: fully balanced characters, epoch sized by the
+  smallest subset, legal characters only (bf9f877, ee124ee, 615cc51).
+- Rating conditioning (0f912b0, 86f485f, 975456b): a rating embedding instead of, or
+  beside, our rank-name codes.
+
 ## v13 design decisions (Keith, 2026-09-16; mostly settled 2026-09-25)
 - **Teacher: the slslsl hybrid** (bf16 BC, delay 18, its own `sl` critic).
   Which BC step becomes the teacher is still open (BC and RL share one GPU).
