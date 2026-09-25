@@ -129,9 +129,12 @@ class HarvestAssembler:
     """
 
     def __init__(self, unroll_length: int, delay: int, controller_embedding, name_code: int,
-                 burn_in: int = 0):
+                 burn_in: int = 0, view=None):
+        """view: the stacked per-frame states -> the Trajectory's state struct
+        (the worker pushes each frame's flats and views them once per chunk)."""
         assert delay >= 1, delay
         self.T, self.D, self.burn_in = unroll_length, delay, burn_in
+        self._view = view or (lambda states: states)
         self._embed = controller_embedding
         self._name_code = name_code
         self._history = 0   # frames buffered before the chunk's first
@@ -180,8 +183,8 @@ class HarvestAssembler:
         idx = torch.as_tensor(rows, device=device)
         resets = resets.index_select(0, idx)
         pressed = np.stack(pressed, axis=1)[rows]
-        stack = lambda frames: tree.map_structure(
-            lambda *xs: torch.stack(xs, dim=1).index_select(0, idx), *frames)
+        stack = lambda frames: self._view(tree.map_structure(
+            lambda *xs: torch.stack(xs, dim=1).index_select(0, idx), *frames))
         name = lambda n: torch.full((len(rows), n), self._name_code, dtype=torch.int64, device=device)
         chunk_resets = resets[:, h:h + T + 1].clone()
         prefix = None

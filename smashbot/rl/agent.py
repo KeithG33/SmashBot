@@ -612,9 +612,10 @@ class LeagueAgent:
         return record
 
     @torch.no_grad()
-    def launch(self, views, resets: torch.Tensor, flats=None) -> FrameRecord:
+    def launch(self, views, resets: torch.Tensor, flats=None, record: bool = True):
         """infer() without waiting on the GPU: settle() appends the sampled
-        controllers to the delay queues."""
+        controllers to the delay queues. views may be None when flats are
+        given; record=False skips the FrameRecord (returns None)."""
         prev = tree.map_structure(
             lambda pv, n: torch.where(
                 resets.view(self.S, self.N, *([1] * (pv.dim() - 2))), n, pv
@@ -625,7 +626,8 @@ class LeagueAgent:
             ctrl, logits = self._captured_forward(views, prev, resets, flats)
         else:
             ctrl, logits, self._hidden = self._vm(
-                self._stacked_params, self._stacked_buffers, views, prev,
+                self._stacked_params, self._stacked_buffers,
+                views if views is not None else self._view_fn(flats), prev,
                 self._hidden, resets,
             )
         if self._timer is not None:
@@ -634,7 +636,12 @@ class LeagueAgent:
             lambda t: t.clone() if t.dtype == torch.bool else t.long().clone(), ctrl
         )
         flat = lambda t: t.reshape(self.S * self.N, *t.shape[2:])
-        record = FrameRecord(
+        self._to_host.start(tree.map_structure(flat, ctrl))
+        if not record:
+            return None
+        if views is None:
+            views = self._view_fn(flats)
+        frame = FrameRecord(
             state=tree.map_structure(flat, views),
             prev_action=tree.map_structure(
                 lambda x: flat(x.clone() if x.dtype == torch.bool else x.long().clone()),
@@ -643,10 +650,9 @@ class LeagueAgent:
             logits=tree.map_structure(flat, logits),
             name=flat(self._name).clone(),
         )
-        self._to_host.start(tree.map_structure(flat, ctrl))
         if self._timer is not None:
             self._timer("record")
-        return record
+        return frame
 
     def settle(self) -> None:
         """Waits for the last launch()'s sampled controllers and appends them

@@ -189,7 +189,7 @@ class MultiOpponentSimWorker:
         self.harvests = [
             HarvestAssembler(unroll_length, student_policy.delay,
                              student_policy.controller_head.controller_embedding, name_code,
-                             burn_in)
+                             burn_in, view=self.ff.view)
             for _ in self._all_grids()]
         for g in self.groups:
             g.agent.set_flat_controllers(True)
@@ -324,12 +324,12 @@ class MultiOpponentSimWorker:
             for g, g_reset in zip(self.groups, group_resets):
                 gflats = tuple(t.index_select(0, g.idx_t) for t in opp_flats)
                 g.agent.launch(self.ff.view(gflats), g_reset, want_snapshot=False, flats=gflats)
-            grid_records = []
+            grid_flats = []
             for gr, (_, gr_reset, _) in zip(self._all_grids(), grid_seats):
                 gflats = tuple(t.index_select(0, gr.idx_t).view(gr.S, gr.Nc, t.shape[-1])
                                for t in opp_flats)
-                grid_records.append(gr.agent.launch(
-                    self.ff.view(gflats), gr_reset.view(gr.S, gr.Nc), flats=gflats))
+                gr.agent.launch(None, gr_reset.view(gr.S, gr.Nc), flats=gflats, record=False)
+                grid_flats.append(tuple(t.view(-1, t.shape[-1]) for t in gflats))
 
             # ---- rewards, on the CPU: a host-to-device copy now would wait
             # for the forwards ----
@@ -359,9 +359,9 @@ class MultiOpponentSimWorker:
             if reward is not None:
                 reward = reward.to(dev)
                 self.assembler.push_reward(reward)
-            for gr, harvest, grec, (rows_all, gr_reset, tenure) in zip(
-                    self._all_grids(), self.harvests, grid_records, grid_seats):
-                harvest.push_frame(grec.state, rows_all, gr_reset, tenure)
+            for gr, harvest, gflats, (rows_all, gr_reset, tenure) in zip(
+                    self._all_grids(), self.harvests, grid_flats, grid_seats):
+                harvest.push_frame(gflats, rows_all, gr_reset, tenure)
                 if reward is not None:
                     harvest.push_reward((-reward[gr.idx_t]).clone())
             for rec in records:
