@@ -28,12 +28,12 @@ exec $REPO/.venv/bin/python -m smashbot.rl.train_rl \
   --learner.learning-rate 3e-5 \
   --learner.precision fp16 \
   --learner.micro-batches 12 \
-  --learner.kl-teacher-weight 0.025 \
-  --learner.kl-teacher-weight-final -1 \
+  --learner.kl-teacher-weight 0.075 \
+  --learner.kl-teacher-weight-final 0.01 \
   --learner.entropy-weight 1e-4 \
   --learner.imitation-rows -1 \
-  --learner.imitation-lambda 0.01 \
-  --learner.imitation-lambda-final-frac 1.0 \
+  --learner.imitation-lambda 0.05 \
+  --learner.imitation-lambda-final-frac 0.2 \
   --sim.num-envs 400 \
   --sim.pfsp-slices 40 \
   --sim.unroll-length 240 \
