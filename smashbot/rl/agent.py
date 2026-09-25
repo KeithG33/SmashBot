@@ -66,17 +66,40 @@ class FrameRecord(tp.NamedTuple):
     name: torch.Tensor  # [N]
 
 
-def _controller_to_host(ctrl):
+class _HostCopy:
     """One device-to-host copy for the whole sampled controller (13 uint8/bool
-    leaves -> one [.., 13] tensor); each leaf comes back in its own dtype."""
-    leaves = tree.flatten(ctrl)
-    pack = (torch.uint8 if all(t.dtype in (torch.bool, torch.uint8) for t in leaves)
-            else torch.int64)
-    packed = torch.stack([t.to(pack) for t in leaves], dim=-1).cpu().numpy()
-    return tree.unflatten_as(ctrl, [
-        packed[..., k].astype(torch.empty(0, dtype=t.dtype).numpy().dtype)
-        for k, t in enumerate(leaves)
-    ])
+    leaves -> one [.., 13] tensor), queued into pinned memory without waiting;
+    wait() blocks on it and returns each leaf in its own dtype."""
+
+    def __init__(self):
+        self._buf = None
+        self._pending = None
+
+    def start(self, ctrl) -> None:
+        assert self._pending is None, "a copy is still in flight: wait() first"
+        leaves = tree.flatten(ctrl)
+        pack = (torch.uint8 if all(t.dtype in (torch.bool, torch.uint8) for t in leaves)
+                else torch.int64)
+        packed = torch.stack([t.to(pack) for t in leaves], dim=-1)
+        if self._buf is None or self._buf.shape != packed.shape or self._buf.dtype != pack:
+            self._buf = torch.empty(packed.shape, dtype=pack, pin_memory=packed.is_cuda)
+        self._buf.copy_(packed, non_blocking=True)
+        done = None
+        if packed.is_cuda:
+            done = torch.cuda.Event()
+            done.record()
+        self._pending = (ctrl, [t.dtype for t in leaves], done)
+
+    def wait(self):
+        ctrl, dtypes, done = self._pending
+        self._pending = None
+        if done is not None:
+            done.synchronize()
+        packed = self._buf.numpy()
+        return tree.unflatten_as(ctrl, [
+            packed[..., k].astype(torch.empty(0, dtype=dt).numpy().dtype)
+            for k, dt in enumerate(dtypes)
+        ])
 
 
 class BatchedPolicyAgent:
@@ -137,6 +160,7 @@ class BatchedPolicyAgent:
             collections.deque([_neutral_controller()] * self.delay)
             for _ in range(num_envs)
         ]
+        self._to_host = _HostCopy()
         # manual CUDA-graph capture with STATIC buffers.
         # torch.compile's cudagraph trees hand back outputs that the next
         # replay overwrites, forcing a full clone of the carried state every
@@ -222,9 +246,6 @@ class BatchedPolicyAgent:
         records, hidden_before = self.infer(states, resets, want_snapshot)
         return to_execute, records, hidden_before
 
-    @torch.no_grad()  # rollout stepping is inference: without this the
-    # compiled sample saves every frame's activations for a backward that
-    # never comes
     def infer(
         self, states: tp.Any, resets: torch.Tensor, want_snapshot: bool = True,
         flats: tuple | None = None,
@@ -234,6 +255,20 @@ class BatchedPolicyAgent:
         One forward; the sampled controllers are appended to the delay
         queues. Returns [FrameRecord] and the recurrent snapshot from just
         before the forward (None unless wanted) for chunk-boundary bookkeeping."""
+        out = self.launch(states, resets, want_snapshot, flats)
+        self.settle()
+        return out
+
+    @torch.no_grad()  # rollout stepping is inference: without this the
+    # compiled sample saves every frame's activations for a backward that
+    # never comes
+    def launch(
+        self, states: tp.Any, resets: torch.Tensor, want_snapshot: bool = True,
+        flats: tuple | None = None,
+    ) -> tuple[list[FrameRecord], tp.Any]:
+        """infer() without waiting on the GPU: settle() appends the sampled
+        controllers to the delay queues. Nothing executed before then depends
+        on them (execute() pops what was decided a delay ago)."""
         hidden_before = self.hidden_snapshot() if want_snapshot else None
         prev = tree.map_structure(
             lambda pv, n: torch.where(
@@ -272,10 +307,13 @@ class BatchedPolicyAgent:
             logits=tree.map_structure(lambda x: x.clone(), logits),
             name=self._name.clone(),
         )
-        encoded_np = _controller_to_host(ctrl)
-        decoded = self._embed_controller.decode(encoded_np)
-        self._enqueue(decoded)
+        self._to_host.start(ctrl)
         return [record], hidden_before
+
+    def settle(self) -> None:
+        """Waits for the last launch()'s sampled controllers and appends them
+        to the delay queues."""
+        self._enqueue(self._embed_controller.decode(self._to_host.wait()))
 
     def _autocast(self):
         dev = torch.device(self.device).type
@@ -476,6 +514,7 @@ class LeagueAgent:
         self._graph = None
         self._vm = self._make_vmap()
         self._timer = None  # optional profiler callback (name) -> None
+        self._to_host = _HostCopy()
         # eager-path recurrent state [S, N, ...]; the captured path keeps
         # state in its static in/out buffers — lazy, so capture-mode never
         # allocates this third full copy
@@ -542,13 +581,20 @@ class LeagueAgent:
         rows = self.execute()
         return rows, self.infer(views, resets)
 
-    @torch.no_grad()
     def infer(self, views, resets: torch.Tensor, flats=None) -> FrameRecord:
         """views: encoded Game struct batched [S, N, ...] on device; resets:
         [S, N] bool on device (True on a cell's first frame of a game —
         zeroes its recurrent state and substitutes the neutral prev action).
         One forward; the sampled controllers are appended to the delay
         queues. Returns ONE FrameRecord over all S*N cells."""
+        record = self.launch(views, resets, flats)
+        self.settle()
+        return record
+
+    @torch.no_grad()
+    def launch(self, views, resets: torch.Tensor, flats=None) -> FrameRecord:
+        """infer() without waiting on the GPU: settle() appends the sampled
+        controllers to the delay queues."""
         prev = tree.map_structure(
             lambda pv, n: torch.where(
                 resets.view(self.S, self.N, *([1] * (pv.dim() - 2))), n, pv
@@ -577,17 +623,24 @@ class LeagueAgent:
             logits=tree.map_structure(flat, logits),
             name=flat(self._name).clone(),
         )
+        self._to_host.start(tree.map_structure(flat, ctrl))
+        if self._timer is not None:
+            self._timer("record")
+        return record
+
+    def settle(self) -> None:
+        """Waits for the last launch()'s sampled controllers and appends them
+        to the delay queues."""
         from smashbot import encode
 
-        encoded_np = _controller_to_host(tree.map_structure(flat, ctrl))
+        encoded_np = self._to_host.wait()
         if self._timer is not None:
-            self._timer("record+to_cpu")
+            self._timer("to_cpu")
         rows = encode.controller_rows(self._embed_controller.decode(encoded_np))
         for q, row in zip(self._queues, rows):
             q.append(row)
         if self._timer is not None:
             self._timer("decode+queues")
-        return record
 
     # ---------------------------------------------------------- forward
 

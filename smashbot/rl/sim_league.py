@@ -283,24 +283,18 @@ class MultiOpponentSimWorker:
                 row_flats = flats
             states = self.ff.view(row_flats)
             want = (self._pushed % T == 0)
-            records, hidden_before = self.student.infer(states, reset_rows, want_snapshot=want,
-                                                        flats=row_flats)
-            if len(self.self_idx):
-                learner_rows = lambda s: Learner._rows_take(s, 0, N, self.student.num_envs)
-                records, hidden_before = [learner_rows(r) for r in records], learner_rows(hidden_before)
 
-            # ---- opponent seats (player 1) ----
+            # ---- opponent seats (player 1): what they press now ----
             p1_rows = np.empty((N, 13), dtype=np.float32)
             if len(self.self_idx):
                 p1_rows[self.self_idx] = rows[N:]
+            group_resets = []
             for g in self.groups:
                 p1_rows[g.env_idx] = np.stack(
                     g.agent.execute(np.nonzero(g._reset)[0].tolist()))
-                gflats = tuple(t.index_select(0, g.idx_t) for t in opp_flats)
-                gstates = self.ff.view(gflats)
-                g.agent.infer(gstates, torch.as_tensor(g._reset, device=dev),
-                              want_snapshot=False, flats=gflats)
-            for gr, harvest in zip(self._all_grids(), self.harvests):   # each grid: ONE forward
+                group_resets.append(torch.as_tensor(g._reset, device=dev))
+            grid_seats = []
+            for gr in self._all_grids():
                 gr.sync()
                 gr_reset = reset_np[gr.cell_env]
                 gr_reset[~gr.valid] = True         # idle cells: perpetual reset
@@ -308,17 +302,29 @@ class MultiOpponentSimWorker:
                     gr.agent.reset_cell(cell // gr.Nc, cell % gr.Nc)
                 rows_all = gr.agent.execute()
                 p1_rows[gr.cell_env[gr.valid]] = rows_all[gr.valid]
-                gflats = tuple(t.index_select(0, gr.idx_t).view(gr.S, gr.Nc, t.shape[-1])
-                               for t in opp_flats)
-                gviews = self.ff.view(gflats)
-                grec = gr.agent.infer(
-                    gviews, torch.as_tensor(gr_reset.reshape(gr.S, gr.Nc), device=dev),
-                    flats=gflats)
-                harvest.push_frame(grec.state, rows_all, torch.as_tensor(gr_reset, device=dev),
-                                   gr.tenure.copy())
+                grid_seats.append((rows_all, torch.as_tensor(gr_reset, device=dev),
+                                   gr.tenure.copy()))
             sim_env.write_controller_rows(env, p1_rows, player=1)
 
-            # ---- rewards ----
+            # ---- every seat's forward, queued back to back: the sim steps
+            # while they run (what it executes was decided a delay ago) ----
+            records, hidden_before = self.student.launch(states, reset_rows, want_snapshot=want,
+                                                         flats=row_flats)
+            if len(self.self_idx):
+                learner_rows = lambda s: Learner._rows_take(s, 0, N, self.student.num_envs)
+                records, hidden_before = [learner_rows(r) for r in records], learner_rows(hidden_before)
+            for g, g_reset in zip(self.groups, group_resets):
+                gflats = tuple(t.index_select(0, g.idx_t) for t in opp_flats)
+                g.agent.launch(self.ff.view(gflats), g_reset, want_snapshot=False, flats=gflats)
+            grid_records = []
+            for gr, (_, gr_reset, _) in zip(self._all_grids(), grid_seats):
+                gflats = tuple(t.index_select(0, gr.idx_t).view(gr.S, gr.Nc, t.shape[-1])
+                               for t in opp_flats)
+                grid_records.append(gr.agent.launch(
+                    self.ff.view(gflats), gr_reset.view(gr.S, gr.Nc), flats=gflats))
+
+            # ---- rewards, on the CPU: a host-to-device copy now would wait
+            # for the forwards ----
             stocks, percent = seat_stats(obs)
             followers = Followers(*map(torch.as_tensor, follower_stats(obs)))
             if self._prev is not None and self.event_fn is not None:
@@ -328,23 +334,35 @@ class MultiOpponentSimWorker:
                     self.event_fn(int(i), self.env_opp[i], "kill", float(pp[i, 1]))
                 for i in np.nonzero(live & (stocks[:, 0] < ps[:, 0]))[0]:
                     self.event_fn(int(i), self.env_opp[i], "death", float(pp[i, 0]))
+            reward = None
             if self._prev is not None:
                 reward = compute_reward(
                     torch.as_tensor(self._prev[0]), torch.as_tensor(stocks),
                     torch.as_tensor(self._prev[1]), torch.as_tensor(percent),
                     torch.as_tensor(reset_np), prev_followers=self._prev[2],
-                    followers=followers).to(dev)
-                self.assembler.push_reward(reward)
-                for gr, harvest in zip(self._all_grids(), self.harvests):
-                    harvest.push_reward((-reward[gr.idx_t]).clone())
+                    followers=followers)
             self._prev = (stocks, percent, followers)
 
+            is_resetting, term = env.step_and_reset()
+            self.student.settle()
+            for g in self.groups:
+                g.agent.settle()
+            for gr in self._all_grids():
+                gr.agent.settle()
+
+            if reward is not None:
+                reward = reward.to(dev)
+                self.assembler.push_reward(reward)
+            for gr, harvest, grec, (rows_all, gr_reset, tenure) in zip(
+                    self._all_grids(), self.harvests, grid_records, grid_seats):
+                harvest.push_frame(grec.state, rows_all, gr_reset, tenure)
+                if reward is not None:
+                    harvest.push_reward((-reward[gr.idx_t]).clone())
             for rec in records:
                 snap = hidden_before if self._pushed % T == 0 else None
                 self.assembler.push_frame(rec, reset_rows[:N], snap)
                 self._pushed += 1
 
-            is_resetting, term = env.step_and_reset()
             self._reset_mask = np.asarray(is_resetting, dtype=bool)
             done = np.asarray(term["done"], dtype=bool)
             if done.any():
