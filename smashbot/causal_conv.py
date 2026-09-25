@@ -147,3 +147,67 @@ def _grads(ctx, gy):
 
 
 causal_conv.register_autograd(_grads, setup_context=_setup_context)
+
+
+@triton.jit
+def _ring(ring, v, w, bias, cache_len, ptr, y, C,
+          ring_ss, ring_sb, ring_sm, v_ss, v_sb, w_ss, bias_ss, cl_ss, cl_sb, ptr_ss, y_ss, y_sb,
+          M: tl.constexpr, MM: tl.constexpr, BC: tl.constexpr):
+    c = tl.program_id(0) * BC + tl.arange(0, BC)
+    b = tl.program_id(1)
+    sl = tl.program_id(2)
+    cm = c < C
+    p0 = tl.load(ptr + sl * ptr_ss)
+    first = M - tl.load(cache_len + sl * cl_ss + b * cl_sb)   # oldest valid position
+    acc = tl.zeros((BC,), dtype=tl.float32)
+    for s0 in range(0, M, MM):
+        s = s0 + tl.arange(0, MM)
+        pos = (s - p0 + M) % M                                  # slot s holds this position
+        m = ((s < M) & (pos >= first))[:, None] & cm[None, :]
+        x = tl.load(ring + sl * ring_ss + b * ring_sb + s[:, None] * ring_sm + c[None, :], mask=m, other=0.0)
+        k = tl.load(w + sl * w_ss + pos[:, None] * C + c[None, :], mask=m, other=0.0)
+        acc += tl.sum(x.to(tl.float32) * k.to(tl.float32), axis=0)
+    now = tl.load(v + sl * v_ss + b * v_sb + c, mask=cm, other=0.0).to(tl.float32)
+    acc += now * tl.load(w + sl * w_ss + M * C + c, mask=cm, other=0.0).to(tl.float32)
+    acc += tl.load(bias + sl * bias_ss + c, mask=cm, other=0.0).to(tl.float32)
+    tl.store(y + sl * y_ss + b * y_sb + c, acc.to(y.dtype.element_ty), mask=cm)
+
+
+def _ring_forward(ring, v, weight, bias, cache_len, ptr, MM=32, BC=64):
+    """Over a leading slice dim: ring [S, B, W-1, C], v [S, B, C], weight
+    [S, C, 1, W], bias [S, C], cache_len [S, B], ptr [S] -> [S, B, C]."""
+    S, B, M, C = ring.shape
+    wt = weight.reshape(S, C, M + 1).to(v.dtype).transpose(1, 2).contiguous()   # [S, W, C]
+    bias = bias.to(v.dtype)
+    y = v.new_empty(S, B, C)
+    _ring[(triton.cdiv(C, BC), B, S)](
+        ring, v, wt, bias, cache_len, ptr, y, C,
+        ring.stride(0), ring.stride(1), ring.stride(2), v.stride(0), v.stride(1), wt.stride(0),
+        bias.stride(0), cache_len.stride(0), cache_len.stride(1), ptr.stride(0), y.stride(0), y.stride(1),
+        M=M, MM=MM, BC=BC)
+    return y
+
+
+@torch.library.custom_op("smashbot::causal_conv_ring", mutates_args=())
+def causal_conv_ring(ring: torch.Tensor, v: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor,
+                     cache_len: torch.Tensor, ptr: torch.Tensor) -> torch.Tensor:
+    """One serving frame of the conv, read from the v-cache ring in slot order:
+    ring [B, W-1, C] (slot s holds window position (s - ptr) mod (W-1);
+    positions below W-1-cache_len are stale), v [B, C] the frame's own v,
+    weight [C, 1, W], bias [C], cache_len [B], ptr [] -> [B, C] in v's dtype.
+    Serving only (no backward)."""
+    return _ring_forward(ring[None], v[None], weight[None], bias[None], cache_len[None], ptr[None])[0]
+
+
+@causal_conv_ring.register_fake
+def _(ring, v, weight, bias, cache_len, ptr):
+    return v.new_empty(v.shape)
+
+
+@causal_conv_ring.register_vmap
+def _(info, in_dims, ring, v, weight, bias, cache_len, ptr):
+    """The grid's slices in one launch: batch dims to the front, unbatched
+    inputs broadcast over the slices."""
+    lead = lambda t, d: t.movedim(d, 0) if d is not None else t.expand(info.batch_size, *t.shape)
+    args = (ring, v, weight, bias, cache_len, ptr)
+    return _ring_forward(*(lead(t, d) for t, d in zip(args, in_dims))), 0

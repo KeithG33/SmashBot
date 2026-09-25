@@ -161,7 +161,7 @@ def test_student_serving_matches_eager_under_capture_and_ring(layout):
 
 @GPU
 @pytest.mark.parametrize("layout", LAYOUTS)
-@pytest.mark.parametrize("read,tol", [("gather", 0.0), ("roll", 5e-2)])
+@pytest.mark.parametrize("read,tol", [("gather", 0.0), ("roll", 5e-2), ("fused", 5e-2)])
 def test_grid_ring_matches_canonical_under_capture(layout, read, tol):
     """LeagueAgent (fp16 stacked slices, captured vmap) with the ring vs without:
     every slice's recurrent state over three wraps, staggered resets, two seat
@@ -236,3 +236,40 @@ def test_fp16_grid_keeps_norm_weights_fp32():
     assert all(t.dtype == torch.float16 for k, t in grid._stacked_params.items()
                if k not in norms and t.dim() > 2)
 
+
+@GPU
+def test_fused_ring_read_matches_the_roll_read():
+    """causal_conv_ring against the roll read computed in fp32 and rounded to
+    fp16: one slice, and the grid's vmap over slices with their own weights,
+    pointers and cache lengths (empty and full included). C and W-1 are not
+    multiples of the kernel's blocks."""
+    from smashbot.causal_conv import causal_conv_ring
+    from smashbot.networks import SGUBlock
+    torch.manual_seed(0)
+    S, N, C, W = 3, 7, 48, 20
+    blocks = [SGUBlock(C, W).cuda() for _ in range(S)]
+    for b in blocks:
+        _randomize(b)
+    ring = torch.randn(S, N, W - 1, C, device="cuda").half()
+    v = torch.randn(S, N, C, device="cuda").half()
+    cache_len = torch.randint(0, W, (S, N), device="cuda")
+    cache_len[0, :2] = torch.tensor([0, W - 1])
+    ptr = torch.tensor([0, 5, W - 2], device="cuda")
+    weight = torch.stack([b.spatial.weight.detach() for b in blocks]).half()
+    bias = torch.stack([b.spatial.bias.detach() for b in blocks]).half()
+
+    def roll_read(s):   # the reference: SGUCore's roll read in fp32
+        blk = blocks[s]
+        core = SGUCore(C, C, 1, W)
+        where = core._ring_index(ptr[s], cache_len[s], "cuda", roll=True)
+        with torch.no_grad():
+            blk.spatial.weight.copy_(weight[s].float()); blk.spatial.bias.copy_(bias[s].float())
+            out, _ = blk._spatial_ring(v[s, :, None].float(), ring[s].float(), where, "roll")
+        return out[:, 0].half()
+
+    want = torch.stack([roll_read(s) for s in range(S)])
+    one = torch.stack([causal_conv_ring(ring[s], v[s], weight[s], bias[s], cache_len[s], ptr[s])
+                       for s in range(S)])
+    batched = torch.vmap(causal_conv_ring)(ring, v, weight, bias, cache_len, ptr)
+    assert torch.equal(one, batched), "the vmap rule must compute each slice as a single call does"
+    torch.testing.assert_close(batched.float(), want.float(), rtol=1e-3, atol=2e-3)

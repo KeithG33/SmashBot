@@ -520,13 +520,13 @@ class LeagueAgent:
         # v-cache ring (capture-only, see BatchedPolicyAgent): the captured graph
         # writes one slot per layer per frame and carries the rest of the state
         # in place, so there is no per-frame carry outside it. The grid's
-        # forward is eager vmap, so the ring is read with rotated weights (no
-        # gather to fuse).
+        # forward is eager vmap, where nothing fuses the ring read, so it is one
+        # kernel (causal_conv_ring).
         self._core = getattr(self._template.network, "core", None)
         self._ring = (self._use_capture and hasattr(self._core, "initial_ring_state")
                       and ring is not False)
         if self._ring:
-            self._core.ring_read = "roll"
+            self._core.ring_read = "fused"
         self._graph = None
         self._vm = self._make_vmap()
         self._timer = None  # optional profiler callback (name) -> None

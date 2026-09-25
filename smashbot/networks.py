@@ -14,7 +14,7 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 
-from smashbot.causal_conv import causal_conv
+from smashbot.causal_conv import causal_conv, causal_conv_ring
 
 RecurrentState = tp.Any
 
@@ -582,15 +582,23 @@ class SGUBlock(nn.Module):
         v_mixed = self.spatial(v_full.transpose(1, 2)).transpose(1, 2)
         return v_mixed, v_full[:, -(W - 1):].contiguous()
 
-    def _spatial_ring(self, v, v_ring, idx, valid, roll):
+    def _spatial_ring(self, v, v_ring, where, read):
         # gather-by-age: inductor fuses the gather into the reduction (no window
         # materialized) and the summation order matches _spatial: exact in
         # eager, within the compile-vs-eager fp16 floor under inductor. roll:
         # eager paths can't fuse a gather, so rotate the (tiny) weights and
         # read the ring in slot order (different order -> fp16-ULP class).
+        # fused: roll's read as one kernel (fp32 accumulation), for the grid's
+        # eager vmap, where nothing fuses the masked copy, product and sum.
+        if read == "fused":
+            ptr, cache_len = where
+            v_mixed = causal_conv_ring(v_ring, v[:, 0], self.spatial.weight, self.spatial.bias,
+                                       cache_len, ptr)
+            return v_mixed.unsqueeze(1), v[:, 0]
+        idx, valid = where
         W = self.window
         w = self.spatial.weight.squeeze(1)[:, : W - 1]
-        if roll:
+        if read == "roll":
             hist = torch.where(valid[:, :, None], v_ring.to(v.dtype), 0.0)
             w = w.index_select(1, idx)
         else:
@@ -602,12 +610,12 @@ class SGUBlock(nn.Module):
         ).unsqueeze(1)
         return v_mixed, v[:, 0]
 
-    def mix_ring(self, x, v_ring, kv_cache, attn_mask, idx, valid, roll=False):
+    def mix_ring(self, x, v_ring, kv_cache, attn_mask, where, read="gather"):
         """Serving with the v-cache as a ring: returns the NEW slot [B, d]
         instead of a shifted cache; the caller writes it in place."""
         xn = self.mix_norm(x)
         u, v = _recomputed_in_backward(self._uv, xn)
-        v_mixed, v_new = self._spatial_ring(v, v_ring, idx, valid, roll)
+        v_mixed, v_new = self._spatial_ring(v, v_ring, where, read)
         attn, new_kv = self._attend(xn, kv_cache, attn_mask)
         x = x + self.mix_out(u * (v_mixed + attn))
 
@@ -722,7 +730,7 @@ class SGUCore(Network):
         )
         self.final_norm = RMSNorm(hidden_size)
         self.output_size = hidden_size
-        self.ring_read = "gather"   # "roll" for eager (vmap) serving paths
+        self.ring_read = "gather"   # "roll" or "fused" for eager (vmap) serving paths
 
     def initial_state(self, batch_size, device=None):
         z = lambda *shape: torch.zeros(*shape, device=device)
@@ -810,10 +818,11 @@ class SGUCore(Network):
         x = self.encoder(inputs)
         mask = self._attn_mask(T, state["cache_len"], inputs.shape[0], inputs.device)
         ring = "ptr" in state
-        roll = self.ring_read == "roll"
+        read = self.ring_read
         if ring:
             assert T == 1, "ring mode is the serving path"
-            idx, valid = self._ring_index(state["ptr"], state["cache_len"], inputs.device, roll)
+            where = ((state["ptr"], state["cache_len"]) if read == "fused" else
+                     self._ring_index(state["ptr"], state["cache_len"], inputs.device, read == "roll"))
         new_layers = []
         for block, layer in zip(self.blocks, state["layers"]):
             if isinstance(block, RecurrentBlock):
@@ -822,7 +831,7 @@ class SGUCore(Network):
                 continue
             v_cache, kv_cache = layer
             if ring:
-                x, v_new, nkv = block.mix_ring(x, v_cache, kv_cache, mask, idx, valid, roll)
+                x, v_new, nkv = block.mix_ring(x, v_cache, kv_cache, mask, where, read)
                 new_layers.append((v_new, nkv))
             else:
                 x, nv, nkv = block.mix(x, v_cache, kv_cache, mask)
