@@ -265,30 +265,18 @@ graph (no functionalization there, so `index_copy_` is legal). The ring's
 non-canonical state layout is acceptable for SERVING state, which is never
 compared or checkpointed — unlike the learner's.
 
-## v13 design decisions (Keith, 2026-09-16 evening — NO action yet)
-Launch only once the teacher question is settled; the teacher cannot change
-mid-run, and three things are open at once (fp32 vs bf16; SGU vs tx_like now
-that the latency table inverted; delay 18 vs 21).
-
-- **Pool mix.** v12 runs self 46% / phillips 27% / PFSP 27% of learner ROWS,
-  because `self_frac=0.30` is a share of ENVS and each self env contributes two
-  rows (`2s/(1+s)`). That silently cut phillip signal from v11's 35%. Keith wants
-  one learner row per self-play game plus a larger phillip share. Note the two
-  routes are not equivalent:
-    - `self_frac=0.176`, both seats -> 30% self rows, no extra envs, but the two
-      rows of a game are CORRELATED (same trajectory, mirrored).
-    - one row per self game -> independent rows, but needs ~400 envs for 400
-      rows (~30% more sim CPU per frame).
-- **Schedules.** v12 holds both flat (`kl-teacher-weight 0.025 --final -1`,
-  `imitation-lambda 0.01 --final-frac 1.0`). v10 phase 2 held imitation at
-  0.002, so v12 runs 5x that constantly. Decay both over the run (the machinery
-  exists: `kl_teacher_weight_final`, `imitation_lambda_final_frac`).
-- **Open question, cheap to test:** the phillips are LSTMs served under fp16
-  autocast. If precision hurts LSTM recurrence (the BC result suggests it may),
-  our opponents play below true strength and "winrate vs gm" is not calibrated.
-  `check_fp16_state.py` does NOT cover this — it compared fp16 vs fp32 STATE
-  STORAGE with the forward in fp16 both times. Test = lockstep fp32 vs fp16
-  forward for one phillip, compare action agreement.
+## v13 design decisions (Keith, 2026-09-16; mostly settled 2026-09-25)
+- **Teacher: the slslsl hybrid** (bf16 BC, delay 18, its own `sl` critic).
+  Which BC step becomes the teacher is still open (BC and RL share one GPU).
+- **Pool mix.** DONE: one learner row per self-play game (96eac7c; a self
+  env's second seat plays but is not learned from), so shares of envs are
+  shares of rows. The Phillip tier fractions are decided later.
+- **Schedules.** Decay both the teacher KL and the imitation coefficient
+  (Keith); end values still to pick. The machinery is linear in
+  `step / --runtime.steps`, so changing `--runtime.steps` mid-run moves both.
+- **Phillip fp16 serving: resolved.** The league's Phillip serving (fp16
+  stacked weights, fp16 caches, hand-rolled cells) agrees with an fp32 forward
+  on 99.996% of actions (scripts/check_serving_precision.py, 2026-09-23).
 
 ## A/B: residual stream in fp32 under bf16/fp16 autocast (Keith, 2026-09-24)
 - Today the encoder's output enters the core in bf16 (fp16 in RL), so every block's
