@@ -27,7 +27,7 @@ exec $REPO/.venv/bin/python -m smashbot.rl.train_rl \
   --runtime.checkpoint-interval 25 \
   --learner.learning-rate 3e-5 \
   --learner.precision fp16 \
-  --learner.micro-batches 12 \
+  --learner.micro-batches 6 \
   --learner.kl-teacher-weight 0.075 \
   --learner.kl-teacher-weight-final 0.01 \
   --learner.entropy-weight 1e-4 \
