@@ -346,7 +346,7 @@ def run(args) -> None:
         serving_policy.sample = torch.compile(
             serving_policy.sample,
             mode=None if scfg.capture_serving else "reduce-overhead")
-        compile_cores(policy, value_fn)   # after the serving deepcopy: a later copy would run these weights
+        compile_cores(policy, value_fn, teacher)   # after the serving deepcopy: a later copy would run these weights
 
     # ---- league ----
     snap_dir = f"{run_dir}/snapshots"
