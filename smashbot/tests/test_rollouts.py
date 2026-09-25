@@ -87,6 +87,32 @@ def test_compute_reward():
     assert torch.equal(r, torch.zeros(2))
 
 
+
+def test_compute_reward_counts_nana_at_half_weight():
+    """Nana's first dead frame and her damage count at half a leader's, only
+    while she is present: env0 our Nana dies taking 10; env1 the opponent's
+    Nana takes 20 and ours vanishes alive (an absent follower is zeroed, and
+    action 0 is a dead action); env2 ours returns."""
+    from smashbot.rl.rollouts import Followers
+
+    s = torch.full((3, 2), 4.0)
+    p = torch.zeros(3, 2)
+    f = lambda present, dying, percent: Followers(
+        torch.tensor(present), torch.tensor(dying), torch.tensor(percent))
+    prev = f([[True, False], [True, True], [False, False]],
+             [[False, True], [False, False], [True, True]],
+             [[30.0, 0.0], [50.0, 5.0], [0.0, 0.0]])
+    cur = f([[True, False], [False, True], [True, False]],
+            [[True, True], [True, False], [False, True]],
+            [[40.0, 0.0], [0.0, 25.0], [0.0, 0.0]])
+    no_reset = torch.zeros(3, dtype=torch.bool)
+    r = compute_reward(s, s, p, p, no_reset, prev_followers=prev, followers=cur)
+    assert r.tolist() == pytest.approx([-0.5 * (1 + 0.1), 0.5 * 0.2, 0.0])
+    assert torch.equal(compute_reward(s, s, p, p, no_reset), torch.zeros(3))
+    r = compute_reward(s, s, p, p, torch.ones(3, dtype=torch.bool),
+                       prev_followers=prev, followers=cur)
+    assert torch.equal(r, torch.zeros(3))
+
 def test_batched_agent_matches_independent_runs(monkeypatch):
     """N=2 envs fed identical states must behave like two synced single runs:
     env-batching cannot leak information across the batch. Sampling is

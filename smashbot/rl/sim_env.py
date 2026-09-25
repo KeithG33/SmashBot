@@ -18,6 +18,7 @@ from __future__ import annotations
 import melee
 import numpy as np
 
+from slippi_ai import reward as reward_lib
 from slippi_ai import types
 from slippi_db.parsing_utils import ItemAssigner
 from smashbot import embed as embed_lib
@@ -38,24 +39,10 @@ _INTERNAL_STAGE = np.array(
 _RANDALL_HLR = np.array([melee.stages.randall_position(f) for f in range(1200)])
 
 
-def _empty_nana(n: int) -> types.Nana:
-    z = np.zeros(n, np.float32)
-    zi = np.zeros(n, np.int64)
-    zb = np.zeros(n, np.bool_)
-    return types.Nana(
-        exists=zb, percent=z, facing=z, x=z, y=z, action=zi, invulnerable=zb,
-        character=zi, jumps_left=zi, shield_strength=z, on_ground=zb,
-    )
-
-
-def _player(slot: np.ndarray) -> types.Player:
-    """One player slot of an MslObservation batch -> slippi_ai Player.
-
-    slot: structured array [N] for one viewpoint-relative slot. nana is left
-    empty (the sim's per-player slots don't expose Ice Climbers' follower;
-    Popo plays with nana.exists=0 -- a minor obs gap, tracked as follow-up).
-    """
-    return types.Player(
+def _fighter(slot: np.ndarray) -> dict:
+    """One fighter record of an MslObservation batch (a player slot or its
+    follower), [N] structured, in the replays' conventions (parse_peppi)."""
+    return dict(
         percent=np.floor(slot["percent"]).astype(np.float32),   # replays store whole percent
         facing=slot["facing"].astype(np.bool_),        # 0 left / 1 right -> bool right
         x=slot["pos_x"].astype(np.float32),
@@ -66,8 +53,16 @@ def _player(slot: np.ndarray) -> types.Player:
         jumps_left=slot["jumps_left"].astype(np.int64),
         shield_strength=slot["shield_hp"].astype(np.float32),
         on_ground=slot["on_ground"].astype(np.bool_),
+    )
+
+
+def _player(slot: np.ndarray, follower: np.ndarray) -> types.Player:
+    """A player slot and its follower (Ice Climbers' Nana; zeroed while
+    absent, as the replays carry her) -> slippi_ai Player."""
+    return types.Player(
+        **_fighter(slot),
         controller=None,                                # not encoded in the game state
-        nana=_empty_nana(len(slot)),
+        nana=types.Nana(exists=follower["present"].astype(np.bool_), **_fighter(follower)),
     )
 
 
@@ -126,14 +121,14 @@ def obs_to_game(obs: np.ndarray, items: np.ndarray, self_slot: int = 0,
     (positions are world coords; only the slot roles change), which is how we
     build the player-1 input from the same frame.
     """
-    slots = obs["slots"]  # [N, 4] structured
+    slots, followers = obs["slots"], obs["followers"]  # [N, 4] structured
     stage = obs["stage"]
     stage_id = _INTERNAL_STAGE[obs["stage_id"]]
     on_yoshis = stage_id == melee.Stage.YOSHIS_STORY.value
     height, left, right = _RANDALL_HLR[(obs["frame_id"] + 1200) % 1200].T
     return types.Game(
-        p0=_player(slots[:, self_slot]),
-        p1=_player(slots[:, opp_slot]),
+        p0=_player(slots[:, self_slot], followers[:, self_slot]),
+        p1=_player(slots[:, opp_slot], followers[:, opp_slot]),
         stage=stage_id,
         randall=_RANDALL_T(
             x=np.where(on_yoshis, (left + right) / 2, 0).astype(np.float32),
@@ -253,3 +248,11 @@ def seat_stats(obs):
     stocks = np.stack([s[:, 0]["stocks"], s[:, 1]["stocks"]], axis=1).astype(np.float32)
     percent = np.stack([s[:, 0]["percent"], s[:, 1]["percent"]], axis=1).astype(np.float32)
     return stocks, percent
+
+
+def follower_stats(obs) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(present, dying, percent), each [N, 2] in seat_stats' columns: the
+    seats' followers (Nana), zeroed while absent."""
+    f = obs["followers"][:, :2]
+    return (f["present"].astype(np.bool_), reward_lib.is_dying(f["action_id"]),
+            f["percent"].astype(np.float32))

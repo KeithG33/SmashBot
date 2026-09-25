@@ -22,28 +22,17 @@ carry copy ~0.13. So a grid ring with the ROLL-THE-WEIGHTS read (same cost as
 today, ~1e-6 tolerance — acceptable for opponent seats) removes ~2.5 ms/frame:
 9.6 -> ~7. Beyond that only a compiled grid-native forward fuses the read.
 
-## Expose Nana (Ice Climbers' follower) from melee-sim-light (Keith, 2026-09-23)
-- The mismatch: replays (slippi_db.parse_peppi, Slippi records Nana as a follower) and
-  Dolphin (libmelee `player.nana`) give the policy Nana's full state, and the embedding
-  uses it (`with_nana=True`); Nana is present on ~71% of Popo frames in the replays. The
-  sim simulates her exactly (upstream validates Ice Climbers replays bit-exact, incl.
-  Nana), but `MslObservation` has only per-player slots and no follower fields, so
-  `rl/sim_env.py` reports `nana.exists=0` on every frame.
-- Consequence in sim RL and sim evals: a student playing Ice Climbers can't see its own
-  Nana; against Ice Climbers, Nana is invisible but still hits. The KL teacher and the
-  Phillip opponents get the same blind input; a sim-trained policy meets a visible Nana
-  only in Dolphin. About 1 seat in 12 per player.
-- Upstream (checked 2026-09-24, pinned at origin/main 978598dc):
-  still no follower in the observation (`melee_sim/dtypes.py` unchanged); no Python
-  accessor for the core's follower lanes.
-- Patch: `src/runtime/observation.c` writes each player with `write_player(...)` into
-  `output->slots[...]`; a 1v1 leaves two of the four slots empty. Write Popo's follower
-  fighter (`sub_character_entity`) there with the same writer, mark it as a follower
-  (a flag in the slot dtype, `melee_sim/dtypes.py`), and read it into `nana` in
-  `sim_env._player`. Rebuild (`make python-release`), then pin it in
-  `smashbot/tests/test_sim_encoding.py` with an Ice Climbers fixture. Or ask upstream.
-- Until then, leaving ICE_CLIMBERS out of the sim character lists (`rl/train_sim.py`,
-  `eval/sim_arena.py`) removes the gap at the cost of the matchup.
+## Nana exposed from melee-sim-light: PR pending (Keith, 2026-09-24)
+- Done on branch `sim-nana` here and `fix/ice-climbers-follower-observation` in vendor/melee-sim-light
+  (e861419e, local): the observation gains `followers[4]` (Nana of the player in each
+  slot), and `rl/sim_env.py` fills `Player.nana` from it as parse_peppi does. Verified:
+  upstream's replay validator on its Ice Climbers suite (28 replays, 270,067 frames),
+  live vs compare observations byte-identical with Nana present (context_smoke), and
+  test_sim_encoding's Ice Climbers ditto embedding exactly as the BC replay path.
+- The submodule points at the PR commit (kyhavlov/melee-sim-light#31, pushed); repin to
+  upstream main once it merges.
+- The RL sim reward counts Nana at nana_ratio 0.5 as BC's value targets do (slippi-ai
+  compute_rewards); test_sim_encoding checks her term against it on the ditto, every frame.
 
 ## DONE (branch ring-serving, worktree SmashBot-ring, 2026-09-16 late): SGU v-cache ring under capture
 Frame @400 (fixed bench, fp16 + fp16 statics, capture): 9.4 -> 6.3 ms; GPU 8.08 ->

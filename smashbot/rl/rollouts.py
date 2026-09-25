@@ -5,7 +5,8 @@
   expects (reward slot t = the game transition at sample-time t + delay).
 - HarvestAssembler: an opponent seat's pressed controllers -> imitation
   chunks aligned exactly as BC aligns replays.
-- compute_reward: stock/percent deltas -> reward, zeroed at game boundaries.
+- compute_reward: stock/percent deltas (Nana's at half weight) -> reward,
+  zeroed at game boundaries.
 - GameTracker: per-opponent-class win/stock/kill-percent statistics.
 
 Consumed by the sim training worker (rl/sim_league.py) and the sim eval
@@ -219,6 +220,13 @@ class HarvestAssembler:
             self._embed.from_state(encode.controller_from_rows(rows)))
 
 
+class Followers(tp.NamedTuple):
+    """Each seat's follower (Ice Climbers' Nana), [N, 2] (own, opp)."""
+    present: torch.Tensor  # bool
+    dying: torch.Tensor    # bool, in a dead action (slippi_ai.reward.is_dying)
+    percent: torch.Tensor
+
+
 def compute_reward(
     prev_stocks: torch.Tensor,  # [N, 2] (own, opp)
     stocks: torch.Tensor,
@@ -226,20 +234,28 @@ def compute_reward(
     percent: torch.Tensor,
     is_resetting: torch.Tensor,  # [N]
     damage_ratio: float = 0.01,
+    prev_followers: Followers | None = None,
+    followers: Followers | None = None,
+    nana_ratio: float = 0.5,
 ) -> torch.Tensor:
     """Zero-sum reward from the bot's perspective, zeroed at game boundaries.
 
     death: stock decrease. damage: positive percent delta (percent resets to
-    zero on death; negative deltas are ignored).
+    zero on death; negative deltas are ignored). A follower counts at
+    nana_ratio, as in the value targets BC trains on (slippi_ai
+    compute_rewards): a death on entering a dead action, damage as above,
+    both only on frames where she is present.
     """
-    own_death = (stocks[:, 0] < prev_stocks[:, 0]).float()
-    opp_death = (stocks[:, 1] < prev_stocks[:, 1]).float()
-    # Percent is a raw libmelee read; the state path wraps+clamps it but
-    # the reward path would pass garbage straight through. Nothing deals
-    # 100% in one frame, so the delta cap keeps |reward| <= 2.
-    own_dmg = (percent[:, 0] - prev_percent[:, 0]).clamp(min=0, max=100)
-    opp_dmg = (percent[:, 1] - prev_percent[:, 1]).clamp(min=0, max=100)
-    reward = (opp_death - own_death) + damage_ratio * (opp_dmg - own_dmg)
+    # Percent is a raw read; nothing deals 100% in one frame, so the delta
+    # cap bounds |reward| by 3 (2 without followers).
+    loss = ((stocks < prev_stocks).float()
+            + damage_ratio * (percent - prev_percent).clamp(min=0, max=100))
+    if followers is not None:
+        death = (followers.dying & ~prev_followers.dying).float()
+        damage = (followers.percent - prev_followers.percent).clamp(min=0, max=100)
+        nana = torch.where(followers.present, death + damage_ratio * damage, 0.0)
+        loss = loss + nana_ratio * nana
+    reward = loss[:, 1] - loss[:, 0]
     return torch.where(is_resetting, torch.zeros_like(reward), reward)
 
 
