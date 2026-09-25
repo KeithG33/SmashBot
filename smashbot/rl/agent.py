@@ -441,6 +441,7 @@ class LeagueAgent:
         device, temperature=None, capture: bool | None = None,
         weights_dtype: torch.dtype = torch.float32,
         state_dtype: torch.dtype | None = None,
+        ring: bool | None = None,
     ):
         import copy
 
@@ -511,6 +512,16 @@ class LeagueAgent:
             "LeagueAgent capture=True needs a CUDA device"
         )
         self._use_capture = capture
+        # v-cache ring (capture-only, see BatchedPolicyAgent): the captured graph
+        # writes one slot per layer per frame and carries the rest of the state
+        # in place, so there is no per-frame carry outside it. The grid's
+        # forward is eager vmap, so the ring is read with rotated weights (no
+        # gather to fuse).
+        self._core = getattr(self._template.network, "core", None)
+        self._ring = (self._use_capture and hasattr(self._core, "initial_ring_state")
+                      and ring is not False)
+        if self._ring:
+            self._core.ring_read = "roll"
         self._graph = None
         self._vm = self._make_vmap()
         self._timer = None  # optional profiler callback (name) -> None
@@ -532,14 +543,18 @@ class LeagueAgent:
         tree.map_structure(lambda t: t[s1, n1].copy_(t[s0, n0]), self._prev)
         if not (self._use_capture and self._graph is not None) and self._hidden is None:
             self._hidden = self._initial_hidden()   # lazy (pre-capture move)
-        hidden = self._out_hidden if self._use_capture and self._graph is not None else self._hidden
+        if self._ring and self._graph is not None:
+            hidden = self._in_hidden          # carried in place by the graph
+        else:
+            hidden = self._out_hidden if self._use_capture and self._graph is not None else self._hidden
 
         def cell(t, s, n):   # state leaves are [S, N, ...], torch RNN state [S, layers, N, H]
             x = t[s]
             return x[n] if x.shape[0] == self.N else x[:, n]
 
-        tree.map_structure(
-            lambda t: cell(t, s1, n1).copy_(cell(t, s0, n0)) if isinstance(t, torch.Tensor) else None,
+        tree.map_structure(   # the ring's ptr [S] is shared by every cell
+            lambda t: cell(t, s1, n1).copy_(cell(t, s0, n0))
+            if isinstance(t, torch.Tensor) and t.dim() >= 2 else None,
             hidden,
         )
         self._queues[s1 * self.N + n1] = self._queues[s0 * self.N + n0]
@@ -645,7 +660,8 @@ class LeagueAgent:
     # ---------------------------------------------------------- forward
 
     def _initial_hidden(self):
-        h0 = [self._template.initial_state(self.N, self.device) for _ in range(self.S)]
+        make = self._core.initial_ring_state if self._ring else self._template.initial_state
+        h0 = [make(self.N, self.device) for _ in range(self.S)]
         stacked = tree.map_structure(
             lambda *xs: torch.stack(xs) if isinstance(xs[0], torch.Tensor) else xs[0],
             *h0,
@@ -703,11 +719,11 @@ class LeagueAgent:
             tree.map_structure(lambda d, s: d.copy_(s), self._in_views, views)
         tree.map_structure(lambda d, s: d.copy_(s), self._in_prev, prev)
         self._in_resets.copy_(resets)
-        # recurrent state: static in <- last replay's static out
-        tree.map_structure(
-            lambda d, s: d.copy_(s) if isinstance(d, torch.Tensor) else None,
-            self._in_hidden, self._out_hidden,
-        )
+        if not self._ring:   # recurrent state: static in <- last replay's static out
+            tree.map_structure(
+                lambda d, s: d.copy_(s) if isinstance(d, torch.Tensor) else None,
+                self._in_hidden, self._out_hidden,
+            )
         self._graph.replay()
         ctrl = tree.map_structure(lambda t: t.clone(), self._out_ctrl)
         logits = tree.map_structure(lambda t: t.clone(), self._out_logits)
@@ -743,9 +759,31 @@ class LeagueAgent:
         self._graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self._graph):
             self._out_ctrl, self._out_logits, self._out_hidden = self._vm(*args)
+            if self._ring:
+                self._ring_carry()
         # the just-captured pass ran with warm-up inputs; hidden restarts
         # from the initial state on the first real replay
-        tree.map_structure(
-            lambda d, s_: d.copy_(s_) if isinstance(d, torch.Tensor) else None,
-            self._out_hidden, self._in_hidden,
-        )
+        if self._ring:
+            tree.map_structure(
+                lambda d, s_: d.copy_(s_) if isinstance(d, torch.Tensor) else None,
+                self._in_hidden, self._initial_hidden(),
+            )
+        else:
+            tree.map_structure(
+                lambda d, s_: d.copy_(s_) if isinstance(d, torch.Tensor) else None,
+                self._out_hidden, self._in_hidden,
+            )
+
+    def _ring_carry(self):
+        ptr = self._in_hidden["ptr"]                      # [S], all equal
+        for layer, new in zip(self._in_hidden["layers"], self._out_hidden["layers"]):
+            if not isinstance(layer, tuple):   # recurrent layer: one state tensor
+                layer.copy_(new)
+                continue
+            (v_ring, kv), (v_new, kv_new) = layer, new
+            assert v_new.dim() == 3 and v_ring.dim() == 4, "ring carry takes [S, N, d] slots"
+            v_ring.index_copy_(2, ptr[:1], v_new.unsqueeze(2).to(v_ring.dtype))
+            kv.copy_(kv_new)
+        self._in_hidden["cache_len"].copy_(self._out_hidden["cache_len"])
+        ptr.add_(1)
+        ptr.remainder_(self._core.window - 1)

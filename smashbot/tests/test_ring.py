@@ -55,18 +55,22 @@ def _ring_step(core, x, reset, ring):
 
 
 @pytest.mark.parametrize("layout", LAYOUTS)
-def test_ring_matches_canonical_across_wraps_and_resets(layout):
+@pytest.mark.parametrize("read,tol", [("gather", 0.0), ("roll", 1e-4)])
+def test_ring_matches_canonical_across_wraps_and_resets(layout, read, tol):
+    """gather (the student's read) is exact; roll (the grid's: rotated weights,
+    slot order) sums in another order, so it agrees to rounding."""
     core = _core(layout)
+    core.ring_read = read
     xs, rs = _stream()
     can, ring = core.initial_state(B), core.initial_ring_state(B)
     with torch.no_grad():
         for t, (x, reset) in enumerate(zip(xs, rs)):
             yc, can = core.step_with_reset(x, reset, can)
             yr, ring = _ring_step(core, x, reset, ring)
-            assert torch.equal(yc, yr), f"output differs at frame {t}"
+            assert (yc - yr).abs().max().item() <= tol, f"output differs at frame {t}"
             exported = core.canonical_state(ring)   # what the learner receives
             for a, b in zip(tree.flatten(can), tree.flatten(exported)):
-                assert torch.equal(a, b), f"state differs at frame {t}"
+                assert (a.float() - b.float()).abs().max().item() <= tol, f"state differs at frame {t}"
 
 
 @pytest.mark.parametrize("layout", LAYOUTS)
@@ -102,10 +106,10 @@ GPU = pytest.mark.skipif(
     reason="cuda-only; set SMASHBOT_GPU_TESTS=1 on an IDLE gpu (never beside a live training run)")
 
 
-def _policy(layout, dev):
+def _policy(layout, dev, seed=0):
     from smashbot import configs, embed as embed_lib
     from smashbot.policy import build_policy
-    torch.manual_seed(0)
+    torch.manual_seed(seed)
     pol = build_policy(
         embed_config=embed_lib.EmbedConfig(), controller_config=embed_lib.ControllerConfig(),
         network_config=configs.NetworkConfig(name="sgu", num_layers=len(layout), layout=layout,
@@ -153,3 +157,68 @@ def test_student_serving_matches_eager_under_capture_and_ring(layout):
         for name, other in (("capture", snaps[1]), ("ring", snaps[2])):
             for x, y in zip(tree.flatten(snaps[0]), tree.flatten(other)):
                 assert torch.equal(x, y), f"{name} state differs at frame {t}"
+
+
+@GPU
+@pytest.mark.parametrize("layout", LAYOUTS)
+@pytest.mark.parametrize("read,tol", [("gather", 0.0), ("roll", 5e-2)])
+def test_grid_ring_matches_canonical_under_capture(layout, read, tol):
+    """LeagueAgent (fp16 stacked slices, captured vmap) with the ring vs without:
+    every slice's recurrent state over three wraps, staggered resets, two seat
+    moves and a reload of a different member's weights. roll sums in another
+    order in fp16 (opponent seats only; nothing enters a loss)."""
+    from smashbot import embed as embed_lib, encode
+    from smashbot.rl import sim_env
+    from smashbot.rl.agent import LeagueAgent
+    from scripts.bench_agent_step import _rand_raw
+    dev, S, N = "cuda", 2, 8
+    sd, other = _policy(layout, dev).state_dict(), _policy(layout, dev, seed=7).state_dict()
+    game = embed_lib.EmbedConfig().make_game_embedding()
+    ff = sim_env.FlatFrames(dev)
+    rng = np.random.default_rng(1)
+
+    def frame():
+        enc = game.from_state(_rand_raw(game, rng, S * N))
+        flats = tuple(t.view(S, N, t.shape[-1])
+                      for t in ff.to_device(encode.flatten_typed_batched(enc, S * N)))
+        return ff.view(flats), flats
+
+    g = torch.Generator().manual_seed(2)
+    frames = [frame() for _ in range(FRAMES)]
+    resets = [(torch.rand(S, N, generator=g) < 0.08).to(dev) for _ in range(FRAMES)]
+    resets[0][:] = True
+    moves, reload_at = {9: ((0, 1), (1, 5)), 23: ((1, 0), (1, 7))}, 31
+
+    def make(ring):
+        a = LeagueAgent(_policy(layout, dev), S, N, 1, dev, capture=True,
+                        weights_dtype=torch.float16, state_dtype=torch.float16, ring=ring)
+        if ring:
+            a._core.ring_read = read
+        for s in range(S):
+            a.load_slice(s, sd)
+        a.set_flat_inputs(ff.view)
+        return a
+
+    canonical, ringed = make(False), make(True)
+    assert ringed._ring and not canonical._ring
+    prev = tree.map_structure(torch.clone, canonical._prev)
+    for t in range(FRAMES):
+        views, flats = frames[t]
+        for a in (canonical, ringed):
+            a._prev = tree.map_structure(torch.clone, prev)   # open loop
+            if t in moves:
+                a.move_cell(*moves[t])
+            if t == reload_at:
+                a.load_slice(1, other)
+            a.execute()
+            a.infer(views, resets[t], flats=flats)
+        flat = lambda h: {k: v for k, v in h.items() if k != "ptr"} | {
+            "layers": [tuple(x.reshape(S * N, *x.shape[2:]) for x in l) if isinstance(l, tuple)
+                       else l.reshape(S * N, *l.shape[2:]) for l in h["layers"]],
+            "cache_len": h["cache_len"].reshape(-1)}
+        want = flat(canonical._out_hidden)
+        got = ringed._core.canonical_state({**flat(ringed._in_hidden), "ptr": ringed._in_hidden["ptr"][0]})
+        assert torch.equal(want["cache_len"], got["cache_len"]), f"cache_len differs at frame {t}"
+        for x, y in zip(tree.flatten(want["layers"]), tree.flatten(got["layers"])):
+            diff = (x.float() - y.float()).abs().max().item()
+            assert diff <= tol, f"state differs at frame {t}: {diff:.2e}"

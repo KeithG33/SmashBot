@@ -582,25 +582,32 @@ class SGUBlock(nn.Module):
         v_mixed = self.spatial(v_full.transpose(1, 2)).transpose(1, 2)
         return v_mixed, v_full[:, -(W - 1):].contiguous()
 
-    def _spatial_ring(self, v, v_ring, idx, valid):
-        # gather-by-age is fused into the reduction by inductor (no window
-        # materialized; measured), so the summation order matches _spatial
+    def _spatial_ring(self, v, v_ring, idx, valid, roll):
+        # gather-by-age: inductor fuses the gather into the reduction (no window
+        # materialized) and the summation order matches _spatial: exact in
+        # eager, within the compile-vs-eager fp16 floor under inductor. roll:
+        # eager paths can't fuse a gather, so rotate the (tiny) weights and
+        # read the ring in slot order (different order -> fp16-ULP class).
         W = self.window
-        w = self.spatial.weight.squeeze(1)
-        hist = torch.where(valid[:, :, None], v_ring.index_select(1, idx).to(v.dtype), 0.0)
+        w = self.spatial.weight.squeeze(1)[:, : W - 1]
+        if roll:
+            hist = torch.where(valid[:, :, None], v_ring.to(v.dtype), 0.0)
+            w = w.index_select(1, idx)
+        else:
+            hist = torch.where(valid[:, :, None], v_ring.index_select(1, idx).to(v.dtype), 0.0)
         v_mixed = (
-            (hist * w[:, : W - 1].t()).sum(dim=1)
-            + v[:, 0] * w[:, W - 1]
+            (hist * w.t()).sum(dim=1)
+            + v[:, 0] * self.spatial.weight.squeeze(1)[:, W - 1]
             + self.spatial.bias
         ).unsqueeze(1)
         return v_mixed, v[:, 0]
 
-    def mix_ring(self, x, v_ring, kv_cache, attn_mask, idx, valid):
+    def mix_ring(self, x, v_ring, kv_cache, attn_mask, idx, valid, roll=False):
         """Serving with the v-cache as a ring: returns the NEW slot [B, d]
         instead of a shifted cache; the caller writes it in place."""
         xn = self.mix_norm(x)
         u, v = _recomputed_in_backward(self._uv, xn)
-        v_mixed, v_new = self._spatial_ring(v, v_ring, idx, valid)
+        v_mixed, v_new = self._spatial_ring(v, v_ring, idx, valid, roll)
         attn, new_kv = self._attend(xn, kv_cache, attn_mask)
         x = x + self.mix_out(u * (v_mixed + attn))
 
@@ -715,6 +722,7 @@ class SGUCore(Network):
         )
         self.final_norm = RMSNorm(hidden_size)
         self.output_size = hidden_size
+        self.ring_read = "gather"   # "roll" for eager (vmap) serving paths
 
     def initial_state(self, batch_size, device=None):
         z = lambda *shape: torch.zeros(*shape, device=device)
@@ -761,9 +769,12 @@ class SGUCore(Network):
         s["ptr"] = torch.zeros((), dtype=torch.long, device=device)
         return s
 
-    def _ring_index(self, ptr, cache_len, device):
+    def _ring_index(self, ptr, cache_len, device, roll=False):
         W = self.window
         i = torch.arange(W - 1, device=device)
+        if roll:   # slot order: slot s holds canonical position (s - ptr) mod (W-1)
+            canon = (i - ptr) % (W - 1)
+            return canon, canon[None, :] >= (W - 1 - cache_len)[:, None]
         idx = (i + ptr) % (W - 1)                 # canonical position i -> ring slot
         valid = i[None, :] >= (W - 1 - cache_len)[:, None]
         return idx, valid
@@ -781,14 +792,16 @@ class SGUCore(Network):
     def step_with_reset(self, inputs, reset, prev_state):
         if "ptr" not in prev_state:
             return super().step_with_reset(inputs, reset, prev_state)
-        # stale ring slots are masked at read time by cache_len; never rewrite the ring
-        initial = self.initial_state(reset.shape[0], device=reset.device)
+        # stale ring slots are masked at read time by cache_len; never rewrite the
+        # ring, and never allocate the v zeros initial_state would (eager paths
+        # would memset them every frame)
         state = {
             "cache_len": torch.where(reset, 0, prev_state["cache_len"]),
             "ptr": prev_state["ptr"],
-            "layers": [(layer[0], _mask_state(reset, init[1], layer[1])) if isinstance(layer, tuple)
-                       else _mask_state(reset, init, layer)
-                       for layer, init in zip(prev_state["layers"], initial["layers"])],
+            "layers": [(layer[0], _mask_state(reset, torch.zeros_like(layer[1]), layer[1]))
+                       if isinstance(layer, tuple)
+                       else _mask_state(reset, torch.zeros_like(layer), layer)
+                       for layer in prev_state["layers"]],
         }
         return self.step(inputs, state)
 
@@ -797,9 +810,10 @@ class SGUCore(Network):
         x = self.encoder(inputs)
         mask = self._attn_mask(T, state["cache_len"], inputs.shape[0], inputs.device)
         ring = "ptr" in state
+        roll = self.ring_read == "roll"
         if ring:
             assert T == 1, "ring mode is the serving path"
-            idx, valid = self._ring_index(state["ptr"], state["cache_len"], inputs.device)
+            idx, valid = self._ring_index(state["ptr"], state["cache_len"], inputs.device, roll)
         new_layers = []
         for block, layer in zip(self.blocks, state["layers"]):
             if isinstance(block, RecurrentBlock):
@@ -808,7 +822,7 @@ class SGUCore(Network):
                 continue
             v_cache, kv_cache = layer
             if ring:
-                x, v_new, nkv = block.mix_ring(x, v_cache, kv_cache, mask, idx, valid)
+                x, v_new, nkv = block.mix_ring(x, v_cache, kv_cache, mask, idx, valid, roll)
                 new_layers.append((v_new, nkv))
             else:
                 x, nv, nkv = block.mix(x, v_cache, kv_cache, mask)
