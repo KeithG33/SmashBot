@@ -449,7 +449,8 @@ class LeagueAgent:
         self.device = torch.device(device)
         self.temperature = temperature
         # fp16 stacked weights halve the per-slice VRAM (107 -> 54 MB); the
-        # forward then runs under fp16 autocast (norms stay fp32)
+        # forward then runs under fp16 autocast. Norm weights stay fp32: the
+        # norms run in fp32, and an fp16 weight drops them off the fused kernel.
         self.weights_dtype = weights_dtype
         # optional recurrent-state storage dtype (see _initial_hidden); only
         # meaningful with the fp16-autocast forward
@@ -479,8 +480,12 @@ class LeagueAgent:
                 if dtype is not None and t.is_floating_point():
                     t = t.to(dtype)  # parameters only; buffers are constants
                 return t.unsqueeze(0).repeat(self.S, *([1] * t.dim())).clone()
+            norms = {f"{m_name}.{p_name}"
+                     for m_name, m in self._template.named_modules()
+                     if isinstance(m, (torch.nn.RMSNorm, torch.nn.LayerNorm))
+                     for p_name, _ in m.named_parameters(recurse=False)}
             self._stacked_params = {
-                k: stack(v, self.weights_dtype) for k, v in params.items()
+                k: stack(v, None if k in norms else self.weights_dtype) for k, v in params.items()
             }
             self._stacked_buffers = {k: stack(v) for k, v in buffers.items()}
         self._name = torch.full(
