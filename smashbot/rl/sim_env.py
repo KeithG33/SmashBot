@@ -208,6 +208,61 @@ class FlatFrames:
 _BUTTONS = ("A", "B", "X", "Y", "Z", "L", "R", "D_UP")
 
 
+class ShardedEnvBatch:
+    """EnvBatch's interface over several batches stepped in parallel, one
+    thread each: melee-sim-light drives a batch from any one thread at a time,
+    and a process's batches share its game data. current_frame is a copy of
+    the shards' frames in env order."""
+
+    def __init__(self, batch_size: int, shards: int, **kwargs):
+        import concurrent.futures
+        import melee_sim as msl
+        sizes = [len(a) for a in np.array_split(np.arange(batch_size), shards)]
+        self.bounds = np.cumsum([0] + sizes)
+        self.shards = [msl.EnvBatch(batch_size=n, **kwargs) for n in sizes]
+        self.batch_size, self.length = batch_size, self.shards[0].length
+        self._pool = concurrent.futures.ThreadPoolExecutor(shards, thread_name_prefix="sim-shard")
+
+    def _spans(self):
+        return zip(self.shards, self.bounds[:-1], self.bounds[1:])
+
+    @property
+    def t(self) -> int:
+        return self.shards[0].t
+
+    @property
+    def current_frame(self) -> np.ndarray:
+        return np.concatenate([s.current_frame for s in self.shards])
+
+    def configure_matches(self, configs, *, env_ids=None) -> None:
+        if env_ids is None:
+            for s, lo, hi in self._spans():
+                s.configure_matches(configs[lo:hi])
+            return
+        ids = np.asarray(env_ids)
+        for s, lo, hi in self._spans():
+            mine = np.nonzero((ids >= lo) & (ids < hi))[0]
+            if len(mine):
+                s.configure_matches([configs[i] for i in mine], env_ids=ids[mine] - lo)
+
+    def reset_all(self) -> None:
+        for s in self.shards:
+            s.reset_all()
+
+    def reset_cursor(self) -> None:
+        for s in self.shards:
+            s.reset_cursor()
+
+    def step_and_reset(self) -> tuple[np.ndarray, np.ndarray]:
+        stepped = list(self._pool.map(lambda s: s.step_and_reset(), self.shards))
+        return np.concatenate([r for r, _ in stepped]), np.concatenate([t for _, t in stepped])
+
+    def close(self) -> None:
+        self._pool.shutdown()
+        for s in self.shards:
+            s.close()
+
+
 def write_controller_rows(env, rows: np.ndarray, player: int) -> None:
     """Flat [N, 13] controller rows -> MslInputat
     (encode.controller_rows / BatchedPolicyAgent flat_controllers /
@@ -215,6 +270,14 @@ def write_controller_rows(env, rows: np.ndarray, player: int) -> None:
     ring via env.current_action_frame -- the previous version built a full
     [length, N] neutral controller and whole-buffer-assigned it through
     msl.write_controller, ~240x the numpy traffic, per player, per frame."""
+    if isinstance(env, ShardedEnvBatch):
+        for s, lo, hi in env._spans():
+            _write_rows(s, rows[lo:hi], player)
+    else:
+        _write_rows(env, rows, player)
+
+
+def _write_rows(env, rows: np.ndarray, player: int) -> None:
     p = env.current_action_frame["players"][..., int(player)]
     p["main_stick_x"] = rows[:, 0]
     p["main_stick_y"] = rows[:, 1]

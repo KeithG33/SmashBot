@@ -108,3 +108,36 @@ def test_self_play_second_seat_plays_but_is_not_a_learner_row(monkeypatch):
                    *tree.flatten(chunk.states), *tree.flatten(chunk.initial_state)]
         assert all(t.shape[0] == N for t in per_row if isinstance(t, torch.Tensor) and t.dim())
     np.testing.assert_array_equal(np.stack(sent), np.stack(executed)[:, N:])
+
+
+def test_sharded_sim_steps_as_one_batch():
+    """Envs split across sim batches stepped on parallel threads give the same
+    chunks as one batch: uneven shards, every env its own matchup and game
+    length (so a row routed to the wrong env, or a reset credited to the
+    wrong one, shows), games ending and reconfigured mid-run."""
+    T, N = 16, 5
+    C = msl.Character
+    pairs = [(C.FOX, C.FALCON), (C.MARTH, C.SHEIK), (C.FALCO, C.PEACH),
+             (C.JIGGLYPUFF, C.FOX), (C.SAMUS, C.MARTH)]
+
+    def match(e, member):
+        return msl.MatchConfig(stage=msl.Stage.BATTLEFIELD, seed=e, max_frame=40 + 9 * e,
+                               players=tuple(msl.PlayerConfig(c) for c in pairs[e])), None
+
+    def run(shards):
+        student = _policy(delay=2, seed=0)
+        worker = sim_league.MultiOpponentSimWorker(
+            student, [], N, T, str(paths.MSL_DATA_DIR), None, None, name_code=1,
+            self_idx=range(N), match_fn=match, shards=shards)
+        torch.manual_seed(1)
+        chunks, _ = worker.collect(12 * T)
+        worker.close()
+        return chunks
+
+    single, sharded = run(1), run(2)
+    assert len(single) == len(sharded) >= 10
+    resets = torch.cat([c.is_resetting[:, 1:] for c in single], dim=1)
+    assert resets.any() and not (resets == resets[:1]).all(), "resets must happen, staggered"
+    for a, b in zip(tree.flatten(single), tree.flatten(sharded)):
+        if isinstance(a, torch.Tensor):
+            assert a.dtype == b.dtype and torch.equal(a, b)

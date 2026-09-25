@@ -45,6 +45,9 @@ class SimRolloutConfig:
     # its imitation chunk, without gradients, so the chunk starts warm
     imitation_burn_in: int = 256
     data_dir: str = "/home/kage/drive2/ShineBot/msl-data"
+    # sim batches stepped in parallel threads: one batch's step (~18 ms at
+    # 400 envs) was the collect frame's critical path
+    sim_shards: int = 2
     rollout_precision: str = "fp16"
     # Manual static-buffer CUDA graph for the student forward. Its state
     # buffers are fp16 (sim_league): with fp32 statics the graph paid an
@@ -226,7 +229,7 @@ class SimLeagueWorker:
             grids=[self._phillip_grid], event_fn=self._on_event,
             self_idx=self.part["self"], league=self.league, pfsp_grid=self._grid,
             match_fn=self._match, max_frame=cfg.max_game_frames, seed=cfg.seed,
-            capture=cfg.capture_serving)
+            capture=cfg.capture_serving, shards=cfg.sim_shards)
         self.rows = self._worker.rows
 
     def env_share(self) -> dict:

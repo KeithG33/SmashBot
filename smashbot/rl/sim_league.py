@@ -141,7 +141,7 @@ class MultiOpponentSimWorker:
                  stage, char_pairs, name_code=1, device="cpu", record_fn=None,
                  precision="fp32", grids=(), event_fn=None, self_idx=(),
                  league=None, pfsp_grid=None, match_fn=None, max_frame=28800,
-                 seed=0, capture=False, burn_in=0):
+                 seed=0, capture=False, burn_in=0, shards=1):
         """opponents: [(gid, policy, env_idx, name_code)] fixed groups (eval
         arena; not harvested). grids: static PfspGrids (phillip tiers), env ->
         gid via gid_of_env below. self_idx: envs whose player-1 seat is the
@@ -153,7 +153,8 @@ class MultiOpponentSimWorker:
         default = the fixed stage/char_pairs given, fresh seed per game.
         record_fn(env, gid, s0, s1) / event_fn(env, gid, kind, pct) are
         called with the gid of the game the frames belong to; game_info[env]
-        holds match_fn's info for that game."""
+        holds match_fn's info for that game. shards: the envs are split into
+        that many sim batches, stepped in parallel (sim_env.ShardedEnvBatch)."""
         import melee_sim as msl
         self.msl = msl
         self.N = batch_size
@@ -232,8 +233,10 @@ class MultiOpponentSimWorker:
                     seed=self._rng.getrandbits(31), max_frame=self.max_frame)
                 return cfg, None
         self.match_fn = match_fn
-        self.env = msl.EnvBatch(batch_size=batch_size, length=max(64, unroll_length + 1),
-                                data_dir=data_dir)
+        length = max(64, unroll_length + 1)
+        self.env = (msl.EnvBatch(batch_size=batch_size, length=length, data_dir=data_dir)
+                    if shards == 1 else
+                    sim_env.ShardedEnvBatch(batch_size, shards, length=length, data_dir=data_dir))
         self._stepper = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="sim")
         cfgs = []
         for e in range(batch_size):
