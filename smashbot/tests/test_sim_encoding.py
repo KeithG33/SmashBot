@@ -215,3 +215,39 @@ def test_nana_encodes_as_the_replay_parser_does():
             np.testing.assert_array_equal(got, want)
         absent += int((~present).sum())
     assert absent, "Nana never left: the absent frames are untested"
+
+
+def test_nana_reward_is_the_value_targets_nana_term():
+    """An Ice Climbers ditto, every frame: Nana's part of the RL reward, from
+    what the sim observes (her replay rows as its lanes), equals her part of
+    the value targets BC trains on (slippi_ai compute_rewards, nana_ratio).
+    Percent is taken whole as the replays store it; the leader's units are
+    the reward's own concern, not Nana's."""
+    if not ICS_DITTO.is_file() or ICS_DITTO.stat().st_size < 1024:
+        pytest.skip(f"{ICS_DITTO.name} not fetched (git lfs pull --include='replays/validation/icies/**')")
+    import torch
+    from slippi_ai import reward, types
+    from slippi_db import parse_peppi
+    from smashbot.rl.rollouts import Followers, compute_reward
+    from tools.validation.slpz import replay_path_for_peppi
+
+    with replay_path_for_peppi(ICS_DITTO) as slp:
+        peppi = parse_peppi.read_slippi(str(slp))
+    replay = types.array_to_nt(types.Game, parse_peppi.from_peppi(peppi))
+    followers = []
+    for port in peppi.frames.ports:
+        present = ~np.isnan(port.follower.post.position.x.to_numpy(zero_copy_only=False))
+        lanes = _lanes(port.follower.post, present)
+        lanes["percent"] = np.floor(lanes["percent"])
+        followers.append(lanes)
+    obs = {"followers": np.stack(followers, axis=1)}          # [F, 2], frames as envs
+    f = Followers(*map(torch.as_tensor, sim_env.follower_stats(obs)))
+    prev, cur = (Followers(*(x[:-1] for x in f)), Followers(*(x[1:] for x in f)))
+    still = torch.zeros(len(f.present) - 1, 2)
+    no_reset = torch.zeros(len(still), dtype=torch.bool)
+    got = compute_reward(still, still, still, still, no_reset,
+                         prev_followers=prev, followers=cur).numpy()
+    want = reward.compute_rewards(replay) - reward.compute_rewards(replay, nana_ratio=0)
+    np.testing.assert_allclose(got, want, atol=1e-6)
+    deaths = (cur.dying & ~prev.dying & cur.present).sum().item()
+    assert deaths and np.count_nonzero(want) > deaths, "no Nana deaths or damage to compare"

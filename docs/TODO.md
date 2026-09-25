@@ -29,10 +29,10 @@ today, ~1e-6 tolerance — acceptable for opponent seats) removes ~2.5 ms/frame:
   upstream's replay validator on its Ice Climbers suite (28 replays, 270,067 frames),
   live vs compare observations byte-identical with Nana present (context_smoke), and
   test_sim_encoding's Ice Climbers ditto embedding exactly as the BC replay path.
-- Until the upstream PR merges, the submodule points at that unpushed branch commit:
-  push it (branch or fork) before anyone else needs to fetch it.
-- Still open: the RL sim reward ignores Nana, while BC's value targets
-  (slippi-ai compute_rewards, nana_ratio 0.5) count her deaths and damage at half weight.
+- The submodule points at the PR commit (kyhavlov/melee-sim-light#31, pushed); repin to
+  upstream main once it merges.
+- The RL sim reward counts Nana at nana_ratio 0.5 as BC's value targets do (slippi-ai
+  compute_rewards); test_sim_encoding checks her term against it on the ditto, every frame.
 
 ## DONE (branch ring-serving, worktree SmashBot-ring, 2026-09-16 late): SGU v-cache ring under capture
 Frame @400 (fixed bench, fp16 + fp16 statics, capture): 9.4 -> 6.3 ms; GPU 8.08 ->

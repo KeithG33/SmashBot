@@ -18,6 +18,7 @@ from __future__ import annotations
 import melee
 import numpy as np
 
+from slippi_ai import reward as reward_lib
 from slippi_ai import types
 from slippi_db.parsing_utils import ItemAssigner
 from smashbot import embed as embed_lib
@@ -247,3 +248,11 @@ def seat_stats(obs):
     stocks = np.stack([s[:, 0]["stocks"], s[:, 1]["stocks"]], axis=1).astype(np.float32)
     percent = np.stack([s[:, 0]["percent"], s[:, 1]["percent"]], axis=1).astype(np.float32)
     return stocks, percent
+
+
+def follower_stats(obs) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(present, dying, percent), each [N, 2] in seat_stats' columns: the
+    seats' followers (Nana), zeroed while absent."""
+    f = obs["followers"][:, :2]
+    return (f["present"].astype(np.bool_), reward_lib.is_dying(f["action_id"]),
+            f["percent"].astype(np.float32))

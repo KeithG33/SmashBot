@@ -25,9 +25,9 @@ from smashbot.rl.agent import BatchedPolicyAgent
 from smashbot.networks import check_loadable
 from smashbot.rl.league import League, MemberWeights
 from smashbot.rl.pool import SnapshotPool
-from smashbot.rl.rollouts import ChunkAssembler, HarvestAssembler, compute_reward
+from smashbot.rl.rollouts import ChunkAssembler, Followers, HarvestAssembler, compute_reward
 from smashbot.rl import sim_env
-from smashbot.rl.sim_env import seat_stats
+from smashbot.rl.sim_env import follower_stats, seat_stats
 
 
 class PfspGrid:
@@ -314,8 +314,9 @@ class MultiOpponentSimWorker:
 
             # ---- rewards ----
             stocks, percent = seat_stats(obs)
+            followers = Followers(*map(torch.as_tensor, follower_stats(obs)))
             if self._prev is not None and self.event_fn is not None:
-                ps, pp = self._prev
+                ps, pp, _ = self._prev
                 live = ~reset_np
                 for i in np.nonzero(live & (stocks[:, 1] < ps[:, 1]))[0]:
                     self.event_fn(int(i), self.env_opp[i], "kill", float(pp[i, 1]))
@@ -325,7 +326,8 @@ class MultiOpponentSimWorker:
                 reward = compute_reward(
                     torch.as_tensor(self._prev[0]), torch.as_tensor(stocks),
                     torch.as_tensor(self._prev[1]), torch.as_tensor(percent),
-                    torch.as_tensor(reset_np)).to(dev)
+                    torch.as_tensor(reset_np), prev_followers=self._prev[2],
+                    followers=followers).to(dev)
                 if len(self.self_idx):
                     self.assembler.push_reward(
                         torch.cat([reward, -reward.index_select(0, self.self_idx_t)]))
@@ -333,7 +335,7 @@ class MultiOpponentSimWorker:
                     self.assembler.push_reward(reward)
                 for gr, harvest in zip(self._all_grids(), self.harvests):
                     harvest.push_reward((-reward[gr.idx_t]).clone())
-            self._prev = (stocks, percent)
+            self._prev = (stocks, percent, followers)
 
             for rec in records:
                 snap = hidden_before if self._pushed % T == 0 else None
