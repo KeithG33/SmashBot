@@ -303,6 +303,10 @@ def run(args) -> None:
     restored_trackers = None
     if rpath:
         rl_ckpt = saving.load_checkpoint(rpath)
+        trained_with = rl_ckpt["state"].get("teacher_ckpt")
+        if trained_with and os.path.realpath(trained_with) != os.path.realpath(args.ckpt):
+            raise SystemExit(f"{rpath} was trained with teacher --ckpt {trained_with}, "
+                             f"not {args.ckpt}: resume with the teacher it was trained with")
         check_loadable(rl_ckpt["config"]["network"], rl_ckpt["state"]["policy"])
         check_loadable({}, rl_ckpt["state"]["value"])
         policy.load_state_dict(rl_ckpt["state"]["policy"])
