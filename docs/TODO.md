@@ -272,7 +272,10 @@ compared or checkpointed — unlike the learner's.
   env's second seat plays but is not learned from), so shares of envs are
   shares of rows. The Phillip tier fractions are decided later.
 - **Schedules** (Keith): teacher KL 0.075 -> 0.01 and imitation 0.05 -> 0.01
-  (launcher). For reference, v8/v9 -> v10 ran KL 0.08 -> 0.025 and
+  over a first 50k-step budget (launcher). To continue past 50k at the end
+  values, resume with the final values as flat weights
+  (`--learner.kl-teacher-weight 0.01 --learner.kl-teacher-weight-final -1
+  --learner.imitation-lambda 0.01 --learner.imitation-lambda-final-frac 1`). For reference, v8/v9 -> v10 ran KL 0.08 -> 0.025 and
   imitation 0.01 -> 0.002 over 40k from BC. The machinery is linear in
   `step / --runtime.steps`, so changing `--runtime.steps` mid-run moves both.
 - **Phillip fp16 serving: resolved.** The league's Phillip serving (fp16

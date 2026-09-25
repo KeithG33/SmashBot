@@ -23,7 +23,7 @@ exec $REPO/.venv/bin/python -m smashbot.rl.train_rl \
   --runtime.device cuda \
   --runtime.run-dir $SHINE/runs --runtime.tag "$TAG" \
   --runtime.restore "$([ -f "$SHINE/runs/$TAG/latest.pt" ] && echo auto || true)" \
-  --runtime.steps 100000 \
+  --runtime.steps 50000 \
   --runtime.checkpoint-interval 25 \
   --learner.learning-rate 3e-5 \
   --learner.precision fp16 \
