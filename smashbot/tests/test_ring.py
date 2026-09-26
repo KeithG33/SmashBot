@@ -92,13 +92,34 @@ def test_ring_reset_clears_history_only_for_reset_rows(layout):
     assert torch.equal(reset_rows["cache_len"][~reset], ring["cache_len"][~reset] + 1)
     for layer, prior, new, fresh_layer in zip(ring["layers"], before, reset_rows["layers"], fresh["layers"]):
         if isinstance(layer, tuple):
-            assert torch.equal(layer[0], prior[0])        # the ring is never rewritten on reset
-            kv, kv_before = new[1], prior[1]
-            assert torch.equal(kv[reset][:, :-1], torch.zeros_like(kv[reset][:, :-1]))
-            assert torch.equal(kv[~reset][:, :-1], kv_before[~reset][:, 1:])
+            # neither the ring nor the attention cache is rewritten on reset:
+            # cache_len masks what the finished game left
+            assert torch.equal(layer[0], prior[0])
+            assert torch.equal(new[1][:, :-1], prior[1][:, 1:])
         else:   # a recurrent layer: reset rows restart from zero, the others carry on
             assert torch.equal(new[reset], fresh_layer[reset])
             assert not torch.equal(new[~reset], fresh_layer[~reset])
+
+
+def test_serving_never_stores_a_non_finite_attention_entry():
+    """A reset leaves the attention cache for cache_len to mask, and a masked
+    NaN still poisons SDPA: serving stores a non-finite K/V entry as 0 and
+    every finite one as computed."""
+    core = _core("s")
+    block = core.blocks[0]
+    A = block.attn_width
+    ring = core.initial_ring_state(B)
+    x, reset = torch.randn(B, D), torch.ones(B, dtype=torch.bool)
+    with torch.no_grad():
+        _, clean = core.step_with_reset(x, reset, ring)
+        block.attn_qkv.weight[A] = float("nan")          # key channel 0
+        block.attn_qkv.weight[2 * A + 1] = float("inf")  # value channel 1
+        _, poisoned = core.step_with_reset(x, reset, ring)
+    kv, kv_clean = poisoned["layers"][0][1], clean["layers"][0][1]
+    bad = torch.zeros(2 * A, dtype=torch.bool)
+    bad[[0, A + 1]] = True
+    assert torch.equal(kv[..., bad], torch.zeros_like(kv[..., bad]))
+    assert torch.equal(kv[..., ~bad], kv_clean[..., ~bad])
 
 
 GPU = pytest.mark.skipif(
@@ -316,3 +337,44 @@ def test_grid_graph_carries_prev_action_and_packs_what_it_sampled(layout):
         rows = encode.controller_rows(grid._embed_controller.decode(
             tree.map_structure(lambda x: flat(x).cpu().numpy(), sampled)))
         np.testing.assert_array_equal(np.stack([q[-1] for q in grid._queues]), rows)
+
+
+@GPU
+@pytest.mark.parametrize("layout", LAYOUTS)
+def test_grid_reset_cells_ignore_what_the_finished_game_left(layout):
+    """A reset leaves the finished game's v-ring and attention entries for
+    cache_len to mask: a twin grid whose resetting cells hold junk there
+    serves bit-identical logits, on the grid's fp16 SDPA and fused read."""
+    from smashbot import embed as embed_lib, encode
+    from smashbot.rl import sim_env
+    from smashbot.rl.agent import LeagueAgent
+    from scripts.bench_agent_step import _rand_raw
+    dev, S, N, RESET_AT, LAST = "cuda", 2, 8, 2 * W, 3 * W
+    sd = _policy(layout, dev, seed=1).state_dict()
+    ff = sim_env.FlatFrames(dev)
+    grids = [LeagueAgent(_policy(layout, dev), S, N, 1, dev, capture=True,
+                         weights_dtype=torch.float16, state_dtype=torch.float16) for _ in range(2)]
+    for grid in grids:
+        for s in range(S):
+            grid.load_slice(s, sd)
+        grid.set_flat_inputs(ff.view)
+    game = embed_lib.EmbedConfig().make_game_embedding()
+    rng, g = np.random.default_rng(1), torch.Generator().manual_seed(4)
+    prev = tree.map_structure(torch.clone, grids[0]._prev)
+    for t in range(LAST):
+        enc = game.from_state(_rand_raw(game, rng, S * N))
+        flats = tuple(x.view(S, N, x.shape[-1])
+                      for x in ff.to_device(encode.flatten_typed_batched(enc, S * N)))
+        resets = torch.full((S, N), t == 0, device=dev)
+        if t == RESET_AT:
+            resets = (torch.rand(S, N, generator=g) < 0.5).to(dev)
+            for layer in grids[1]._in_hidden["layers"]:
+                for cache in layer if isinstance(layer, tuple) else ():
+                    cache[resets] = (100 * torch.randn(cache[resets].shape, generator=g)).to(cache)
+        records = []
+        for grid in grids:
+            tree.map_structure(lambda d, s: d.copy_(s), grid._prev, prev)   # open loop
+            grid.execute()
+            records.append(grid.infer(ff.view(flats), resets, flats=flats))
+        for a, b in zip(tree.flatten(records[0].logits), tree.flatten(records[1].logits)):
+            assert torch.equal(a, b), f"logits differ at frame {t}"

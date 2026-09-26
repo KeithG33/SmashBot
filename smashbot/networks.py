@@ -548,10 +548,14 @@ class SGUBlock(nn.Module):
         u, v = self.uv(xn).chunk(2, dim=-1)
         return u, self.v_norm(v)
 
-    def _attend(self, xn, kv_cache, attn_mask):
+    def _attend(self, xn, kv_cache, attn_mask, finite_cache=False):
         W = self.window
         q, k_new, va_new = self.attn_qkv(xn).chunk(3, dim=-1)
         kv_new = torch.cat([k_new, va_new], dim=-1)
+        if finite_cache:
+            # serving never clears the cache on a reset: cache_len masks the
+            # stale entries, and a masked NaN still poisons SDPA (0 * NaN)
+            kv_new = torch.nan_to_num(kv_new.to(kv_cache.dtype), nan=0.0, posinf=0.0, neginf=0.0)
         kv_full = torch.cat([kv_cache.to(kv_new.dtype), kv_new], dim=1)
         keys, vals = kv_full.chunk(2, dim=-1)
         heads = lambda t: t.unflatten(-1, (self.attn_heads, -1)).transpose(1, 2)   # [B, h, T, dk]
@@ -616,7 +620,7 @@ class SGUBlock(nn.Module):
         xn = self.mix_norm(x)
         u, v = _recomputed_in_backward(self._uv, xn)
         v_mixed, v_new = self._spatial_ring(v, v_ring, where, read)
-        attn, new_kv = self._attend(xn, kv_cache, attn_mask)
+        attn, new_kv = self._attend(xn, kv_cache, attn_mask, finite_cache=True)
         x = x + self.mix_out(u * (v_mixed + attn))
 
         x = _swiglu(self, x)
@@ -802,7 +806,8 @@ class SGUCore(Network):
         """Ring state -> the chronological state the learner expects."""
         idx, valid = self._ring_index(state["ptr"], state["cache_len"], state["cache_len"].device)
         layers = [
-            (torch.where(valid[:, :, None], layer[0].index_select(1, idx), 0.0), layer[1])
+            (torch.where(valid[:, :, None], layer[0].index_select(1, idx), 0.0),
+             torch.where(valid[:, :, None], layer[1], 0.0))
             if isinstance(layer, tuple) else layer
             for layer in state["layers"]
         ]
@@ -811,14 +816,13 @@ class SGUCore(Network):
     def step_with_reset(self, inputs, reset, prev_state):
         if "ptr" not in prev_state:
             return super().step_with_reset(inputs, reset, prev_state)
-        # stale ring slots are masked at read time by cache_len; never rewrite the
-        # ring, and never allocate the v zeros initial_state would (eager paths
-        # would memset them every frame)
+        # stale v-ring and attention-cache entries are masked at read time by
+        # cache_len: a reset rewrites neither (a full pass over every cache,
+        # every frame), only the recurrent layers' state
         state = {
             "cache_len": torch.where(reset, 0, prev_state["cache_len"]),
             "ptr": prev_state["ptr"],
-            "layers": [(layer[0], _mask_state(reset, torch.zeros_like(layer[1]), layer[1]))
-                       if isinstance(layer, tuple)
+            "layers": [layer if isinstance(layer, tuple)
                        else _mask_state(reset, torch.zeros_like(layer), layer)
                        for layer in prev_state["layers"]],
         }
