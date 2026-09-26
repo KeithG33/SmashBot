@@ -66,6 +66,12 @@ class FrameRecord(tp.NamedTuple):
     name: torch.Tensor  # [N]
 
 
+def _pack(leaves) -> torch.Tensor:
+    pack = (torch.uint8 if all(t.dtype in (torch.bool, torch.uint8) for t in leaves)
+            else torch.int64)
+    return torch.stack([t.to(pack) for t in leaves], dim=-1)
+
+
 class _HostCopy:
     """One device-to-host copy for the whole sampled controller (13 uint8/bool
     leaves -> one [.., 13] tensor), queued into pinned memory without waiting;
@@ -76,19 +82,19 @@ class _HostCopy:
         self._pending = None
 
     def start(self, ctrl) -> None:
+        self.start_packed(_pack(tree.flatten(ctrl)), ctrl)
+
+    def start_packed(self, packed: torch.Tensor, template) -> None:
+        """packed: [.., 13] as _pack builds it from template's leaves."""
         assert self._pending is None, "a copy is still in flight: wait() first"
-        leaves = tree.flatten(ctrl)
-        pack = (torch.uint8 if all(t.dtype in (torch.bool, torch.uint8) for t in leaves)
-                else torch.int64)
-        packed = torch.stack([t.to(pack) for t in leaves], dim=-1)
-        if self._buf is None or self._buf.shape != packed.shape or self._buf.dtype != pack:
-            self._buf = torch.empty(packed.shape, dtype=pack, pin_memory=packed.is_cuda)
+        if self._buf is None or self._buf.shape != packed.shape or self._buf.dtype != packed.dtype:
+            self._buf = torch.empty(packed.shape, dtype=packed.dtype, pin_memory=packed.is_cuda)
         self._buf.copy_(packed, non_blocking=True)
         done = None
         if packed.is_cuda:
             done = torch.cuda.Event()
             done.record()
-        self._pending = (ctrl, [t.dtype for t in leaves], done)
+        self._pending = (template, [t.dtype for t in tree.flatten(template)], done)
 
     def wait(self):
         ctrl, dtypes, done = self._pending
@@ -546,12 +552,12 @@ class LeagueAgent:
         its few occupants into its other slices). Bit-exact for the env."""
         (s0, n0), (s1, n1) = src, dst
         tree.map_structure(lambda t: t[s1, n1].copy_(t[s0, n0]), self._prev)
-        if not (self._use_capture and self._graph is not None) and self._hidden is None:
-            self._hidden = self._initial_hidden()   # lazy (pre-capture move)
-        if self._ring and self._graph is not None:
+        if self._use_capture and self._graph is not None:
             hidden = self._in_hidden          # carried in place by the graph
         else:
-            hidden = self._out_hidden if self._use_capture and self._graph is not None else self._hidden
+            if self._hidden is None:
+                self._hidden = self._initial_hidden()   # lazy (pre-capture move)
+            hidden = self._hidden
 
         def cell(t, s, n):   # state leaves are [S, N, ...], torch RNN state [S, layers, N, H]
             x = t[s]
@@ -616,38 +622,33 @@ class LeagueAgent:
         """infer() without waiting on the GPU: settle() appends the sampled
         controllers to the delay queues. views may be None when flats are
         given; record=False skips the FrameRecord (returns None)."""
-        prev = tree.map_structure(
-            lambda pv, n: torch.where(
-                resets.view(self.S, self.N, *([1] * (pv.dim() - 2))), n, pv
-            ),
-            self._prev, self._neutral,
-        )
         if self._use_capture:
-            ctrl, logits = self._captured_forward(views, prev, resets, flats)
+            prev, logits = self._captured_forward(views, resets, flats)
         else:
+            prev = self._prev_or_neutral(resets)
             ctrl, logits, self._hidden = self._vm(
                 self._stacked_params, self._stacked_buffers,
                 views if views is not None else self._view_fn(flats), prev,
                 self._hidden, resets,
             )
+            self._prev = tree.map_structure(
+                lambda t: t.clone() if t.dtype == torch.bool else t.long().clone(), ctrl
+            )
+            self._to_host.start(tree.map_structure(self._flat, ctrl))
         if self._timer is not None:
             self._timer("forward")
-        self._prev = tree.map_structure(
-            lambda t: t.clone() if t.dtype == torch.bool else t.long().clone(), ctrl
-        )
-        flat = lambda t: t.reshape(self.S * self.N, *t.shape[2:])
-        self._to_host.start(tree.map_structure(flat, ctrl))
         if not record:
             return None
         if views is None:
             views = self._view_fn(flats)
+        flat = self._flat
         frame = FrameRecord(
             state=tree.map_structure(flat, views),
             prev_action=tree.map_structure(
                 lambda x: flat(x.clone() if x.dtype == torch.bool else x.long().clone()),
                 prev,
             ),
-            logits=tree.map_structure(flat, logits),
+            logits=tree.map_structure(lambda t: flat(t.clone()), logits),
             name=flat(self._name).clone(),
         )
         if self._timer is not None:
@@ -717,35 +718,42 @@ class LeagueAgent:
 
         return single
 
-    def _captured_forward(self, views, prev, resets, flats=None):
-        """Copy this frame's inputs into the static buffers, replay, return
-        clones of the static outputs. Captured once at first use (shapes
-        never change); in-place slice loads are visible to replays."""
+    def _flat(self, t):
+        return t.reshape(self.S * self.N, *t.shape[2:])
+
+    def _prev_or_neutral(self, resets):
+        return tree.map_structure(
+            lambda pv, n: torch.where(
+                resets.view(self.S, self.N, *([1] * (pv.dim() - 2))), n, pv
+            ),
+            self._prev, self._neutral,
+        )
+
+    def _captured_forward(self, views, resets, flats=None):
+        """Copy this frame's inputs into the static buffers and replay; the
+        graph carries the previous action and the recurrent state in place
+        and packs the sampled controllers for the host copy started here.
+        Returns the static (prev action used, logits), overwritten by the next
+        replay. Captured once at first use (shapes never change); in-place
+        slice loads are visible to replays."""
         if self._graph is None:
-            self._capture(views, prev, resets, flats)
+            self._capture(views, resets, flats)
         if getattr(self, "_in_flats", None) is not None:
             for d, src in zip(self._in_flats, flats):
                 d.copy_(src)
         else:
             tree.map_structure(lambda d, s: d.copy_(s), self._in_views, views)
-        tree.map_structure(lambda d, s: d.copy_(s), self._in_prev, prev)
         self._in_resets.copy_(resets)
-        if not self._ring:   # recurrent state: static in <- last replay's static out
-            tree.map_structure(
-                lambda d, s: d.copy_(s) if isinstance(d, torch.Tensor) else None,
-                self._in_hidden, self._out_hidden,
-            )
         self._graph.replay()
-        ctrl = tree.map_structure(lambda t: t.clone(), self._out_ctrl)
-        logits = tree.map_structure(lambda t: t.clone(), self._out_logits)
-        return ctrl, logits
+        self._to_host.start_packed(self._out_packed, self._out_template)
+        return self._out_prev, self._out_logits
 
     def set_flat_inputs(self, view_fn) -> None:
         """view_fn(flats) -> views struct; pass the grid's three flats to infer."""
         self._view_fn = view_fn
         self._in_flats = None
 
-    def _capture(self, views, prev, resets, flats=None):
+    def _capture(self, views, resets, flats=None):
         if flats is not None:
             self._in_flats = tuple(
                 t.clone().long() if not (t.is_floating_point() or t.dtype == torch.bool) else t.clone()
@@ -756,34 +764,37 @@ class LeagueAgent:
                 "grid views do not alias the static flats"
         else:
             self._in_views = tree.map_structure(lambda t: t.clone(), views)
-        self._in_prev = tree.map_structure(lambda t: t.clone(), prev)
         self._in_resets = resets.clone()
         self._in_hidden = self._initial_hidden()
-        args = (self._stacked_params, self._stacked_buffers, self._in_views,
-                self._in_prev, self._in_hidden, self._in_resets)
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             for _ in range(3):
-                self._vm(*args)
+                self._vm(self._stacked_params, self._stacked_buffers, self._in_views,
+                         self._prev_or_neutral(self._in_resets), self._in_hidden, self._in_resets)
         torch.cuda.current_stream().wait_stream(s)
         self._graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self._graph):
-            self._out_ctrl, self._out_logits, self._out_hidden = self._vm(*args)
+            self._out_prev = self._prev_or_neutral(self._in_resets)
+            self._out_ctrl, self._out_logits, self._out_hidden = self._vm(
+                self._stacked_params, self._stacked_buffers, self._in_views,
+                self._out_prev, self._in_hidden, self._in_resets)
             if self._ring:
                 self._ring_carry()
-        # the just-captured pass ran with warm-up inputs; hidden restarts
-        # from the initial state on the first real replay
-        if self._ring:
-            tree.map_structure(
-                lambda d, s_: d.copy_(s_) if isinstance(d, torch.Tensor) else None,
-                self._in_hidden, self._initial_hidden(),
-            )
-        else:
-            tree.map_structure(
-                lambda d, s_: d.copy_(s_) if isinstance(d, torch.Tensor) else None,
-                self._out_hidden, self._in_hidden,
-            )
+            else:
+                tree.map_structure(
+                    lambda d, s_: d.copy_(s_) if isinstance(d, torch.Tensor) else None,
+                    self._in_hidden, self._out_hidden,
+                )
+            tree.map_structure(lambda d, s_: d.copy_(s_), self._prev, self._out_ctrl)
+            self._out_template = tree.map_structure(self._flat, self._out_ctrl)
+            self._out_packed = _pack(tree.flatten(self._out_template))
+        # capture only records: the carried prev action is untouched, and the
+        # recurrent state restarts from the initial state on the first replay
+        tree.map_structure(
+            lambda d, s_: d.copy_(s_) if isinstance(d, torch.Tensor) else None,
+            self._in_hidden, self._initial_hidden(),
+        )
 
     def _ring_carry(self):
         ptr = self._in_hidden["ptr"]                      # [S], all equal

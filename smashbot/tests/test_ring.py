@@ -205,7 +205,7 @@ def test_grid_ring_matches_canonical_under_capture(layout, read, tol):
     for t in range(FRAMES):
         views, flats = frames[t]
         for a in (canonical, ringed):
-            a._prev = tree.map_structure(torch.clone, prev)   # open loop
+            tree.map_structure(lambda d, s: d.copy_(s), a._prev, prev)   # open loop (in place: the graph reads it)
             if t in moves:
                 a.move_cell(*moves[t])
             if t == reload_at:
