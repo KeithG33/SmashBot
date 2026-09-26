@@ -238,15 +238,17 @@ def test_fp16_grid_keeps_norm_weights_fp32():
 
 
 @GPU
-def test_fused_ring_read_matches_the_roll_read():
+@pytest.mark.parametrize("C,W", [(48, 20), (96, 67), (576, 256)])
+def test_fused_ring_read_matches_the_roll_read(C, W):
     """causal_conv_ring against the roll read computed in fp32 and rounded to
     fp16: one slice, and the grid's vmap over slices with their own weights,
-    pointers and cache lengths (empty and full included). C and W-1 are not
-    multiples of the kernel's blocks."""
+    pointers and cache lengths (empty and full included). Shapes: inside one
+    64-channel x 32-slot tile; several tiles with partial tails in both; the
+    hybrid's 576 channels, window 256."""
     from smashbot.causal_conv import causal_conv_ring
     from smashbot.networks import SGUBlock
     torch.manual_seed(0)
-    S, N, C, W = 3, 7, 48, 20
+    S, N = 3, 7
     blocks = [SGUBlock(C, W).cuda() for _ in range(S)]
     for b in blocks:
         _randomize(b)
@@ -273,3 +275,43 @@ def test_fused_ring_read_matches_the_roll_read():
     batched = torch.vmap(causal_conv_ring)(ring, v, weight, bias, cache_len, ptr)
     assert torch.equal(one, batched), "the vmap rule must compute each slice as a single call does"
     torch.testing.assert_close(batched.float(), want.float(), rtol=1e-3, atol=2e-3)
+
+
+@GPU
+@pytest.mark.parametrize("layout", LAYOUTS)
+def test_grid_graph_carries_prev_action_and_packs_what_it_sampled(layout):
+    """One captured grid's own outputs, frame after frame: the previous action
+    a frame is served with is the controller the graph sampled the frame
+    before (neutral on a reset), and the rows settle queues are that same
+    sampled controller, unpacked from the host copy."""
+    from smashbot import embed as embed_lib, encode
+    from smashbot.rl import sim_env
+    from smashbot.rl.agent import LeagueAgent
+    from scripts.bench_agent_step import _rand_raw
+    dev, S, N, FRAMES = "cuda", 2, 8, 12
+    grid = LeagueAgent(_policy(layout, dev), S, N, 1, dev, capture=True,
+                       weights_dtype=torch.float16, state_dtype=torch.float16)
+    for s in range(S):
+        grid.load_slice(s, _policy(layout, dev, seed=s).state_dict())
+    ff = sim_env.FlatFrames(dev)
+    grid.set_flat_inputs(ff.view)
+    game = embed_lib.EmbedConfig().make_game_embedding()
+    rng, g = np.random.default_rng(1), torch.Generator().manual_seed(3)
+    flat = lambda t: t.reshape(S * N, *t.shape[2:])
+    sampled = grid._neutral
+    for t in range(FRAMES):
+        enc = game.from_state(_rand_raw(game, rng, S * N))
+        flats = tuple(x.view(S, N, x.shape[-1])
+                      for x in ff.to_device(encode.flatten_typed_batched(enc, S * N)))
+        resets = (torch.rand(S, N, generator=g) < 0.25).to(dev) | (t == 0)
+        grid.execute()
+        record = grid.infer(ff.view(flats), resets, flats=flats)
+        want = tree.map_structure(
+            lambda n, s_: torch.where(resets.view(S, N, *([1] * (n.dim() - 2))), n, s_),
+            grid._neutral, sampled)
+        for got, w in zip(tree.flatten(record.prev_action), tree.flatten(want)):
+            assert torch.equal(got, flat(w)), f"previous action differs at frame {t}"
+        sampled = tree.map_structure(torch.clone, grid._out_ctrl)
+        rows = encode.controller_rows(grid._embed_controller.decode(
+            tree.map_structure(lambda x: flat(x).cpu().numpy(), sampled)))
+        np.testing.assert_array_equal(np.stack([q[-1] for q in grid._queues]), rows)
