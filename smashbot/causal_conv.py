@@ -1,113 +1,111 @@
-"""The SGU block's training convolution in Triton: the depthwise causal conv
+"""The SGU block's training convolution: the depthwise causal conv
 y[b, t, c] = bias[c] + sum_k w[c, k] * x[b, t + k, c] over x = [cache | chunk]
-(cache: the window - 1 frames before the chunk), reading cache and chunk in
-place instead of concatenating them. nn.Conv1d runs this 256-tap depthwise
-conv on PyTorch's generic kernels, whose backward took a third of the BC step;
-these run it 6x faster. Registered as custom ops so a compiled core calls
-them as single ops."""
+(cache: the window - 1 frames before the chunk). Per channel it is one matmul
+against the chunk's Toeplitz matrix of that channel's taps, so the conv and
+both its gradients run as batched matmuls on tensor cores: inputs in the
+activation dtype and fp32 accumulation, as the direct conv kernels had them,
+in half their time for the 256-tap window (measured). The matmuls take the
+channels first; a tiled Triton kernel transposes (PyTorch's permute copy runs
+these 20x slower). Registered as custom ops so a compiled core calls them as
+single ops."""
 import torch
 import triton
 import triton.language as tl
 
-
-@triton.jit
-def _fwd(cache, v, w, bias, y, T, C, cache_sb, cache_ss, v_sb, v_ss, y_sb, y_ss,
-         W: tl.constexpr, TT: tl.constexpr, BC: tl.constexpr):
-    c = tl.program_id(0) * BC + tl.arange(0, BC)
-    b = tl.program_id(1)
-    t = tl.program_id(2) * TT + tl.arange(0, TT)
-    cm = c < C
-    tm = t < T
-    acc = tl.zeros((TT, BC), dtype=tl.float32)
-    for k in range(W):
-        s = t + k
-        hist = s < W - 1
-        x = tl.load(cache + b * cache_sb + s[:, None] * cache_ss + c[None, :],
-                    mask=(hist & tm)[:, None] & cm[None, :], other=0.0)
-        x += tl.load(v + b * v_sb + (s - (W - 1))[:, None] * v_ss + c[None, :],
-                     mask=(~hist & tm)[:, None] & cm[None, :], other=0.0)
-        acc += x.to(tl.float32) * tl.load(w + k * C + c, mask=cm, other=0.0).to(tl.float32)[None, :]
-    acc += tl.load(bias + c, mask=cm, other=0.0).to(tl.float32)[None, :]
-    tl.store(y + b * y_sb + t[:, None] * y_ss + c[None, :], acc.to(y.dtype.element_ty),
-             mask=tm[:, None] & cm[None, :])
+_INDEX: dict = {}
 
 
-@triton.jit
-def _bwd_x(gy, w, gcache, gv, T, C, gy_sb, gy_ss, gc_sb, gc_ss, gv_sb, gv_ss, s_start,
-           W: tl.constexpr, SS: tl.constexpr, BC: tl.constexpr, CACHE_GRAD: tl.constexpr):
-    c = tl.program_id(0) * BC + tl.arange(0, BC)
-    b = tl.program_id(1)
-    s0 = s_start + tl.program_id(2) * SS
-    s = s0 + tl.arange(0, SS)
-    cm = c < C
-    sm = s < W - 1 + T
-    acc = tl.zeros((SS, BC), dtype=tl.float32)
-    for k in range(tl.maximum(s0 - (T - 1), 0), tl.minimum(s0 + SS, W)):   # taps that reach this block
-        t = s - k
-        m = (t >= 0) & (t < T) & sm
-        g = tl.load(gy + b * gy_sb + t[:, None] * gy_ss + c[None, :], mask=m[:, None] & cm[None, :], other=0.0)
-        acc += g.to(tl.float32) * tl.load(w + k * C + c, mask=cm, other=0.0).to(tl.float32)[None, :]
-    hist = s < W - 1
-    if CACHE_GRAD:
-        tl.store(gcache + b * gc_sb + s[:, None] * gc_ss + c[None, :], acc.to(gcache.dtype.element_ty),
-                 mask=(hist & sm)[:, None] & cm[None, :])
-    tl.store(gv + b * gv_sb + (s - (W - 1))[:, None] * gv_ss + c[None, :], acc.to(gv.dtype.element_ty),
-             mask=(~hist & sm)[:, None] & cm[None, :])
+def _toeplitz_index(W, T, device):
+    """The matmuls run over [cache | a zero column | chunk], W + T columns,
+    so both parts start aligned when W and T are multiples of 8 (cuBLAS then
+    runs its aligned kernels). For each (column, output) pair: its tap
+    (clamped) and whether one reaches, [W + T, T]; and each tap's entries in
+    that flattened matrix, [W, T]."""
+    key = (W, T, device)
+    if key not in _INDEX:
+        col = torch.arange(W + T, device=device)[:, None]
+        t = torch.arange(T, device=device)
+        k = torch.where(col < W - 1, col, col - 1) - t[None, :]
+        pos = torch.arange(W, device=device)[:, None] + t[None, :]
+        entries = (pos + (pos >= W - 1).long()) * T + t[None, :]
+        _INDEX[key] = (k.clamp(0, W - 1), (col != W - 1) & (k >= 0) & (k < W), entries)
+    return _INDEX[key]
+
+
+def _toeplitz(weight, T, dtype):
+    """[C, 1, W] -> [C, W + T, T] in dtype: entry (column, t) is the tap from
+    that input column to output t."""
+    C, _, W = weight.shape
+    tap, reaches, _ = _toeplitz_index(W, T, weight.device)
+    return torch.where(reaches, weight.reshape(C, W).to(dtype)[:, tap], 0)
 
 
 @triton.jit
-def _bwd_w(gy, cache, v, part, B, T, C, B_PER, gy_sb, gy_ss, cache_sb, cache_ss, v_sb, v_ss,
-           W: tl.constexpr, KK: tl.constexpr, BC: tl.constexpr):
-    c = tl.program_id(0) * BC + tl.arange(0, BC)
-    k = tl.program_id(1) * KK + tl.arange(0, KK)
-    pb = tl.program_id(2)
-    cm = c < C
-    km = k < W
-    acc = tl.zeros((KK, BC), dtype=tl.float32)
-    for bi in range(B_PER):
-        b = pb * B_PER + bi
-        bm = b < B
-        for t in range(T):
-            g = tl.load(gy + b * gy_sb + t * gy_ss + c, mask=cm & bm, other=0.0).to(tl.float32)
-            s = t + k
-            hist = s < W - 1
-            x = tl.load(cache + b * cache_sb + s[:, None] * cache_ss + c[None, :],
-                        mask=(hist & km & bm)[:, None] & cm[None, :], other=0.0)
-            x += tl.load(v + b * v_sb + (s - (W - 1))[:, None] * v_ss + c[None, :],
-                         mask=(~hist & km & bm)[:, None] & cm[None, :], other=0.0)
-            acc += x.to(tl.float32) * g[None, :]
-    tl.store(part + pb * W * C + k[:, None] * C + c[None, :], acc, mask=km[:, None] & cm[None, :])
+def _relayout(src, dst, L, C, s_b, s_l, s_c, d_b, d_l, d_c, BL: tl.constexpr, BC: tl.constexpr):
+    """dst[b, l, c] = src[b, l, c] through each side's strides, in tiles so
+    that a transpose between channels-last and channels-first reads and
+    writes contiguous runs on both sides."""
+    l = tl.program_id(0) * BL + tl.arange(0, BL)
+    c = tl.program_id(1) * BC + tl.arange(0, BC)
+    b = tl.program_id(2)
+    m = (l < L)[:, None] & (c < C)[None, :]
+    x = tl.load(src + b * s_b + l[:, None] * s_l + c[None, :] * s_c, mask=m)
+    tl.store(dst + b * d_b + l[:, None] * d_l + c[None, :] * d_c, x.to(dst.dtype.element_ty), mask=m)
 
 
-def _forward(cache, v, weight, bias, TT=16, BC=64):
+def _to_channels_first(src, dst, BL=64, BC=64):
+    """src [B, L, C] into dst [C, B, L] (either may be a strided view)."""
+    B, L, C = src.shape
+    _relayout[(triton.cdiv(L, BL), triton.cdiv(C, BC), B)](
+        src, dst, L, C, src.stride(0), src.stride(1), src.stride(2),
+        dst.stride(1), dst.stride(2), dst.stride(0), BL=BL, BC=BC)
+    return dst
+
+
+def _to_channels_last(src, dst, BL=64, BC=64):
+    """src [C, B, L] into dst [B, L, C]."""
+    C, B, L = src.shape
+    _relayout[(triton.cdiv(L, BL), triton.cdiv(C, BC), B)](
+        src, dst, L, C, src.stride(1), src.stride(2), src.stride(0),
+        dst.stride(0), dst.stride(1), dst.stride(2), BL=BL, BC=BC)
+    return dst
+
+
+def _channels_first(cache, v):
+    """[cache | 0 | v] as the matmuls' operand: [C, B, W + T] in v's dtype,
+    its rows an odd multiple of 8 elements apart: aligned for cuBLAS, where a
+    multiple of 16 halves the transposes' write bandwidth (measured)."""
     B, T, C = v.shape
-    W = weight.shape[-1]
-    wt = weight.reshape(C, W).to(v.dtype).t().contiguous()   # conv under autocast: weights in the input dtype
-    y = v.new_empty(B, T, C)
-    _fwd[(triton.cdiv(C, BC), B, triton.cdiv(T, TT))](
-        cache, v, wt, bias.to(v.dtype), y, T, C, cache.stride(0), cache.stride(1),
-        v.stride(0), v.stride(1), y.stride(0), y.stride(1), W=W, TT=TT, BC=BC)
-    return y
+    M = cache.shape[1]
+    row = -(-(M + 1 + T) // 8) * 8
+    row += 8 * (row // 8 % 2 == 0)
+    x = v.new_empty(C, B, row)[:, :, :M + 1 + T]
+    _to_channels_first(cache, x[:, :, :M])
+    x[:, :, M] = 0
+    _to_channels_first(v, x[:, :, M + 1:])
+    return x
 
 
-def _backward(gy, cache, v, weight, cache_grad, SS=16, BC=64, KK=32, WBC=64, B_PER=16):
+def _forward(cache, v, weight, bias):
+    T = v.shape[1]
+    toe = _toeplitz(weight, T, v.dtype)   # conv under autocast: weights in the input dtype
+    y = torch.baddbmm(bias.to(v.dtype)[:, None, None], _channels_first(cache, v), toe)
+    return _to_channels_last(y, torch.empty_like(v))
+
+
+def _backward(gy, cache, v, weight, cache_grad):
     B, T, C = v.shape
-    W = weight.shape[-1]
-    wt = weight.reshape(C, W).to(v.dtype).t().contiguous()
-    gv = v.new_empty(B, T, C)
-    gcache = cache.new_empty(cache.shape) if cache_grad else cache.new_empty(0)
-    s_start = 0 if cache_grad else W - 1
-    _bwd_x[(triton.cdiv(C, BC), B, triton.cdiv(W - 1 + T - s_start, SS))](
-        gy, wt, gcache if cache_grad else gv, gv, T, C, gy.stride(0), gy.stride(1),
-        gcache.stride(0) if cache_grad else 0, gcache.stride(1) if cache_grad else 0,
-        gv.stride(0), gv.stride(1), s_start, W=W, SS=SS, BC=BC, CACHE_GRAD=cache_grad)
-    nb = triton.cdiv(B, B_PER)
-    part = torch.empty(nb, W, C, device=v.device, dtype=torch.float32)
-    _bwd_w[(triton.cdiv(C, WBC), triton.cdiv(W, KK), nb)](
-        gy, cache, v, part, B, T, C, B_PER, gy.stride(0), gy.stride(1), cache.stride(0), cache.stride(1),
-        v.stride(0), v.stride(1), W=W, KK=KK, BC=WBC)
-    gw = part.sum(0).t().contiguous().reshape(weight.shape).to(weight.dtype)
-    return gcache, gv, gw, gy.float().sum((0, 1)).to(weight.dtype)
+    M = cache.shape[1]
+    toe = _toeplitz(weight, T, v.dtype)
+    g = _to_channels_first(gy, v.new_empty(C, B, T))
+    gx = torch.bmm(g, toe[:, 0 if cache_grad else M + 1:].transpose(1, 2))
+    gv = _to_channels_last(gx[:, :, -T:], torch.empty_like(v))
+    gcache = _to_channels_last(gx[:, :, :M], torch.empty_like(cache)) if cache_grad else cache.new_empty(0)
+    fp32_out = {} if v.dtype == torch.float32 else {"out_dtype": torch.float32}
+    gtoe = torch.bmm(_channels_first(cache, v).transpose(1, 2), g, **fp32_out)   # [C, W + T, T]
+    _, _, diagonals = _toeplitz_index(M + 1, T, v.device)
+    gw = gtoe.flatten(1)[:, diagonals].sum(-1)   # each tap's T entries
+    return gcache, gv, gw.reshape(weight.shape).to(weight.dtype), gy.float().sum((0, 1)).to(weight.dtype)
 
 
 @torch.library.custom_op("smashbot::causal_conv", mutates_args=())
@@ -125,7 +123,7 @@ def _(cache, v, weight, bias):
 @torch.library.custom_op("smashbot::causal_conv_backward", mutates_args=())
 def causal_conv_backward(gy: torch.Tensor, cache: torch.Tensor, v: torch.Tensor, weight: torch.Tensor,
                          cache_grad: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    return _backward(gy if gy.stride(-1) == 1 else gy.contiguous(), cache, v, weight, cache_grad)
+    return _backward(gy, cache, v, weight, cache_grad)
 
 
 @causal_conv_backward.register_fake
