@@ -39,26 +39,29 @@ def _stream(seed=1):
 
 
 def _ring_step(core, x, reset, ring):
-    """What BatchedPolicyAgent._ring_carry does: read via step_with_reset, write
-    each SGU layer's new slot at the pointer, carry kv, recurrent states and
-    cache_len, advance the pointer."""
+    """What BatchedPolicyAgent._ring_carry does: read via step_with_reset (which
+    writes the frame's K/V into the attention ring), write each SGU layer's new
+    v slot at the pointer, carry recurrent states and cache_len, advance both
+    pointers."""
     y, nxt = core.step_with_reset(x, reset, ring)
     layers = []
     for layer, new in zip(ring["layers"], nxt["layers"]):
         if isinstance(layer, tuple):
             layer[0].index_copy_(1, ring["ptr"].view(1), new[0].unsqueeze(1))
-            layers.append((layer[0], new[1]))
+            layers.append(layer)
         else:
             layers.append(new)
-    ring = {"cache_len": nxt["cache_len"], "layers": layers, "ptr": (ring["ptr"] + 1) % (W - 1)}
+    ring = {"cache_len": nxt["cache_len"], "layers": layers, "ptr": (ring["ptr"] + 1) % (W - 1),
+            "kv_ptr": (ring["kv_ptr"] + 1) % W}
     return y, ring
 
 
 @pytest.mark.parametrize("layout", LAYOUTS)
-@pytest.mark.parametrize("read,tol", [("gather", 0.0), ("roll", 1e-4)])
+@pytest.mark.parametrize("read,tol", [("gather", 1e-5), ("roll", 1e-4)])
 def test_ring_matches_canonical_across_wraps_and_resets(layout, read, tol):
-    """gather (the student's read) is exact; roll (the grid's: rotated weights,
-    slot order) sums in another order, so it agrees to rounding."""
+    """The attention sums its ring in slot order, so both reads agree to
+    rounding: gather (the student's) reads the conv in time order, roll (the
+    grid's: rotated weights) in slot order too."""
     core = _core(layout)
     core.ring_read = read
     xs, rs = _stream()
@@ -80,6 +83,7 @@ def test_ring_reset_clears_history_only_for_reset_rows(layout):
     g = torch.Generator().manual_seed(3)
     with torch.no_grad():
         ring["cache_len"] = torch.randint(1, W - 1, (B,), generator=g)
+        ring["kv_ptr"] = torch.tensor(5)
         ring["layers"] = [tuple(torch.randn(t.shape, generator=g) for t in layer)
                           if isinstance(layer, tuple) else torch.randn(layer.shape, generator=g)
                           for layer in ring["layers"]]
@@ -92,10 +96,12 @@ def test_ring_reset_clears_history_only_for_reset_rows(layout):
     assert torch.equal(reset_rows["cache_len"][~reset], ring["cache_len"][~reset] + 1)
     for layer, prior, new, fresh_layer in zip(ring["layers"], before, reset_rows["layers"], fresh["layers"]):
         if isinstance(layer, tuple):
-            # neither the ring nor the attention cache is rewritten on reset:
-            # cache_len masks what the finished game left
+            # neither ring is rewritten on reset (cache_len masks what the
+            # finished game left): the attention ring gains only this frame's
+            # entry, at kv_ptr
             assert torch.equal(layer[0], prior[0])
-            assert torch.equal(new[1][:, :-1], prior[1][:, 1:])
+            kept = torch.arange(W) != 5
+            assert torch.equal(new[1][:, kept], prior[1][:, kept])
         else:   # a recurrent layer: reset rows restart from zero, the others carry on
             assert torch.equal(new[reset], fresh_layer[reset])
             assert not torch.equal(new[~reset], fresh_layer[~reset])
@@ -108,14 +114,13 @@ def test_serving_never_stores_a_non_finite_attention_entry():
     core = _core("s")
     block = core.blocks[0]
     A = block.attn_width
-    ring = core.initial_ring_state(B)
     x, reset = torch.randn(B, D), torch.ones(B, dtype=torch.bool)
     with torch.no_grad():
-        _, clean = core.step_with_reset(x, reset, ring)
+        _, clean = core.step_with_reset(x, reset, core.initial_ring_state(B))
         block.attn_qkv.weight[A] = float("nan")          # key channel 0
         block.attn_qkv.weight[2 * A + 1] = float("inf")  # value channel 1
-        _, poisoned = core.step_with_reset(x, reset, ring)
-    kv, kv_clean = poisoned["layers"][0][1], clean["layers"][0][1]
+        _, poisoned = core.step_with_reset(x, reset, core.initial_ring_state(B))
+    kv, kv_clean = poisoned["layers"][0][1][:, 0], clean["layers"][0][1][:, 0]   # the entry at kv_ptr 0
     bad = torch.zeros(2 * A, dtype=torch.bool)
     bad[[0, A + 1]] = True
     assert torch.equal(kv[..., bad], torch.zeros_like(kv[..., bad]))
@@ -150,7 +155,8 @@ def test_student_serving_matches_eager_under_capture_and_ring(layout):
     against the same agent uncaptured and captured without the ring: the
     recurrent snapshot handed to the learner, every frame, over three wraps
     with staggered resets. Open loop: every agent sees the same previous
-    action, so the snapshots are a function of the inputs alone."""
+    action, so the snapshots are a function of the inputs alone. Capture is
+    exact; the ring's attention sums in slot order (fp16 rounding)."""
     from smashbot import embed as embed_lib
     from smashbot.rl.agent import BatchedPolicyAgent
     from scripts.bench_agent_step import _rand_raw
@@ -175,19 +181,21 @@ def test_student_serving_matches_eager_under_capture_and_ring(layout):
             a._prev_action = tree.map_structure(torch.clone, prev)
             a.execute(torch.nonzero(resets[t]).flatten().tolist())
             snaps.append(a.infer(frames[t], resets[t], want_snapshot=True)[1])
-        for name, other in (("capture", snaps[1]), ("ring", snaps[2])):
+        for name, other, tol in (("capture", snaps[1], 0.0), ("ring", snaps[2], 5e-2)):
             for x, y in zip(tree.flatten(snaps[0]), tree.flatten(other)):
-                assert torch.equal(x, y), f"{name} state differs at frame {t}"
+                diff = (x.float() - y.float()).abs().max().item()
+                assert diff <= tol, f"{name} state differs at frame {t}: {diff:.2e}"
 
 
 @GPU
 @pytest.mark.parametrize("layout", LAYOUTS)
-@pytest.mark.parametrize("read,tol", [("gather", 0.0), ("roll", 5e-2), ("fused", 5e-2)])
-def test_grid_ring_matches_canonical_under_capture(layout, read, tol):
+@pytest.mark.parametrize("read", ["gather", "roll", "fused"])
+def test_grid_ring_matches_canonical_under_capture(layout, read):
     """LeagueAgent (fp16 stacked slices, captured vmap) with the ring vs without:
     every slice's recurrent state over three wraps, staggered resets, two seat
-    moves and a reload of a different member's weights. roll sums in another
-    order in fp16 (opponent seats only; nothing enters a loss)."""
+    moves and a reload of a different member's weights. The attention sums its
+    ring in slot order, and roll and fused the conv too: fp16 rounding."""
+    tol = 5e-2
     from smashbot import embed as embed_lib, encode
     from smashbot.rl import sim_env
     from smashbot.rl.agent import LeagueAgent
@@ -233,12 +241,13 @@ def test_grid_ring_matches_canonical_under_capture(layout, read, tol):
                 a.load_slice(1, other)
             a.execute()
             a.infer(views, resets[t], flats=flats)
-        flat = lambda h: {k: v for k, v in h.items() if k != "ptr"} | {
+        flat = lambda h: {k: v for k, v in h.items() if k not in ("ptr", "kv_ptr")} | {
             "layers": [tuple(x.reshape(S * N, *x.shape[2:]) for x in l) if isinstance(l, tuple)
                        else l.reshape(S * N, *l.shape[2:]) for l in h["layers"]],
             "cache_len": h["cache_len"].reshape(-1)}
         want = flat(canonical._out_hidden)
-        got = ringed._core.canonical_state({**flat(ringed._in_hidden), "ptr": ringed._in_hidden["ptr"][0]})
+        got = ringed._core.canonical_state({**flat(ringed._in_hidden), "ptr": ringed._in_hidden["ptr"][0],
+                                            "kv_ptr": ringed._in_hidden["kv_ptr"][0]})
         assert torch.equal(want["cache_len"], got["cache_len"]), f"cache_len differs at frame {t}"
         for x, y in zip(tree.flatten(want["layers"]), tree.flatten(got["layers"])):
             diff = (x.float() - y.float()).abs().max().item()

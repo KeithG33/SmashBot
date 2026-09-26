@@ -392,18 +392,19 @@ class BatchedPolicyAgent:
         )
 
     def _ring_carry(self, new_hidden):
-        ptr = self.hidden["ptr"]
+        ptr, kv_ptr = self.hidden["ptr"], self.hidden["kv_ptr"]
         for layer, new in zip(self.hidden["layers"], new_hidden["layers"]):
             if not isinstance(layer, tuple):   # recurrent layer: one state tensor
                 layer.copy_(new)
                 continue
-            (v_ring, kv), (v_new, kv_new) = layer, new
+            (v_ring, _), (v_new, _) = layer, new   # the attention ring was written by the forward
             assert v_new.dim() == 2 and v_ring.dim() == 3, "ring carry takes a [B, d] slot, never a cache"
             v_ring.index_copy_(1, ptr.view(1), v_new.unsqueeze(1).to(v_ring.dtype))
-            kv.copy_(kv_new)
         self.hidden["cache_len"].copy_(new_hidden["cache_len"])
         ptr.add_(1)
         ptr.remainder_(self._core.window - 1)
+        kv_ptr.add_(1)
+        kv_ptr.remainder_(self._core.window)
 
     def _graph_step(self, states, prev, resets, flats=None):
         """Replay the captured graph on this frame's inputs. Returns the
@@ -802,15 +803,16 @@ class LeagueAgent:
         )
 
     def _ring_carry(self):
-        ptr = self._in_hidden["ptr"]                      # [S], all equal
+        ptr, kv_ptr = self._in_hidden["ptr"], self._in_hidden["kv_ptr"]   # [S], all equal
         for layer, new in zip(self._in_hidden["layers"], self._out_hidden["layers"]):
             if not isinstance(layer, tuple):   # recurrent layer: one state tensor
                 layer.copy_(new)
                 continue
-            (v_ring, kv), (v_new, kv_new) = layer, new
+            (v_ring, _), (v_new, _) = layer, new   # the attention ring was written by the forward
             assert v_new.dim() == 3 and v_ring.dim() == 4, "ring carry takes [S, N, d] slots"
             v_ring.index_copy_(2, ptr[:1], v_new.unsqueeze(2).to(v_ring.dtype))
-            kv.copy_(kv_new)
         self._in_hidden["cache_len"].copy_(self._out_hidden["cache_len"])
         ptr.add_(1)
         ptr.remainder_(self._core.window - 1)
+        kv_ptr.add_(1)
+        kv_ptr.remainder_(self._core.window)

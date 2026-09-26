@@ -548,21 +548,36 @@ class SGUBlock(nn.Module):
         u, v = self.uv(xn).chunk(2, dim=-1)
         return u, self.v_norm(v)
 
-    def _attend(self, xn, kv_cache, attn_mask, finite_cache=False):
-        W = self.window
-        q, k_new, va_new = self.attn_qkv(xn).chunk(3, dim=-1)
-        kv_new = torch.cat([k_new, va_new], dim=-1)
-        if finite_cache:
-            # serving never clears the cache on a reset: cache_len masks the
-            # stale entries, and a masked NaN still poisons SDPA (0 * NaN)
-            kv_new = torch.nan_to_num(kv_new.to(kv_cache.dtype), nan=0.0, posinf=0.0, neginf=0.0)
-        kv_full = torch.cat([kv_cache.to(kv_new.dtype), kv_new], dim=1)
-        keys, vals = kv_full.chunk(2, dim=-1)
+    def _qkv(self, xn):
+        q, k, va = self.attn_qkv(xn).chunk(3, dim=-1)
+        return q, torch.cat([k, va], dim=-1)
+
+    def _attend_over(self, q, kv, attn_mask):
+        keys, vals = kv.chunk(2, dim=-1)
         heads = lambda t: t.unflatten(-1, (self.attn_heads, -1)).transpose(1, 2)   # [B, h, T, dk]
         a = torch.nn.functional.scaled_dot_product_attention(
             heads(q), heads(keys), heads(vals), attn_mask=attn_mask,
         ).transpose(1, 2).flatten(-2)
-        return self.attn_out(a), kv_full[:, -(W - 1):].contiguous()
+        return self.attn_out(a)
+
+    def _attend(self, xn, kv_cache, attn_mask):
+        q, kv_new = self._qkv(xn)
+        kv_full = torch.cat([kv_cache.to(kv_new.dtype), kv_new], dim=1)
+        return self._attend_over(q, kv_full, attn_mask), kv_full[:, -(self.window - 1):].contiguous()
+
+    def _attend_ring(self, xn, kv_ring, kv_ptr, attn_mask):
+        """Serving: the frame's K/V goes into its ring slot, then the frame
+        attends over the whole ring. The attention has no positions, so slot
+        order only changes the summation order. A reset leaves the finished
+        game's entries for the mask, and a masked NaN still poisons SDPA
+        (0 * NaN): a non-finite entry is stored as 0."""
+        q, kv_new = self._qkv(xn)
+        kv_new = torch.nan_to_num(kv_new.to(kv_ring.dtype), nan=0.0, posinf=0.0, neginf=0.0)
+        # tensor indices on both dims: a Python index reads kv_ptr on the host
+        # (no capture), and vmap loops index_copy_ over the grid's slices
+        rows = torch.arange(kv_ring.shape[0], device=kv_ring.device)
+        kv_ring.index_put_((rows, kv_ptr.expand(rows.shape[0])), kv_new[:, 0])
+        return self._attend_over(q, kv_ring, attn_mask)
 
     def _spatial(self, v, v_cache):
         W = self.window
@@ -614,18 +629,19 @@ class SGUBlock(nn.Module):
         ).unsqueeze(1)
         return v_mixed, v[:, 0]
 
-    def mix_ring(self, x, v_ring, kv_cache, attn_mask, where, read="gather"):
-        """Serving with the v-cache as a ring: returns the NEW slot [B, d]
-        instead of a shifted cache; the caller writes it in place."""
+    def mix_ring(self, x, v_ring, kv_ring, attn_mask, where, kv_ptr, read="gather"):
+        """Serving with both caches as rings: returns the NEW v slot [B, d]
+        for the caller to write (the conv reads the frame's own v apart), and
+        the attention ring, which this frame's K/V was written into first."""
         xn = self.mix_norm(x)
         u, v = _recomputed_in_backward(self._uv, xn)
         v_mixed, v_new = self._spatial_ring(v, v_ring, where, read)
-        attn, new_kv = self._attend(xn, kv_cache, attn_mask, finite_cache=True)
+        attn = self._attend_ring(xn, kv_ring, kv_ptr, attn_mask)
         x = x + self.mix_out(u * (v_mixed + attn))
 
         x = _swiglu(self, x)
 
-        return x, v_new, new_kv
+        return x, v_new, kv_ring
 
     def mix(self, x, v_cache, kv_cache, attn_mask):
         xn = self.mix_norm(x)
@@ -784,13 +800,23 @@ class SGUCore(Network):
                        for layer in state["layers"]],
         }
 
-    # ---- serving ring: the v-cache is a ring written in place by the agent
-    # (kv stays canonical — small, and cat+SDPA beats a ring read for it).
-    # Ring mode is keyed by "ptr" in the state; the learner never sees it. ----
+    # ---- serving rings: the v-cache (W-1 slots, written by the agent at ptr)
+    # and the attention cache (W slots: the frame's own K/V is written at
+    # kv_ptr before it attends). Ring mode is keyed by "ptr" in the state;
+    # the learner never sees it (canonical_state). ----
     def initial_ring_state(self, batch_size, device=None):
         s = self.initial_state(batch_size, device)
+        s["layers"] = [(layer[0], torch.zeros(batch_size, self.window, 2 * self.attn_width, device=device))
+                       if isinstance(layer, tuple) else layer for layer in s["layers"]]
         s["ptr"] = torch.zeros((), dtype=torch.long, device=device)
+        s["kv_ptr"] = torch.zeros((), dtype=torch.long, device=device)
         return s
+
+    def _ring_attn_mask(self, kv_ptr, cache_len):
+        """[B, 1, 1, W]: slot s holds the entry (kv_ptr - s) mod W frames old,
+        valid within cache_len (the frame's own, at kv_ptr, always)."""
+        age = (kv_ptr - torch.arange(self.window, device=cache_len.device)) % self.window
+        return (age[None, :] <= cache_len[:, None])[:, None, None, :]
 
     def _ring_index(self, ptr, cache_len, device, roll=False):
         W = self.window
@@ -805,9 +831,11 @@ class SGUCore(Network):
     def canonical_state(self, state):
         """Ring state -> the chronological state the learner expects."""
         idx, valid = self._ring_index(state["ptr"], state["cache_len"], state["cache_len"].device)
+        W = self.window
+        kv_idx = (torch.arange(W - 1, device=idx.device) + state["kv_ptr"] + 1) % W   # the latest W-1, oldest first
         layers = [
             (torch.where(valid[:, :, None], layer[0].index_select(1, idx), 0.0),
-             torch.where(valid[:, :, None], layer[1], 0.0))
+             torch.where(valid[:, :, None], layer[1].index_select(1, kv_idx), 0.0))
             if isinstance(layer, tuple) else layer
             for layer in state["layers"]
         ]
@@ -822,6 +850,7 @@ class SGUCore(Network):
         state = {
             "cache_len": torch.where(reset, 0, prev_state["cache_len"]),
             "ptr": prev_state["ptr"],
+            "kv_ptr": prev_state["kv_ptr"],
             "layers": [layer if isinstance(layer, tuple)
                        else _mask_state(reset, torch.zeros_like(layer), layer)
                        for layer in prev_state["layers"]],
@@ -831,13 +860,15 @@ class SGUCore(Network):
     def _forward(self, inputs, state):
         T = inputs.shape[1]
         x = self.encoder(inputs)
-        mask = self._attn_mask(T, state["cache_len"], inputs.shape[0], inputs.device)
         ring = "ptr" in state
         read = self.ring_read
         if ring:
             assert T == 1, "ring mode is the serving path"
+            mask = self._ring_attn_mask(state["kv_ptr"], state["cache_len"])
             where = ((state["ptr"], state["cache_len"]) if read == "fused" else
                      self._ring_index(state["ptr"], state["cache_len"], inputs.device, read == "roll"))
+        else:
+            mask = self._attn_mask(T, state["cache_len"], inputs.shape[0], inputs.device)
         new_layers = []
         for block, layer in zip(self.blocks, state["layers"]):
             if isinstance(block, RecurrentBlock):
@@ -846,7 +877,7 @@ class SGUCore(Network):
                 continue
             v_cache, kv_cache = layer
             if ring:
-                x, v_new, nkv = block.mix_ring(x, v_cache, kv_cache, mask, where, read)
+                x, v_new, nkv = block.mix_ring(x, v_cache, kv_cache, mask, where, state["kv_ptr"], read)
                 new_layers.append((v_new, nkv))
             else:
                 x, nv, nkv = block.mix(x, v_cache, kv_cache, mask)
@@ -856,7 +887,8 @@ class SGUCore(Network):
             "layers": new_layers,
         }
         if ring:
-            next_state["ptr"] = state["ptr"]      # advanced by the agent after the write
+            next_state["ptr"] = state["ptr"]      # both advanced by the agent after the frame
+            next_state["kv_ptr"] = state["kv_ptr"]
         return self.final_norm(x), next_state
 
     def step(self, inputs, prev_state):
