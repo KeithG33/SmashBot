@@ -31,6 +31,7 @@ exec $REPO/.venv/bin/python -m smashbot.rl.train_rl \
   --learner.kl-teacher-weight 0.075 \
   --learner.kl-teacher-weight-final 0.01 \
   --learner.entropy-weight 1e-4 \
+  --learner.ppo.max-mean-actor-kl 3e-4 \
   --learner.imitation-rows -1 \
   --learner.imitation-lambda 0.05 \
   --learner.imitation-lambda-final-frac 0.2 \
