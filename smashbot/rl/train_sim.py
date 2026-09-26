@@ -278,7 +278,7 @@ def run(args) -> None:
     from smashbot.rl.sim_league import SimLeague
     from smashbot.rl.train_rl import build_value_function, _save_rl_checkpoint
     from smashbot.training import compile_cores, resolve_restore
-    from smashbot.networks import check_loadable, use_manual_recurrent_step
+    from smashbot.networks import check_loadable, use_manual_recurrent_step, use_packed_encoder
 
     run_dir = f"{args.runtime.run_dir}/{args.runtime.tag}"
     rpath = resolve_restore(run_dir, args.runtime.restore)
@@ -341,6 +341,8 @@ def run(args) -> None:
     serving_policy = _copy.deepcopy(policy)
     serving_policy.requires_grad_(False).eval()
     use_manual_recurrent_step(serving_policy)   # capturable and fp16-faithful one-frame cells
+    for net in (policy, value_fn, teacher):
+        use_packed_encoder(net)   # the learner's copies: serving keeps the embed and encoder apart
     print("learner overlap: ON — student serves a published weight copy; "
           "rollouts are one update stale", flush=True)
     if args.runtime.compile:

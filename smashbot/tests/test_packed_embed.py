@@ -13,6 +13,7 @@ import tree
 
 
 from smashbot import configs, embed as embed_lib
+from smashbot.networks import use_packed_encoder
 from smashbot.policy import build_policy
 
 
@@ -116,8 +117,30 @@ def test_packed_item_mlp_grads_match():
         assert torch.allclose(p.grad, ref, atol=1e-5, rtol=1e-5)
 
 
-@pytest.mark.parametrize("name", ["tx_like", "transformer", "sgu"])
-def test_policy_paths_match(name):
+@pytest.mark.parametrize("shape", [(7,), (3, 5)])
+def test_encode_is_linear_of_packed(shape):
+    """encode(struct, linear) is linear(packed(struct)) up to fp32 summation
+    order, in value and in every gradient: the linear's and the item MLP's."""
+    torch.manual_seed(0)
+    sae = _make_embedding()
+    packed = embed_lib.PackedStructForward(sae)
+    linear = torch.nn.Linear(sae.size, 24)
+    params = [linear.weight, linear.bias] + [p for g in packed._groups for p in g["mlp"].parameters()]
+    sa = _rand_input(sae, shape, np.random.default_rng(4))
+    upstream = torch.randn(*shape, 24)
+
+    def value_and_grads(fn):
+        out = fn()
+        return out, torch.autograd.grad((out * upstream).sum(), params)
+
+    ref, ref_grads = value_and_grads(lambda: linear(packed(sa)))
+    got, got_grads = value_and_grads(lambda: packed.encode(sa, linear))
+    assert torch.allclose(got, ref, atol=1e-5, rtol=1e-5)
+    for g, r in zip(got_grads, ref_grads):
+        assert torch.allclose(g, r, atol=1e-5, rtol=1e-4)
+
+
+def _unroll_inputs(name):
     torch.manual_seed(0)
     policy = build_policy(
         embed_config=embed_lib.EmbedConfig(),
@@ -128,12 +151,29 @@ def test_policy_paths_match(name):
         num_names=16,
     )
     net = policy.network
-    assert net.packed_embed is not None
     rng = np.random.default_rng(3)
     sa = _rand_input(net.embed_state_action, (3, 12), rng)
     reset = torch.zeros(3, 12, dtype=torch.bool)
     reset[1, 4] = True
-    state = net.initial_state(3)
+    return policy, sa, reset, net.initial_state(3)
+
+
+@pytest.mark.parametrize("name", ["transformer", "sgu"])
+def test_packed_encoder_matches_the_policy_path(name):
+    policy, sa, reset, state = _unroll_inputs(name)
+    net = policy.network
+    out_ref, _ = net.unroll(sa, reset, state)
+    use_packed_encoder(policy)
+    assert net.packed_encoder and net.core.inputs_encoded
+    out_fast, _ = net.unroll(sa, reset, state)
+    assert torch.allclose(out_fast, out_ref, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("name", ["tx_like", "transformer", "sgu"])
+def test_policy_paths_match(name):
+    policy, sa, reset, state = _unroll_inputs(name)
+    net = policy.network
+    assert net.packed_embed is not None
 
     out_fast, _ = net.unroll(sa, reset, state)
     packed_ref, net.packed_embed = net.packed_embed, None

@@ -464,9 +464,11 @@ class TransformerCore(Network):
              causal_window[None, :, :].expand(B, T, T)], dim=2,
         ).unsqueeze(1)  # [B, 1, T, W+T]
 
+    inputs_encoded: bool = False   # the learner's StateActionNetwork applied the encoder (use_packed_encoder)
+
     def _forward(self, inputs, state):
         T = inputs.shape[1]
-        x = self.encoder(inputs)
+        x = inputs if self.inputs_encoded else self.encoder(inputs)
         positions = state["pos"][:, None] + torch.arange(T, device=inputs.device)[None]
         mask = self._attn_mask(T, state["cache_len"], inputs.shape[0], inputs.device)
         new_kv = []
@@ -667,6 +669,15 @@ def use_chunk_start_resets(module: nn.Module) -> None:
             m.chunk_start_resets = True
 
 
+def use_packed_encoder(module: nn.Module) -> None:
+    """For the learners: each network's packed input embedding and its core's
+    encoder run as one (PackedStructForward.encode), so the one-hot input is
+    never built. Serving copies keep the two (the grids vmap them)."""
+    for m in module.modules():
+        if isinstance(m, StateActionNetwork) and m.packed_embed is not None and hasattr(m.core, "inputs_encoded"):
+            m.packed_encoder = m.core.inputs_encoded = True
+
+
 def use_manual_recurrent_step(module: nn.Module) -> None:
     """Serve every LSTM/GRU in `module` through its hand-rolled one-frame
     step (vmap-able, fp16-faithful) instead of cuDNN."""
@@ -857,9 +868,11 @@ class SGUCore(Network):
         }
         return self.step(inputs, state)
 
+    inputs_encoded: bool = False   # the learner's StateActionNetwork applied the encoder (use_packed_encoder)
+
     def _forward(self, inputs, state):
         T = inputs.shape[1]
-        x = self.encoder(inputs)
+        x = inputs if self.inputs_encoded else self.encoder(inputs)
         ring = "ptr" in state
         read = self.ring_read
         if ring:
@@ -913,7 +926,13 @@ class StateActionNetwork(Network):
             embed_lib.PackedStructForward(embed_state_action) if packed else None
         )
 
+    packed_encoder: bool = False   # see use_packed_encoder
+
     def embed_sa(self, state_action) -> torch.Tensor:
+        """The core's input: the embedded struct, or with packed_encoder the
+        encoder's output already."""
+        if self.packed_encoder:
+            return self.packed_embed.encode(state_action, self.core.encoder)
         if self.packed_embed is not None:
             return self.packed_embed(state_action)
         return self.embed_state_action(state_action)

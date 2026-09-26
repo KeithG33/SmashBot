@@ -121,15 +121,15 @@ class GradClipper:
 
 def compile_cores(policy, value_fn, teacher=None) -> None:
     """Compile the pieces with a fixed structure, dynamic over the chunk
-    length: the packed input embeddings (in eager each of their out-of-place
-    writes copies the whole input), an SGU core's per-chunk forward (cuDNN
-    recurrent layers stay eager inside it), a tx_like core's stateless layers
-    (the encoder and the FFW blocks between its LSTMs), the controller head,
-    and the value net's return recursion (tiny kernels, one per frame, in
-    eager). RL's frozen teacher compiles like the policy. The reset chunking,
-    tree maps and metric .item()s around them stay in Python. For the
-    learner's copies only: a serving copy has its own compile inside its
-    CUDA-graph capture."""
+    length: the packed input embeddings and their encode (in eager each of
+    their out-of-place writes copies the whole input), an SGU core's
+    per-chunk forward (cuDNN recurrent layers stay eager inside it), a
+    tx_like core's stateless layers (the encoder and the FFW blocks between
+    its LSTMs), the controller head, and the value net's return recursion
+    (tiny kernels, one per frame, in eager). RL's frozen teacher compiles
+    like the policy. The reset chunking, tree maps and metric .item()s around
+    them stay in Python. For the learner's copies only: a serving copy has
+    its own compile inside its CUDA-graph capture."""
     from smashbot import delay as delay_lib
     from smashbot.networks import FFWWrapper
 
@@ -139,6 +139,7 @@ def compile_cores(policy, value_fn, teacher=None) -> None:
     for net in [p.network for p in policies] + [value_fn.network]:
         if net.packed_embed is not None:
             net.packed_embed.forward = torch.compile(net.packed_embed.forward, dynamic=True)
+            net.packed_embed.encode = torch.compile(net.packed_embed.encode, dynamic=True)
         core = net.core
         if hasattr(core, "_forward"):
             core._forward = torch.compile(core._forward, dynamic=True)

@@ -696,12 +696,10 @@ class _PackedSpec(nn.Module):
             self.register_buffer(name, torch.tensor(values, dtype=dtype), persistent=False)
 
         self._bool_fetch = [f for f, _, _ in bools]
-        buf("bool_cols", [o for _, _, o in bools], torch.long)
+        self._float_fetch = [f for f, _, _ in floats]
+        buf("dense_cols", [o for _, _, o in bools + floats], torch.long)   # dense()'s order
         buf("bool_on", [e.on for _, e, _ in bools], torch.float32)
         buf("bool_off", [e.off for _, e, _ in bools], torch.float32)
-
-        self._float_fetch = [f for f, _, _ in floats]
-        buf("float_cols", [o for _, _, o in floats], torch.long)
         # Mirror FloatEmbedding.encode exactly: (+bias?) then (*scale?), then
         # clamp guarded by truthiness (0.0 bounds disable clamping upstream).
         buf("float_bias", [e.bias if e.bias is not None else 0.0 for _, e, _ in floats], torch.float32)
@@ -720,33 +718,58 @@ class _PackedSpec(nn.Module):
         assert fetches, "packed spec must have at least one leaf"
         self._shape_fetch = fetches[0]
 
+    def dense(self, struct) -> torch.Tensor:
+        """The bool and float leaves' values, in dense_cols' order."""
+        parts = []
+        if self._bool_fetch:
+            b = torch.stack([f(struct) for f in self._bool_fetch], dim=-1)
+            parts.append(torch.where(b, self.bool_on, self.bool_off))
+        if self._float_fetch:
+            x = torch.stack([f(struct).float() for f in self._float_fetch], dim=-1)
+            parts.append(torch.clamp((x + self.float_bias) * self.float_scale, self.float_lo, self.float_hi))
+        if not parts:
+            return torch.zeros(*self._shape_fetch(struct).shape, 0, device=self.dense_cols.device)
+        return torch.cat(parts, dim=-1)
+
+    def onehots(self, struct) -> tuple[torch.Tensor, torch.Tensor]:
+        """Each one-hot leaf's column and its value there: 1.0, or 0.0 for an
+        EMPTY-policy leaf's invalid id."""
+        idx = torch.stack([f(struct).long() for f in self._onehot_fetch], dim=-1)
+        valid = (idx >= 0) & (idx < self.oh_sizes)
+        dest = self.oh_offsets + torch.minimum(idx.clamp(min=0), self.oh_sizes - 1)
+        return dest, (valid | ~self.oh_checked).float()
+
     def compute(self, struct) -> torch.Tensor:
         # out-of-place writes (index_copy / scatter, identical results) so the
         # whole forward is vmap-able over stacked per-slot parameters
         lead = self._shape_fetch(struct).shape
         out = torch.zeros(
-            *lead, self.total_size, dtype=torch.float32, device=self.bool_cols.device
+            *lead, self.total_size, dtype=torch.float32, device=self.dense_cols.device
         )
-        if self._bool_fetch:
-            b = torch.stack([f(struct) for f in self._bool_fetch], dim=-1)
-            out = out.index_copy(-1, self.bool_cols, torch.where(b, self.bool_on, self.bool_off))
-        if self._float_fetch:
-            x = torch.stack([f(struct).float() for f in self._float_fetch], dim=-1)
-            x = torch.clamp((x + self.float_bias) * self.float_scale, self.float_lo, self.float_hi)
-            out = out.index_copy(-1, self.float_cols, x)
+        if len(self.dense_cols):
+            out = out.index_copy(-1, self.dense_cols, self.dense(struct))
         if self._onehot_fetch:
-            idx = torch.stack([f(struct).long() for f in self._onehot_fetch], dim=-1)
-            valid = (idx >= 0) & (idx < self.oh_sizes)
-            src = (valid | ~self.oh_checked).float()
-            dest = self.oh_offsets + torch.minimum(idx.clamp(min=0), self.oh_sizes - 1)
-            out = out.scatter(-1, dest, src)
+            out = out.scatter(-1, *self.onehots(struct))
         return out
+
+    def lookup(self, struct, weight: torch.Tensor) -> torch.Tensor:
+        """weight [out, total_size] applied to the input, without building
+        the input: a one-hot's term is its column of weight, looked up; the
+        bools and floats are one small matmul."""
+        y = self.dense(struct) @ weight[:, self.dense_cols].t()
+        if self._onehot_fetch:
+            dest, src = self.onehots(struct)
+            y = y + F.embedding_bag(
+                dest.reshape(-1, dest.shape[-1]), weight.t().contiguous(),
+                per_sample_weights=src.reshape(-1, src.shape[-1]), mode="sum",
+            ).view_as(y)
+        return y
 
 
 class PackedStructForward(nn.Module):
     """Drop-in replacement for `root(struct)` producing the identical tensor.
 
-    Scalars go through two stacked vectorized paths, one-hots through a single
+    Scalars go through one stacked vectorized path, one-hots through a single
     scatter, and slots sharing an MLPWrapper module (the 15 item slots) run as
     one batched MLP call. Registers no parameters and only non-persistent
     buffers: checkpoints and RNG streams are unaffected.
@@ -825,12 +848,30 @@ class PackedStructForward(nn.Module):
             )
         self.group_specs = nn.ModuleList(group_specs)
 
+    def encode(self, struct, linear: nn.Linear) -> torch.Tensor:
+        """linear(self(struct)) without building the input (see
+        _PackedSpec.lookup), for the learners: the lookups sum in fp32 over
+        the fp32 weights the matmul would round to the autocast dtype. The
+        item slots stay a matmul: nearly all are empty, so their lookups would
+        all hit the same few rows. In the dtype linear returns."""
+        device = linear.weight.device.type
+        dtype = torch.get_autocast_dtype(device) if torch.is_autocast_enabled(device) else linear.weight.dtype
+        with torch.autocast(device, enabled=False):
+            y = self.spec.lookup(struct, linear.weight) + linear.bias
+        for g in self._groups:
+            y = y + F.linear(self._items(struct, g).flatten(-2),
+                             linear.weight[:, g["start"] : g["start"] + g["k"] * g["out_size"]]).float()
+        return y.to(dtype)
+
+    def _items(self, struct, g) -> torch.Tensor:
+        """A group's slot MLP outputs, [.., k, out_size]."""
+        x = self.group_specs[g["spec_idx"]].compute(struct)
+        return g["mlp"](x.reshape(*x.shape[:-1], g["k"], g["in_size"]))
+
     def forward(self, struct) -> torch.Tensor:
         out = self.spec.compute(struct)
         for g in self._groups:
-            x = self.group_specs[g["spec_idx"]].compute(struct)
-            x = x.reshape(*x.shape[:-1], g["k"], g["in_size"])
-            y = g["mlp"](x)
+            y = self._items(struct, g)
             width = g["k"] * g["out_size"]
             out[..., g["start"] : g["start"] + width] = y.reshape(*y.shape[:-2], width)
         return out

@@ -27,7 +27,7 @@ import tyro
 from smashbot import configs, embed as embed_lib, saving
 from smashbot.data import loader
 from smashbot.delay import slice_delayed_frames
-from smashbot.networks import build_embed_network, check_loadable, use_chunk_start_resets
+from smashbot.networks import build_embed_network, check_loadable, use_chunk_start_resets, use_packed_encoder
 from smashbot.policy import build_policy, imitation_metrics
 from smashbot.training import GradClipper, compile_cores, resolve_restore
 from smashbot.value import ValueFunction
@@ -253,6 +253,8 @@ def main(config: TrainConfig) -> None:
 
     use_chunk_start_resets(policy)
     use_chunk_start_resets(value_fn)
+    use_packed_encoder(policy)
+    use_packed_encoder(value_fn)
     policy_opt = torch.optim.Adam(policy.parameters(), lr=config.learner.learning_rate, fused=True)
     value_opt = torch.optim.Adam(value_fn.parameters(), lr=config.learner.learning_rate, fused=True)
     # AutoClip is for the policy only: the value net's step-to-step norms swing
