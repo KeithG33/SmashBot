@@ -36,6 +36,7 @@ exec $REPO/.venv/bin/python -m smashbot.rl.train_rl \
   --learner.imitation-lambda 0.05 \
   --learner.imitation-lambda-final-frac 0.2 \
   --sim.num-envs 400 \
+  --sim.sim-shards 4 \
   --sim.pfsp-slices 40 \
   --sim.unroll-length 240 \
   --sim.snapshot-interval 1500 \
