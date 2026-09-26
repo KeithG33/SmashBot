@@ -245,7 +245,7 @@ def test_fused_ring_read_matches_the_roll_read(C, W):
     pointers and cache lengths (empty and full included). Shapes: inside one
     64-channel x 32-slot tile; several tiles with partial tails in both; the
     hybrid's 576 channels, window 256."""
-    from smashbot.causal_conv import causal_conv_ring
+    from smashbot.causal_conv import causal_conv_ring, ring_taps
     from smashbot.networks import SGUBlock
     torch.manual_seed(0)
     S, N = 3, 7
@@ -270,9 +270,10 @@ def test_fused_ring_read_matches_the_roll_read(C, W):
         return out[:, 0].half()
 
     want = torch.stack([roll_read(s) for s in range(S)])
-    one = torch.stack([causal_conv_ring(ring[s], v[s], weight[s], bias[s], cache_len[s], ptr[s])
+    taps = ring_taps(weight)
+    one = torch.stack([causal_conv_ring(ring[s], v[s], taps[s], bias[s], cache_len[s], ptr[s])
                        for s in range(S)])
-    batched = torch.vmap(causal_conv_ring)(ring, v, weight, bias, cache_len, ptr)
+    batched = torch.vmap(causal_conv_ring)(ring, v, taps, bias, cache_len, ptr)
     assert torch.equal(one, batched), "the vmap rule must compute each slice as a single call does"
     torch.testing.assert_close(batched.float(), want.float(), rtol=1e-3, atol=2e-3)
 

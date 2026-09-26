@@ -14,7 +14,7 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 
-from smashbot.causal_conv import causal_conv, causal_conv_ring
+from smashbot.causal_conv import causal_conv, causal_conv_ring, ring_taps
 
 RecurrentState = tp.Any
 
@@ -592,7 +592,7 @@ class SGUBlock(nn.Module):
         # eager vmap, where nothing fuses the masked copy, product and sum.
         if read == "fused":
             ptr, cache_len = where
-            v_mixed = causal_conv_ring(v_ring, v[:, 0], self.spatial.weight, self.spatial.bias,
+            v_mixed = causal_conv_ring(v_ring, v[:, 0], self.spatial_taps, self.spatial.bias,
                                        cache_len, ptr)
             return v_mixed.unsqueeze(1), v[:, 0]
         idx, valid = where
@@ -730,7 +730,18 @@ class SGUCore(Network):
         )
         self.final_norm = RMSNorm(hidden_size)
         self.output_size = hidden_size
-        self.ring_read = "gather"   # "roll" or "fused" for eager (vmap) serving paths
+        self.ring_read = "gather"   # "roll" or "fused" (serve_fused_ring) for eager (vmap) serving paths
+
+    def serve_fused_ring(self, dtype):
+        """Read the ring with one kernel per layer (causal_conv_ring), from
+        conv taps kept slot-major in the serving dtype, so no frame re-lays
+        them out. Whoever loads new weights refreshes them
+        (LeagueAgent.load_slice)."""
+        self.ring_read = "fused"
+        for block in self.blocks:
+            if isinstance(block, SGUBlock):
+                block.register_buffer("spatial_taps", ring_taps(block.spatial.weight.detach()).to(dtype),
+                                      persistent=False)
 
     def initial_state(self, batch_size, device=None):
         z = lambda *shape: torch.zeros(*shape, device=device)

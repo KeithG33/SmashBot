@@ -18,6 +18,7 @@ import tree
 
 from slippi_ai.types import Controller, StateAction
 
+from smashbot.causal_conv import ring_taps
 from smashbot.eval.agent import _neutral_controller
 from smashbot.networks import current_names, use_manual_recurrent_step
 from smashbot.policy import Policy
@@ -477,6 +478,22 @@ class LeagueAgent:
         self._template.__dict__.pop("sample", None)  # any compiled wrapper
         self._template.requires_grad_(False).eval()
         use_manual_recurrent_step(self._template)   # cuDNN steps have no vmap rule
+        if capture is None:
+            capture = self.device.type == "cuda"
+        assert not capture or self.device.type == "cuda", (
+            "LeagueAgent capture=True needs a CUDA device"
+        )
+        self._use_capture = capture
+        # v-cache ring (capture-only, see BatchedPolicyAgent): the captured graph
+        # writes one slot per layer per frame and carries the rest of the state
+        # in place, so there is no per-frame carry outside it. The grid's
+        # forward is eager vmap, where nothing fuses the ring read, so it is one
+        # kernel (causal_conv_ring), whose conv taps are stacked with the weights.
+        self._core = getattr(self._template.network, "core", None)
+        self._ring = (self._use_capture and hasattr(self._core, "initial_ring_state")
+                      and ring is not False)
+        if self._ring:
+            self._core.serve_fused_ring(self.weights_dtype)
         # stacked weights [S, ...]: slice s serves cells (s, 0..N-1)
         with torch.no_grad():
             params = dict(self._template.named_parameters())
@@ -517,22 +534,6 @@ class LeagueAgent:
             collections.deque([self._neutral_row] * self.delay)
             for _ in range(self.S * self.N)
         ]
-        if capture is None:
-            capture = self.device.type == "cuda"
-        assert not capture or self.device.type == "cuda", (
-            "LeagueAgent capture=True needs a CUDA device"
-        )
-        self._use_capture = capture
-        # v-cache ring (capture-only, see BatchedPolicyAgent): the captured graph
-        # writes one slot per layer per frame and carries the rest of the state
-        # in place, so there is no per-frame carry outside it. The grid's
-        # forward is eager vmap, where nothing fuses the ring read, so it is one
-        # kernel (causal_conv_ring).
-        self._core = getattr(self._template.network, "core", None)
-        self._ring = (self._use_capture and hasattr(self._core, "initial_ring_state")
-                      and ring is not False)
-        if self._ring:
-            self._core.ring_read = "fused"
         self._graph = None
         self._vm = self._make_vmap()
         self._timer = None  # optional profiler callback (name) -> None
@@ -583,6 +584,10 @@ class LeagueAgent:
         for name, t in self._stacked_buffers.items():
             if name in state_dict:
                 t[s].copy_(state_dict[name])
+        for name, block in self._template.named_modules():
+            if hasattr(block, "spatial_taps"):
+                self._stacked_buffers[f"{name}.spatial_taps"][s].copy_(
+                    ring_taps(self._stacked_params[f"{name}.spatial.weight"][s]))
 
     # ---------------------------------------------------------- stepping
 
