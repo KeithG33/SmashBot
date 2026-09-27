@@ -309,6 +309,8 @@ def run(args) -> None:
     scfg: SimRolloutConfig = args.sim
     device = args.runtime.device
     assert device == "cuda", "sim backend is a GPU training path"
+    if os.environ.get("SMASHBOT_MEM_FRACTION"):   # a cap, so the allocator's garbage_collection_threshold acts
+        torch.cuda.set_per_process_memory_fraction(float(os.environ["SMASHBOT_MEM_FRACTION"]))
     if os.environ.get("SMASHBOT_MEMDEBUG"):
         # allocator history with python stacks; dumped on OOM (below) for
         # torch.cuda.memory._snapshot analysis
@@ -370,7 +372,9 @@ def run(args) -> None:
           "rollouts are one update stale", flush=True)
     if args.runtime.compile:
         import torch._dynamo
-        torch._dynamo.config.recompile_limit = 128
+        # every variant compiles once (minutes, early); a function at the limit
+        # runs its new variants uncompiled for the rest of the run
+        torch._dynamo.config.recompile_limit = 1024
         # capture mode wraps this in our own CUDA graph, so compile for
         # kernels only (cudagraph trees cannot nest inside a manual capture)
         serving_policy.sample = torch.compile(
@@ -536,6 +540,11 @@ def run(args) -> None:
                       f"alloc {torch.cuda.memory_allocated()/2**30:.2f} "
                       f"peak {torch.cuda.max_memory_allocated()/2**30:.2f} "
                       f"reserved {torch.cuda.memory_reserved()/2**30:.2f} GiB", flush=True)
+            if os.environ.get("SMASHBOT_MEMSNAP", ":").split(":")[1] == str(i):   # path:step
+                import pickle
+                with open(os.environ["SMASHBOT_MEMSNAP"].split(":")[0], "wb") as f:
+                    pickle.dump({"segments": torch.cuda.memory_snapshot(), "stats": torch.cuda.memory_stats()}, f)
+                print(f"[vram] memory snapshot at post-collect {i}", flush=True)
             if fut is not None:
                 state, metrics = fut.result()
                 _post_step(fut_i, metrics)
