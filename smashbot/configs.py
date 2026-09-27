@@ -67,8 +67,9 @@ class NetworkConfig:
     embed_hidden_size: int = 128
     # enhanced only: a constant slippi ranked rating input; None = no input
     rating: float | None = None
-    # enhanced only: the character-action table indexed as slippi-ai does
-    # (the index wraps in uint8; for the ported Phillips, not for new models)
+    # !!! enhanced only: reproduces slippi-ai's uint8 character-action index
+    # BUG for the ported Phillips, which were trained on it. NEVER set it for a
+    # model we train (see embed.EnhancedEmbed's NOTE).
     embed_joint_index_wraps: bool = False
 
 

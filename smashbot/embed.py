@@ -726,9 +726,6 @@ class EnhancedEmbed(nn.Module):
                  item_mlp_layers: int = 2, rating: float | None = None,
                  joint_index_wraps: bool = False):
         super().__init__()
-        # slippi-ai builds the joint table's index in the character's uint8,
-        # so character * 399 wraps mod 256 and characters share rows; the big
-        # Phillips were trained on that index
         self._joint_wraps = joint_index_wraps
         leaves = lambda struct: dict(struct.embedding)
         sa = leaves(embed_state_action)
@@ -755,13 +752,35 @@ class EnhancedEmbed(nn.Module):
         dummy = tree_map_to_torch(embed_state_action.dummy(()))
         self.output_size = self(dummy).shape[-1]
 
+    # ==========================================================================
+    # !!! NOTE: SLIPPI-AI BUG, REPRODUCED ON PURPOSE FOR THE PORTED PHILLIPS !!!
+    #
+    # slippi-ai's MultiEmbed (slippi_ai/jax/networks.py at 275c072, L1081-1086)
+    # builds the character-action index from `jnp.zeros_like(character)`, a
+    # uint8, and multiplies by the table sizes, which are Python ints: JAX keeps
+    # a Python int in the array's dtype, so character * 399 wraps mod 256
+    # before the uint16 action is added. Only rows 0-653 of the 13,167-row
+    # table are ever read, and characters share rows. The big RL Phillips (and
+    # their teacher) were trained on that index, so their checkpoints must use
+    # _joint_index_as_slippi_ai (network.embed_joint_index_wraps, set only by
+    # scripts/port_jax_phillip.py).
+    #
+    # TODO(training): a model we train uses _joint_index, the per-character
+    # table slippi-ai meant; never set embed_joint_index_wraps for one. That
+    # path has not been trained yet: check it on the first run with the
+    # enhanced embed.
+    # ==========================================================================
+    def _joint_index(self, char, action):
+        return char * self._actions + action
+
+    def _joint_index_as_slippi_ai(self, char, action):
+        return char * self._actions % 256 + action
+
     def _player_or_nana(self, raw, leaves: dict, nana: bool) -> torch.Tensor:
         char, action = raw.character.long(), raw.action.long()
         valid = (char >= 0) & (char < self._chars) & (action >= 0) & (action < self._actions)
-        offset = char * self._actions
-        if self._joint_wraps:
-            offset = offset % 256
-        joint = self.embed_char_action(torch.where(valid, offset + action, 0))
+        index = (self._joint_index_as_slippi_ai if self._joint_wraps else self._joint_index)(char, action)
+        joint = self.embed_char_action(torch.where(valid, index, 0))
         parts = [
             leaves["percent"](raw.percent), leaves["facing"](raw.facing),
             leaves["x"](raw.x), leaves["y"](raw.y),
