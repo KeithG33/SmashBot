@@ -36,7 +36,7 @@ import tree
 
 from slippi_ai.types import Frames, StateAction
 
-from smashbot.networks import RecurrentState, _mask_state
+from smashbot.networks import RecurrentState
 from smashbot.rl.config import PPOConfig, RLConfig  # noqa: F401  (re-export)
 from smashbot.policy import Policy
 from smashbot.training import GradClipper
@@ -174,9 +174,6 @@ class _Fixed(tp.NamedTuple):
     # reset-substituted neutral at t+1 (a fictional action the actor never
     # sampled — the AR head's teacher-forcing chains diverge there and the
     # position carries no legitimate learning signal)
-    reset0: torch.Tensor  # [B] bool: the chunk starts a fresh game (the
-    # policy's initial state is masked to zeros per micro-batch chunk, not
-    # for the whole batch up front — two full-batch state copies otherwise)
 
 
 def imitation_weights(
@@ -537,7 +534,6 @@ class Learner:
             actor_logits=cat0(a_logits),
             actor_log_probs=cat0(a_logps),
             valid=(~traj.is_resetting[:, 1:]).float(),
-            reset0=traj.is_resetting[:, 0],
         )
         # Detach carried recurrent states: the next chunk's backward must not
         # reach into this chunk's (already-freed) graph.
@@ -565,13 +561,9 @@ class Learner:
     LOGIT_CLAMP = 500.0  # real |logit| max ~125; kills only fp16 blowups
 
     def _unroll(self, fixed: _Fixed):
-        rows = fixed.valid.shape[0]
-        init = _mask_state(
-            fixed.reset0,
-            self.policy.initial_state(rows, fixed.valid.device),
-            fixed.initial_policy_state,
-        )
-        return self.policy.unroll(fixed.frames, init)
+        # the unroll masks the rows that reset at frame 0 itself (as for the
+        # teacher and value unrolls)
+        return self.policy.unroll(fixed.frames, fixed.initial_policy_state)
 
     def _policy_loss_inner(self, fixed: _Fixed) -> tuple[torch.Tensor, dict]:
         """(loss, metrics); the metrics are 0-dim device tensors, read to the
