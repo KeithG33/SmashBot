@@ -659,10 +659,12 @@ class SGUBlock(nn.Module):
 
         return x, v_new, kv_ring
 
+    recompute_uv: bool = True   # BC keeps them (keep_sgu_activations)
+
     def mix(self, x, v_cache, kv_cache, attn_mask, reset=None):
         """reset [B] (or None): rows whose caches start empty, as if zeroed."""
         xn = self.mix_norm(x)
-        u, v = _recomputed_in_backward(self._uv, xn)
+        u, v = _recomputed_in_backward(self._uv, xn) if self.recompute_uv else self._uv(xn)
         v_mixed, new_v = self._spatial(v, v_cache, reset)
         attn, new_kv = self._attend(xn, kv_cache, attn_mask, reset)
         x = x + self.mix_out(u * (v_mixed + attn))
@@ -682,6 +684,14 @@ def use_chunk_start_resets(module: nn.Module) -> None:
     for m in module.modules():
         if isinstance(m, Network):
             m.chunk_start_resets = True
+
+
+def keep_sgu_activations(module: nn.Module) -> None:
+    """For BC, which has the memory: the SGU blocks keep (u, v) for backward
+    instead of recomputing them."""
+    for m in module.modules():
+        if isinstance(m, SGUBlock):
+            m.recompute_uv = False
 
 
 def use_packed_encoder(module: nn.Module) -> None:
