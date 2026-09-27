@@ -221,6 +221,7 @@ def main(config: TrainConfig) -> None:
         controller_config=embed_lib.ControllerConfig(
             axis_spacing=config.head.axis_spacing,
             shoulder_spacing=config.head.shoulder_spacing,
+            type=config.head.controller_type,
         ),
         network_config=config.network,
         head_config=config.head,
@@ -245,6 +246,7 @@ def main(config: TrainConfig) -> None:
             controller_embedding=embed_lib.ControllerConfig(
                 axis_spacing=config.head.axis_spacing,
                 shoulder_spacing=config.head.shoulder_spacing,
+                type=config.head.controller_type,
             ).make_embedding(),
             num_names=config.data.max_names,
             network_config=value_net_config,

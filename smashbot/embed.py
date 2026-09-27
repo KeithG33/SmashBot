@@ -33,6 +33,8 @@ from slippi_ai.types import (
 
 from slippi_ai.types import NAME_DTYPE
 
+from smashbot import custom_v1
+
 In = TypeVar("In")
 Out = TypeVar("Out")
 
@@ -607,12 +609,63 @@ def get_controller_embedding(
     )
 
 
+class CompoundEmbedding(Embedding[In, Out]):
+    """An embedding of an intermediate encoding: from_state encodes the
+    state first, decode inverts it (upstream's CompoundEmbedding)."""
+
+    def __init__(self, encode: Callable, decode: Callable, embed_mid: Embedding):
+        super().__init__()
+        self._encode, self._decode = encode, decode
+        self.embed_mid = embed_mid
+        self.size = embed_mid.size
+
+    def from_state(self, state: In) -> Out:
+        return self.embed_mid.from_state(self._encode(state))
+
+    def forward(self, x: Out) -> torch.Tensor:
+        return self.embed_mid(x)
+
+    def map(self, f, *args: Out) -> Out:
+        return self.embed_mid.map(f, *args)
+
+    def flatten(self, struct: Out) -> Iterator[Any]:
+        yield from self.embed_mid.flatten(struct)
+
+    def unflatten(self, seq: Iterator[Any]) -> Out:
+        return self.embed_mid.unflatten(seq)
+
+    def decode(self, out: Out) -> In:
+        return self._decode(self.embed_mid.decode(out))
+
+    def dummy(self, shape=()):
+        return self.embed_mid.dummy(shape)
+
+    def dummy_embedding(self, shape):
+        return self.embed_mid.dummy_embedding(shape)
+
+
+def make_custom_v1_embedding(config: custom_v1.Config) -> CompoundEmbedding:
+    """The big RL Phillips' action space: a controller as two labels (see
+    smashbot.custom_v1), each a one-hot and one autoregressive component."""
+    bucketer = config.create_bucketer()
+    labels = ordered_struct_embedding(
+        "custom_v1",
+        [(name, OneHotEmbedding(name, size, dtype=np.int32))
+         for name, size in bucketer.sizes._asdict().items()],
+        custom_v1.ControllerV1,
+    )
+    return CompoundEmbedding(bucketer.bucket, bucketer.decode, labels)
+
+
 @dataclasses.dataclass
 class ControllerConfig:
     axis_spacing: int = 16
     shoulder_spacing: int = 4
+    type: str = "default"   # or "custom_v1"
 
-    def make_embedding(self) -> StructEmbedding[Controller]:
+    def make_embedding(self) -> Embedding[Controller, Any]:
+        if self.type == "custom_v1":
+            return make_custom_v1_embedding(custom_v1.Config())
         return get_controller_embedding(
             axis_spacing=self.axis_spacing,
             shoulder_spacing=self.shoulder_spacing,
@@ -655,6 +708,98 @@ def get_state_action_embedding(
             ),
         ),
     )
+
+
+class EnhancedEmbed(nn.Module):
+    """slippi-ai's EnhancedEmbedModule (upstream slippi_ai/jax/networks.py at
+    275c072), the input layer of the big RL Phillips: each player's and
+    Nana's action state and character as learned vectors (the action's plus a
+    joint character-action table's), the items through one MLP summed over
+    occupied slots, every other leaf its default embedding, then an optional
+    constant rating input (slippi ranked rating) and the previous action.
+
+    Reads the encoded struct of a state-action embedding built with flat
+    items, whose leaves it applies; that embedding stays registered with the
+    network, not here."""
+
+    def __init__(self, embed_state_action: StructEmbedding, hidden_size: int,
+                 item_mlp_layers: int = 2, rating: float | None = None,
+                 joint_index_wraps: bool = False):
+        super().__init__()
+        # slippi-ai builds the joint table's index in the character's uint8,
+        # so character * 399 wraps mod 256 and characters share rows; the big
+        # Phillips were trained on that index
+        self._joint_wraps = joint_index_wraps
+        leaves = lambda struct: dict(struct.embedding)
+        sa = leaves(embed_state_action)
+        game = leaves(sa["state"])
+        player = leaves(game["p0"])
+        self._leaves = {"sa": sa, "game": game, "player": player, "nana": leaves(player["nana"]),
+                        "item": next(iter(leaves(game["items"]).values()))}
+        self._chars = make_embed_char().size
+        self._actions = make_embed_action().size
+        self.embed_char = nn.Embedding(self._chars, hidden_size)
+        self.embed_action = nn.Embedding(self._actions, hidden_size)
+        self.embed_char_action = nn.Embedding(self._chars * self._actions, hidden_size)
+        nn.init.zeros_(self.embed_char_action.weight)
+        layers: list[nn.Module] = []
+        in_size = self._leaves["item"].size
+        for i in range(item_mlp_layers):
+            if i:
+                layers.append(nn.ReLU())
+            layers.append(nn.Linear(in_size, hidden_size))
+            in_size = hidden_size
+        self.item_mlp = nn.Sequential(*layers)
+        # a buffer, so a grid of Phillips stacks each one's rating with its weights
+        self.register_buffer("rating", None if rating is None else torch.tensor(rating, dtype=torch.float32))
+        dummy = tree_map_to_torch(embed_state_action.dummy(()))
+        self.output_size = self(dummy).shape[-1]
+
+    def _player_or_nana(self, raw, leaves: dict, nana: bool) -> torch.Tensor:
+        char, action = raw.character.long(), raw.action.long()
+        valid = (char >= 0) & (char < self._chars) & (action >= 0) & (action < self._actions)
+        offset = char * self._actions
+        if self._joint_wraps:
+            offset = offset % 256
+        joint = self.embed_char_action(torch.where(valid, offset + action, 0))
+        parts = [
+            leaves["percent"](raw.percent), leaves["facing"](raw.facing),
+            leaves["x"](raw.x), leaves["y"](raw.y),
+            self.embed_action(action) + joint * valid[..., None],
+            leaves["invulnerable"](raw.invulnerable),
+            self.embed_char(char),
+            leaves["jumps_left"](raw.jumps_left),
+            leaves["shield_strength"](raw.shield_strength),
+            leaves["on_ground"](raw.on_ground),
+        ]
+        if nana:
+            parts.append(leaves["exists"](raw.exists))
+        return torch.cat(parts, dim=-1)
+
+    def _player(self, raw) -> torch.Tensor:
+        return torch.cat([self._player_or_nana(raw, self._leaves["player"], False),
+                          self._player_or_nana(raw.nana, self._leaves["nana"], True)], dim=-1)
+
+    def forward(self, state_action) -> torch.Tensor:
+        game, sa, g = state_action.state, self._leaves["sa"], self._leaves["game"]
+        items = [self._leaves["item"](item) for item in game.items]
+        exists = torch.stack([item.exists for item in game.items], dim=-1)
+        items = (self.item_mlp(torch.stack(items, dim=-2)) * exists[..., None]).sum(-2)
+        parts = [self._player(game.p0), self._player(game.p1), g["stage"](game.stage),
+                 g["randall"](game.randall), g["fod_platforms"](game.fod_platforms), items]
+        if sa["name"].size:
+            parts.append(sa["name"](state_action.name))
+        if self.rating is not None:
+            parts.append((self.rating * 1e-3).clamp(-10.0, 10.0).expand_as(parts[-1][..., :1]))
+        parts.append(sa["action"](state_action.action))
+        return torch.cat(parts, dim=-1)
+
+
+def tree_map_to_torch(struct):
+    """A numpy struct's leaves as torch tensors."""
+    import tree
+
+    return tree.map_structure(torch.as_tensor, struct)
 
 
 # ---------------------------------------------------------------------------

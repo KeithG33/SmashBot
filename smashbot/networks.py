@@ -8,6 +8,7 @@ segment still runs as one cuDNN call.
 """
 
 import abc
+import dataclasses
 import typing as tp
 
 import torch
@@ -293,6 +294,7 @@ class ResBlock(nn.Module):
         hidden_size: int | None = None,
         activation="relu",
         ln_eps: float = 1e-5,
+        gelu_approximate: bool = False,
     ):
         super().__init__()
         out = nn.Linear(hidden_size or residual_size, residual_size)
@@ -303,7 +305,7 @@ class ResBlock(nn.Module):
             # ported from TF set ln_eps=0.0 for exact equivalence.
             nn.LayerNorm(residual_size, eps=ln_eps),
             nn.Linear(residual_size, hidden_size or residual_size),
-            {"relu": nn.ReLU(), "gelu": nn.GELU()}[activation],
+            {"relu": nn.ReLU(), "gelu": nn.GELU(approximate="tanh" if gelu_approximate else "none")}[activation],
             out,
         )
 
@@ -323,6 +325,7 @@ class TransformerLike(Sequential):
         recurrent_layer: str = "lstm",
         activation: str = "gelu",
         ln_eps: float = 1e-5,
+        gelu_approximate: bool = False,
     ):
         recurrent_cls = {"lstm": nn.LSTM, "gru": nn.GRU}[recurrent_layer]
 
@@ -342,6 +345,7 @@ class TransformerLike(Sequential):
                         hidden_size * ffw_multiplier,
                         activation,
                         ln_eps=ln_eps,
+                        gelu_approximate=gelu_approximate,
                     )
                 )
             )
@@ -915,15 +919,17 @@ class SGUCore(Network):
 class StateActionNetwork(Network):
     """Embeds StateAction structs, then runs the core network."""
 
-    def __init__(self, embed_game, embed_state_action, core: Network, packed: bool = True):
+    def __init__(self, embed_game, embed_state_action, core: Network, packed: bool = True,
+                 enhanced=None):
         super().__init__()
         from smashbot import embed as embed_lib
 
         self.embed_game = embed_game
         self.embed_state_action = embed_state_action
         self.core = core
+        self.enhanced = enhanced   # an EnhancedEmbed in place of the leaves' embedding
         self.packed_embed = (
-            embed_lib.PackedStructForward(embed_state_action) if packed else None
+            embed_lib.PackedStructForward(embed_state_action) if packed and enhanced is None else None
         )
 
     packed_encoder: bool = False   # see use_packed_encoder
@@ -933,6 +939,8 @@ class StateActionNetwork(Network):
         encoder's output already."""
         if self.packed_encoder:
             return self.packed_embed.encode(state_action, self.core.encoder)
+        if self.enhanced is not None:
+            return self.enhanced(state_action)
         if self.packed_embed is not None:
             return self.packed_embed(state_action)
         return self.embed_state_action(state_action)
@@ -970,25 +978,35 @@ def build_embed_network(
 ) -> StateActionNetwork:
     from smashbot import embed as embed_lib
 
+    enhanced = getattr(network_config, "embed", "simple") == "enhanced"
+    if enhanced:   # the enhanced embed runs the items' MLP itself
+        embed_config = dataclasses.replace(
+            embed_config, items=embed_lib.ItemsConfig(type=embed_lib.ItemsType.FLAT))
     embed_game = embed_config.make_game_embedding()
     embed_state_action = embed_lib.get_state_action_embedding(
         embed_game=embed_game,
         embed_action=controller_embedding,
         num_names=num_names,
     )
+    enhanced = embed_lib.EnhancedEmbed(
+        embed_state_action, network_config.embed_hidden_size, rating=network_config.rating,
+        joint_index_wraps=network_config.embed_joint_index_wraps,
+    ) if enhanced else None
+    input_size = enhanced.output_size if enhanced is not None else embed_state_action.size
     name = getattr(network_config, "name", "tx_like")
     if name == "tx_like":
         core = TransformerLike(
-            input_size=embed_state_action.size,
+            input_size=input_size,
             hidden_size=network_config.hidden_size,
             num_layers=network_config.num_layers,
             ffw_multiplier=network_config.ffw_multiplier,
             recurrent_layer=network_config.recurrent_layer,
             ln_eps=getattr(network_config, "ln_eps", 1e-5),
+            gelu_approximate=getattr(network_config, "gelu_approximate", False),
         )
     elif name == "transformer":
         core = TransformerCore(
-            input_size=embed_state_action.size,
+            input_size=input_size,
             hidden_size=network_config.hidden_size,
             num_layers=network_config.num_layers,
             num_heads=network_config.num_heads,
@@ -996,7 +1014,7 @@ def build_embed_network(
         )
     elif name == "sgu":
         core = SGUCore(
-            input_size=embed_state_action.size,
+            input_size=input_size,
             hidden_size=network_config.hidden_size,
             num_layers=network_config.num_layers,
             window=network_config.window,
@@ -1011,4 +1029,5 @@ def build_embed_network(
         embed_state_action,
         core,
         packed=getattr(embed_config, "packed", True),
+        enhanced=enhanced,
     )

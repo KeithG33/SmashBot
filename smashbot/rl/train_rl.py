@@ -67,6 +67,7 @@ def build_value_function(cfg: dict, device: str):
             controller_embedding=embed_lib.ControllerConfig(
                 axis_spacing=cfg["head"]["axis_spacing"],
                 shoulder_spacing=cfg["head"]["shoulder_spacing"],
+                type=cfg["head"].get("controller_type", "default"),
             ).make_embedding(),
             num_names=cfg["data"]["max_names"],
             network_config=net_cfg,

@@ -152,6 +152,7 @@ def build_policy_from_config(cfg: dict) -> Policy:
         controller_config=embed_lib.ControllerConfig(
             axis_spacing=cfg["head"]["axis_spacing"],
             shoulder_spacing=cfg["head"]["shoulder_spacing"],
+            type=cfg["head"].get("controller_type", "default"),
         ),
         network_config=configs.from_dict(configs.NetworkConfig, cfg["network"]),
         head_config=configs.from_dict(configs.ControllerHeadConfig, cfg["head"]),

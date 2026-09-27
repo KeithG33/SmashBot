@@ -58,6 +58,18 @@ class NetworkConfig:
     # sgu only: one letter per layer, s = SGU block, g = GRU, l = LSTM (a
     # residual fp32 cell in place of the conv + attention mixing); empty = all SGU
     layout: str = ""
+    # tx_like only: the FFW blocks' GELU as the tanh approximation
+    gelu_approximate: bool = False
+    # the input embedding: "simple" (every leaf's default embedding) or
+    # "enhanced" (embed.EnhancedEmbed: learned action and character vectors,
+    # items summed), the big RL Phillips'
+    embed: str = "simple"
+    embed_hidden_size: int = 128
+    # enhanced only: a constant slippi ranked rating input; None = no input
+    rating: float | None = None
+    # enhanced only: the character-action table indexed as slippi-ai does
+    # (the index wraps in uint8; for the ported Phillips, not for new models)
+    embed_joint_index_wraps: bool = False
 
 
 @dataclasses.dataclass
@@ -66,6 +78,7 @@ class ControllerHeadConfig:
     component_depth: int = 2
     axis_spacing: int = 16  # 17 bins per stick axis
     shoulder_spacing: int = 4  # 5 shoulder bins
+    controller_type: str = "default"   # or "custom_v1" (smashbot.custom_v1)
 
 
 @dataclasses.dataclass
