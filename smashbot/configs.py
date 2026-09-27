@@ -71,6 +71,9 @@ class NetworkConfig:
     # BUG for the ported Phillips, which were trained on it. NEVER set it for a
     # model we train (see embed.EnhancedEmbed's NOTE).
     embed_joint_index_wraps: bool = False
+    # the opponent's tech hidden as a neutral tech for its first frames
+    # (slippi-ai's AnimationFilter; the big RL Phillips' observation); 0 = off
+    tech_mask_window: int = 0
 
 
 @dataclasses.dataclass

@@ -19,6 +19,9 @@ from smashbot.causal_conv import causal_conv, causal_conv_ring, ring_taps
 
 RecurrentState = tp.Any
 
+# melee.enums.Action: the three techs, indistinguishable for their first frames
+NEUTRAL_TECH, FORWARD_TECH, BACKWARD_TECH = 199, 200, 201
+
 
 class RMSNorm(nn.RMSNorm):
     """nn.RMSNorm computed in fp32 under autocast (fused kernel, full-
@@ -920,7 +923,7 @@ class StateActionNetwork(Network):
     """Embeds StateAction structs, then runs the core network."""
 
     def __init__(self, embed_game, embed_state_action, core: Network, packed: bool = True,
-                 enhanced=None):
+                 enhanced=None, tech_mask_window: int = 0):
         super().__init__()
         from smashbot import embed as embed_lib
 
@@ -928,6 +931,7 @@ class StateActionNetwork(Network):
         self.embed_state_action = embed_state_action
         self.core = core
         self.enhanced = enhanced   # an EnhancedEmbed in place of the leaves' embedding
+        self.tech_mask_window = tech_mask_window   # see _mask_tech
         self.packed_embed = (
             embed_lib.PackedStructForward(embed_state_action) if packed and enhanced is None else None
         )
@@ -953,21 +957,51 @@ class StateActionNetwork(Network):
         return self.embed_game.from_state(game)
 
     def initial_state(self, batch_size, device=None):
-        return self.core.initial_state(batch_size, device)
+        core = self.core.initial_state(batch_size, device)
+        if not self.tech_mask_window:
+            return core
+        zero = torch.zeros(batch_size, dtype=torch.long, device=device)
+        return {"core": core, "tech_mask": (zero, zero.clone())}
 
     def cache_state(self, state, dtype):
-        return self.core.cache_state(state, dtype)
+        if not self.tech_mask_window:
+            return self.core.cache_state(state, dtype)
+        return {**state, "core": self.core.cache_state(state["core"], dtype)}
 
     def step(self, state_action, prev_state):
-        return self.core.step(self.embed_sa(state_action), prev_state)
+        if not self.tech_mask_window:
+            return self.core.step(self.embed_sa(state_action), prev_state)
+        state_action, mask = self._mask_tech(state_action, *prev_state["tech_mask"])
+        out, core = self.core.step(self.embed_sa(state_action), prev_state["core"])
+        return out, {"core": core, "tech_mask": mask}
 
     def step_with_reset(self, state_action, reset, prev_state):
-        return self.core.step_with_reset(
-            self.embed_sa(state_action), reset, prev_state
-        )
+        if not self.tech_mask_window:
+            return self.core.step_with_reset(self.embed_sa(state_action), reset, prev_state)
+        prev_action, count = (torch.where(reset, 0, t) for t in prev_state["tech_mask"])
+        state_action, mask = self._mask_tech(state_action, prev_action, count)
+        out, core = self.core.step_with_reset(self.embed_sa(state_action), reset, prev_state["core"])
+        return out, {"core": core, "tech_mask": mask}
 
     def unroll(self, state_action, reset, initial_state):
+        if self.tech_mask_window:
+            raise NotImplementedError("the tech mask runs frame by frame (serving); "
+                                      "training data would get it offline")
         return self.core.unroll(self.embed_sa(state_action), reset, initial_state)
+
+    def _mask_tech(self, state_action, prev_action, count):
+        """slippi-ai's AnimationFilter (upstream slippi_ai/observations.py), as
+        the big RL Phillips observed their opponent: the three techs look
+        alike at first, so for the first tech_mask_window frames of one the
+        opponent's action reads as a neutral tech. The filter's state is the
+        opponent's previous (unmasked) action and how many frames it has
+        repeated; the recurrent state carries it, a reset zeroes it."""
+        action = state_action.state.p1.action
+        count = torch.where(action.long() == prev_action, count + 1, 0)
+        tech = (action == NEUTRAL_TECH) | (action == FORWARD_TECH) | (action == BACKWARD_TECH)
+        masked = torch.where(tech & (count < self.tech_mask_window), NEUTRAL_TECH, action)
+        state = state_action.state._replace(p1=state_action.state.p1._replace(action=masked))
+        return state_action._replace(state=state), (action.long(), count)
 
 
 def build_embed_network(
@@ -1030,4 +1064,5 @@ def build_embed_network(
         core,
         packed=getattr(embed_config, "packed", True),
         enhanced=enhanced,
+        tech_mask_window=getattr(network_config, "tech_mask_window", 0),
     )

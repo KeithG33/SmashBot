@@ -19,6 +19,17 @@ import random
 import time
 
 MODELS = "/home/kage/drive2/ShineBot/models"
+def group_by_architecture(policies: dict) -> list[list[str]]:
+    """Tiers whose policies stack into one grid (same parameter shapes,
+    delay and observation), in the order given."""
+    groups: dict = {}
+    for tier, policy in policies.items():
+        key = (tuple((k, tuple(v.shape)) for k, v in policy.state_dict().items()),
+               policy.delay, policy.network.tech_mask_window)
+        groups.setdefault(key, []).append(tier)
+    return list(groups.values())
+
+
 # tiers whose checkpoint isn't <tier>-torch.pt or whose RL run conditioned on
 # another name: tier -> (checkpoint, name)
 PHILLIP_FILES = {
@@ -62,6 +73,8 @@ class SimRolloutConfig:
     capture_serving: bool = True
     # --- pool shares (fractions of num_envs) ---
     self_frac: float = 0.30       # of envs = of learner rows
+    # tiers may mix architectures (the ported big Phillips: "<rank>-big",
+    # "super-gm"); each architecture serves from its own grid
     phillip_tiers: tuple[str, ...] = ("medium", "gold", "plat", "diamond", "master", "gm")
     phillip_fracs: tuple[float, ...] = (0.04, 0.04, 0.06, 0.07, 0.08, 0.10)  # 39% of envs
     # everything left after self+phillips (~31%) is the PFSP pool
@@ -194,23 +207,22 @@ class SimLeagueWorker:
         self.part = self.lg.layout(N)
         from smashbot.rl.league import LeagueSeats
         from smashbot.rl.sim_league import MultiOpponentSimWorker, PfspGrid
-        # --- phillip grid: all tiers on ONE stacked forward (their LSTM
-        # steps via the hand-rolled cell — cuDNN has no vmap rule); static
-        # cells, slices padded to the largest tier
-        tiers = list(cfg.phillip_tiers)
-        rows = [self.part[f"phillip:{t}"] for t in tiers]
-        tmpl = self.lg.phillips[tiers[0]][0]
-        self._phillip_grid = PfspGrid(
-            tmpl, len(tiers), max(len(r) for r in rows), self.name_code, self.device)
-        for s, t in enumerate(tiers):
-            self._phillip_grid.load(s, f"phillip:{t}",
-                                    lambda k: self.lg.phillips[k.split(':', 1)[1]][0].state_dict())
-            self._phillip_grid.agent._name[s] = self.lg.phillips[t][2]
-        self._phillip_grid.assign_static(rows)
-        for t in tiers:   # weights live in the grid stack now; free the GPU copies
+        # --- phillip grids: the tiers of one architecture on ONE stacked
+        # forward (their LSTM steps via the hand-rolled cell — cuDNN has no
+        # vmap rule); static cells, slices padded to the largest tier
+        self._phillip_grids = []
+        for tiers in group_by_architecture({t: self.lg.phillips[t][0] for t in cfg.phillip_tiers}):
+            rows = [self.part[f"phillip:{t}"] for t in tiers]
+            tmpl = self.lg.phillips[tiers[0]][0]
+            grid = PfspGrid(tmpl, len(tiers), max(len(r) for r in rows), self.name_code, self.device)
+            for s, t in enumerate(tiers):
+                grid.load(s, f"phillip:{t}", lambda k: self.lg.phillips[k.split(':', 1)[1]][0].state_dict())
+                grid.agent._name[s] = self.lg.phillips[t][2]
+            grid.assign_static(rows)
+            self._phillip_grids.append(grid)
+            print(f"phillip grid: {', '.join(tiers)} x {grid.Nc} cells (delay {tmpl.delay})", flush=True)
+        for t in cfg.phillip_tiers:   # weights live in the grid stacks now; free the GPU copies
             self.lg.phillips[t][0].to("cpu")
-        print(f"phillip grid: {len(tiers)} tiers x {self._phillip_grid.Nc} cells "
-              f"(delay {tmpl.delay})", flush=True)
         # --- PFSP grid: S slices x Nc cells with one slice's worth of slack
         # (v5 sizing) so seats float to demand; League routes per match
         pfsp_envs = self.part["pfsp"]
@@ -232,7 +244,7 @@ class SimLeagueWorker:
             name_code=self.name_code, device=self.device,
             record_fn=self._on_game, precision=cfg.rollout_precision,
             burn_in=cfg.imitation_burn_in,
-            grids=[self._phillip_grid], event_fn=self._on_event,
+            grids=self._phillip_grids, event_fn=self._on_event,
             self_idx=self.part["self"], league=self.league, pfsp_grid=self._grid,
             match_fn=self._match, max_frame=cfg.max_game_frames, seed=cfg.seed,
             capture=cfg.capture_serving, shards=cfg.sim_shards)

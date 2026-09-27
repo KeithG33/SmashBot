@@ -2,7 +2,7 @@
 models/gm-big) to a SmashBot checkpoint: tx_like with the enhanced embed and
 the custom_v1 controller, conditioned on the rating its RL run fed it. Reads
 the pickle's arrays directly (no JAX), refuses configs the port does not
-cover, and records the tech mask its observations were trained under.
+cover, and keeps the tech mask its observations were trained under.
 
     python scripts/port_jax_phillip.py <pickle> <out.pt>
 """
@@ -81,13 +81,21 @@ def train_config(saved: dict, rating: float) -> TrainConfig:
             ln_eps=1e-6,   # flax nnx.LayerNorm's default epsilon
             gelu_approximate=tx["gelu_approximate"], embed="enhanced",
             embed_hidden_size=enhanced["hidden_size"], rating=rating,
-            embed_joint_index_wraps=True),   # as slippi-ai computed it in training
+            embed_joint_index_wraps=True,   # as slippi-ai computed it in training
+            tech_mask_window=_tech_mask_window(saved["observation"])),
         head=configs.ControllerHeadConfig(residual_size=head["residual_size"],
                                           component_depth=head["component_depth"],
                                           controller_type="custom_v1"),
         policy=configs.PolicyConfig(delay=saved["policy"]["delay"]),
         data=dataclasses.replace(TrainConfig().data, max_names=saved["max_names"]),
     )
+
+
+def _tech_mask_window(observation: dict) -> int:
+    """The window of the tech mask the Phillip observed its opponent through
+    (slippi-ai's AnimationFilter); 0 without one."""
+    animation = observation.get("animation", {})
+    return animation["tech_mask_window"] if animation.get("mask") else 0
 
 
 def _get(tree: dict, *keys):
@@ -156,8 +164,7 @@ def port(src: str, dst: str) -> None:
     weights = torch_state(saved["state"]["policy"], config.network.num_layers)
     policy.load_state_dict({**weights, "network.enhanced.rating": policy.network.enhanced.rating}, strict=True)
     torch.save({
-        "config": {**dataclasses.asdict(config),
-                   "observation": {"tech_mask_window": saved["config"]["observation"]["animation"]["tech_mask_window"]}},
+        "config": dataclasses.asdict(config),
         "state": {"policy": policy.state_dict(), "name_map": {}, "step": saved["step"], "ported_from": src},
         "best_eval_loss": None,
         "version": 1,
