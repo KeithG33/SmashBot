@@ -43,6 +43,14 @@ from smashbot.training import GradClipper
 from smashbot.value import ValueFunction
 
 
+
+def _linear_decay(start: float, final: float, progress: float) -> float:
+    """start at progress 0 to final at 1, clamped; start throughout while
+    final is negative."""
+    if final < 0:
+        return start
+    return start + (final - start) * min(max(progress, 0.0), 1.0)
+
 class ActionData(tp.NamedTuple):
     # prev-action stream: controller_state[t] = the action sampled at frame
     # t-1, i.e. exactly what the agent fed as its input at frame t. This makes
@@ -271,6 +279,7 @@ class Learner:
         # schedule at each step() (constant when decay is disabled).
         # Initialized here so direct _policy_loss calls (tests) work.
         self._kl_teacher_w = config.kl_teacher_weight
+        self._reverse_kl_teacher_w = config.reverse_kl_teacher_weight
         # Persistent trust-region snapshot buffers (see step): tensor
         # storages allocated once and copied into per step.
         self._snap_buffers: dict = {}
@@ -645,7 +654,7 @@ class Learner:
         for w, term in (
             (cfg.ppo.beta, actor_kl),
             (self._kl_teacher_w, teacher_kl),
-            (cfg.reverse_kl_teacher_weight, reverse_teacher_kl),
+            (self._reverse_kl_teacher_w, reverse_teacher_kl),
             (-cfg.entropy_weight, entropy),
         ):
             if w != 0.0:
@@ -666,6 +675,7 @@ class Learner:
             "loss": loss.detach(),
             "surrogate": vmean(surrogate),
             "teacher_kl": vmean(teacher_kl),
+            "reverse_teacher_kl": vmean(reverse_teacher_kl),
             "actor_kl_mean": vmean(actor_kl),
             "actor_kl_max": (actor_kl * valid).max().detach(),
             "entropy": vmean(entropy),
@@ -729,13 +739,12 @@ class Learner:
         from kl_teacher_weight to kl_teacher_weight_final; constant (the
         historical behavior) while the final is negative."""
         cfg = self.config
-        if cfg.kl_teacher_weight_final < 0:
-            return cfg.kl_teacher_weight
-        p = min(max(progress, 0.0), 1.0)
-        return (
-            cfg.kl_teacher_weight
-            + (cfg.kl_teacher_weight_final - cfg.kl_teacher_weight) * p
-        )
+        return _linear_decay(cfg.kl_teacher_weight, cfg.kl_teacher_weight_final, progress)
+
+    def reverse_kl_teacher_weight_at(self, progress: float) -> float:
+        """The reverse leash's coefficient, decaying like the forward one."""
+        cfg = self.config
+        return _linear_decay(cfg.reverse_kl_teacher_weight, cfg.reverse_kl_teacher_weight_final, progress)
 
     # ------------------------------------------------ opponent imitation
 
@@ -993,6 +1002,7 @@ class Learner:
             imit_fixed, imit_stats = self._plan_imitation(imit_trajs, budget)
         lambda_t = self.lambda_at(progress)
         self._kl_teacher_w = self.kl_teacher_weight_at(progress)
+        self._reverse_kl_teacher_w = self.reverse_kl_teacher_weight_at(progress)
 
         check_fixed = fixed_list  # post-update KL check: full rows, no grad
         train_fixed = fixed_list
@@ -1169,6 +1179,7 @@ class Learner:
         }
         # surface the (possibly decaying) leash weight beside teacher_kl
         post["kl_teacher_w"] = float(self._kl_teacher_w)
+        post["reverse_kl_teacher_w"] = float(self._reverse_kl_teacher_w)
         if imit_stats:
             metrics["imitation"] = dict(
                 imit_stats, loss=imit_loss_val, **{"lambda": lambda_t}

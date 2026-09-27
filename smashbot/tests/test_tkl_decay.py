@@ -1,6 +1,6 @@
 """Teacher-KL leash decay schedule: exact at the endpoints and at v10's
 mid-run splice point; disabled default is bitwise the historical constant;
-step() actually applies the scheduled weight."""
+step() actually applies the scheduled weights, the reverse leash its own."""
 
 import pytest
 import torch
@@ -46,3 +46,17 @@ def test_step_applies_scheduled_weight():
     _, m = learner.step([traj], learner.initial_state(3), progress=0.425)
     assert learner._kl_teacher_w == pytest.approx(0.08, abs=1e-6)
     assert m["post_update"]["kl_teacher_w"] == pytest.approx(0.08, abs=1e-6)
+
+
+def test_reverse_leash_decays_on_its_own_schedule():
+    assert _learner().reverse_kl_teacher_weight_at(0.5) == 0.0   # default: off
+    learner = _learner(
+        kl_teacher_weight=0.025, kl_teacher_weight_final=0.0025,
+        reverse_kl_teacher_weight=0.025, reverse_kl_teacher_weight_final=0.0025,
+        imitation_rows=0,
+    )
+    assert learner.reverse_kl_teacher_weight_at(1.0) == pytest.approx(0.0025)
+    traj = _rollout(learner.policy, B=3, T=8, seed=0)
+    _, m = learner.step([traj], learner.initial_state(3), progress=0.5)
+    assert learner._reverse_kl_teacher_w == pytest.approx(0.01375)
+    assert m["post_update"]["reverse_kl_teacher_w"] == pytest.approx(0.01375)

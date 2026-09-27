@@ -42,6 +42,8 @@ class RLConfig:
     # at 40k).
     kl_teacher_weight_final: float = -1.0
     reverse_kl_teacher_weight: float = 0.0
+    # the reverse leash's decay, as kl_teacher_weight_final's; negative = constant
+    reverse_kl_teacher_weight_final: float = -1.0
     entropy_weight: float = 0.0
     reward_halflife: float = 4.0  # seconds
     max_grad_norm: float = 1.0  # 0 = no clipping
