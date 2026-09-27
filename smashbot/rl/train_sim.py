@@ -2,11 +2,12 @@
 PPO learner. Reached via `train_rl` (its whole body); reuses train_rl's learner,
 checkpoint schema and overlap pipeline over SimLeague + MultiOpponentSimWorker.
 
-Pool design (locked): self-play (both seats are learner rows, no harvest) /
-6 fixed phillip tiers (harvest, medium 4% = gold 4% < plat 6% < diamond 7% <
-master 8% < gm 10%) / PFSP pool (the run's snapshots, harvest, drawn PER
-MATCH with replacement and routed on the PFSP grid at each env's own game
-boundary — rl/league.py). Env layout is static; every game runs to its end.
+Pool design (locked): self-play 25% (both seats are learner rows, no
+harvest) / 12 fixed phillip tiers 50% (harvest; shares rise with strength
+within each architecture: the six 3/768 tiers, then the six big RL Phillips)
+/ PFSP pool 25% (the run's snapshots, harvest, drawn PER MATCH with
+replacement and routed on the PFSP grid at each env's own game boundary —
+rl/league.py). Env layout is static; every game runs to its end.
 
 Logging: `rl/phillip/{tier}/*` per fixed tier, `rl/self/*`, `rl/snapshots/*`
 and per-ghost `rl/snapshots/s{step}` win estimates.
@@ -51,11 +52,11 @@ class SimRolloutConfig:
     # learner rows = num_envs, one per game (a self env's second seat is
     # served but not learned from); rows are the VRAM budget: v12 fit 400
     # learner rows (449 ran out of memory at the first learner step), and
-    # the student forward also serves the self envs' second seats (520 rows
-    # at 400 envs). Shares of envs = shares of rows: self 30 / phillips 39 /
-    # pfsp 31; 124 pfsp envs over 40 slices = 3.1 games per loaded brain,
-    # above v10's 2.6 (more games per slice, more fallback draws). Sized for
-    # the 6/576 SGU: the hybrid's dry run re-derives envs and slices.
+    # the student forward also serves the self envs' second seats (500 rows
+    # at 400 envs). Shares of envs = shares of rows: self 25 / phillips 50 /
+    # pfsp 25; 100 pfsp envs over 40 slices = 2.5 games per loaded brain,
+    # about v10's 2.6. Sized for the 6/576 SGU: the hybrid's dry run
+    # re-derives envs and slices.
     num_envs: int = 400
     unroll_length: int = 240
     # frames of each harvested seat's own history the learner runs before
@@ -72,15 +73,19 @@ class SimRolloutConfig:
     # (12.9 vs 12.0 ms @400 rows); with fp16 statics it wins (9.4 ms).
     capture_serving: bool = True
     # --- pool shares (fractions of num_envs) ---
-    self_frac: float = 0.30       # of envs = of learner rows
-    # tiers may mix architectures (the ported big Phillips: "<rank>-big",
-    # "super-gm"); each architecture serves from its own grid
-    phillip_tiers: tuple[str, ...] = ("medium", "gold", "plat", "diamond", "master", "gm")
-    phillip_fracs: tuple[float, ...] = (0.04, 0.04, 0.06, 0.07, 0.08, 0.10)  # 39% of envs
-    # everything left after self+phillips (~31%) is the PFSP pool
+    self_frac: float = 0.25       # of envs = of learner rows
+    # each architecture serves from its own grid: the 3/768 Phillips, then
+    # the big RL ones (tx_like 3x1536, custom_v1, delay 21)
+    phillip_tiers: tuple[str, ...] = (
+        "medium", "gold", "plat", "diamond", "master", "gm",
+        "gold-big", "plat-big", "diamond-big", "master-big", "gm-big", "super-gm")
+    phillip_fracs: tuple[float, ...] = (   # 50% of envs: 96 + 104 of 400
+        0.025, 0.025, 0.0375, 0.0425, 0.05, 0.06,
+        0.03, 0.035, 0.04, 0.045, 0.05, 0.06)
+    # everything left after self+phillips (25%) is the PFSP pool
     # PFSP grid weight slices = resident members. v10 ran 36 slices x 4
     # cells so a per-match draw usually found its member resident; each
-    # fp16 slice is ~54 MB; 40 slices for 108 pfsp envs = 2.7 envs/slice,
+    # fp16 slice is ~54 MB; 40 slices for 100 pfsp envs = 2.5 envs/slice,
     # about v10's 2.6, where per-match draws usually find their member
     # resident; watch rl/league/* (fallback rate)
     pfsp_slices: int = 40
@@ -387,7 +392,7 @@ def run(args) -> None:
         pol.eval()
         # all tiers serve from the phillip grid (one stacked forward)
         phillips[tier] = (pol, frac, resolve_name_code(pnm, name))
-        print(f"phillip:{tier} <- {fname} ({frac:.0%} of envs)")
+        print(f"phillip:{tier} <- {fname} ({frac:.2%} of envs)")
     league = SimLeague(
         snap_dir, phillips=phillips,
         self_frac=scfg.self_frac, device=device,

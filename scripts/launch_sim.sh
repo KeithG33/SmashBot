@@ -6,8 +6,9 @@
 # not learned from). v12 fit 400 learner rows / 40 pfsp slices / mb 12 on the
 # pre-paper 6/576 SGU (first-step peak 18.6 GiB of 21.2 reserved; 449 rows
 # OOM'd), with self-play feeding both seats. 400 envs keeps 400 learner rows
-# and serves 520; the slslsl hybrid changes the memory: dry-run before the
-# first launch, and size the slices there (140 pfsp envs / 40 = 3.5 per slice).
+# and serves 500; the slslsl hybrid and the big Phillips' grid (~1.2 GB fp16)
+# change the memory: dry-run before the first launch, and size the slices
+# there (100 pfsp envs / 40 = 2.5 per slice).
 set -euo pipefail
 
 REPO=/home/kage/smashbot_workspace/SmashBot
