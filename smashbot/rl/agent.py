@@ -459,6 +459,7 @@ class LeagueAgent:
         # fp16 stacked weights halve the per-slice VRAM (107 -> 54 MB); the
         # forward then runs under fp16 autocast. Norm weights stay fp32: the
         # norms run in fp32, and an fp16 weight drops them off the fused kernel.
+        # The controller head stays fp32 and runs in fp32 (Policy.fp32_head).
         self.weights_dtype = weights_dtype
         # optional recurrent-state storage dtype (see _initial_hidden); only
         # meaningful with the fp16-autocast forward
@@ -478,6 +479,7 @@ class LeagueAgent:
         self._template = copy.deepcopy(template).to("cpu")
         self._template.__dict__.pop("sample", None)  # any compiled wrapper
         self._template.requires_grad_(False).eval()
+        self._template.fp32_head = True
         use_manual_recurrent_step(self._template)   # cuDNN steps have no vmap rule
         if capture is None:
             capture = self.device.type == "cuda"
@@ -504,12 +506,13 @@ class LeagueAgent:
                 if dtype is not None and t.is_floating_point():
                     t = t.to(dtype)  # parameters only; buffers are constants
                 return t.unsqueeze(0).repeat(self.S, *([1] * t.dim())).clone()
-            norms = {f"{m_name}.{p_name}"
-                     for m_name, m in self._template.named_modules()
-                     if isinstance(m, (torch.nn.RMSNorm, torch.nn.LayerNorm))
-                     for p_name, _ in m.named_parameters(recurse=False)}
+            fp32 = {f"{m_name}.{p_name}"
+                    for m_name, m in self._template.named_modules()
+                    if isinstance(m, (torch.nn.RMSNorm, torch.nn.LayerNorm))
+                    for p_name, _ in m.named_parameters(recurse=False)}
+            fp32 |= {k for k in params if k.startswith("controller_head.")}
             self._stacked_params = {
-                k: stack(v, None if k in norms else self.weights_dtype) for k, v in params.items()
+                k: stack(v, None if k in fp32 else self.weights_dtype) for k, v in params.items()
             }
             self._stacked_buffers = {k: stack(v) for k, v in buffers.items()}
         self._name = torch.full(
