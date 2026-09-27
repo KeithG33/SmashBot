@@ -946,9 +946,17 @@ class SGUCore(Network):
         return out[:, 0], state
 
     def unroll(self, inputs, reset, initial_state):
+        """A segment per reset frame, each starting with its reset rows'
+        caches masked where they are read (_forward), no zeroed state."""
         if self.chunk_start_resets:
             return self._forward(inputs, initial_state, reset[:, 0])
-        return self._segmented_unroll(self._forward, inputs, reset, initial_state)
+        T = inputs.shape[1]
+        starts = [0] + [t for t in torch.nonzero(reset.any(dim=0)).squeeze(-1).tolist() if t > 0]
+        outputs, state = [], initial_state
+        for start, end in zip(starts, starts[1:] + [T]):
+            out, state = self._forward(inputs[:, start:end], state, reset[:, start])
+            outputs.append(out)
+        return torch.cat(outputs, dim=1) if len(outputs) > 1 else outputs[0], state
 
 
 class StateActionNetwork(Network):
