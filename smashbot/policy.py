@@ -99,6 +99,10 @@ class Policy(nn.Module):
         live-caught as a 22GB OOM. The capture path wants pure eager here."""
         return Policy.sample(self, state_action, initial_state, is_resetting, temperature)
 
+    # the league grids sample in fp32 behind an fp16 trunk: the ported
+    # super-gm's logits reach ~1400, where fp16 rounds in steps of 1
+    fp32_head: bool = False
+
     def sample(
         self,
         state_action: StateAction,  # [B], encoded
@@ -115,9 +119,15 @@ class Policy(nn.Module):
         output, final_state = self.network.step_with_reset(
             state_action, is_resetting, initial_state
         )
-        next_action = self.controller_head.sample(
-            output, state_action.action, temperature=temperature
-        )
+        if self.fp32_head:
+            with torch.autocast(output.device.type, enabled=False):
+                next_action = self.controller_head.sample(
+                    output.float(), state_action.action, temperature=temperature
+                )
+        else:
+            next_action = self.controller_head.sample(
+                output, state_action.action, temperature=temperature
+            )
         return next_action, final_state
 
 
