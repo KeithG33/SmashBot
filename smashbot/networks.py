@@ -507,6 +507,11 @@ def _recomputed_in_backward(fn, *args):
     return fn(*args)
 
 
+def _reset_rows(t, reset):
+    """t [B, ...] with the reset rows zeroed (t itself without resets)."""
+    return t if reset is None else t.masked_fill(reset.view(-1, *[1] * (t.dim() - 1)), 0)
+
+
 class SGUBlock(nn.Module):
     """aMLP-style causal Spatial Gating Unit (right-aligned window / Toeplitz):
     norm -> project to (gate u, value v); v mixed by causal depthwise conv over
@@ -569,9 +574,9 @@ class SGUBlock(nn.Module):
         ).transpose(1, 2).flatten(-2)
         return self.attn_out(a)
 
-    def _attend(self, xn, kv_cache, attn_mask):
+    def _attend(self, xn, kv_cache, attn_mask, reset=None):
         q, kv_new = self._qkv(xn)
-        kv_full = torch.cat([kv_cache.to(kv_new.dtype), kv_new], dim=1)
+        kv_full = torch.cat([_reset_rows(kv_cache.to(kv_new.dtype), reset), kv_new], dim=1)
         return self._attend_over(q, kv_full, attn_mask), kv_full[:, -(self.window - 1):].contiguous()
 
     def _attend_ring(self, xn, kv_ring, kv_ptr, attn_mask):
@@ -588,10 +593,11 @@ class SGUBlock(nn.Module):
         kv_ring.index_put_((rows, kv_ptr.expand(rows.shape[0])), kv_new[:, 0])
         return self._attend_over(q, kv_ring, attn_mask)
 
-    def _spatial(self, v, v_cache):
+    def _spatial(self, v, v_cache, reset=None):
         W = self.window
         v_cache = v_cache.to(v.dtype)
         if v.shape[1] == 1:
+            v_cache = _reset_rows(v_cache, reset)
             # one output position is a per-channel weighted sum, not a conv:
             # 2.4x faster at n=400, +30% at n=1. Don't "simplify" it away.
             w = self.spatial.weight.squeeze(1)
@@ -601,12 +607,13 @@ class SGUBlock(nn.Module):
                 + self.spatial.bias
             ).unsqueeze(1)
             return v_mixed, torch.cat([v_cache[:, 1:], v], dim=1)
-        if v.is_cuda:
+        if v.is_cuda:   # the conv and the carried cache mask the reset rows as they copy
             T = v.shape[1]
-            v_mixed = causal_conv(v_cache, v, self.spatial.weight, self.spatial.bias)
-            v_new = torch.cat([v_cache[:, T:], v], dim=1) if T < W - 1 else v[:, T - (W - 1):]
+            v_mixed = causal_conv(v_cache, v, self.spatial.weight, self.spatial.bias, reset)
+            v_new = (torch.cat([_reset_rows(v_cache[:, T:], reset), v], dim=1) if T < W - 1
+                     else v[:, T - (W - 1):])
             return v_mixed, v_new.contiguous()
-        v_full = torch.cat([v_cache, v], dim=1)
+        v_full = torch.cat([_reset_rows(v_cache, reset), v], dim=1)
         v_mixed = self.spatial(v_full.transpose(1, 2)).transpose(1, 2)
         return v_mixed, v_full[:, -(W - 1):].contiguous()
 
@@ -652,11 +659,12 @@ class SGUBlock(nn.Module):
 
         return x, v_new, kv_ring
 
-    def mix(self, x, v_cache, kv_cache, attn_mask):
+    def mix(self, x, v_cache, kv_cache, attn_mask, reset=None):
+        """reset [B] (or None): rows whose caches start empty, as if zeroed."""
         xn = self.mix_norm(x)
         u, v = _recomputed_in_backward(self._uv, xn)
-        v_mixed, new_v = self._spatial(v, v_cache)
-        attn, new_kv = self._attend(xn, kv_cache, attn_mask)
+        v_mixed, new_v = self._spatial(v, v_cache, reset)
+        attn, new_kv = self._attend(xn, kv_cache, attn_mask, reset)
         x = x + self.mix_out(u * (v_mixed + attn))
 
         x = _swiglu(self, x)
@@ -703,7 +711,9 @@ class RecurrentBlock(nn.Module):
     def __init__(self, d: int, cell: str):
         super().__init__()
         self.norm = RMSNorm(d)
-        self.rnn = {"gru": nn.GRU, "lstm": nn.LSTM}[cell](d, d, batch_first=True)
+        # time-major: the transposes fuse into the fp32 casts around the cell
+        # (compiled), where batch_first had cuDNN copy both ways
+        self.rnn = {"gru": nn.GRU, "lstm": nn.LSTM}[cell](d, d)
         self.state_shape = (d,) if cell == "gru" else (2, d)
 
         hidden = int(8 * d / 3 / 64) * 64
@@ -728,12 +738,15 @@ class RecurrentBlock(nn.Module):
                 else:
                     h = _gru_cell(self.rnn, xn[:, 0], h)
                     out = h[:, None]
-            elif isinstance(self.rnn, nn.LSTM):
-                out, (hn, cn) = self.rnn(xn.float(), tuple(t[None].contiguous() for t in h.unbind(1)))
-                h = torch.stack([hn[0], cn[0]], dim=1)
             else:
-                out, hn = self.rnn(xn.float(), h[None].contiguous())
-                h = hn[0]
+                xt = xn.float().transpose(0, 1).contiguous()
+                if isinstance(self.rnn, nn.LSTM):
+                    out, (hn, cn) = self.rnn(xt, tuple(t[None].contiguous() for t in h.unbind(1)))
+                    h = torch.stack([hn[0], cn[0]], dim=1)
+                else:
+                    out, hn = self.rnn(xt, h[None].contiguous())
+                    h = hn[0]
+                out = out.transpose(0, 1)
         return _swiglu(self, x + out.to(x.dtype)), h
 
 
@@ -877,9 +890,16 @@ class SGUCore(Network):
 
     inputs_encoded: bool = False   # the learner's StateActionNetwork applied the encoder (use_packed_encoder)
 
-    def _forward(self, inputs, state):
+    def _forward(self, inputs, state, reset=None):
+        """reset [B] (or None): rows starting over at the chunk's first frame
+        (BC's chunk-start resets): the caches are masked where they are read
+        and carried, not zeroed first."""
         T = inputs.shape[1]
         x = inputs if self.inputs_encoded else self.encoder(inputs)
+        if reset is not None:
+            state = {"cache_len": torch.where(reset, 0, state["cache_len"]),
+                     "layers": [layer if isinstance(layer, tuple) else _reset_rows(layer, reset)
+                                for layer in state["layers"]]}
         ring = "ptr" in state
         read = self.ring_read
         if ring:
@@ -900,7 +920,7 @@ class SGUCore(Network):
                 x, v_new, nkv = block.mix_ring(x, v_cache, kv_cache, mask, where, state["kv_ptr"], read)
                 new_layers.append((v_new, nkv))
             else:
-                x, nv, nkv = block.mix(x, v_cache, kv_cache, mask)
+                x, nv, nkv = block.mix(x, v_cache, kv_cache, mask, reset)
                 new_layers.append((nv, nkv))
         next_state = {
             "cache_len": torch.clamp(state["cache_len"] + T, max=self.window - 1),
@@ -916,6 +936,8 @@ class SGUCore(Network):
         return out[:, 0], state
 
     def unroll(self, inputs, reset, initial_state):
+        if self.chunk_start_resets:
+            return self._forward(inputs, initial_state, reset[:, 0])
         return self._segmented_unroll(self._forward, inputs, reset, initial_state)
 
 

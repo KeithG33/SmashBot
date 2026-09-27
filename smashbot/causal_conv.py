@@ -1,13 +1,16 @@
 """The SGU block's training convolution: the depthwise causal conv
 y[b, t, c] = bias[c] + sum_k w[c, k] * x[b, t + k, c] over x = [cache | chunk]
-(cache: the window - 1 frames before the chunk). Per channel it is one matmul
+(cache: the window - 1 frames before the chunk; a reset row's cache reads as
+zeros). Per channel it is one matmul
 against the chunk's Toeplitz matrix of that channel's taps, so the conv and
 both its gradients run as batched matmuls on tensor cores: inputs in the
 activation dtype and fp32 accumulation, as the direct conv kernels had them,
 in half their time for the 256-tap window (measured). The matmuls take the
 channels first; a tiled Triton kernel transposes (PyTorch's permute copy runs
-these 20x slower). Registered as custom ops so a compiled core calls them as
-single ops."""
+these 20x slower); the backward reuses the forward's channels-first operand.
+Registered as custom ops so a compiled core calls them as single ops."""
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -41,110 +44,130 @@ def _toeplitz(weight, T, dtype):
 
 
 @triton.jit
-def _relayout(src, dst, L, C, s_b, s_l, s_c, d_b, d_l, d_c, BL: tl.constexpr, BC: tl.constexpr):
+def _relayout(src, dst, reset, L, C, s_b, s_l, s_c, d_b, d_l, d_c,
+              RESET: tl.constexpr, BL: tl.constexpr, BC: tl.constexpr):
     """dst[b, l, c] = src[b, l, c] through each side's strides, in tiles so
     that a transpose between channels-last and channels-first reads and
-    writes contiguous runs on both sides."""
+    writes contiguous runs on both sides; 0 for a reset row b."""
     l = tl.program_id(0) * BL + tl.arange(0, BL)
     c = tl.program_id(1) * BC + tl.arange(0, BC)
     b = tl.program_id(2)
     m = (l < L)[:, None] & (c < C)[None, :]
-    x = tl.load(src + b * s_b + l[:, None] * s_l + c[None, :] * s_c, mask=m)
+    if RESET:
+        m = m & (tl.load(reset + b) == 0)
+    x = tl.load(src + b * s_b + l[:, None] * s_l + c[None, :] * s_c, mask=m, other=0)
+    m = (l < L)[:, None] & (c < C)[None, :]
     tl.store(dst + b * d_b + l[:, None] * d_l + c[None, :] * d_c, x.to(dst.dtype.element_ty), mask=m)
 
 
-def _to_channels_first(src, dst, BL=64, BC=64):
+def _to_channels_first(src, dst, reset=None, BL=64, BC=64):
     """src [B, L, C] into dst [C, B, L] (either may be a strided view)."""
     B, L, C = src.shape
     _relayout[(triton.cdiv(L, BL), triton.cdiv(C, BC), B)](
-        src, dst, L, C, src.stride(0), src.stride(1), src.stride(2),
-        dst.stride(1), dst.stride(2), dst.stride(0), BL=BL, BC=BC)
+        src, dst, src if reset is None else reset, L, C, src.stride(0), src.stride(1), src.stride(2),
+        dst.stride(1), dst.stride(2), dst.stride(0), RESET=reset is not None, BL=BL, BC=BC)
     return dst
 
 
-def _to_channels_last(src, dst, BL=64, BC=64):
+def _to_channels_last(src, dst, reset=None, BL=64, BC=64):
     """src [C, B, L] into dst [B, L, C]."""
     C, B, L = src.shape
     _relayout[(triton.cdiv(L, BL), triton.cdiv(C, BC), B)](
-        src, dst, L, C, src.stride(1), src.stride(2), src.stride(0),
-        dst.stride(0), dst.stride(1), dst.stride(2), BL=BL, BC=BC)
+        src, dst, src if reset is None else reset, L, C, src.stride(1), src.stride(2), src.stride(0),
+        dst.stride(0), dst.stride(1), dst.stride(2), RESET=reset is not None, BL=BL, BC=BC)
     return dst
 
 
-def _channels_first(cache, v):
-    """[cache | 0 | v] as the matmuls' operand: [C, B, W + T] in v's dtype,
-    its rows an odd multiple of 8 elements apart: aligned for cuBLAS, where a
-    multiple of 16 halves the transposes' write bandwidth (measured)."""
+def _row(M, T):
+    """The operand's row length: M + 1 + T padded to an odd multiple of 8
+    elements, aligned for cuBLAS, where a multiple of 16 halves the
+    transposes' write bandwidth (measured)."""
+    row = -(-(M + 1 + T) // 8) * 8
+    return row + 8 * (row // 8 % 2 == 0)
+
+
+def _channels_first(cache, v, reset):
+    """[cache | 0 | v] as the matmuls' operand, [C, B, _row] in v's dtype
+    (the first M + 1 + T columns used)."""
     B, T, C = v.shape
     M = cache.shape[1]
-    row = -(-(M + 1 + T) // 8) * 8
-    row += 8 * (row // 8 % 2 == 0)
-    x = v.new_empty(C, B, row)[:, :, :M + 1 + T]
-    _to_channels_first(cache, x[:, :, :M])
+    x = v.new_empty(C, B, _row(M, T))
+    _to_channels_first(cache, x[:, :, :M], reset)
     x[:, :, M] = 0
-    _to_channels_first(v, x[:, :, M + 1:])
+    _to_channels_first(v, x[:, :, M + 1:M + 1 + T])
     return x
 
 
-def _forward(cache, v, weight, bias):
-    T = v.shape[1]
-    toe = _toeplitz(weight, T, v.dtype)   # conv under autocast: weights in the input dtype
-    y = torch.baddbmm(bias.to(v.dtype)[:, None, None], _channels_first(cache, v), toe)
-    return _to_channels_last(y, torch.empty_like(v))
-
-
-def _backward(gy, cache, v, weight, cache_grad):
+def _forward(cache, v, weight, bias, reset):
     B, T, C = v.shape
-    M = cache.shape[1]
-    toe = _toeplitz(weight, T, v.dtype)
-    g = _to_channels_first(gy, v.new_empty(C, B, T))
+    x = _channels_first(cache, v, reset)
+    toe = _toeplitz(weight, T, v.dtype)   # conv under autocast: weights in the input dtype
+    y = torch.baddbmm(bias.to(v.dtype)[:, None, None], x[:, :, :toe.shape[1]], toe)
+    return _to_channels_last(y, torch.empty_like(v)), x
+
+
+def _backward(gy, x, weight, reset, M, cache_grad):
+    B, T, C = gy.shape
+    toe = _toeplitz(weight, T, gy.dtype)
+    g = _to_channels_first(gy, gy.new_empty(C, B, T))
     gx = torch.bmm(g, toe[:, 0 if cache_grad else M + 1:].transpose(1, 2))
-    gv = _to_channels_last(gx[:, :, -T:], torch.empty_like(v))
-    gcache = _to_channels_last(gx[:, :, :M], torch.empty_like(cache)) if cache_grad else cache.new_empty(0)
-    fp32_out = {} if v.dtype == torch.float32 else {"out_dtype": torch.float32}
-    gtoe = torch.bmm(_channels_first(cache, v).transpose(1, 2), g, **fp32_out)   # [C, W + T, T]
-    _, _, diagonals = _toeplitz_index(M + 1, T, v.device)
+    gv = _to_channels_last(gx[:, :, -T:], torch.empty_like(gy))
+    gcache = _to_channels_last(gx[:, :, :M], gy.new_empty(B, M, C), reset) if cache_grad else gy.new_empty(0)
+    fp32_out = {} if gy.dtype == torch.float32 else {"out_dtype": torch.float32}
+    gtoe = torch.bmm(x[:, :, :M + 1 + T].transpose(1, 2), g, **fp32_out)   # [C, W + T, T]
+    _, _, diagonals = _toeplitz_index(M + 1, T, gy.device)
     gw = gtoe.flatten(1)[:, diagonals].sum(-1)   # each tap's T entries
     return gcache, gv, gw.reshape(weight.shape).to(weight.dtype), gy.float().sum((0, 1)).to(weight.dtype)
 
 
 @torch.library.custom_op("smashbot::causal_conv", mutates_args=())
-def causal_conv(cache: torch.Tensor, v: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
-    """cache [B, W-1, C], v [B, T, C] (channels contiguous), weight [C, 1, W],
-    bias [C] -> [B, T, C] in v's dtype."""
-    return _forward(cache, v, weight, bias)
+def _causal_conv(cache: torch.Tensor, v: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor,
+                 reset: Optional[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    return _forward(cache, v, weight, bias, reset)
 
 
-@causal_conv.register_fake
-def _(cache, v, weight, bias):
-    return v.new_empty(v.shape)
+@_causal_conv.register_fake
+def _(cache, v, weight, bias, reset):
+    B, T, C = v.shape
+    return v.new_empty(v.shape), v.new_empty(C, B, _row(cache.shape[1], T))
 
 
 @torch.library.custom_op("smashbot::causal_conv_backward", mutates_args=())
-def causal_conv_backward(gy: torch.Tensor, cache: torch.Tensor, v: torch.Tensor, weight: torch.Tensor,
-                         cache_grad: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    return _backward(gy, cache, v, weight, cache_grad)
+def causal_conv_backward(gy: torch.Tensor, x: torch.Tensor, weight: torch.Tensor, reset: Optional[torch.Tensor],
+                         M: int, cache_grad: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _backward(gy, x, weight, reset, M, cache_grad)
 
 
 @causal_conv_backward.register_fake
-def _(gy, cache, v, weight, cache_grad):
-    return (cache.new_empty(cache.shape) if cache_grad else cache.new_empty(0), v.new_empty(v.shape),
+def _(gy, x, weight, reset, M, cache_grad):
+    B, T, C = gy.shape
+    return (gy.new_empty(B, M, C) if cache_grad else gy.new_empty(0), gy.new_empty(gy.shape),
             weight.new_empty(weight.shape), weight.new_empty(weight.shape[0]))
 
 
 def _setup_context(ctx, inputs, output):
-    cache, v, weight, _ = inputs
-    ctx.save_for_backward(cache, v, weight)
+    cache, _, weight, _, reset = inputs
+    ctx.mark_non_differentiable(output[1])
+    ctx.set_materialize_grads(False)
+    ctx.save_for_backward(output[1], weight, reset)
+    ctx.M = cache.shape[1]
 
 
-def _grads(ctx, gy):
-    cache, v, weight = ctx.saved_tensors
+def _grads(ctx, gy, _):
+    x, weight, reset = ctx.saved_tensors
     cache_grad = ctx.needs_input_grad[0]
-    gcache, gv, gw, gb = causal_conv_backward(gy, cache, v, weight, cache_grad)
-    return (gcache if cache_grad else None), gv, gw, gb
+    gcache, gv, gw, gb = causal_conv_backward(gy, x, weight, reset, ctx.M, cache_grad)
+    return (gcache if cache_grad else None), gv, gw, gb, None
 
 
-causal_conv.register_autograd(_grads, setup_context=_setup_context)
+_causal_conv.register_autograd(_grads, setup_context=_setup_context)
+
+
+def causal_conv(cache: torch.Tensor, v: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor,
+                reset: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """cache [B, W-1, C], v [B, T, C] (channels contiguous), weight [C, 1, W],
+    bias [C], reset [B] bool or None -> [B, T, C] in v's dtype."""
+    return _causal_conv(cache, v, weight, bias, reset)[0]
 
 
 @triton.jit
