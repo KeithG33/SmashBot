@@ -432,8 +432,10 @@ def run(args) -> None:
 
     state = learner.initial_state(worker.rows, device)
     torch.cuda.synchronize()
+    free, total = torch.cuda.mem_get_info()
     print(f"[vram] boot complete: alloc {torch.cuda.memory_allocated()/2**30:.2f} "
-          f"reserved {torch.cuda.memory_reserved()/2**30:.2f} GiB", flush=True)
+          f"reserved {torch.cuda.memory_reserved()/2**30:.2f} GiB; card free {free/2**30:.2f} "
+          f"of {total/2**30:.2f} GiB", flush=True)
     t0 = time.time()
 
     league.league.payoff_autosave = False  # flushed below, not per game
