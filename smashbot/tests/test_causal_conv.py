@@ -19,7 +19,8 @@ pytestmark = pytest.mark.skipif(
 def test_matches_conv1d(B, T, C, W, dtype, cache_grad, with_reset):
     from smashbot.causal_conv import causal_conv
     torch.manual_seed(0)
-    reset = (torch.arange(B, device="cuda") % 2 == 0) if with_reset else None
+    # a column of [B, T] resets, as BC passes it: strided
+    reset = (torch.arange(B, device="cuda") % 2 == 0)[:, None].repeat(1, 3)[:, 0] if with_reset else None
     cache = torch.randn(B, W - 1, C, device="cuda").to(dtype).requires_grad_(cache_grad)
     v = torch.randn(B, T, C, device="cuda").to(dtype).requires_grad_()
     weight = (torch.randn(C, 1, W, device="cuda") * 0.1).requires_grad_()

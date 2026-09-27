@@ -167,6 +167,7 @@ def causal_conv(cache: torch.Tensor, v: torch.Tensor, weight: torch.Tensor, bias
                 reset: Optional[torch.Tensor] = None) -> torch.Tensor:
     """cache [B, W-1, C], v [B, T, C] (channels contiguous), weight [C, 1, W],
     bias [C], reset [B] bool or None -> [B, T, C] in v's dtype."""
+    reset = None if reset is None else reset.contiguous()   # the kernels read reset[b] at offset b
     return _causal_conv(cache, v, weight, bias, reset)[0]
 
 
