@@ -3,8 +3,8 @@ PPO learner. Reached via `train_rl` (its whole body); reuses train_rl's learner,
 checkpoint schema and overlap pipeline over SimLeague + MultiOpponentSimWorker.
 
 Pool design (locked): self-play (both seats are learner rows, no harvest) /
-5 fixed phillip tiers (harvest, medium 4% < plat 6% < diamond 7% < master 8%
-< gm 10%) / PFSP pool (the run's snapshots, harvest, drawn PER
+6 fixed phillip tiers (harvest, medium 4% = gold 4% < plat 6% < diamond 7% <
+master 8% < gm 10%) / PFSP pool (the run's snapshots, harvest, drawn PER
 MATCH with replacement and routed on the PFSP grid at each env's own game
 boundary — rl/league.py). Env layout is static; every game runs to its end.
 
@@ -19,6 +19,12 @@ import random
 import time
 
 MODELS = "/home/kage/drive2/ShineBot/models"
+# tiers whose checkpoint isn't <tier>-torch.pt or whose RL run conditioned on
+# another name: tier -> (checkpoint, name)
+PHILLIP_FILES = {
+    "medium": ("medium-v2-torch.pt", "Master Player"),
+    "gold": ("gold-v2-torch.pt", "Platinum Player"),
+}
 
 # MAIN_12 -> melee_sim Character names
 _MSL_CHAR = {
@@ -35,8 +41,8 @@ class SimRolloutConfig:
     # served but not learned from); rows are the VRAM budget: v12 fit 400
     # learner rows (449 ran out of memory at the first learner step), and
     # the student forward also serves the self envs' second seats (520 rows
-    # at 400 envs). Shares of envs = shares of rows: self 30 / phillips 35 /
-    # pfsp 35; 140 pfsp envs over 40 slices = 3.5 games per loaded brain,
+    # at 400 envs). Shares of envs = shares of rows: self 30 / phillips 39 /
+    # pfsp 31; 124 pfsp envs over 40 slices = 3.1 games per loaded brain,
     # above v10's 2.6 (more games per slice, more fallback draws). Sized for
     # the 6/576 SGU: the hybrid's dry run re-derives envs and slices.
     num_envs: int = 400
@@ -56,9 +62,9 @@ class SimRolloutConfig:
     capture_serving: bool = True
     # --- pool shares (fractions of num_envs) ---
     self_frac: float = 0.30       # of envs = of learner rows
-    phillip_tiers: tuple[str, ...] = ("medium", "plat", "diamond", "master", "gm")
-    phillip_fracs: tuple[float, ...] = (0.04, 0.06, 0.07, 0.08, 0.10)  # 35% of envs
-    # everything left after self+phillips (~35%) is the PFSP pool
+    phillip_tiers: tuple[str, ...] = ("medium", "gold", "plat", "diamond", "master", "gm")
+    phillip_fracs: tuple[float, ...] = (0.04, 0.04, 0.06, 0.07, 0.08, 0.10)  # 39% of envs
+    # everything left after self+phillips (~31%) is the PFSP pool
     # PFSP grid weight slices = resident members. v10 ran 36 slices x 4
     # cells so a per-match draw usually found its member resident; each
     # fp16 slice is ~54 MB; 40 slices for 108 pfsp envs = 2.7 envs/slice,
@@ -362,13 +368,13 @@ def run(args) -> None:
                         scfg.seed_keep_best)
     phillips = {}
     for tier, frac in zip(scfg.phillip_tiers, scfg.phillip_fracs):
-        fname = "medium-v2-torch.pt" if tier == "medium" else f"{tier}-torch.pt"
+        fname, name = PHILLIP_FILES.get(tier, (f"{tier}-torch.pt", "Master Player"))
         path = f"{MODELS}/{fname}"
         pol, pnm, _ = load_policy(path, device)
         pol.requires_grad_(False)
         pol.eval()
         # all tiers serve from the phillip grid (one stacked forward)
-        phillips[tier] = (pol, frac, resolve_name_code(pnm, "Master Player"))
+        phillips[tier] = (pol, frac, resolve_name_code(pnm, name))
         print(f"phillip:{tier} <- {fname} ({frac:.0%} of envs)")
     league = SimLeague(
         snap_dir, phillips=phillips,
