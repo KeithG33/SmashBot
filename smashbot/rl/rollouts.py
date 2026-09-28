@@ -282,9 +282,8 @@ class GameTracker:
         self.kill_percents = collections.deque(maxlen=event_window)
         self.death_percents = collections.deque(maxlen=event_window)
         self.wins = self.losses = self.draws = 0
-        # EMA companion to the window: smoother (no window-exit jumps) and
-        # persistable across restarts via state()/load_state — the window
-        # resets every boot; the EMA rides in the RL checkpoint.
+        # EMA companion to the window: smoother (no window-exit jumps). Both
+        # ride in the RL checkpoint via state()/load_state.
         self.ema_alpha = ema_alpha
         self.win_ema: float | None = None
         self.diff_ema: float | None = None
@@ -321,13 +320,17 @@ class GameTracker:
         return ema + rate * (x - ema)
 
     def state(self) -> dict:
-        """Persistable summary state (EMA VALUES + lifetime counters); the
-        raw windows are boot-local by design. ema_alpha is deliberately NOT
-        persisted: the horizon is a code-level tuning knob, so restored
-        checkpoints pick up the current default automatically."""
+        """Persistable state: EMA values, lifetime counters and the recent
+        windows, so window stats continue across a restart. ema_alpha and the
+        window sizes are NOT persisted: they're code-level knobs, so restored
+        checkpoints pick up the current defaults (a longer saved window keeps
+        its newest games)."""
         return {"win_ema": self.win_ema, "diff_ema": self.diff_ema,
                 "wins": self.wins, "losses": self.losses,
-                "draws": self.draws}
+                "draws": self.draws,
+                "diffs": [int(d) for d in self.diffs],
+                "kill_percents": [float(p) for p in self.kill_percents],
+                "death_percents": [float(p) for p in self.death_percents]}
 
     def load_state(self, st: dict) -> None:
         self.win_ema = st.get("win_ema")
@@ -335,6 +338,9 @@ class GameTracker:
         self.wins = st.get("wins", 0)
         self.losses = st.get("losses", 0)
         self.draws = st.get("draws", 0)
+        self.diffs.extend(st.get("diffs", ()))
+        self.kill_percents.extend(st.get("kill_percents", ()))
+        self.death_percents.extend(st.get("death_percents", ()))
 
     def add_kill(self, opp_percent: float) -> None:
         self.kill_percents.append(opp_percent)

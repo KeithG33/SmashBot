@@ -578,6 +578,32 @@ def test_tracker_ema_and_persistence():
     assert t3.ema_alpha == 0.008 and t3.win_ema == 0.6
 
 
+def test_tracker_windows_survive_restart():
+    """The recent windows ride in state(), so win_rate_recent and the stock
+    diff/percent averages continue after a restart instead of starting from
+    the first few (short, lopsided) games of the new boot."""
+    from smashbot.rl.rollouts import GameTracker
+
+    t = GameTracker(window=4)
+    for stocks in [(0, 3), (2, 0), (1, 1), (3, 0), (0, 1)]:
+        t.add_game(stocks)
+    t.add_kill(80.0)
+    t.add_death(120.0)
+
+    t2 = GameTracker(window=4)
+    t2.load_state(t.state())
+    assert t2.stats() == t.stats()
+    assert list(t2.diffs) == [2, 0, 3, -1]
+
+    shorter = GameTracker(window=2)
+    shorter.load_state(t.state())
+    assert list(shorter.diffs) == [3, -1]   # the newest games
+
+    legacy = GameTracker()
+    legacy.load_state({"win_ema": 0.6, "wins": 1})
+    assert len(legacy.diffs) == 0 and legacy.stats()["win_rate_recent"] == 0.5
+
+
 def test_tracker_ema_starts_as_the_plain_mean():
     """No prior: while games << 1/alpha the EMA is (almost exactly) the plain
     win rate and stock differential, from the very first game."""
