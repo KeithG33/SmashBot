@@ -274,7 +274,7 @@ class GameTracker:
     # ema_alpha 0.008 ~ a 250-game horizon: several full fleet waves, so
     # the EMA reflects rounds rather than single-batch luck. Restored
     # checkpoints store EMA values only, so alpha changes apply cleanly.
-    def __init__(self, window: int = 100, event_window: int = 200,
+    def __init__(self, window: int = 250, event_window: int = 200,
                  ema_alpha: float = 0.008):
         import collections
 
