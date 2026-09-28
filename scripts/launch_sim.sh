@@ -46,5 +46,5 @@ exec $REPO/.venv/bin/python -m smashbot.rl.train_rl \
   --sim.sim-shards 4 \
   --sim.pfsp-slices 40 \
   --sim.unroll-length 240 \
-  --sim.snapshot-interval 1500 \
+  --sim.snapshot-interval 1000 \
   "$@"
