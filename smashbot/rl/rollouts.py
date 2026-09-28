@@ -307,15 +307,18 @@ class GameTracker:
         else:
             self.draws += 1
         if diff != 0:  # EMA over decided games, matching win_rate_recent
-            outcome = 1.0 if diff > 0 else 0.0
-            a = self.ema_alpha
-            # seed at the 0.5 prior, not the first outcome: an extreme seed
-            # takes ~200 games to wash out at this alpha
-            prev = 0.5 if self.win_ema is None else self.win_ema
-            self.win_ema = (1 - a) * prev + a * outcome
-        a = self.ema_alpha
-        prev_d = 0.0 if self.diff_ema is None else self.diff_ema
-        self.diff_ema = (1 - a) * prev_d + a * diff
+            self.win_ema = self._ema_step(self.win_ema, 1.0 if diff > 0 else 0.0,
+                                          self.wins + self.losses)
+        self.diff_ema = self._ema_step(self.diff_ema, diff,
+                                       self.wins + self.losses + self.draws)
+
+    def _ema_step(self, ema: float | None, x: float, n: int) -> float:
+        """Bias-corrected EMA (Adam's correction) with x its nth sample: the
+        plain mean of the samples while n << 1/alpha, recency-weighted after."""
+        if ema is None:
+            return x
+        rate = self.ema_alpha / (1 - (1 - self.ema_alpha) ** n)
+        return ema + rate * (x - ema)
 
     def state(self) -> dict:
         """Persistable summary state (EMA VALUES + lifetime counters); the
