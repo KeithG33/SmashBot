@@ -93,17 +93,17 @@ def test_scores():
     exact = {"main_stick": torch.tensor([[[60, 0]]])}
     score = lambda scorer, bucket, size, human, exact: scorer.score(
         {"main_stick": _sure(bucket, size)}, human, exact)["main_stick"]
-    # [top1, same_action, action_nll, same_read, read_distance]
-    torch.testing.assert_close(score(grid, _grid(60, 0), 289, human, exact), torch.tensor([1.0, 1.0, 0.0, 1.0, 0.0]))
-    torch.testing.assert_close(score(grid, _grid(60, 10), 289, human, exact), torch.tensor([0.0, 1.0, 0.0, 1.0, 0.0]))
+    # [top1, same_action, action_nll, read_distance]
+    torch.testing.assert_close(score(grid, _grid(60, 0), 289, human, exact), torch.tensor([1.0, 1.0, 0.0, 0.0]))
+    torch.testing.assert_close(score(grid, _grid(60, 10), 289, human, exact), torch.tensor([0.0, 1.0, 0.0, 0.0]))
     # 70 is past the dash/smash line at 64, 60 isn't: a different action, its
     # probability floored at 1e-6
     torch.testing.assert_close(score(grid, _grid(70, 0), 289, human, exact),
-                               torch.tensor([0.0, 0.0, -math.log(1e-6), 0.0, 10.0]))
+                               torch.tensor([0.0, 0.0, -math.log(1e-6), 10.0]))
     # 66 and 70 are on the same side of every line: the same action, 4 units off
     exact66 = {"main_stick": torch.tensor([[[66, 0]]])}
     human66 = Controller(main_stick=Stick(x=torch.tensor([[15]]), y=torch.tensor([[8]])), c_stick=None, shoulder=None, buttons=None)
-    torch.testing.assert_close(score(grid, _grid(70, 0), 289, human66, exact66), torch.tensor([1.0, 1.0, 0.0, 0.0, 4.0]))
+    torch.testing.assert_close(score(grid, _grid(70, 0), 289, human66, exact66), torch.tensor([1.0, 1.0, 0.0, 4.0]))
 
     joint_head = AutoRegressive(_controller("balanced_v6_157"), input_size=4)
     joint = StickScorer(joint_head, "cpu")
@@ -112,10 +112,10 @@ def test_scores():
     centre = tuple(int(v) for v in stick.positions[bucket])
     assert centre != (57, 30)   # a member of the bucket other than its decode point
     human = Controller(main_stick=torch.tensor([[bucket]]), c_stick=None, shoulder=None, buttons=None)
-    for position, want_read in ((centre, 1.0), ((57, 30), 0.0)):
+    for position in (centre, (57, 30)):
         got = score(joint, bucket, 157, human, {"main_stick": torch.tensor([[position]])})
         miss = float(np.hypot(centre[0] - position[0], centre[1] - position[1]))
-        torch.testing.assert_close(got, torch.tensor([1.0, 1.0, 0.0, want_read, miss]))
+        torch.testing.assert_close(got, torch.tensor([1.0, 1.0, 0.0, miss]))
 
 
 def test_stick_regions():

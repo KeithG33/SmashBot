@@ -192,12 +192,10 @@ class StickScorer:
       action_nll: -log of the probability on every bucket that reads into
         the human's game region, floored at 1e-6 (a grid can lack a bucket
         for some regions);
-      same_read: the game reads the model's most likely bucket exactly as it
-        read the human's stick;
       read_distance: the probability-weighted distance between what the game
         reads from each bucket and the human's stick (full tilt = 80).
-    same_action, action_nll, same_read and read_distance don't depend on the
-    encoding, so they compare encodings."""
+    same_action, action_nll and read_distance don't depend on the encoding,
+    so they compare encodings."""
 
     def __init__(self, controller_head, device):
         struct = controller_head.embed_struct
@@ -213,8 +211,8 @@ class StickScorer:
         return human.x.long() * self.sticks[name].x.size + human.y.long()
 
     def score(self, log_probs: dict, target, exact: dict) -> dict:
-        """[top1, same_action, action_nll, same_read, read_distance] per
-        stick, averaged over the frames, on device."""
+        """[top1, same_action, action_nll, read_distance] per stick,
+        averaged over the frames, on device."""
         scores = {}
         for name, log_p in log_probs.items():
             reads, position = self.reads[name], exact[name].float()
@@ -227,7 +225,6 @@ class StickScorer:
                 (guess == self._bucket(name, getattr(target, name))).float().mean(),
                 (region(reads[guess]) == region(exact[name])).float().mean(),
                 -action_log_p.clamp(min=math.log(1e-6)).mean(),
-                (reads[guess] == position).all(-1).float().mean(),
                 (log_p.exp() * miss).sum(-1).mean(),
             ])
         return scores
@@ -310,7 +307,7 @@ def stick_metrics(batches: list) -> dict:
     names = list(batches[0])
     values = torch.stack([torch.stack([b[n] for b in batches]).mean(0) for n in names]).tolist()
     return {f"{name}/{score}": v for name, row in zip(names, values)
-            for score, v in zip(("top1", "same_action", "action_nll", "same_read", "read_distance"), row)}
+            for score, v in zip(("top1", "same_action", "action_nll", "read_distance"), row)}
 
 
 def build_policy_from_config(cfg: dict) -> Policy:
