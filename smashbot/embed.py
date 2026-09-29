@@ -584,6 +584,12 @@ STICK_TABLES = {
         "main_stick": ("balanced_v2_main.json", "ffd1160ff6b7e0eb172d03b90e1394a029450208a73ab9dee9d5cdeef37c78c2"),
         "c_stick": ("balanced_v2_c.json", "f708457e1f70c17698c6ad9ce6a876cbddbb7166811dfa59c96991973d6a21f2"),
     },
+    # v2's rules with ring-and-arc cells kept whole: slivers merge along their
+    # own ring or arc (stick_encoding.py build_v6); the c-stick is v2's
+    "balanced_v6": {
+        "main_stick": ("balanced_v6_main.json", "b8d0e22a2c9deaccfe646eb26f56520da3678450e679c9e8815a2c94587cc9aa"),
+        "c_stick": ("balanced_v2_c.json", "f708457e1f70c17698c6ad9ce6a876cbddbb7166811dfa59c96991973d6a21f2"),
+    },
 }
 STICK_TABLE_DIR = os.path.join(os.path.dirname(__file__), "stick_tables")
 

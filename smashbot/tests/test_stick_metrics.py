@@ -34,7 +34,7 @@ def _grid(x, y):
     return (x + 80) // 10 * 17 + (y + 80) // 10
 
 
-@pytest.mark.parametrize("stick_table", ["", "balanced_v2"])
+@pytest.mark.parametrize("stick_table", ["", "balanced_v2", "balanced_v6"])
 def test_stick_distribution_matches_distance(stick_table):
     torch.manual_seed(0)
     rng = np.random.default_rng(0)
@@ -56,9 +56,10 @@ def test_stick_distribution_matches_distance(stick_table):
         torch.testing.assert_close(at_human, -(d.x + d.y) if stick_table == "" else -d)
 
 
-def test_joint_tables_cover_every_position():
-    for which, size, neutral in (("main_stick", 237, 116), ("c_stick", 75, 35)):
-        stick = embed_lib.JointStickEmbedding(which, "balanced_v2", which)
+@pytest.mark.parametrize("table, main_size, main_neutral", [("balanced_v2", 237, 116), ("balanced_v6", 241, 118)])
+def test_joint_tables_cover_every_position(table, main_size, main_neutral):
+    for which, size, neutral in (("main_stick", main_size, main_neutral), ("c_stick", 75, 35)):
+        stick = embed_lib.JointStickEmbedding(which, table, which)
         assert stick.size == size and stick.lookup.shape == (161, 161) and stick.lookup.max() == size - 1
         # every bucket decodes to one of its own positions
         np.testing.assert_array_equal(stick.from_state(stick.decode(np.arange(size))), np.arange(size))
