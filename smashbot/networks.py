@@ -1024,10 +1024,34 @@ class StateActionNetwork(Network):
         return out, {"core": core, "tech_mask": mask}
 
     def unroll(self, state_action, reset, initial_state):
-        if self.tech_mask_window:
-            raise NotImplementedError("the tech mask runs frame by frame (serving); "
-                                      "training data would get it offline")
-        return self.core.unroll(self.embed_sa(state_action), reset, initial_state)
+        if not self.tech_mask_window:
+            return self.core.unroll(self.embed_sa(state_action), reset, initial_state)
+        state_action, mask = self._mask_tech_unroll(state_action, reset, *initial_state["tech_mask"])
+        out, core = self.core.unroll(self.embed_sa(state_action), reset, initial_state["core"])
+        return out, {"core": core, "tech_mask": mask}
+
+    def _mask_tech_unroll(self, state_action, reset, prev_action, count):
+        """_mask_tech over a [B, T] unroll, frame for frame what step_with_reset
+        computes. A run of one opponent action starts where the action changes
+        or at a reset; its count is the frames since that start, plus 1 when a
+        reset lands inside a repeating action (step_with_reset's zeroed state
+        still sees the action repeat), or carried on from the previous chunk
+        when no run starts in this one."""
+        action = state_action.state.p1.action
+        a = action.long()
+        pos = torch.arange(a.shape[1], device=a.device)
+        prev = torch.cat([prev_action[:, None], a[:, :-1]], dim=1)
+        prev = torch.where(reset, 0, prev)
+        same = a == prev
+        start = ~same | reset
+        last_start = torch.cummax(torch.where(start, pos, -1), dim=1).values
+        start_count = torch.where(same, 1, 0)       # the count at a run start
+        from_start = start_count.gather(1, last_start.clamp(min=0)) + pos - last_start
+        counts = torch.where(last_start >= 0, from_start, count[:, None] + 1 + pos)
+        tech = (action == NEUTRAL_TECH) | (action == FORWARD_TECH) | (action == BACKWARD_TECH)
+        masked = torch.where(tech & (counts < self.tech_mask_window), NEUTRAL_TECH, action)
+        state = state_action.state._replace(p1=state_action.state.p1._replace(action=masked))
+        return state_action._replace(state=state), (a[:, -1], counts[:, -1])
 
     def _mask_tech(self, state_action, prev_action, count):
         """slippi-ai's AnimationFilter (upstream slippi_ai/observations.py), as
