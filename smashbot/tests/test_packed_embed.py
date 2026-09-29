@@ -42,8 +42,9 @@ def _rand_input(emb, shape, rng):
     raise TypeError(emb)
 
 
-def _make_embedding(num_names=16):
+def _make_embedding(num_names=16, controller="default"):
     cfg = embed_lib.EmbedConfig()
+    cfg.controller.type = controller
     return embed_lib.get_state_action_embedding(
         embed_game=cfg.make_game_embedding(),
         embed_action=cfg.controller.make_embedding(),
@@ -58,9 +59,10 @@ def _mlp_col_mask(packed, size):
     return mask
 
 
+@pytest.mark.parametrize("controller", ["default", "balanced_v2"])
 @pytest.mark.parametrize("shape", [(7,), (3, 5)])
-def test_packed_matches_reference_bitwise(shape):
-    sae = _make_embedding()
+def test_packed_matches_reference_bitwise(shape, controller):
+    sae = _make_embedding(controller=controller)
     packed = embed_lib.PackedStructForward(sae)
     mlp_cols = _mlp_col_mask(packed, sae.size)
     rng = np.random.default_rng(0)

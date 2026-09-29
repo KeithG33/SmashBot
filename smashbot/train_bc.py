@@ -29,7 +29,7 @@ from smashbot.data import loader
 from smashbot.delay import slice_delayed_frames
 from smashbot.networks import (build_embed_network, check_loadable, keep_sgu_activations,
                                use_chunk_start_resets, use_packed_encoder)
-from smashbot.policy import build_policy, imitation_metrics, stick_metrics, stick_scores
+from smashbot.policy import StickScorer, build_policy, imitation_metrics, stick_metrics
 from smashbot.training import GradClipper, compile_cores, resolve_restore
 from smashbot.value import ValueFunction
 
@@ -343,7 +343,9 @@ def main(config: TrainConfig) -> None:
     loader.seat_mid_game(
         sources.test, span=(warm_batches + rt.eval_batches + 1) * (config.data.unroll_length + config.policy.delay + 1),
         seed=config.data.dataset.seed, num_workers=config.data.num_workers)
-    eval_stream = loader.TorchBatchStream(sources.test, config.data, encode_network=policy.network)
+    # with each stick's exact position, which eval scores both encodings against
+    eval_stream = loader.TorchBatchStream(sources.test, config.data, encode_network=policy.network,
+                                          with_sticks=True)
     eval_set = [next(eval_stream)[0] for _ in range(warm_batches + rt.eval_batches)]
     eval_stream.stop()
     sources.test.shutdown()
@@ -382,13 +384,15 @@ def main(config: TrainConfig) -> None:
             best_eval_loss,
         )
 
+    stick_scorer = StickScorer(policy.controller_head, device)
+
     def run_eval() -> dict:
         policy.eval()
         losses, value_metrics_acc, stick_batches = [], [], []
         eval_hidden = policy.initial_state(B, device)
         eval_value_hidden = value_fn.initial_state(B, device)
         with torch.no_grad():
-            for i, frames in enumerate(eval_set):
+            for i, (frames, exact) in enumerate(eval_set):
                 frames = to_device(frames)
                 with autocast():
                     sliced = slice_delayed_frames(frames, config.policy.delay)
@@ -401,7 +405,8 @@ def main(config: TrainConfig) -> None:
                     losses.append(-outputs.log_probs.mean().item())
                     value_metrics_acc.append(vm)
                     human = tree.map_structure(lambda t: t[:, 1:], sliced.state_action.action)
-                    stick_batches.append(stick_scores(outputs.sticks, human))
+                    exact = {k: v.to(device)[:, config.policy.delay + 1:] for k, v in exact.items()}
+                    stick_batches.append(stick_scorer.score(outputs.sticks, human, exact))
         policy.train()
         policy_loss = float(np.mean(losses))
         value_uev = float(np.mean([m["uev"] for m in value_metrics_acc]))

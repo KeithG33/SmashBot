@@ -234,6 +234,13 @@ def batch_to_frames(batch: data_lib.Batch, network, pin: bool = False):
     return tree.map_structure(lambda x: _to_torch(np.ascontiguousarray(x), pin), frames)
 
 
+def exact_sticks(controller) -> dict:
+    """Each stick's exact position [B, T, 2] on the game's -80..80 scale:
+    replay sticks are the game's own reads, so v * 160 - 80 is an integer."""
+    return {name: torch.from_numpy(np.rint(np.stack([s.x, s.y], -1) * 160 - 80).astype(np.int16))
+            for name, s in (("main_stick", controller.main_stick), ("c_stick", controller.c_stick))}
+
+
 class TorchBatchStream:
     """Background thread: pulls numpy batches, converts to (pinned) torch.
 
@@ -249,9 +256,11 @@ class TorchBatchStream:
         source: Split,
         config: DataConfig,
         encode_network=None,
+        with_sticks: bool = False,
     ):
         self._source = source
         self._network = encode_network
+        self._with_sticks = with_sticks
         self._pin = config.pin_memory and torch.cuda.is_available()
         self._queue: queue.Queue = queue.Queue(maxsize=config.prefetch)
         self._stop = threading.Event()
@@ -270,6 +279,8 @@ class TorchBatchStream:
                     )
                 else:
                     item = batch_to_torch(batch_with_meta.batch, self._pin)
+                if self._with_sticks:
+                    item = (item, exact_sticks(batch_with_meta.batch.game.p0.controller))
                 while not self._stop.is_set():
                     try:
                         self._queue.put((item, epoch, state), timeout=1.0)

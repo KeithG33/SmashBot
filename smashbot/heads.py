@@ -141,28 +141,34 @@ class AutoRegressive(ControllerHead):
         )
 
     def stick_log_probs(self, inputs, prev_controller_state, target_controller_state) -> dict:
-        """Each stick's joint log p(x, y) over every pair of axis buckets,
-        [..., x, y], with the components before it teacher-forced as in
-        distance. distance only scores y given the human's x; this runs the y
-        component once per x, so a metric can score the pair the model
-        would pick."""
+        """Each stick's log-probabilities over all its buckets [..., K], with
+        the components before it teacher-forced as in distance: a joint
+        stick's own distribution, or a grid stick's log p(x, y) over every
+        bucket pair, flattened x-major. distance only scores a grid's y given
+        the human's x; here the y component runs once per x, so a metric can
+        score the pair the model would pick."""
         sticks = {name: getattr(self.embed_struct, name) for name in ("main_stick", "c_stick")
                   if hasattr(self.embed_struct, name)}
-        first_axis = {next(i for i, e in enumerate(self.embed_flat) if e is stick.x): name
-                      for name, stick in sticks.items()}
+        first_component = {}
+        for name, stick in sticks.items():
+            leaf = stick if isinstance(stick, Embedding) else stick.x
+            first_component[next(i for i, e in enumerate(self.embed_flat) if e is leaf)] = name
         residual = self.to_residual(inputs)
         prev_flat = list(self.embed_controller.flatten(prev_controller_state))
         target_flat = list(self.embed_controller.flatten(target_controller_state))
-        joint = {}
+        log_probs = {}
         for i, (block, prev, target) in enumerate(zip(self.res_blocks, prev_flat, target_flat)):
-            if i in first_axis:
-                y_block, y_prev = self.res_blocks[i + 1], prev_flat[i + 1]
-                assert y_block.embedder is sticks[first_axis[i]].y
-                n = block.embedder.size
-                every_x = block.decoder(block.embedder(torch.arange(n, device=residual.device)))
-                y_logits = y_block._logits(
-                    residual.unsqueeze(-2) + every_x, y_prev.unsqueeze(-1).expand(*y_prev.shape, n))
-                log_px = torch.log_softmax(block._logits(residual, prev).float(), dim=-1)
-                joint[first_axis[i]] = log_px.unsqueeze(-1) + torch.log_softmax(y_logits.float(), dim=-1)
+            if i in first_component:
+                name = first_component[i]
+                log_p = torch.log_softmax(block._logits(residual, prev).float(), dim=-1)
+                if not isinstance(sticks[name], Embedding):
+                    y_block, y_prev = self.res_blocks[i + 1], prev_flat[i + 1]
+                    assert y_block.embedder is sticks[name].y
+                    n = block.embedder.size
+                    every_x = block.decoder(block.embedder(torch.arange(n, device=residual.device)))
+                    y_logits = y_block._logits(
+                        residual.unsqueeze(-2) + every_x, y_prev.unsqueeze(-1).expand(*y_prev.shape, n))
+                    log_p = (log_p.unsqueeze(-1) + torch.log_softmax(y_logits.float(), dim=-1)).flatten(-2)
+                log_probs[name] = log_p
             residual = residual + block.decoder(block.embedder(target))
-        return joint
+        return log_probs

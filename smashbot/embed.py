@@ -9,6 +9,9 @@ game structs); `__call__`/`distance`/`sample` operate on torch tensors.
 import abc
 import dataclasses
 import enum
+import hashlib
+import json
+import os
 from typing import Any, Callable, Generic, Iterator, Mapping, Sequence, TypeVar
 
 import numpy as np
@@ -565,6 +568,57 @@ class DiscreteEmbedding(OneHotEmbedding):
         return (out / self.n).astype(np.float32)
 
 
+def stick_read(xy: np.ndarray) -> np.ndarray:
+    """The position Melee reads from stick positions [..., 2] on its -80..80
+    scale: clamped to the unit circle, then |k| <= 22 on either axis reads
+    as 0."""
+    xy = np.asarray(xy, np.float64)
+    radius = np.hypot(xy[..., 0], xy[..., 1])[..., None]
+    read = np.trunc(np.where(radius > 80, xy * 80 / np.maximum(radius, 1), xy))
+    return np.where(np.abs(read) <= 22, 0, read).astype(np.int16)
+
+
+# A table never changes in place: a new table is a new controller type.
+STICK_TABLES = {
+    "balanced_v2": {
+        "main_stick": ("balanced_v2_main.json", "ffd1160ff6b7e0eb172d03b90e1394a029450208a73ab9dee9d5cdeef37c78c2"),
+        "c_stick": ("balanced_v2_c.json", "f708457e1f70c17698c6ad9ce6a876cbddbb7166811dfa59c96991973d6a21f2"),
+    },
+}
+STICK_TABLE_DIR = os.path.join(os.path.dirname(__file__), "stick_tables")
+
+
+class JointStickEmbedding(OneHotEmbedding):
+    """A stick as one choice among a table's buckets (built by
+    stick-encoding/stick_encoding.py): each bucket a set of the positions
+    Melee reads, decoding to one of its members. Replay sticks are the
+    game's own reads, so each lands in exactly one bucket; any other
+    position (an opponent's grid or custom_v1 press) lands in the bucket of
+    what the game reads there."""
+
+    def __init__(self, name: str, table: str, which: str):
+        file, sha256 = STICK_TABLES[table][which]
+        with open(os.path.join(STICK_TABLE_DIR, file), "rb") as f:
+            raw = f.read()
+        if hashlib.sha256(raw).hexdigest() != sha256:
+            raise ValueError(f"{file} changed: a new table needs a new controller type")
+        spec = json.loads(raw)
+        super().__init__(name, len(spec["decode"]), dtype=np.uint8)
+        bucket = {tuple(p): b for b, members in enumerate(spec["buckets"]) for p in members}
+        every = np.stack(np.meshgrid(np.arange(-80, 81), np.arange(-80, 81), indexing="ij"), -1)
+        self.lookup = np.array([[bucket[tuple(p)] for p in row] for row in stick_read(every)], np.uint8)
+        self.positions = np.array(spec["decode"], np.int16)
+
+    def from_state(self, stick: Stick) -> np.ndarray:
+        k = [np.clip(np.rint(np.asarray(v, np.float64) * 160 - 80), -80, 80).astype(np.intp) + 80
+             for v in (stick.x, stick.y)]
+        return self.lookup[k[0], k[1]]
+
+    def decode(self, out) -> Stick:
+        xy = ((self.positions[np.asarray(out, np.intp)] + 80) / 160).astype(np.float32)
+        return Stick(x=xy[..., 0], y=xy[..., 1])
+
+
 NATIVE_AXIS_SPACING = 160
 NATIVE_SHOULDER_SPACING = 140
 
@@ -580,8 +634,11 @@ def make_embed_buttons() -> StructEmbedding[Buttons]:
 def get_controller_embedding(
     axis_spacing: int = 0,
     shoulder_spacing: int = 4,
+    stick_table: str = "",
 ) -> StructEmbedding[Controller]:
-    """Controller embedding. Used for autoregressive sampling, so order matters."""
+    """Controller embedding. Used for autoregressive sampling, so order matters.
+    With a stick_table each stick is one JointStickEmbedding choice instead of
+    x then y."""
     if axis_spacing:
         if NATIVE_AXIS_SPACING % axis_spacing != 0:
             raise ValueError(f"Axis spacing must divide {NATIVE_AXIS_SPACING}")
@@ -592,7 +649,9 @@ def get_controller_embedding(
         def make_axis():
             return embed_float
 
-    def make_stick():
+    def make_stick(which):
+        if stick_table:
+            return JointStickEmbedding(which, stick_table, which)
         return struct_embedding_from_nt("stick", Stick(x=make_axis(), y=make_axis()))
 
     if NATIVE_SHOULDER_SPACING % shoulder_spacing != 0:
@@ -602,8 +661,8 @@ def get_controller_embedding(
         "controller",
         [
             ("buttons", make_embed_buttons()),
-            ("main_stick", make_stick()),
-            ("c_stick", make_stick()),
+            ("main_stick", make_stick("main_stick")),
+            ("c_stick", make_stick("c_stick")),
             ("shoulder", DiscreteEmbedding(shoulder_spacing)),
         ],
         Controller,
@@ -662,14 +721,17 @@ def make_custom_v1_embedding(config: custom_v1.Config) -> CompoundEmbedding:
 class ControllerConfig:
     axis_spacing: int = 16
     shoulder_spacing: int = 4
-    type: str = "default"   # or "custom_v1"
+    type: str = "default"   # or "custom_v1", or a STICK_TABLES name
 
     def make_embedding(self) -> Embedding[Controller, Any]:
         if self.type == "custom_v1":
             return make_custom_v1_embedding(custom_v1.Config())
+        if self.type != "default" and self.type not in STICK_TABLES:
+            raise ValueError(f"unknown controller type {self.type!r}")
         return get_controller_embedding(
             axis_spacing=self.axis_spacing,
             shoulder_spacing=self.shoulder_spacing,
+            stick_table=self.type if self.type in STICK_TABLES else "",
         )
 
 

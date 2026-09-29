@@ -58,6 +58,10 @@ def _nan_loss(module, out):
     return loss * math.nan, state, extras
 
 
+def _nan_log_probs(module, out):
+    return out._replace(log_probs=out.log_probs * math.nan)
+
+
 def _nan_state(module, out):
     loss, state, extras = out
     leaves = tree.flatten(state)
@@ -92,7 +96,7 @@ def test_a_nonfinite_recurrent_state_is_never_written(tmp_path, monkeypatch):
 def test_a_nonfinite_eval_stops_training(tmp_path, monkeypatch):
     config = _config(tmp_path, eval_interval=3)
     warm_batches = -(-config.runtime.eval_burn_in // config.data.unroll_length)   # unscored
-    _poison(monkeypatch, Policy, "imitation_loss", warm_batches + 1, _nan_loss, training=False)
+    _poison(monkeypatch, Policy, "unroll", warm_batches + 1, _nan_log_probs, training=False)
     with pytest.raises(FloatingPointError, match="non-finite eval"):
         train_bc.main(config)
     assert _latest_step(tmp_path) == 2
