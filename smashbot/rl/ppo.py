@@ -44,12 +44,15 @@ from smashbot.value import ValueFunction
 
 
 
-def _linear_decay(start: float, final: float, progress: float) -> float:
-    """start at progress 0 to final at 1, clamped; start throughout while
-    final is negative."""
+def _decay(start: float, final: float, progress: float, path: str) -> float:
+    """start at progress 0 to final at 1, clamped, along a line or
+    geometrically ("exponential"); start throughout while final is negative."""
     if final < 0:
         return start
-    return start + (final - start) * min(max(progress, 0.0), 1.0)
+    progress = min(max(progress, 0.0), 1.0)
+    if path == "exponential":
+        return start * (final / start) ** progress
+    return start + (final - start) * progress
 
 class ActionData(tp.NamedTuple):
     # prev-action stream: controller_state[t] = the action sampled at frame
@@ -237,6 +240,13 @@ class Learner:
         self.teacher.eval()
 
         assert config.precision in ("fp32", "fp16"), config.precision
+        if config.kl_teacher_decay not in ("linear", "exponential"):
+            raise ValueError(f"kl_teacher_decay {config.kl_teacher_decay!r}: linear or exponential")
+        if config.kl_teacher_decay == "exponential" and any(
+                final >= 0 and min(start, final) <= 0 for start, final in (
+                    (config.kl_teacher_weight, config.kl_teacher_weight_final),
+                    (config.reverse_kl_teacher_weight, config.reverse_kl_teacher_weight_final))):
+            raise ValueError("an exponential leash decay needs positive start and final weights")
         self._device_type = next(policy.parameters()).device.type
         precision = config.precision
         if precision == "fp16" and self._device_type != "cuda":
@@ -730,16 +740,16 @@ class Learner:
             print(f"ANOMALY: dumped {path}")
 
     def kl_teacher_weight_at(self, progress: float) -> float:
-        """Teacher-KL leash coefficient at run fraction `progress`: linear
-        from kl_teacher_weight to kl_teacher_weight_final; constant (the
-        historical behavior) while the final is negative."""
+        """Teacher-KL leash coefficient at run fraction `progress`: from
+        kl_teacher_weight to kl_teacher_weight_final along kl_teacher_decay;
+        constant (the historical behavior) while the final is negative."""
         cfg = self.config
-        return _linear_decay(cfg.kl_teacher_weight, cfg.kl_teacher_weight_final, progress)
+        return _decay(cfg.kl_teacher_weight, cfg.kl_teacher_weight_final, progress, cfg.kl_teacher_decay)
 
     def reverse_kl_teacher_weight_at(self, progress: float) -> float:
         """The reverse leash's coefficient, decaying like the forward one."""
         cfg = self.config
-        return _linear_decay(cfg.reverse_kl_teacher_weight, cfg.reverse_kl_teacher_weight_final, progress)
+        return _decay(cfg.reverse_kl_teacher_weight, cfg.reverse_kl_teacher_weight_final, progress, cfg.kl_teacher_decay)
 
     # ------------------------------------------------ opponent imitation
 
