@@ -46,7 +46,9 @@ class RuntimeConfig:
     checkpoint_interval: int = 1000
     tag: str = "debug"
     run_dir: str = "/home/kage/drive2/ShineBot/runs"
-    wandb_mode: str = "online"  # online | offline | disabled
+    # online | offline | disabled; $WANDB_MODE sets the default, since this
+    # value goes to wandb.init and would otherwise override the variable
+    wandb_mode: str = os.environ.get("WANDB_MODE", "online")
     restore: str = ""  # checkpoint path, or "auto" for <run_dir>/<tag>/latest.pt
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     seed: int = 0  # seeds model init; makes A/B runs attributable

@@ -296,7 +296,8 @@ class StructEmbedding(Embedding[NT, NT]):
             if op.size == 0:
                 continue
             embed.append(op(self.getter(struct, field)))
-        assert embed, "Embedding must not be empty"
+        if not embed:   # not `assert embed`: Dynamo can't trace a list assert
+            raise ValueError("Embedding must not be empty")
         return torch.cat(embed, dim=-1)
 
     def dummy(self, shape=()):

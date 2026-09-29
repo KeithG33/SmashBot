@@ -143,6 +143,8 @@ def compile_cores(policy, value_fn, teacher=None) -> None:
             net.packed_embed.encode = torch.compile(net.packed_embed.encode, dynamic=True)
         if net.enhanced is not None:
             net.enhanced.forward = torch.compile(net.enhanced.forward, dynamic=True)
+        if getattr(net, "tech_mask_window", 0):
+            net._mask_tech_unroll = torch.compile(net._mask_tech_unroll, dynamic=True)
         core = net.core
         if hasattr(core, "_forward"):
             core._forward = torch.compile(core._forward, dynamic=True)

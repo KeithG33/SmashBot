@@ -12,6 +12,7 @@ and the config/name_map (RL checkpoints stay play.py-compatible).
 from __future__ import annotations
 
 import dataclasses
+import os
 
 import tyro
 
@@ -27,7 +28,7 @@ class RuntimeConfig:
     run_dir: str = "/home/kage/drive2/ShineBot/runs"
     checkpoint_interval: int = 50
     log_interval: int = 1
-    wandb_mode: str = "online"
+    wandb_mode: str = os.environ.get("WANDB_MODE", "online")   # $WANDB_MODE sets the default
     # wandb run id override (default: the tag). Needed when a tag's id was
     # deleted on the server — deleted ids are tombstoned and unreusable.
     wandb_id: str = ""
