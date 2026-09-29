@@ -12,6 +12,7 @@ Usage (from repo root):
 
 import contextlib
 import dataclasses
+import functools
 import math
 import os
 import random
@@ -29,7 +30,7 @@ from smashbot.data import loader
 from smashbot.delay import slice_delayed_frames
 from smashbot.networks import (build_embed_network, check_loadable, keep_sgu_activations,
                                use_chunk_start_resets, use_packed_encoder)
-from smashbot.policy import StickScorer, build_policy, imitation_metrics, stick_metrics
+from smashbot.policy import EnergyScore, StickScorer, build_policy, imitation_metrics, stick_metrics
 from smashbot.training import GradClipper, compile_cores, resolve_restore
 from smashbot.value import ValueFunction
 
@@ -283,7 +284,9 @@ def main(config: TrainConfig) -> None:
     else:
         autocast = contextlib.nullcontext
 
-    policy_loss_fn = policy.imitation_loss
+    energy_weight = config.learner.energy_score_weight
+    energy = EnergyScore(policy.controller_head, device) if energy_weight else None
+    policy_loss_fn = functools.partial(policy.imitation_loss, energy=energy, energy_weight=energy_weight)
     value_loss_fn = value_fn.loss
     if config.learner.compile and device == "cuda":
         compile_cores(policy, value_fn)
@@ -483,7 +486,9 @@ def main(config: TrainConfig) -> None:
             value_opt.step()
 
             if log_step:
-                metrics = imitation_metrics(policy_loss, distances)
+                # the plain negative log-likelihood, as in eval: the loss minus any energy term
+                nll = sum(d.mean() for d in tree.flatten(distances)) if energy else policy_loss
+                metrics = imitation_metrics(nll, distances)
                 now = time.perf_counter()
                 fps = (step - step_window) * B * config.data.unroll_length / (
                     now - t_window
@@ -492,6 +497,8 @@ def main(config: TrainConfig) -> None:
                 wandb.log(
                     {
                         "train/policy_loss": metrics["policy_loss"],
+                        **({"train/energy_score": (policy_loss.detach() - nll.detach()).item() / energy_weight}
+                           if energy else {}),
                         "train/epoch": epoch,
                         "train/frames_per_sec": fps,
                         **{f"train/controller/{k}": v

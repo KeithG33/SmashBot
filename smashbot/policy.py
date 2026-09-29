@@ -80,13 +80,21 @@ class Policy(nn.Module):
         self,
         frames: Frames,
         initial_state: RecurrentState,
+        energy: tp.Optional["EnergyScore"] = None,
+        energy_weight: float = 0.0,
     ) -> tuple[torch.Tensor, RecurrentState, tp.Any]:
         """frames: [B, U + D + 1] raw (not yet delay-aligned). The loss, the
         final state and the per-component distances, all left on device:
-        imitation_metrics reads them out when they are wanted."""
+        imitation_metrics reads them out when they are wanted. With `energy`,
+        the loss adds energy_weight x the joint sticks' energy score; the
+        distances stay the plain negative log-probs."""
         delayed = delay_lib.slice_delayed_frames(frames, self.delay)
         outputs = self.unroll(delayed, initial_state)
-        return -outputs.log_probs.mean(), outputs.final_state, outputs.distances
+        loss = -outputs.log_probs.mean()
+        if energy is not None:
+            target = tree.map_structure(lambda t: t[:, 1:], delayed.state_action.action)
+            loss = loss + energy_weight * energy(outputs.logits, target)
+        return loss, outputs.final_state, outputs.distances
 
     @torch.no_grad()
     def forward(
@@ -215,6 +223,36 @@ class StickScorer:
                 (log_p.exp() * miss).sum(-1).mean(),
             ])
         return scores
+
+
+class EnergyScore:
+    """Each joint stick's energy score against the human's bucket (Gneiting
+    and Raftery 2007): E|X - y| - E|X - X'| / 2 under the model's
+    distribution over bucket decode points, Euclidean distance in full-tilt
+    units. Probability near the human's bucket costs less than probability
+    far away, and the score is still lowest at the true distribution. With
+    Q = P @ D, E|X - y| is Q at the human's bucket and E|X - X'| is P . Q."""
+
+    def __init__(self, controller_head, device):
+        struct = controller_head.embed_struct
+        points = {name: getattr(struct, name) for name in ("main_stick", "c_stick")
+                  if isinstance(getattr(struct, name, None), JointStickEmbedding)}
+        if not points:
+            raise ValueError("the energy score needs joint sticks: a STICK_TABLES controller type")
+        self.distance = {}
+        for name, stick in points.items():
+            xy = torch.tensor(stick.positions, dtype=torch.float32, device=device) / 80
+            self.distance[name] = torch.cdist(xy, xy)
+
+    def __call__(self, logits, target) -> torch.Tensor:
+        """The sticks' energy scores, each averaged over the frames, summed."""
+        total = 0.0
+        for name, distance in self.distance.items():
+            p = torch.softmax(getattr(logits, name).float(), dim=-1)
+            q = p @ distance
+            human = getattr(target, name).long().unsqueeze(-1)
+            total = total + (q.gather(-1, human).squeeze(-1) - 0.5 * (p * q).sum(-1)).mean()
+        return total
 
 
 def stick_metrics(batches: list) -> dict:

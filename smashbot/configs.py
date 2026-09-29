@@ -113,3 +113,6 @@ class LearnerConfig:
     autoclip_percentile: float = 0.0
     precision: str = "fp32"  # bf16 | fp32
     compile: bool = False
+    # BC: add this weight x each joint stick's energy score (policy.EnergyScore)
+    # to the loss; needs a joint stick controller type; 0 = off
+    energy_score_weight: float = 0.0
