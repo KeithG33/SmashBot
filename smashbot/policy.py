@@ -15,7 +15,7 @@ from torch import nn
 from slippi_ai.types import Frames, StateAction
 
 from smashbot import delay as delay_lib
-from smashbot.embed import JointStickEmbedding, stick_read
+from smashbot.embed import JointStickEmbedding, stick_read, stick_regions
 from smashbot.heads import ControllerHead, SampleOutputs
 from smashbot.networks import RecurrentState, StateActionNetwork
 
@@ -177,18 +177,22 @@ class StickScorer:
     its buckets, the human's bucket and the human's exact position (replay
     sticks are the game's own reads):
       top1: the model's most likely bucket is the human's;
+      same_action: the model's most likely bucket reads on the same side of
+        every line the game checks as the human's stick (stick_regions);
       same_read: the game reads the model's most likely bucket exactly as it
         read the human's stick;
       read_distance: the probability-weighted distance between what the game
         reads from each bucket and the human's stick (full tilt = 80).
-    same_read and read_distance don't depend on the encoding, so they
-    compare encodings."""
+    same_action, same_read and read_distance don't depend on the encoding,
+    so they compare encodings."""
 
     def __init__(self, controller_head, device):
         struct = controller_head.embed_struct
         self.sticks = {name: getattr(struct, name) for name in ("main_stick", "c_stick") if hasattr(struct, name)}
         self.reads = {name: torch.tensor(bucket_reads(stick), dtype=torch.float32, device=device)
                       for name, stick in self.sticks.items()}
+        self.regions = {name: torch.tensor(stick_regions(name), dtype=torch.long, device=device)
+                        for name in self.sticks}
 
     def _bucket(self, name, human):
         if isinstance(self.sticks[name], JointStickEmbedding):
@@ -196,15 +200,17 @@ class StickScorer:
         return human.x.long() * self.sticks[name].x.size + human.y.long()
 
     def score(self, log_probs: dict, target, exact: dict) -> dict:
-        """[top1, same_read, read_distance] per stick, averaged over the
-        frames, on device."""
+        """[top1, same_action, same_read, read_distance] per stick, averaged
+        over the frames, on device."""
         scores = {}
         for name, log_p in log_probs.items():
             reads, position = self.reads[name], exact[name].float()
+            region = lambda xy: self.regions[name][xy[..., 0].long() + 80, xy[..., 1].long() + 80]
             guess = log_p.argmax(-1)
             miss = torch.linalg.vector_norm(reads - position.unsqueeze(-2), dim=-1)
             scores[name] = torch.stack([
                 (guess == self._bucket(name, getattr(target, name))).float().mean(),
+                (region(reads[guess]) == region(exact[name])).float().mean(),
                 (reads[guess] == position).all(-1).float().mean(),
                 (log_p.exp() * miss).sum(-1).mean(),
             ])
@@ -219,7 +225,7 @@ def stick_metrics(batches: list) -> dict:
     names = list(batches[0])
     values = torch.stack([torch.stack([b[n] for b in batches]).mean(0) for n in names]).tolist()
     return {f"{name}/{score}": v for name, row in zip(names, values)
-            for score, v in zip(("top1", "same_read", "read_distance"), row)}
+            for score, v in zip(("top1", "same_action", "same_read", "read_distance"), row)}
 
 
 def build_policy_from_config(cfg: dict) -> Policy:

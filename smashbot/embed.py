@@ -11,6 +11,7 @@ import dataclasses
 import enum
 import hashlib
 import json
+import math
 import os
 from typing import Any, Callable, Generic, Iterator, Mapping, Sequence, TypeVar
 
@@ -578,17 +579,45 @@ def stick_read(xy: np.ndarray) -> np.ndarray:
     return np.where(np.abs(read) <= 22, 0, read).astype(np.int16)
 
 
+def _region(x: int, y: int, stick: str) -> tuple:
+    """The side of each line the game checks a read position against (the
+    builder's tier1 and c_tier1 in stick-encoding/stick_encoding.py)."""
+    if x == 0 and y == 0:
+        return ("neutral",)
+    full = abs(x) + abs(y) == 80 and (x == 0 or y == 0)
+    angle = math.atan2(y, abs(x))
+    past_sdi = x * x + y * y >= 56 * 56
+    if stick == "main_stick":
+        zone = "H" if y == 0 else "V" if x == 0 else "D"
+        return (zone, x > 0, y > 0, (abs(x) >= 53) + (abs(x) >= 64), (abs(y) >= 53) + (abs(y) >= 64),
+                angle >= math.radians(50), angle >= -math.radians(50), past_sdi, full)
+    degrees = math.degrees(angle)
+    return (np.sign(x), np.sign(y), (degrees >= 50) - (degrees <= -50), abs(x) >= 64, abs(y) >= 53, abs(x) >= 56,
+            y <= -56, past_sdi, full)
+
+
+def stick_regions(stick: str) -> np.ndarray:
+    """[161, 161] (index position + 80): the game region each stick position
+    reads into, as an id. Two positions in one region are on the same side
+    of every line the game checks that stick against: the deadzone, the
+    per-axis lines at 53 and 64, the 50-degree zones and the SDI circle for
+    the main stick; the smash, roll, spotdodge and ASDI lines for the
+    c-stick."""
+    every = np.stack(np.meshgrid(np.arange(-80, 81), np.arange(-80, 81), indexing="ij"), -1)
+    ids: dict = {}
+    return np.array([[ids.setdefault(_region(int(x), int(y), stick), len(ids)) for x, y in row]
+                     for row in stick_read(every)], np.int16)
+
+
 # A table never changes in place: a new table is a new controller type.
 STICK_TABLES = {
-    "balanced_v2": {
-        "main_stick": ("balanced_v2_main.json", "ffd1160ff6b7e0eb172d03b90e1394a029450208a73ab9dee9d5cdeef37c78c2"),
-        "c_stick": ("balanced_v2_c.json", "f708457e1f70c17698c6ad9ce6a876cbddbb7166811dfa59c96991973d6a21f2"),
-    },
-    # v2's rules with ring-and-arc cells kept whole: slivers merge along their
-    # own ring or arc (stick_encoding.py build_v6); the c-stick is v2's
-    "balanced_v6": {
-        "main_stick": ("balanced_v6_main.json", "b8d0e22a2c9deaccfe646eb26f56520da3678450e679c9e8815a2c94587cc9aa"),
-        "c_stick": ("balanced_v2_c.json", "f708457e1f70c17698c6ad9ce6a876cbddbb7166811dfa59c96991973d6a21f2"),
+    # stick-encoding/stick_encoding.py, preset --v6-157: cut on the game's
+    # lines, ring-and-arc cells between them (two rings inside the SDI circle
+    # and two outside, arcs of 12 and 5.5 on the rim ring), axis steps of
+    # 7.5; the c-stick cut on its own lines
+    "balanced_v6_157": {
+        "main_stick": ("balanced_v6_157_main.json", "f56617e4d8a61badc86dedd3dc6703f7566554a7ede271c173eed796ca91945b"),
+        "c_stick": ("balanced_v6_157_c.json", "f708457e1f70c17698c6ad9ce6a876cbddbb7166811dfa59c96991973d6a21f2"),
     },
 }
 STICK_TABLE_DIR = os.path.join(os.path.dirname(__file__), "stick_tables")

@@ -82,9 +82,8 @@ class ControllerHeadConfig:
     component_depth: int = 2
     axis_spacing: int = 16  # 17 bins per stick axis
     shoulder_spacing: int = 4  # 5 shoulder bins
-    # or "custom_v1" (smashbot.custom_v1), or a joint stick table in
-    # embed.STICK_TABLES: "balanced_v2" (237 main, 75 c-stick) or
-    # "balanced_v6" (241 main, 75 c-stick)
+    # or "custom_v1" (smashbot.custom_v1), or "balanced_v6_157": each stick one
+    # choice among embed.STICK_TABLES' buckets (157 main, 75 c-stick)
     controller_type: str = "default"
 
 

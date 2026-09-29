@@ -34,7 +34,7 @@ def _grid(x, y):
     return (x + 80) // 10 * 17 + (y + 80) // 10
 
 
-@pytest.mark.parametrize("stick_table", ["", "balanced_v2", "balanced_v6"])
+@pytest.mark.parametrize("stick_table", ["", "balanced_v6_157"])
 def test_stick_distribution_matches_distance(stick_table):
     torch.manual_seed(0)
     rng = np.random.default_rng(0)
@@ -56,10 +56,9 @@ def test_stick_distribution_matches_distance(stick_table):
         torch.testing.assert_close(at_human, -(d.x + d.y) if stick_table == "" else -d)
 
 
-@pytest.mark.parametrize("table, main_size, main_neutral", [("balanced_v2", 237, 116), ("balanced_v6", 241, 118)])
-def test_joint_tables_cover_every_position(table, main_size, main_neutral):
-    for which, size, neutral in (("main_stick", main_size, main_neutral), ("c_stick", 75, 35)):
-        stick = embed_lib.JointStickEmbedding(which, table, which)
+def test_joint_tables_cover_every_position():
+    for which, size, neutral in (("main_stick", 157, 76), ("c_stick", 75, 35)):
+        stick = embed_lib.JointStickEmbedding(which, "balanced_v6_157", which)
         assert stick.size == size and stick.lookup.shape == (161, 161) and stick.lookup.max() == size - 1
         # every bucket decodes to one of its own positions
         np.testing.assert_array_equal(stick.from_state(stick.decode(np.arange(size))), np.arange(size))
@@ -92,11 +91,17 @@ def test_scores():
     exact = {"main_stick": torch.tensor([[[60, 0]]])}
     score = lambda scorer, bucket, size, human, exact: scorer.score(
         {"main_stick": _sure(bucket, size)}, human, exact)["main_stick"]
-    torch.testing.assert_close(score(grid, _grid(60, 0), 289, human, exact), torch.tensor([1.0, 1.0, 0.0]))
-    torch.testing.assert_close(score(grid, _grid(60, 10), 289, human, exact), torch.tensor([0.0, 1.0, 0.0]))
-    torch.testing.assert_close(score(grid, _grid(70, 0), 289, human, exact), torch.tensor([0.0, 0.0, 10.0]))
+    # [top1, same_action, same_read, read_distance]
+    torch.testing.assert_close(score(grid, _grid(60, 0), 289, human, exact), torch.tensor([1.0, 1.0, 1.0, 0.0]))
+    torch.testing.assert_close(score(grid, _grid(60, 10), 289, human, exact), torch.tensor([0.0, 1.0, 1.0, 0.0]))
+    # 70 is past the dash/smash line at 64, 60 isn't: a different action
+    torch.testing.assert_close(score(grid, _grid(70, 0), 289, human, exact), torch.tensor([0.0, 0.0, 0.0, 10.0]))
+    # 66 and 70 are on the same side of every line: the same action, 4 units off
+    exact66 = {"main_stick": torch.tensor([[[66, 0]]])}
+    human66 = Controller(main_stick=Stick(x=torch.tensor([[15]]), y=torch.tensor([[8]])), c_stick=None, shoulder=None, buttons=None)
+    torch.testing.assert_close(score(grid, _grid(70, 0), 289, human66, exact66), torch.tensor([1.0, 1.0, 0.0, 4.0]))
 
-    joint_head = AutoRegressive(_controller("balanced_v2"), input_size=4)
+    joint_head = AutoRegressive(_controller("balanced_v6_157"), input_size=4)
     joint = StickScorer(joint_head, "cpu")
     stick = joint.sticks["main_stick"]
     bucket = int(stick.from_state(Stick(np.float32([(57 + 80) / 160]), np.float32([(30 + 80) / 160])))[0])
@@ -104,6 +109,26 @@ def test_scores():
     assert centre != (57, 30)   # a member of the bucket other than its decode point
     human = Controller(main_stick=torch.tensor([[bucket]]), c_stick=None, shoulder=None, buttons=None)
     for position, want_read in ((centre, 1.0), ((57, 30), 0.0)):
-        got = score(joint, bucket, 237, human, {"main_stick": torch.tensor([[position]])})
+        got = score(joint, bucket, 157, human, {"main_stick": torch.tensor([[position]])})
         miss = float(np.hypot(centre[0] - position[0], centre[1] - position[1]))
-        torch.testing.assert_close(got, torch.tensor([1.0, want_read, miss]))
+        torch.testing.assert_close(got, torch.tensor([1.0, 1.0, want_read, miss]))
+
+
+def test_stick_regions():
+    """The lines the builder cuts on: 61 main-stick regions, 59 c-stick ones."""
+    assert len(np.unique(embed_lib.stick_regions("main_stick"))) == 61
+    assert len(np.unique(embed_lib.stick_regions("c_stick"))) == 59
+
+
+@pytest.mark.parametrize("table", list(embed_lib.STICK_TABLES))
+def test_every_bucket_is_one_action(table):
+    """No bucket straddles a line the game checks: all its positions, and the
+    point it decodes to, read into one region."""
+    for which in ("main_stick", "c_stick"):
+        stick = embed_lib.JointStickEmbedding(which, table, which)
+        regions = embed_lib.stick_regions(which)
+        every = np.stack(np.meshgrid(np.arange(-80, 81), np.arange(-80, 81), indexing="ij"), -1).reshape(-1, 2)
+        bucket = stick.lookup[every[:, 0] + 80, every[:, 1] + 80]
+        region = regions[every[:, 0] + 80, every[:, 1] + 80]
+        decoded = regions[stick.positions[:, 0] + 80, stick.positions[:, 1] + 80]
+        assert (region == decoded[bucket]).all()

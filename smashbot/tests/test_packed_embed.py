@@ -59,7 +59,7 @@ def _mlp_col_mask(packed, size):
     return mask
 
 
-@pytest.mark.parametrize("controller", ["default", "balanced_v2", "balanced_v6"])
+@pytest.mark.parametrize("controller", ["default", "balanced_v6_157"])
 @pytest.mark.parametrize("shape", [(7,), (3, 5)])
 def test_packed_matches_reference_bitwise(shape, controller):
     sae = _make_embedding(controller=controller)
