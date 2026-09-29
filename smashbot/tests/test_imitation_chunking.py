@@ -127,3 +127,23 @@ def test_burn_in_warms_policy_and_critic_like_one_unbroken_unroll():
     with torch.no_grad():
         cold = learner.policy.unroll(part.frames, learner.policy.initial_state(B))
     assert not torch.allclose(cold.log_probs, expected_policy.log_probs[:, P:], atol=1e-5)
+
+
+def test_imitation_loss_by_source():
+    """loss_phillip / loss_pfsp are each harvested pool's own weighted mean:
+    the Phillip figure matches a step that saw only the Phillip rows, and the
+    two, weighted by valid positions, make up the overall imitation loss."""
+    mixed = _make_learner(imitation_rows=-1, imitation_lambda=0.1)
+    alone = _make_learner(imitation_rows=-1, imitation_lambda=0.1)
+    ppo = _rollout(mixed.policy, B=3, T=8, seed=0)
+    phillip = _imit_traj(mixed.policy, B=4, seed=1)._replace(source="phillip")
+    pfsp = _imit_traj(mixed.policy, B=2, seed=2)._replace(source="pfsp")
+
+    _, both = mixed.step([ppo, phillip, pfsp], mixed.initial_state(3))
+    _, only = alone.step([ppo, phillip], alone.initial_state(3))
+    both, only = both["imitation"], only["imitation"]
+
+    assert both["loss_phillip"] == pytest.approx(only["loss"], rel=1e-5)
+    n_phillip, n_pfsp = phillip.valid.sum().item(), pfsp.valid.sum().item()
+    weighted = (both["loss_phillip"] * n_phillip + both["loss_pfsp"] * n_pfsp) / (n_phillip + n_pfsp)
+    assert weighted == pytest.approx(both["loss"], rel=1e-5)

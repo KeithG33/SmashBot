@@ -129,14 +129,17 @@ class HarvestAssembler:
     """
 
     def __init__(self, unroll_length: int, delay: int, controller_embedding, name_code: int,
-                 burn_in: int = 0, view=None):
+                 burn_in: int = 0, view=None, source: str = ""):
         """view: the stacked per-frame states -> the Trajectory's state struct
-        (the worker pushes each frame's flats and views them once per chunk)."""
+        (the worker pushes each frame's flats and views them once per chunk).
+        source: the harvested pool, tagged on every Trajectory for per-source
+        imitation metrics."""
         assert delay >= 1, delay
         self.T, self.D, self.burn_in = unroll_length, delay, burn_in
         self._view = view or (lambda states: states)
         self._embed = controller_embedding
         self._name_code = name_code
+        self._source = source
         self._history = 0   # frames buffered before the chunk's first
         self._states: list = []
         self._pressed: list[np.ndarray] = []
@@ -213,6 +216,7 @@ class HarvestAssembler:
             kind="imitation",
             valid=valid,
             prefix=prefix,
+            source=self._source,
         )
 
     def _encoded(self, rows: np.ndarray, device):

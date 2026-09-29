@@ -475,8 +475,8 @@ def run(args) -> None:
             log["rl/grad_scaler_scale"] = learner.grad_scaler.get_scale()
         im = metrics.get("imitation")
         if im:
-            for k in ("loss", "w_mean", "w_max", "traj_count", "lambda"):
-                log[f"rl/imitation/{k}"] = im[k]
+            for k, v in im.items():   # loss, loss_phillip, loss_pfsp, w_mean, ...
+                log[f"rl/imitation/{k}"] = v
 
         # ---- league panels ----
         share = worker.env_share()

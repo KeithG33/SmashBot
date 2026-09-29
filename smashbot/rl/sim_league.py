@@ -190,8 +190,9 @@ class MultiOpponentSimWorker:
         self.harvests = [
             HarvestAssembler(unroll_length, student_policy.delay,
                              student_policy.controller_head.controller_embedding, name_code,
-                             burn_in, view=self.ff.view)
-            for _ in self._all_grids()]
+                             burn_in, view=self.ff.view,
+                             source="pfsp" if gr is self.pfsp_grid else "phillip")
+            for gr in self._all_grids()]
         for g in self.groups:
             g.agent.set_flat_controllers(True)
             g.agent.set_flat_inputs(self.ff.view)

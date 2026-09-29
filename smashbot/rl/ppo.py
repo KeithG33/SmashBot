@@ -91,6 +91,7 @@ class Trajectory(tp.NamedTuple):
     # imitation only, [B, T]: positions whose target was pressed in their own game
     valid: tp.Optional[torch.Tensor] = None
     prefix: tp.Optional[Prefix] = None  # imitation only
+    source: str = ""  # imitation only: the harvested pool ("phillip", "pfsp")
 
 
 def slice_trajectory_rows(traj: Trajectory, rows: tp.Sequence[int]) -> Trajectory:
@@ -115,6 +116,7 @@ def slice_trajectory_rows(traj: Trajectory, rows: tp.Sequence[int]) -> Trajector
         kind=traj.kind,
         valid=None if traj.valid is None else take(traj.valid),
         prefix=None if traj.prefix is None else tree.map_structure(take, traj.prefix),
+        source=traj.source,
     )
 
 
@@ -204,6 +206,7 @@ class _ImitFixed(tp.NamedTuple):
     rows: int
     prefix: tp.Optional[Prefix] = None
     initial_state: tp.Any = None  # the policy's warmed state; None: zeros
+    source: str = ""
 
 
 def _warm(network, prefix: Prefix, initial_state):
@@ -828,7 +831,8 @@ class Learner:
                   flush=True)
             return None
         return _ImitFixed(
-            frames=frames, weights=weights, valid=valid, rows=batch_size, prefix=traj.prefix
+            frames=frames, weights=weights, valid=valid, rows=batch_size, prefix=traj.prefix,
+            source=traj.source,
         )
 
     def _imitation_chunk_loss(
@@ -870,7 +874,7 @@ class Learner:
             out.append(_ImitFixed(
                 frames=tree.map_structure(take, imf.frames),
                 weights=imf.weights[lo:hi], valid=imf.valid[lo:hi],
-                rows=hi - lo, initial_state=initial_state,
+                rows=hi - lo, initial_state=initial_state, source=imf.source,
             ))
         return out
 
@@ -1013,8 +1017,9 @@ class Learner:
             [f.valid.sum() for f in train_fixed] + [c.valid.sum() for c in imit_chunks]
         ).tolist() if train_fixed or imit_chunks else []
         chunk_valid = counts[:len(train_fixed)]
+        imit_valid = counts[len(train_fixed):]
         total_valid = sum(chunk_valid) or 1.0
-        total_imit_valid = sum(counts[len(train_fixed):]) or 1.0
+        total_imit_valid = sum(imit_valid) or 1.0
 
         # Trust-region snapshot: weights AND optimizer slots (weights
         # alone leave Adam's m/v carrying the rejected update). Copied into
@@ -1027,6 +1032,7 @@ class Learner:
 
         epoch_metrics: list[dict] = []
         imit_loss_val = 0.0
+        imit_source_loss: dict = {}
         for _ in range(cfg.ppo.num_epochs):
             self.policy_optimizer.zero_grad(set_to_none=True)
             any_backward = False
@@ -1066,8 +1072,8 @@ class Learner:
                 ]
                 ppo_grad_nonfinite = torch.stack(flags).any() if flags else False   # read if the guard trips
             if imit_chunks and lambda_t > 0.0:
-                imit_losses = []
-                for chunk in imit_chunks:
+                imit_losses = []   # (source, the chunk's share of the mean, valid count)
+                for chunk, n_valid in zip(imit_chunks, imit_valid):
                     iloss = self._imitation_chunk_loss(chunk, total_imit_valid)
                     if not torch.isfinite(iloss):
                         print("NONFINITE IMITATION LOSS: skipping minibatch",
@@ -1076,9 +1082,15 @@ class Learner:
                         continue
                     self._backward(lambda_t * iloss)
                     any_backward = True
-                    imit_losses.append(iloss.detach())
+                    imit_losses.append((chunk.source, iloss.detach(), n_valid))
                 if imit_losses:
-                    imit_loss_val = torch.stack(imit_losses).sum()  # = step-wide mean
+                    imit_loss_val = torch.stack([l for _, l, _ in imit_losses]).sum()  # = step-wide mean
+                    # each source's own mean: its shares rescaled to its valid count
+                    imit_source_loss = {
+                        f"loss_{src}": torch.stack([l for s, l, _ in imit_losses if s == src]).sum()
+                        * total_imit_valid / max(sum(v for s, _, v in imit_losses if s == src), 1.0)
+                        for src in {s for s, _, _ in imit_losses if s}
+                    }
             use_scaler = self.grad_scaler is not None and any_backward
             if use_scaler:
                 # Divide the loss scale back out BEFORE clipping/guarding so
@@ -1174,7 +1186,7 @@ class Learner:
         post["reverse_kl_teacher_w"] = float(self._reverse_kl_teacher_w)
         if imit_stats:
             metrics["imitation"] = dict(
-                imit_stats, loss=imit_loss_val, **{"lambda": lambda_t}
+                imit_stats, loss=imit_loss_val, **imit_source_loss, **{"lambda": lambda_t}
             )
         return state, _to_host(metrics)
 
