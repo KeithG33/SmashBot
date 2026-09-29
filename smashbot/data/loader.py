@@ -144,6 +144,31 @@ def seat_mid_game(split: Split, span: int, seed: int, num_workers: int) -> None:
         manager.frame = int(rng.integers(0, max(1, manager.game_len - span + 1)))
 
 
+def seat_random(split: Split, span: int, rng: np.random.Generator, num_workers: int) -> None:
+    """Seat every row on a random replay of the split, at a random frame with
+    at least `span` frames of its game left (frame 0 when the game is
+    shorter): a fresh random sample of games for each eval. A pick the
+    manager rejects (shorter than a chunk) is redrawn."""
+    managers = split.source.managers
+    picks = rng.choice(len(split.replays), size=len(managers), replace=len(split.replays) < len(managers))
+    infos = [split.replays[int(i)] for i in picks]
+    if num_workers > 0:
+        with mp.get_context("forkserver").Pool(num_workers) as pool:
+            decoded = pool.map(data_lib.ReplayInfo.to_replay, infos)
+    else:
+        decoded = [info.to_replay() for info in infos]
+    for manager, feed, replay in zip(managers, split.feeds, decoded):
+        while True:
+            manager.source = iter([replay])
+            try:
+                manager.find_game()
+                break
+            except StopIteration:
+                replay = split.replays[int(rng.integers(len(split.replays)))].to_replay()
+        manager.source = feed
+        manager.frame = int(rng.integers(0, max(1, manager.game_len - span + 1)))
+
+
 @dataclasses.dataclass
 class Sources:
     train: Split
@@ -207,6 +232,21 @@ def make_sources(
         test=_make_split(test_replays, config, extra_frames, name_map, None),
         name_map=name_map,
     )
+
+
+def random_eval_stream(
+    split: Split, config: DataConfig, extra_frames: int, name_map: dict[str, int], network,
+    groups: int, rows: int, batches: int, seed: int,
+) -> "RandomEvalStream":
+    """A RandomEvalStream over `split`'s replays (the test split), on a source
+    of its own `rows` rows. Its decode workers only feed rows whose game
+    ends mid-draw, so two suffice; seating decodes on num_workers."""
+    # random_offset 0: seating sets every frame, and a manager's find_game
+    # must not draw from the global RNG the training stream uses
+    eval_config = dataclasses.replace(config, batch_size=rows, num_workers=min(2, config.num_workers), random_offset=0)
+    eval_split = _make_split(split.replays, eval_config, extra_frames, name_map, None)
+    span = (batches + 1) * (config.unroll_length + extra_frames)
+    return RandomEvalStream(eval_split, network, groups, batches, span, seed, config.num_workers)
 
 
 def batch_to_frames(batch: data_lib.Batch, network, pin: bool = False):
@@ -307,3 +347,64 @@ class TorchBatchStream:
         self._stop.set()
         self._thread.join(timeout=5.0)
         self._source.shutdown()
+
+
+class RandomEvalStream:
+    """Fresh random test games for every eval, drawn in the background.
+
+    A draw is `groups` groups of the split's batch size in games, each row
+    seated at a random mid-game point (seat_random) and read for `batches`
+    consecutive batches of encoded Frames plus each stick's exact position.
+    The next draw waits ready while the current one is scored.
+    """
+
+    def __init__(self, split: Split, network, groups: int, batches: int, span: int, seed: int,
+                 num_workers: int):
+        self._split, self._network = split, network
+        self._groups, self._batches, self._span = groups, batches, span
+        self._rng = np.random.default_rng(seed)
+        self._num_workers = num_workers
+        self._queue: queue.Queue = queue.Queue(maxsize=1)
+        self._stop = threading.Event()
+        self._error: tp.Optional[BaseException] = None
+        self._thread = threading.Thread(target=self._work, daemon=True)
+        self._thread.start()
+
+    def _draw(self) -> list:
+        groups = []
+        for _ in range(self._groups):
+            seat_random(self._split, self._span, self._rng, self._num_workers)
+            group = []
+            for _ in range(self._batches):
+                batch = next(self._split)[0].batch
+                group.append((batch_to_frames(batch, self._network), exact_sticks(batch.game.p0.controller)))
+            groups.append(group)
+        return groups
+
+    def _work(self) -> None:
+        try:
+            while not self._stop.is_set():
+                draw = self._draw()
+                while not self._stop.is_set():
+                    try:
+                        self._queue.put(draw, timeout=1.0)
+                        break
+                    except queue.Full:
+                        continue
+        except BaseException as e:
+            self._error = e
+
+    def __next__(self) -> list:
+        while True:
+            try:
+                return self._queue.get(timeout=1.0)
+            except queue.Empty:
+                if self._error is not None:
+                    raise self._error
+                if not self._thread.is_alive():
+                    raise StopIteration
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5.0)
+        self._split.shutdown()

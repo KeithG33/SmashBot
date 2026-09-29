@@ -42,6 +42,13 @@ class RuntimeConfig:
     # frames of each eval row's own history run (unscored) before its scored
     # batches, so every eval starts from the current model's warm state
     eval_burn_in: int = 256
+    # the random-draw eval (eval_wide/*): every eval also scores
+    # wide_eval_groups groups of wide_eval_rows fresh random test games, each
+    # warmed like the fixed set, then scored for wide_eval_batches batches
+    # (0 groups: off)
+    wide_eval_groups: int = 0
+    wide_eval_rows: int = 1024
+    wide_eval_batches: int = 16
     log_interval: int = 50
     checkpoint_interval: int = 1000
     tag: str = "debug"
@@ -349,6 +356,11 @@ def main(config: TrainConfig) -> None:
     eval_set = [next(eval_stream)[0] for _ in range(warm_batches + rt.eval_batches)]
     eval_stream.stop()
     sources.test.shutdown()
+    # seeded by the step too, so a resumed run draws games it hasn't scored yet
+    wide_stream = loader.random_eval_stream(
+        sources.test, config.data, config.policy.delay + 1, sources.name_map, policy.network,
+        groups=rt.wide_eval_groups, rows=rt.wide_eval_rows, batches=warm_batches + rt.wide_eval_batches,
+        seed=config.data.dataset.seed * 1_000_003 + step) if rt.wide_eval_groups else None
 
     def to_device(frames):
         return tree.map_structure(lambda t: t.to(device, non_blocking=True), frames)
@@ -386,36 +398,48 @@ def main(config: TrainConfig) -> None:
 
     stick_scorer = StickScorer(policy.controller_head, device)
 
-    def run_eval() -> dict:
+    def score_groups(groups: list, rows: int, name: str) -> dict:
+        """Policy loss, value UEV and stick metrics over groups of `rows` rows:
+        each group starts cold, runs warm_batches unscored, then scores the
+        rest."""
+        start = time.perf_counter()
         policy.eval()
         losses, value_metrics_acc, stick_batches = [], [], []
-        eval_hidden = policy.initial_state(B, device)
-        eval_value_hidden = value_fn.initial_state(B, device)
         with torch.no_grad():
-            for i, (frames, exact) in enumerate(eval_set):
-                frames = to_device(frames)
-                with autocast():
-                    sliced = slice_delayed_frames(frames, config.policy.delay)
-                    outputs = policy.unroll(sliced, eval_hidden, joint_sticks=True)
-                    eval_hidden = outputs.final_state
-                    _, eval_value_hidden, vm = value_fn.loss(
-                        sliced, eval_value_hidden, discount
-                    )
-                if i >= warm_batches:
-                    losses.append(-outputs.log_probs.mean().item())
-                    value_metrics_acc.append(vm)
-                    human = tree.map_structure(lambda t: t[:, 1:], sliced.state_action.action)
-                    exact = {k: v.to(device)[:, config.policy.delay + 1:] for k, v in exact.items()}
-                    stick_batches.append(stick_scorer.score(outputs.sticks, human, exact))
+            for group in groups:
+                eval_hidden = policy.initial_state(rows, device)
+                eval_value_hidden = value_fn.initial_state(rows, device)
+                for i, (frames, exact) in enumerate(group):
+                    frames = to_device(frames)
+                    with autocast():
+                        sliced = slice_delayed_frames(frames, config.policy.delay)
+                        outputs = policy.unroll(sliced, eval_hidden, joint_sticks=True)
+                        eval_hidden = outputs.final_state
+                        _, eval_value_hidden, vm = value_fn.loss(
+                            sliced, eval_value_hidden, discount
+                        )
+                    if i >= warm_batches:
+                        losses.append(-outputs.log_probs.mean())
+                        value_metrics_acc.append(vm)
+                        human = tree.map_structure(lambda t: t[:, 1:], sliced.state_action.action)
+                        exact = {k: v.to(device)[:, config.policy.delay + 1:] for k, v in exact.items()}
+                        stick_batches.append(stick_scorer.score(outputs.sticks, human, exact))
         policy.train()
-        policy_loss = float(np.mean(losses))
+        policy_loss = torch.stack(losses).float().mean().item()
         value_uev = float(np.mean([m["uev"] for m in value_metrics_acc]))
         if not (math.isfinite(policy_loss) and math.isfinite(value_uev)):
-            raise FloatingPointError(f"step {step}: non-finite eval (policy loss {policy_loss}, value uev {value_uev})")
+            raise FloatingPointError(f"step {step}: non-finite {name} (policy loss {policy_loss}, value uev {value_uev})")
         sticks = stick_metrics(stick_batches)
-        print(f"eval @ {step}: policy_loss {policy_loss:.6f}"
-              + "".join(f", {k} {v:.4f}" for k, v in sticks.items()), flush=True)
-        return {"policy_loss": policy_loss, "value_uev": value_uev, "sticks": sticks}
+        seconds = time.perf_counter() - start
+        print(f"{name} @ {step}: policy_loss {policy_loss:.6f}"
+              + "".join(f", {k} {v:.4f}" for k, v in sticks.items()) + f" ({seconds:.1f}s)", flush=True)
+        return {"policy_loss": policy_loss, "value_uev": value_uev, "sticks": sticks, "seconds": seconds}
+
+    def run_eval() -> dict:
+        return score_groups([eval_set], B, "eval")
+
+    def run_wide_eval() -> dict:
+        return score_groups(next(wide_stream), rt.wide_eval_rows, "eval_wide")
 
     from tqdm import tqdm
 
@@ -495,12 +519,16 @@ def main(config: TrainConfig) -> None:
                 if is_best:
                     best_eval_loss = eval_metrics["policy_loss"]
                     save("best.pt")
+                wide = run_wide_eval() if wide_stream else None
                 wandb.log(
                     {
                         "eval/policy_loss": eval_metrics["policy_loss"],
                         "eval/value_uev": eval_metrics["value_uev"],
                         "eval/best_policy_loss": best_eval_loss,
                         **{f"eval/{k}": v for k, v in eval_metrics["sticks"].items()},
+                        **({"eval_wide/policy_loss": wide["policy_loss"],
+                            "eval_wide/value_uev": wide["value_uev"],
+                            **{f"eval_wide/{k}": v for k, v in wide["sticks"].items()}} if wide else {}),
                     },
                     step=step,
                 )
@@ -523,6 +551,8 @@ def main(config: TrainConfig) -> None:
                 print(f"interrupted mid-step {step}; latest.pt left as it was")
         finally:
             train_stream.stop()
+            if wide_stream:
+                wide_stream.stop()
             wandb.finish()
         print(f"done at step {step}; best eval {best_eval_loss:.4f}")
 
