@@ -5,6 +5,7 @@ NamedTuples with torch tensors as leaves. All sequence tensors are batch-major
 (B, T, ...).
 """
 
+import math
 import typing as tp
 
 import numpy as np
@@ -80,20 +81,21 @@ class Policy(nn.Module):
         self,
         frames: Frames,
         initial_state: RecurrentState,
-        energy: tp.Optional["EnergyScore"] = None,
-        energy_weight: float = 0.0,
+        extra: tp.Sequence[tuple[float, tp.Callable]] = (),
     ) -> tuple[torch.Tensor, RecurrentState, tp.Any]:
         """frames: [B, U + D + 1] raw (not yet delay-aligned). The loss, the
         final state and the per-component distances, all left on device:
-        imitation_metrics reads them out when they are wanted. With `energy`,
-        the loss adds energy_weight x the joint sticks' energy score; the
-        distances stay the plain negative log-probs."""
+        imitation_metrics reads them out when they are wanted. `extra`:
+        (weight, term) pairs whose term(logits, target) is added to the loss
+        at its weight (EnergyScore, ActionLoss); the distances stay the plain
+        negative log-probs."""
         delayed = delay_lib.slice_delayed_frames(frames, self.delay)
         outputs = self.unroll(delayed, initial_state)
         loss = -outputs.log_probs.mean()
-        if energy is not None:
+        if extra:
             target = tree.map_structure(lambda t: t[:, 1:], delayed.state_action.action)
-            loss = loss + energy_weight * energy(outputs.logits, target)
+            for weight, term in extra:
+                loss = loss + weight * term(outputs.logits, target)
         return loss, outputs.final_state, outputs.distances
 
     @torch.no_grad()
@@ -187,12 +189,15 @@ class StickScorer:
       top1: the model's most likely bucket is the human's;
       same_action: the model's most likely bucket reads on the same side of
         every line the game checks as the human's stick (stick_regions);
+      action_nll: -log of the probability on every bucket that reads into
+        the human's game region, floored at 1e-6 (a grid can lack a bucket
+        for some regions);
       same_read: the game reads the model's most likely bucket exactly as it
         read the human's stick;
       read_distance: the probability-weighted distance between what the game
         reads from each bucket and the human's stick (full tilt = 80).
-    same_action, same_read and read_distance don't depend on the encoding,
-    so they compare encodings."""
+    same_action, action_nll, same_read and read_distance don't depend on the
+    encoding, so they compare encodings."""
 
     def __init__(self, controller_head, device):
         struct = controller_head.embed_struct
@@ -208,21 +213,33 @@ class StickScorer:
         return human.x.long() * self.sticks[name].x.size + human.y.long()
 
     def score(self, log_probs: dict, target, exact: dict) -> dict:
-        """[top1, same_action, same_read, read_distance] per stick, averaged
-        over the frames, on device."""
+        """[top1, same_action, action_nll, same_read, read_distance] per
+        stick, averaged over the frames, on device."""
         scores = {}
         for name, log_p in log_probs.items():
             reads, position = self.reads[name], exact[name].float()
             region = lambda xy: self.regions[name][xy[..., 0].long() + 80, xy[..., 1].long() + 80]
             guess = log_p.argmax(-1)
             miss = torch.linalg.vector_norm(reads - position.unsqueeze(-2), dim=-1)
+            in_action = region(reads) == region(exact[name]).unsqueeze(-1)
+            action_log_p = torch.logsumexp(log_p.float().masked_fill(~in_action, -math.inf), dim=-1)
             scores[name] = torch.stack([
                 (guess == self._bucket(name, getattr(target, name))).float().mean(),
                 (region(reads[guess]) == region(exact[name])).float().mean(),
+                -action_log_p.clamp(min=math.log(1e-6)).mean(),
                 (reads[guess] == position).all(-1).float().mean(),
                 (log_p.exp() * miss).sum(-1).mean(),
             ])
         return scores
+
+
+def _joint_sticks(controller_head, term: str) -> dict:
+    struct = controller_head.embed_struct
+    sticks = {name: getattr(struct, name) for name in ("main_stick", "c_stick")
+              if isinstance(getattr(struct, name, None), JointStickEmbedding)}
+    if not sticks:
+        raise ValueError(f"the {term} needs joint sticks: a STICK_TABLES controller type")
+    return sticks
 
 
 class EnergyScore:
@@ -231,18 +248,17 @@ class EnergyScore:
     distribution over bucket decode points, Euclidean distance in full-tilt
     units. Probability near the human's bucket costs less than probability
     far away, and the score is still lowest at the true distribution. With
-    Q = P @ D, E|X - y| is Q at the human's bucket and E|X - X'| is P . Q."""
+    Q = P @ D, E|X - y| is Q at the human's bucket and E|X - X'| is P . Q.
+    `value` keeps the last call's result for logging."""
+
+    name = "energy_score"
 
     def __init__(self, controller_head, device):
-        struct = controller_head.embed_struct
-        points = {name: getattr(struct, name) for name in ("main_stick", "c_stick")
-                  if isinstance(getattr(struct, name, None), JointStickEmbedding)}
-        if not points:
-            raise ValueError("the energy score needs joint sticks: a STICK_TABLES controller type")
         self.distance = {}
-        for name, stick in points.items():
+        for name, stick in _joint_sticks(controller_head, self.name).items():
             xy = torch.tensor(stick.positions, dtype=torch.float32, device=device) / 80
             self.distance[name] = torch.cdist(xy, xy)
+        self.value = None
 
     def __call__(self, logits, target) -> torch.Tensor:
         """The sticks' energy scores, each averaged over the frames, summed."""
@@ -252,6 +268,37 @@ class EnergyScore:
             q = p @ distance
             human = getattr(target, name).long().unsqueeze(-1)
             total = total + (q.gather(-1, human).squeeze(-1) - 0.5 * (p * q).sum(-1)).mean()
+        self.value = total.detach()
+        return total
+
+
+class ActionLoss:
+    """Each joint stick's action loss: -log of the probability on every
+    bucket in the human's game region (stick_regions), so any bucket in the
+    right action counts, whatever the bucket; cross-entropy credits only the
+    exact one. A joint table's buckets each lie in one region (tested), so
+    the human's bucket names the region. `value` keeps the last call's
+    result for logging."""
+
+    name = "action_loss"
+
+    def __init__(self, controller_head, device):
+        self.bucket_region = {}
+        for name, stick in _joint_sticks(controller_head, self.name).items():
+            regions = torch.tensor(stick_regions(name), dtype=torch.long, device=device)
+            positions = torch.tensor(stick.positions, dtype=torch.long, device=device) + 80
+            self.bucket_region[name] = regions[positions[:, 0], positions[:, 1]]
+        self.value = None
+
+    def __call__(self, logits, target) -> torch.Tensor:
+        """The sticks' action losses, each averaged over the frames, summed."""
+        total = 0.0
+        for name, bucket_region in self.bucket_region.items():
+            log_p = torch.log_softmax(getattr(logits, name).float(), dim=-1)
+            human_region = bucket_region[getattr(target, name).long()]
+            in_action = bucket_region == human_region.unsqueeze(-1)
+            total = total - torch.logsumexp(log_p.masked_fill(~in_action, -math.inf), dim=-1).mean()
+        self.value = total.detach()
         return total
 
 
@@ -263,7 +310,7 @@ def stick_metrics(batches: list) -> dict:
     names = list(batches[0])
     values = torch.stack([torch.stack([b[n] for b in batches]).mean(0) for n in names]).tolist()
     return {f"{name}/{score}": v for name, row in zip(names, values)
-            for score, v in zip(("top1", "same_action", "same_read", "read_distance"), row)}
+            for score, v in zip(("top1", "same_action", "action_nll", "same_read", "read_distance"), row)}
 
 
 def build_policy_from_config(cfg: dict) -> Policy:
