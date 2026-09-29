@@ -5,8 +5,10 @@ NamedTuples with torch tensors as leaves. All sequence tensors are batch-major
 (B, T, ...).
 """
 
+import functools
 import typing as tp
 
+import numpy as np
 import torch
 import tree
 from torch import nn
@@ -23,6 +25,7 @@ class UnrollOutputs(tp.NamedTuple):
     distances: tp.Any  # controller struct of [B, T]
     final_state: RecurrentState
     logits: tp.Any = None  # controller struct of [B, T, ...]; used by RL
+    sticks: tp.Any = None  # stick name -> joint log p(x, y) [B, T, X, Y]; eval
 
 
 class Policy(nn.Module):
@@ -49,6 +52,7 @@ class Policy(nn.Module):
         self,
         frames: Frames,
         initial_state: RecurrentState,
+        joint_sticks: bool = False,
     ) -> UnrollOutputs:
         """Frames must already be delay-aligned (see delay.slice_delayed_frames)
         and include one extra overlap frame at the end."""
@@ -68,6 +72,8 @@ class Policy(nn.Module):
             distances=distance_outputs.distance,
             final_state=final_state,
             logits=distance_outputs.logits,
+            sticks=(self.controller_head.stick_log_probs(outputs, prev_action, next_action)
+                    if joint_sticks else None),
         )
 
     def imitation_loss(
@@ -151,6 +157,56 @@ def imitation_metrics(loss: torch.Tensor, distances) -> dict:
             "shoulder": controller["shoulder"],
         },
     }
+
+
+@functools.lru_cache
+def _stick_tables(size: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    """For every pair of `size` axis buckets: which distinct stick value Melee
+    reads from it, and the distance between each two pairs' read values. A
+    bucket decodes to a -80..80 position; the game clamps it to the unit
+    circle, then reads |k| <= 22 on either axis as 0."""
+    position = np.arange(size) * 160 / (size - 1) - 80
+    xy = np.stack(np.meshgrid(position, position, indexing="ij"), -1).reshape(-1, 2)
+    radius = np.hypot(xy[:, 0], xy[:, 1])[:, None]
+    read = np.trunc(np.where(radius > 80, xy * 80 / radius, xy))
+    read = np.where(np.abs(read) <= 22, 0, read)
+    _, outcome = np.unique(read, axis=0, return_inverse=True)
+    read = torch.tensor(read, dtype=torch.float32, device=device)
+    return torch.tensor(outcome.reshape(-1), device=device), torch.cdist(read, read)
+
+
+def stick_scores(sticks: dict, target) -> dict:
+    """Per stick, from unroll's joint log p(x, y) and the human's controller:
+    [top-1, same outcome, miss distance] averaged over the frames, on device.
+    Top-1: the model's most likely bucket pair is the human's. Same outcome:
+    the game reads it as the same stick value as the human's. Miss distance:
+    the probability-weighted distance between the value the game reads from
+    each bucket pair and from the human's (full tilt = 80)."""
+    scores = {}
+    for name, log_p in sticks.items():
+        size = log_p.shape[-1]
+        outcome, distance = _stick_tables(size, log_p.device)
+        stick = getattr(target, name)
+        human = stick.x.long() * size + stick.y.long()
+        flat = log_p.flatten(-2)
+        guess = flat.argmax(-1)
+        scores[name] = torch.stack([
+            (guess == human).float().mean(),
+            (outcome[guess] == outcome[human]).float().mean(),
+            (flat.exp() * distance[human]).sum(-1).mean(),
+        ])
+    return scores
+
+
+def stick_metrics(batches: list) -> dict:
+    """stick_scores of equal-sized batches, averaged and named, read in one
+    host transfer."""
+    if not batches or not batches[0]:
+        return {}
+    names = list(batches[0])
+    values = torch.stack([torch.stack([b[n] for b in batches]).mean(0) for n in names]).tolist()
+    return {f"{name}/{score}": v for name, row in zip(names, values)
+            for score, v in zip(("top1", "same_outcome", "miss_distance"), row)}
 
 
 def build_policy_from_config(cfg: dict) -> Policy:

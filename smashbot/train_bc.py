@@ -29,7 +29,7 @@ from smashbot.data import loader
 from smashbot.delay import slice_delayed_frames
 from smashbot.networks import (build_embed_network, check_loadable, keep_sgu_activations,
                                use_chunk_start_resets, use_packed_encoder)
-from smashbot.policy import build_policy, imitation_metrics
+from smashbot.policy import build_policy, imitation_metrics, stick_metrics, stick_scores
 from smashbot.training import GradClipper, compile_cores, resolve_restore
 from smashbot.value import ValueFunction
 
@@ -384,28 +384,33 @@ def main(config: TrainConfig) -> None:
 
     def run_eval() -> dict:
         policy.eval()
-        losses, value_metrics_acc = [], []
+        losses, value_metrics_acc, stick_batches = [], [], []
         eval_hidden = policy.initial_state(B, device)
         eval_value_hidden = value_fn.initial_state(B, device)
         with torch.no_grad():
             for i, frames in enumerate(eval_set):
                 frames = to_device(frames)
                 with autocast():
-                    loss, eval_hidden, _ = policy.imitation_loss(frames, eval_hidden)
                     sliced = slice_delayed_frames(frames, config.policy.delay)
+                    outputs = policy.unroll(sliced, eval_hidden, joint_sticks=True)
+                    eval_hidden = outputs.final_state
                     _, eval_value_hidden, vm = value_fn.loss(
                         sliced, eval_value_hidden, discount
                     )
                 if i >= warm_batches:
-                    losses.append(loss.item())
+                    losses.append(-outputs.log_probs.mean().item())
                     value_metrics_acc.append(vm)
+                    human = tree.map_structure(lambda t: t[:, 1:], sliced.state_action.action)
+                    stick_batches.append(stick_scores(outputs.sticks, human))
         policy.train()
         policy_loss = float(np.mean(losses))
         value_uev = float(np.mean([m["uev"] for m in value_metrics_acc]))
         if not (math.isfinite(policy_loss) and math.isfinite(value_uev)):
             raise FloatingPointError(f"step {step}: non-finite eval (policy loss {policy_loss}, value uev {value_uev})")
-        print(f"eval @ {step}: policy_loss {policy_loss:.6f}", flush=True)
-        return {"policy_loss": policy_loss, "value_uev": value_uev}
+        sticks = stick_metrics(stick_batches)
+        print(f"eval @ {step}: policy_loss {policy_loss:.6f}"
+              + "".join(f", {k} {v:.4f}" for k, v in sticks.items()), flush=True)
+        return {"policy_loss": policy_loss, "value_uev": value_uev, "sticks": sticks}
 
     from tqdm import tqdm
 
@@ -490,6 +495,7 @@ def main(config: TrainConfig) -> None:
                         "eval/policy_loss": eval_metrics["policy_loss"],
                         "eval/value_uev": eval_metrics["value_uev"],
                         "eval/best_policy_loss": best_eval_loss,
+                        **{f"eval/{k}": v for k, v in eval_metrics["sticks"].items()},
                     },
                     step=step,
                 )
