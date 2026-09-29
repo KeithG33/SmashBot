@@ -20,7 +20,7 @@ export PYTHONPATH=$REPO:$REPO/vendor/melee-sim-light
 # can't reuse it: at 560 envs reserved reached 21.7 GiB for a 15.3 GiB peak.
 # A cap with garbage collection keeps reserved at 18.8 GiB (step 8.65 -> 8.88 s).
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8
-export SMASHBOT_MEM_FRACTION=0.80
+export SMASHBOT_MEM_FRACTION=${SMASHBOT_MEM_FRACTION:-0.80}
 
 cd $REPO
 exec $REPO/.venv/bin/python -m smashbot.rl.train_rl \
