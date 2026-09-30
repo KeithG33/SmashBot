@@ -35,7 +35,7 @@ def _rand_raw(embedding, rng, n):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--ckpt", default="", help="the policy to time; or --arch for a random one")
     ap.add_argument("--n", type=int, default=8)
     ap.add_argument("--steps", type=int, default=300)
     ap.add_argument("--compile", action="store_true")
@@ -65,6 +65,8 @@ def main():
     ap.add_argument("--ffw", type=int, default=2)
     ap.add_argument("--rec", default="lstm")
     args = ap.parse_args()
+    if not args.ckpt and not args.arch:
+        ap.error("give --ckpt or --arch")
     device = "cuda"
     if args.arch:
         policy = build_policy(
