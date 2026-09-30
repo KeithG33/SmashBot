@@ -14,6 +14,7 @@ import tree
 from smashbot import configs
 from smashbot import embed as embed_lib
 from smashbot.eval.game import load_policy
+from smashbot.networks import use_manual_recurrent_step
 from smashbot.policy import build_policy
 from smashbot.rl.agent import BatchedPolicyAgent
 
@@ -83,6 +84,7 @@ def main():
         label = args.ckpt.split("/")[-1]
     policy.requires_grad_(False)
     policy.eval()
+    use_manual_recurrent_step(policy)   # as the rollout serves it (train_sim)
     if args.compile:
         # a manual graph cannot contain cudagraph trees: compile for kernels only
         policy.sample = torch.compile(
