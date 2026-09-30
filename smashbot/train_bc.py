@@ -58,6 +58,9 @@ class RuntimeConfig:
     # value goes to wandb.init and would otherwise override the variable
     wandb_mode: str = os.environ.get("WANDB_MODE", "online")
     restore: str = ""  # checkpoint path, or "auto" for <run_dir>/<tag>/latest.pt
+    # a fresh run's starting policy and value weights, from a checkpoint built
+    # for this model config (smashbot.warm_start's); a restore takes precedence
+    init_from: str = ""
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     seed: int = 0  # seeds model init; makes A/B runs attributable
 
@@ -248,11 +251,19 @@ def main(config: TrainConfig) -> None:
         ckpt = saving.load_checkpoint(restore_path)
         _check_config(ckpt["config"], dataclasses.asdict(config), dataclasses.asdict(TrainConfig()))
     resume = _resume_state(ckpt)
+    init = saving.load_checkpoint(rt.init_from) if rt.init_from and ckpt is None else None
+    if init is not None:
+        for section, cls in (("network", configs.NetworkConfig), ("head", configs.ControllerHeadConfig),
+                             ("policy", configs.PolicyConfig), ("value", configs.ValueConfig)):
+            built, saved = getattr(config, section), configs.from_dict(cls, init["config"][section])
+            if built != saved:
+                raise SystemExit(f"--runtime.init-from {rt.init_from} was built for {section} {saved}, "
+                                 f"this run's is {built}")
 
     sources = loader.make_sources(
         config.data,
         extra_frames=config.policy.delay + 1,
-        name_map=resume.get("name_map"),
+        name_map=resume.get("name_map", init["state"]["name_map"] if init else None),
         train_state=resume.get("train_data"),
     )
     print(f"name_map: {sources.name_map}")
@@ -346,6 +357,10 @@ def main(config: TrainConfig) -> None:
         step = resume["step"]
         best_eval_loss = ckpt["best_eval_loss"]
         print(f"restored from {restore_path} at step {step} (best eval {best_eval_loss:.4f})")
+    elif init is not None:
+        policy.load_state_dict(init["state"]["policy"])
+        value_fn.load_state_dict(init["state"]["value"])
+        print(f"initialized from {rt.init_from}")
 
     import wandb
 
