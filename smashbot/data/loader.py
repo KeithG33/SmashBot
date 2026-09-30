@@ -370,12 +370,15 @@ class RandomEvalStream:
         self._thread = threading.Thread(target=self._work, daemon=True)
         self._thread.start()
 
-    def _draw(self) -> list:
+    def _draw(self) -> tp.Optional[list]:
+        """A draw, or None once stop() is called: it gives up between batches."""
         groups = []
         for _ in range(self._groups):
             seat_random(self._split, self._span, self._rng, self._num_workers)
             group = []
             for _ in range(self._batches):
+                if self._stop.is_set():
+                    return None
                 batch = next(self._split)[0].batch
                 group.append((batch_to_frames(batch, self._network), exact_sticks(batch.game.p0.controller)))
             groups.append(group)
@@ -385,7 +388,7 @@ class RandomEvalStream:
         try:
             while not self._stop.is_set():
                 draw = self._draw()
-                while not self._stop.is_set():
+                while draw is not None and not self._stop.is_set():
                     try:
                         self._queue.put(draw, timeout=1.0)
                         break
@@ -405,6 +408,9 @@ class RandomEvalStream:
                     raise StopIteration
 
     def stop(self) -> None:
+        """Waits out a draw in progress (at most its current seating) before
+        shutting the split down: a draw left running under a shut-down source
+        hangs interpreter exit."""
         self._stop.set()
-        self._thread.join(timeout=5.0)
+        self._thread.join()
         self._split.shutdown()
