@@ -64,6 +64,8 @@ def main():
     ap.add_argument("--window", type=int, default=256)
     ap.add_argument("--ffw", type=int, default=2)
     ap.add_argument("--rec", default="lstm")
+    ap.add_argument("--cudnn-step", action="store_true",
+                    help="step recurrent layers with cuDNN instead of the manual cell the rollout serves")
     args = ap.parse_args()
     if not args.ckpt and not args.arch:
         ap.error("give --ckpt or --arch")
@@ -86,7 +88,8 @@ def main():
         label = args.ckpt.split("/")[-1]
     policy.requires_grad_(False)
     policy.eval()
-    use_manual_recurrent_step(policy)   # as the rollout serves it (train_sim)
+    if not args.cudnn_step:
+        use_manual_recurrent_step(policy)   # as the rollout serves it (train_sim)
     if args.compile:
         # a manual graph cannot contain cudagraph trees: compile for kernels only
         policy.sample = torch.compile(
