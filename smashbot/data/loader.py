@@ -235,16 +235,16 @@ def make_sources(
 
 
 def random_eval_stream(
-    split: Split, config: DataConfig, extra_frames: int, name_map: dict[str, int], network,
-    groups: int, rows: int, batches: int, seed: int,
+    replays: list[data_lib.ReplayInfo], config: DataConfig, extra_frames: int, name_map: dict[str, int],
+    network, groups: int, rows: int, batches: int, seed: int,
 ) -> "RandomEvalStream":
-    """A RandomEvalStream over `split`'s replays (the test split), on a source
-    of its own `rows` rows. Its decode workers only feed rows whose game
+    """A RandomEvalStream over `replays` (the test split's), on a source of
+    its own `rows` rows. Its decode workers only feed rows whose game
     ends mid-draw, so two suffice; seating decodes on num_workers."""
     # random_offset 0: seating sets every frame, and a manager's find_game
     # must not draw from the global RNG the training stream uses
     eval_config = dataclasses.replace(config, batch_size=rows, num_workers=min(2, config.num_workers), random_offset=0)
-    eval_split = _make_split(split.replays, eval_config, extra_frames, name_map, None)
+    eval_split = _make_split(replays, eval_config, extra_frames, name_map, None)
     span = (batches + 1) * (config.unroll_length + extra_frames)
     return RandomEvalStream(eval_split, network, groups, batches, span, seed, config.num_workers)
 

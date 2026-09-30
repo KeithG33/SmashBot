@@ -199,6 +199,36 @@ class _StopRequest:
         print(f"stop requested (signal {signum}); finishing the current step", flush=True)
 
 
+def score(policy, value_fn, stick_scorer: StickScorer, groups: list, rows: int, delay: int,
+          warm_batches: int, discount: float, autocast, device) -> dict:
+    """Policy loss, value UEV and stick metrics over groups of `rows` rows:
+    each group starts cold, runs warm_batches unscored, then scores the
+    rest."""
+    policy.eval()
+    losses, value_metrics_acc, stick_batches = [], [], []
+    with torch.no_grad():
+        for group in groups:
+            eval_hidden = policy.initial_state(rows, device)
+            eval_value_hidden = value_fn.initial_state(rows, device)
+            for i, (frames, exact) in enumerate(group):
+                frames = tree.map_structure(lambda t: t.to(device, non_blocking=True), frames)
+                with autocast():
+                    sliced = slice_delayed_frames(frames, delay)
+                    outputs = policy.unroll(sliced, eval_hidden, joint_sticks=True)
+                    eval_hidden = outputs.final_state
+                    _, eval_value_hidden, vm = value_fn.loss(sliced, eval_value_hidden, discount)
+                if i >= warm_batches:
+                    losses.append(-outputs.log_probs.mean())
+                    value_metrics_acc.append(vm)
+                    human = tree.map_structure(lambda t: t[:, 1:], sliced.state_action.action)
+                    exact = {k: v.to(device)[:, delay + 1:] for k, v in exact.items()}
+                    stick_batches.append(stick_scorer.score(outputs.sticks, human, exact))
+    policy.train()
+    return {"policy_loss": torch.stack(losses).float().mean().item(),
+            "value_uev": float(np.mean([m["uev"] for m in value_metrics_acc])),
+            "sticks": stick_metrics(stick_batches)}
+
+
 def main(config: TrainConfig) -> None:
     dataset = config.data.dataset
     if dataset.data_dir is not None and dataset.meta_path is None:   # the dataset's own full index
@@ -361,7 +391,7 @@ def main(config: TrainConfig) -> None:
     sources.test.shutdown()
     # seeded by the step too, so a resumed run draws games it hasn't scored yet
     wide_stream = loader.random_eval_stream(
-        sources.test, config.data, config.policy.delay + 1, sources.name_map, policy.network,
+        sources.test.replays, config.data, config.policy.delay + 1, sources.name_map, policy.network,
         groups=rt.wide_eval_groups, rows=rt.wide_eval_rows, batches=warm_batches + rt.wide_eval_batches,
         seed=config.data.dataset.seed * 1_000_003 + step) if rt.wide_eval_groups else None
 
@@ -402,41 +432,16 @@ def main(config: TrainConfig) -> None:
     stick_scorer = StickScorer(policy.controller_head, device)
 
     def score_groups(groups: list, rows: int, name: str) -> dict:
-        """Policy loss, value UEV and stick metrics over groups of `rows` rows:
-        each group starts cold, runs warm_batches unscored, then scores the
-        rest."""
         start = time.perf_counter()
-        policy.eval()
-        losses, value_metrics_acc, stick_batches = [], [], []
-        with torch.no_grad():
-            for group in groups:
-                eval_hidden = policy.initial_state(rows, device)
-                eval_value_hidden = value_fn.initial_state(rows, device)
-                for i, (frames, exact) in enumerate(group):
-                    frames = to_device(frames)
-                    with autocast():
-                        sliced = slice_delayed_frames(frames, config.policy.delay)
-                        outputs = policy.unroll(sliced, eval_hidden, joint_sticks=True)
-                        eval_hidden = outputs.final_state
-                        _, eval_value_hidden, vm = value_fn.loss(
-                            sliced, eval_value_hidden, discount
-                        )
-                    if i >= warm_batches:
-                        losses.append(-outputs.log_probs.mean())
-                        value_metrics_acc.append(vm)
-                        human = tree.map_structure(lambda t: t[:, 1:], sliced.state_action.action)
-                        exact = {k: v.to(device)[:, config.policy.delay + 1:] for k, v in exact.items()}
-                        stick_batches.append(stick_scorer.score(outputs.sticks, human, exact))
-        policy.train()
-        policy_loss = torch.stack(losses).float().mean().item()
-        value_uev = float(np.mean([m["uev"] for m in value_metrics_acc]))
+        scores = score(policy, value_fn, stick_scorer, groups, rows, config.policy.delay, warm_batches,
+                       discount, autocast, device)
+        policy_loss, value_uev, sticks = scores["policy_loss"], scores["value_uev"], scores["sticks"]
         if not (math.isfinite(policy_loss) and math.isfinite(value_uev)):
             raise FloatingPointError(f"step {step}: non-finite {name} (policy loss {policy_loss}, value uev {value_uev})")
-        sticks = stick_metrics(stick_batches)
         seconds = time.perf_counter() - start
         print(f"{name} @ {step}: policy_loss {policy_loss:.6f}"
               + "".join(f", {k} {v:.4f}" for k, v in sticks.items()) + f" ({seconds:.1f}s)", flush=True)
-        return {"policy_loss": policy_loss, "value_uev": value_uev, "sticks": sticks, "seconds": seconds}
+        return {**scores, "seconds": seconds}
 
     def run_eval() -> dict:
         return score_groups([eval_set], B, "eval")
