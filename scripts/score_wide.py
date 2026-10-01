@@ -63,7 +63,7 @@ def main() -> None:
     args = parser.parse_args()
     for path in args.checkpoints:
         s = score_checkpoint(path, args.seed, args.groups, args.device)
-        print(f"{path} @ {s['step']}: policy_loss {s['policy_loss']:.4f}, value_uev {s['value_uev']:.4f}"
+        print(f"{path} @ {s['step']}: policy_loss {s['policy_loss']:.4f}, value_uev {s['value_uev']:.4f}, value_loss {s['value_loss']:.5f}"
               + "".join(f", {k} {v:.4f}" for k, v in s["sticks"].items()), flush=True)
 
 

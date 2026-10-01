@@ -229,6 +229,7 @@ def score(policy, value_fn, stick_scorer: StickScorer, groups: list, rows: int, 
     policy.train()
     return {"policy_loss": torch.stack(losses).float().mean().item(),
             "value_uev": float(np.mean([m["uev"] for m in value_metrics_acc])),
+            "value_loss": float(np.mean([m["loss"] for m in value_metrics_acc])),
             "sticks": stick_metrics(stick_batches)}
 
 
@@ -550,10 +551,12 @@ def main(config: TrainConfig) -> None:
                     {
                         "eval/policy_loss": eval_metrics["policy_loss"],
                         "eval/value_uev": eval_metrics["value_uev"],
+                        "eval/value_loss": eval_metrics["value_loss"],
                         "eval/best_policy_loss": best_eval_loss,
                         **{f"eval/{k}": v for k, v in eval_metrics["sticks"].items()},
                         **({"eval_wide/policy_loss": wide["policy_loss"],
                             "eval_wide/value_uev": wide["value_uev"],
+                            "eval_wide/value_loss": wide["value_loss"],
                             **{f"eval_wide/{k}": v for k, v in wide["sticks"].items()}} if wide else {}),
                     },
                     step=step,
