@@ -83,7 +83,8 @@ class RLConfig:
     # Loss coefficient: lambda_t * L_opp added to the policy loss; 0 = the
     # actor-side term is entirely absent (critic still trains on harvested
     # states when slots > 0). Decays linearly from imitation_lambda to
-    # imitation_lambda * imitation_lambda_final_frac across runtime.steps.
+    # imitation_lambda * imitation_lambda_final_frac across runtime.schedule_steps
+    # (default runtime.steps).
     imitation_lambda: float = 0.0
     imitation_lambda_final_frac: float = 0.2
 

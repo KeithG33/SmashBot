@@ -24,6 +24,9 @@ from smashbot.rl.train_sim import SimRolloutConfig
 class RuntimeConfig:
     tag: str = "rl-dev"
     steps: int = 1000
+    # step at which the leash and imitation schedules reach their final values
+    # and stay there (0 = steps), so steps can be extended without rescaling them
+    schedule_steps: int = 0
     trajectories_per_step: int = 1
     run_dir: str = "/home/kage/drive2/ShineBot/runs"
     checkpoint_interval: int = 50

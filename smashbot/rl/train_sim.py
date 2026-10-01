@@ -529,6 +529,7 @@ def run(args) -> None:
             for dst, src in _pub_pairs:
                 dst.copy_(src)
 
+    schedule_steps = max(1, args.runtime.schedule_steps or args.runtime.steps)
     try:
         fut = None
         fut_i = None
@@ -562,7 +563,7 @@ def run(args) -> None:
                 # must not co-peak with a concurrent collect.
                 state, metrics = learner.step(
                     trajectories, state,
-                    progress=i / max(1, args.runtime.steps))
+                    progress=i / schedule_steps)
                 _post_step(i, metrics)
                 torch.cuda.synchronize()
                 print(f"[vram] first learner step: "
@@ -575,7 +576,7 @@ def run(args) -> None:
             ready.record()
 
             def _run(traj=trajectories, st=state, ev=ready, step_i=i,
-                     prog=i / max(1, args.runtime.steps)):
+                     prog=i / schedule_steps):
                 _t0 = time.perf_counter()
                 overlap_stream.wait_event(ev)
                 with torch.cuda.stream(overlap_stream):
