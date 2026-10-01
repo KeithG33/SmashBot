@@ -45,7 +45,7 @@ def load_player(path: str, device: str, config_from: str = ""):
     weights (a league snapshot) built with the config of the full checkpoint
     `config_from`."""
     from smashbot import saving
-    from smashbot.eval.game import resolve_name_code
+    from smashbot.eval.naming import resolve_name_code
     from smashbot.networks import check_loadable
     from smashbot.policy import build_policy_from_config
 

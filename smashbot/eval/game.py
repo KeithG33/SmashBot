@@ -21,6 +21,7 @@ from slippi_ai import dolphin as dolphin_lib
 from smashbot import saving
 from smashbot.eval.agent import DelayedAgent
 from smashbot.eval.dolphin_setup import make_dolphin  # noqa: F401  (re-export)
+from smashbot.eval.naming import resolve_name_code  # noqa: F401  (re-export)
 from smashbot.networks import check_loadable
 from smashbot.policy import build_policy_from_config
 
@@ -61,12 +62,6 @@ def compile_policy(policy) -> None:
     torch._dynamo.config.recompile_limit = 128
 
 
-def resolve_name_code(name_map: dict, name: str, verbose: bool = True) -> int:
-    if name in name_map:
-        return name_map[name]
-    if name_map and verbose:
-        print(f"'{name}' not in name_map {name_map}; using code 0")
-    return 0
 
 
 @dataclasses.dataclass
