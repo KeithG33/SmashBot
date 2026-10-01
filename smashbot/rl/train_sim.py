@@ -502,7 +502,6 @@ def run(args) -> None:
             if g >= 20:
                 log[f"bychar/{c}"] = w / g
         log["rl/frames_per_sec"] = frames / max(1e-9, time.time() - t0)
-        log["rl/frames"] = frames
         wandb.log(log, step=i)
 
         if i % 5 == 0:
