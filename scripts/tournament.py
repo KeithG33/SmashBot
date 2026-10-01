@@ -14,13 +14,15 @@ the sim is deterministic and the games are seeded, so results replay.
 from __future__ import annotations
 
 import argparse
+import collections
 import itertools
 import json
+import time
 
 import torch
 
 from smashbot import paths
-from smashbot.eval.sim_arena import MatchSet, load_player, stratified, unique_labels
+from smashbot.eval.sim_arena import MatchSet, dittos, load_player, stratified, unique_labels
 
 
 def main():
@@ -28,6 +30,8 @@ def main():
     ap.add_argument("--ckpts", nargs="+", required=True)
     ap.add_argument("--games", type=int, default=48,
                     help="games per pairing, stratified over the 12 characters")
+    ap.add_argument("--dittos", type=int, default=0,
+                    help="instead: this many games of each character against itself")
     ap.add_argument("--envs", type=int, default=24, help="games played at once")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--threads", type=int, default=16)
@@ -48,20 +52,27 @@ def main():
         players[label] = (policy, code)
         print(f"loaded {label}" + (f" (step {step})" if step is not None else ""), flush=True)
 
-    slate = stratified(args.games, args.seed)
+    slate = dittos(args.dittos) if args.dittos else stratified(args.games, args.seed)
     results = {}
     win_rates = {label: [] for label in players}
     for a, b in itertools.combinations(players, 2):
         ms = MatchSet(players[a][0], players[b][0], slate, args.data_dir, args.envs, args.device,
                       student_name_code=players[a][1], opp_name_code=players[b][1])
+        start = time.perf_counter()
         ms.run()
+        seconds = time.perf_counter() - start
         ms.close()
         st = ms.stats()
         results[f"{a}|{b}"] = st
         win_rates[a].append(st["wins"] / st["games"])
         win_rates[b].append(st["losses"] / st["games"])
         print(f"  {a} vs {b}: {st['wins']}-{st['losses']}-{st['draws']} of {st['games']} "
-              f"(stockdiff {st['avg_stock_diff']:+.2f})", flush=True)
+              f"(stockdiff {st['avg_stock_diff']:+.2f}, {seconds / 60:.1f} min)", flush=True)
+        by_char = collections.defaultdict(lambda: [0, 0, 0])
+        for (char, _), (s0, s1) in zip(ms.slate, ms.results):
+            by_char[char][0 if s0 > s1 else 1 if s1 > s0 else 2] += 1
+        print("    by " + a + "'s character: " + ", ".join(
+            f"{c} {w}-{l}" + (f"-{d}" if d else "") for c, (w, l, d) in by_char.items()), flush=True)
 
     standings = {label: sum(v) / len(v) for label, v in win_rates.items()}
     print("\nstandings (mean win rate over pairings):")

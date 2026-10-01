@@ -71,6 +71,11 @@ def load_player(path: str, device: str, config_from: str = ""):
     return policy, code, step
 
 
+def dittos(per_char: int) -> list[tuple[str, str]]:
+    """per_char games of each of the 12 characters against itself."""
+    return [(c, c) for _ in range(per_char) for c in MAIN_12_MSL]
+
+
 def unique_labels(paths: list[str]) -> list[str]:
     """Each path's last components, as few as keep every label distinct
     (two runs' best.pt stay apart as runA/best.pt and runB/best.pt)."""
