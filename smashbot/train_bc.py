@@ -32,7 +32,7 @@ from smashbot.networks import (build_embed_network, check_loadable, keep_sgu_act
                                use_chunk_start_resets, use_packed_encoder)
 from smashbot.policy import ActionLoss, EnergyScore, StickScorer, build_policy, imitation_metrics, stick_metrics
 from smashbot.training import GradClipper, compile_cores, resolve_restore
-from smashbot.value import ValueFunction
+from smashbot.value import ValueFunction, value_network_config
 
 
 @dataclasses.dataclass
@@ -282,17 +282,8 @@ def main(config: TrainConfig) -> None:
         num_names=config.data.max_names,
     ).to(device)
 
-    value_name = config.value.name
-    if value_name == "match":
-        value_name = config.network.name
-    value_net_config = configs.NetworkConfig(
-        name=value_name,
-        hidden_size=config.value.hidden_size,
-        num_layers=config.value.num_layers,
-        num_heads=config.network.num_heads,
-        window=config.value.window or config.network.window,
-        layout=config.value.layout,
-    )
+    value_net_config = value_network_config(dataclasses.asdict(config.network),
+                                            dataclasses.asdict(config.value))
     value_fn = ValueFunction(
         build_embed_network(
             embed_config=embed_lib.EmbedConfig(),

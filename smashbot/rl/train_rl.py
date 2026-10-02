@@ -50,21 +50,11 @@ class Config:
 
 
 def build_value_function(cfg: dict, device: str):
-    from smashbot import configs, embed as embed_lib
+    from smashbot import embed as embed_lib
     from smashbot.networks import build_embed_network
-    from smashbot.value import ValueFunction
+    from smashbot.value import ValueFunction, value_network_config
 
-    value_name = cfg["value"].get("name", "match")
-    if value_name == "match":
-        value_name = cfg["network"]["name"]
-    net_cfg = configs.NetworkConfig(
-        name=value_name,
-        hidden_size=cfg["value"]["hidden_size"],
-        num_layers=cfg["value"]["num_layers"],
-        num_heads=cfg["network"]["num_heads"],
-        window=cfg["value"].get("window", 0) or cfg["network"]["window"],
-        layout=cfg["value"].get("layout", ""),
-    )
+    net_cfg = value_network_config(cfg["network"], cfg["value"])
     return ValueFunction(
         build_embed_network(
             embed_config=embed_lib.EmbedConfig(),

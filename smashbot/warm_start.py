@@ -124,6 +124,33 @@ def factor_enhanced_tables(core, target) -> dict:
 
 
 @torch.no_grad()
+def bridge_value(src, dst, policy, batches) -> dict:
+    """dst (a value net on the policy's enhanced inputs) from src (one on
+    simple inputs): src's recurrent layers and head; character and action
+    tables factored from src's one-hot columns; the policy's trained item
+    MLP; the input layer fitted on real frames so dst's embedded features
+    reproduce src's input-layer output. Returns the fit's relative error."""
+    state = dst.state_dict()
+    for k, v in src.state_dict().items():
+        if (k.startswith("network.core.") and not k.startswith("network.core.encoder.")) or k.startswith("head."):
+            state[k] = v.clone()
+    dst.load_state_dict(state)
+    report = factor_enhanced_tables(src, dst)
+    dst.network.enhanced.item_mlp.load_state_dict(policy.network.enhanced.item_mlp.state_dict())
+
+    xtx = xty = yy = 0
+    for b in batches:
+        fs, fd = loader.batch_to_frames(b, src.network), loader.batch_to_frames(b, dst.network)
+        y = src.network.core.encoder(src.network.embed_sa(fs.state_action)).flatten(0, -2).double()
+        x = _with_ones(dst.network.embed_sa(fd.state_action))
+        xtx, xty, yy = xtx + x.T @ x, xty + x.T @ y, yy + (y * y).sum()
+    beta, error = _lstsq(xtx, xty, yy)
+    dst.network.core.encoder.weight.copy_(beta[:-1].T.float())
+    dst.network.core.encoder.bias.copy_(beta[-1].float())
+    return {"value_input_layer_error": error, **{f"value_{k}": v for k, v in report.items()}}
+
+
+@torch.no_grad()
 def bridge_policy(core, io, target, batches, head_rows: int) -> dict:
     """target (io's config, io's weights on entry) gets core's recurrent
     layers and the two fitted layers; returns the fits' relative errors."""
@@ -215,7 +242,10 @@ def warm_start(core_path: str, io_path: str, out_path: str, n_batches: int = 5, 
 
     src_value, value = build_value_function(core_ckpt["config"], "cpu"), build_value_function(config, "cpu")
     src_value.load_state_dict(core_ckpt["state"]["value"])
-    value.load_state_dict(remap_value(src_value, value))
+    if value.network.enhanced is not None and src_value.network.enhanced is None:
+        report.update(bridge_value(src_value, value, target, batches))
+    else:
+        value.load_state_dict(remap_value(src_value, value))
 
     torch.save({"config": config, "best_eval_loss": float("inf"), "version": io_ckpt["version"],
                 "state": {"policy": target.state_dict(), "value": value.state_dict(),

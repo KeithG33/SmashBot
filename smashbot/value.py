@@ -25,6 +25,32 @@ class ValueOutputs(tp.NamedTuple):
     metrics: dict
 
 
+INPUT_KEYS = ("embed", "embed_hidden_size", "rating", "embed_joint_index_wraps", "tech_mask_window")
+
+
+def value_network_config(network: dict, value: dict):
+    """The value net's NetworkConfig from saved (or asdict'd) network and value
+    sections: value's size, depth, window and layout on the policy's family
+    ("match"), with the policy's inputs unless value["inputs"] is "simple"
+    (configs saved before 2026-10-02 lack the key and are simple)."""
+    from smashbot import configs
+
+    name = value.get("name", "match")
+    if name == "match":
+        name = network["name"]
+    inputs = ({k: network[k] for k in INPUT_KEYS if k in network}
+              if value.get("inputs", "simple") == "policy" else {})
+    return configs.NetworkConfig(
+        name=name,
+        hidden_size=value["hidden_size"],
+        num_layers=value["num_layers"],
+        num_heads=network["num_heads"],
+        window=value.get("window", 0) or network["window"],
+        layout=value.get("layout", ""),
+        **inputs,
+    )
+
+
 class ValueFunction(nn.Module):
     def __init__(self, network: StateActionNetwork):
         super().__init__()

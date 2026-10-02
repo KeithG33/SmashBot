@@ -101,6 +101,10 @@ class ValueConfig:
     # sgu only: one letter per layer as network.layout; empty = all SGU
     layout: str = ""
     reward_halflife: float = 4.0  # seconds; discount = 0.5 ** (1 / (halflife * 60))
+    # "policy": the policy network's input embedding and tech mask; "simple":
+    # one-hot leaves, unmasked (what every value net before 2026-10-02 had,
+    # whatever the policy used: configs saved without this key mean it)
+    inputs: str = "policy"
 
 
 @dataclasses.dataclass
