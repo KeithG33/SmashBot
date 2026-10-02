@@ -653,6 +653,8 @@ def test_snapshots_carry_their_config_and_old_bare_ones_still_load(tmp_path):
     new = pool.save(Stub(), 100, config, {"Master Player": 1})
     saved = _torch.load(new, weights_only=True)   # the league reads with weights_only
     assert saved["config"] == config and saved["state"]["name_map"] == {"Master Player": 1}
+    from smashbot import saving
+    assert saving.load_checkpoint(new)["state"]["step"] == 100   # what watch/tournament loaders call
     old = f"{tmp_path}/snapshot-0000050.pt"
     _torch.save({"w": _torch.zeros(2)}, old)
     weights = MemberWeights(lambda member: member)

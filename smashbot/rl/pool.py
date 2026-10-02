@@ -186,7 +186,9 @@ class SnapshotPool:
         state dicts)."""
         path = os.path.join(self.dir, f"snapshot-{step:07d}.pt")
         tmp = path + ".tmp"
-        torch.save({"config": config,
+        from smashbot import saving
+
+        torch.save({"config": config, "version": saving.VERSION,
                     "state": {"policy": policy.state_dict(), "name_map": name_map, "step": step}}, tmp)
         os.replace(tmp, path)
         if path not in self.archive:  # crash-restore can re-save a step
