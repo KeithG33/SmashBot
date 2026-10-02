@@ -22,21 +22,35 @@ ENCODER = "network.core.encoder.weight"
 
 
 @torch.no_grad()
-def encoder_input_scale(policy, rescale) -> torch.Tensor:
-    """Per input column of the core's encoder, how much rescale(policy) scales
-    it: the enhanced embed's output on a dummy frame, before over after."""
-    enhanced = policy.network.enhanced
+def table_columns(policy) -> dict[str, torch.Tensor]:
+    """Which of the core encoder's input columns each table group feeds: the
+    enhanced embed's output on a dummy frame, changed by doubling the group
+    (exact in floating point, so every other column stays bit-identical)."""
+    enhanced, params = policy.network.enhanced, dict(policy.named_parameters())
     dummy = tree_map_to_torch(policy.network.embed_state_action.dummy((1,)))
-    before = enhanced(dummy).double()[0]
+    base = enhanced(dummy)[0]
+    columns = {}
+    for key, names in TABLES.items():
+        for name in names:
+            params[name].mul_(2)
+        columns[key] = enhanced(dummy)[0] != base
+        for name in names:
+            params[name].div_(2)
+    assert not (columns["char_table_scale"] & columns["action_table_scale"]).any()
+    return columns
+
+
+@torch.no_grad()
+def encoder_input_scale(policy, rescale) -> torch.Tensor:
+    """Per input column of the core's encoder, how much rescale(policy)
+    scales it."""
+    columns = table_columns(policy)
     report = rescale(policy)
-    after = enhanced(dummy).double()[0]
-    changed = (after - before).abs() > 1e-9 * before.abs().max()
-    ratio = torch.where(changed, after / before, torch.ones_like(before))
-    known = torch.zeros_like(changed)
-    for s in report.values():
-        known |= changed & ((ratio - s).abs() < 1e-6 * s)
-    assert torch.equal(known, changed), "a column scaled by neither table's factor"
-    return ratio.float(), report
+    ratio = torch.ones(policy.network.core.encoder.weight.shape[1])
+    for key, cols in columns.items():
+        assert cols.sum() == 4 * policy.network.enhanced.embed_char.weight.shape[1], key   # p0, p1, both nanas
+        ratio[cols] = report[key]
+    return ratio, report
 
 
 @torch.no_grad()
