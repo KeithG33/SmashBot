@@ -833,8 +833,13 @@ class EnhancedEmbed(nn.Module):
                         "item": next(iter(leaves(game["items"]).values()))}
         self._chars = make_embed_char().size
         self._actions = make_embed_action().size
+        # upstream's flax initializers: nnx.Embed's N(0, 1/features) and
+        # nnx.Linear's lecun normal with zero bias (torch's N(0, 1) embedding
+        # init is ~11x larger at 128 features, and Adam barely moves it)
         self.embed_char = nn.Embedding(self._chars, hidden_size)
         self.embed_action = nn.Embedding(self._actions, hidden_size)
+        for table in (self.embed_char, self.embed_action):
+            nn.init.normal_(table.weight, std=hidden_size ** -0.5)
         self.embed_char_action = nn.Embedding(self._chars * self._actions, hidden_size)
         nn.init.zeros_(self.embed_char_action.weight)
         layers: list[nn.Module] = []
@@ -842,7 +847,11 @@ class EnhancedEmbed(nn.Module):
         for i in range(item_mlp_layers):
             if i:
                 layers.append(nn.ReLU())
-            layers.append(nn.Linear(in_size, hidden_size))
+            linear = nn.Linear(in_size, hidden_size)
+            std = in_size ** -0.5 / 0.87962566103423978
+            nn.init.trunc_normal_(linear.weight, std=std, a=-2 * std, b=2 * std)
+            nn.init.zeros_(linear.bias)
+            layers.append(linear)
             in_size = hidden_size
         self.item_mlp = nn.Sequential(*layers)
         # a buffer, so a grid of Phillips stacks each one's rating with its weights
