@@ -404,7 +404,7 @@ def run(args) -> None:
         config_from=args.ckpt,
     )
     if not league.league.archive:
-        league.league.save(policy, start_step)
+        league.league.save(policy, start_step, ckpt["config"], name_map)
         print(f"boot snapshot: seeded empty archive at step {start_step}", flush=True)
     worker = SimLeagueWorker(scfg, league, serving_policy, name_code, device)
     print(f"sim league: {scfg.num_envs} envs -> {worker.rows} learner rows "
@@ -448,7 +448,7 @@ def run(args) -> None:
         if (i + 1) % args.runtime.checkpoint_interval == 0:
             league.league._save_payoff()   # debounced ledger flush
         if i > 0 and i % scfg.snapshot_interval == 0:
-            path = league.league.save(policy, i)
+            path = league.league.save(policy, i, ckpt["config"], name_map)
             print(f"[{i}] snapshot saved: {os.path.basename(path)} joins the league",
                   flush=True)
 

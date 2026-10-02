@@ -48,11 +48,16 @@ class DelayedAgent:
         self._ports = (own_port, opponent_port)
         self._name = torch.tensor([name_code], dtype=torch.int32, device=device)
         self._embed_controller = policy.controller_head.controller_embedding
+        self._graph = None
         self.reset()
 
     def reset(self) -> None:
         self.parser = Parser(ports=list(self._ports))
-        self.hidden = self.policy.initial_state(1, self.device)
+        initial = self.policy.initial_state(1, self.device)
+        if self._graph is None:
+            self.hidden = initial
+        else:   # the captured graph reads and advances these buffers in place
+            tree.map_structure(lambda dst, src: dst.copy_(src), self.hidden, initial)
         neutral = tree.map_structure(
             lambda x: np.asarray(x)[None], _neutral_controller()
         )
@@ -109,32 +114,73 @@ class DelayedAgent:
     def _act(self, state):
         """The live forward: one sample from the carried state; returns the
         sampled (encoded) controller."""
-        sampled, self.hidden = self.policy.sample(
-            StateAction(state=state, action=self._prev_action, name=self._name),
-            self.hidden,
-            temperature=self.temperature,
-        )
+        if self._graph is not None:
+            tree.map_structure(lambda dst, src: dst.copy_(src), self._in_state, state)
+            tree.map_structure(lambda dst, src: dst.copy_(src), self._in_prev, self._prev_action)
+            self._graph.replay()
+            controller = self._out_controller
+        else:
+            sampled, self.hidden = self.policy.sample(
+                StateAction(state=state, action=self._prev_action, name=self._name),
+                self.hidden,
+                temperature=self.temperature,
+            )
+            controller = sampled.controller_state
         # clone: retained across steps, and cudagraph replay reuses output buffers.
         # int64 keeps dtypes uniform for dynamo guards (bools stay bool).
         self._prev_action = tree.map_structure(
             lambda t: t.clone() if t.dtype == torch.bool else t.long().clone(),
-            sampled.controller_state,
+            controller,
         )
-        return sampled.controller_state
+        return controller
 
-    def warm_up(self, frames: int = 50) -> None:
-        """Compile a torch.compile'd policy through the exact call play makes
-        (grad mode, arguments, dtypes), so the first live frame never
-        recompiles; then start fresh."""
+    def _dummy_state(self):
+        """A frame with the live encoding's structure and dtypes."""
         dummy = self.policy.network.embed_state_action.dummy((1,)).state
-        state = tree.map_structure(
+        return tree.map_structure(
             lambda x: torch.from_numpy(np.ascontiguousarray(
                 np.asarray(x).astype(np.int64) if np.asarray(x).dtype.kind in "iu" else np.asarray(x)
             )).to(self.device),
             dummy,
         )
+
+    def warm_up(self, frames: int = 50) -> None:
+        """Compile a torch.compile'd policy through the exact call play makes
+        (grad mode, arguments, dtypes), so the first live frame never
+        recompiles; then start fresh."""
+        state = self._dummy_state()
         for _ in range(frames):
             self._act(state)
+        self.reset()
+
+    @torch.no_grad()
+    def capture(self) -> None:
+        """Serve through one manual CUDA graph (cuda only): static buffers for
+        the frame, the previous action and the carried state, which each
+        replay reads and advances in place. Record it before play, with no
+        other GPU work running; policy.sample must not use CUDA graph trees."""
+        self._in_state = self._dummy_state()
+        self._in_prev = tree.map_structure(torch.clone, self._prev_action)
+
+        def forward():
+            return self.policy.sample(
+                StateAction(state=self._in_state, action=self._in_prev, name=self._name),
+                self.hidden,
+                temperature=self.temperature,
+            )
+
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(3):   # allocations and autotuning before capture
+                forward()
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            sampled, hidden = forward()
+            tree.map_structure(lambda dst, src: dst.copy_(src), self.hidden, hidden)
+        self._out_controller = sampled.controller_state
+        self._graph = graph
         self.reset()
 
 

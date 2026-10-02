@@ -37,6 +37,7 @@ from smashbot.eval import game as game_lib
 from smashbot.networks import check_loadable
 from smashbot.eval.agent import AsyncDelayedAgent
 from smashbot.rl.config import MAIN_12
+from smashbot.rl.pool import snapshot_weights
 
 from slippi_ai import dolphin as dolphin_lib
 
@@ -144,7 +145,7 @@ def load_side(spec: SideSpec, device: str = "cpu"):
     bare snapshots borrow config/name_map from config_from."""
     if spec.snapshot:
         policy, name_map, _ = game_lib.load_policy(spec.config_from, device)
-        state = torch.load(spec.snapshot, map_location=device, weights_only=True)
+        state = snapshot_weights(torch.load(spec.snapshot, map_location=device, weights_only=True))
         check_loadable({}, state)   # a bare snapshot has no config: only today's names pass
         policy.load_state_dict(state)
         policy.eval()
@@ -158,6 +159,7 @@ def build_agents(
     compile_policies: bool = False,
     name: str = "Master Player",
     temperature: float | None = None,
+    capture: bool = False,
 ) -> tuple[dict[int, AsyncDelayedAgent], dict[int, SideInfo]]:
     """Load both policies and wrap each in an AsyncDelayedAgent. Each agent
     keeps its own delay (from its checkpoint's policy config -- Phillip 21,
@@ -204,6 +206,8 @@ def build_agents(
         )
         if compile_policies:
             agents[port].warm_up()
+        if capture:   # here, before Dolphin and the other worker touch the GPU
+            agents[port].capture()
         infos[port] = SideInfo(
             port=port,
             label=specs[port].label,
@@ -278,6 +282,10 @@ def parse_args(argv=None):
                     help="torch.compile both policies (cpu inductor) and "
                          "warm them BEFORE Dolphin boots (~2x faster "
                          "inference; avoids the compile stall at game start)")
+    ap.add_argument("--capture", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="serve each policy through one captured CUDA graph "
+                         "(cuda only): a third of the per-frame inference time")
     ap.add_argument("--temperature", type=float, default=None,
                     help="sampling temperature for both policies")
     ap.add_argument("--name", default="Master Player",
@@ -342,6 +350,7 @@ def main(argv=None) -> None:
         compile_policies=args.compile,
         name=args.name,
         temperature=args.temperature,
+        capture=args.capture and device == "cuda",
     )
 
     for port in sorted(infos):
@@ -354,6 +363,7 @@ def main(argv=None) -> None:
           f"games {args.games or 'forever'} | "
           f"device {device} | "
           f"compile {'on (warmed)' if args.compile else 'off'} | "
+          f"capture {'on' if args.capture and device == 'cuda' else 'off'} | "
           f"mute {'on' if args.mute else 'off'} | "
           f"replays {'-> ' + args.replay_dir if args.save_replays else 'off'}")
 

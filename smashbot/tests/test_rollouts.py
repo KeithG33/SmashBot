@@ -350,7 +350,7 @@ def test_snapshot_pool_exponential_thinning(tmp_path):
 
     pool = SnapshotPool(str(tmp_path), keep=12)
     for step in range(0, 6000, 100):
-        pool.save(Stub(), step)
+        pool.save(Stub(), step, {}, {})
     steps = [SnapshotPool._step_of(p) for p in pool.archive]
     assert len(steps) == 12
     assert steps == sorted(steps)
@@ -636,3 +636,77 @@ def test_tracker_records_winrate_by_opponent_character():
     assert set(t.by_char) == {"FOX", "MARTH"}
     # overall bookkeeping is untouched by the new field
     assert t.wins == 4 and t.losses == 2 and t.draws == 1
+
+
+def test_snapshots_carry_their_config_and_old_bare_ones_still_load(tmp_path):
+    import torch as _torch
+
+    from smashbot.rl.league import MemberWeights
+    from smashbot.rl.pool import SnapshotPool
+
+    class Stub:
+        def state_dict(self):
+            return {"w": _torch.ones(2)}
+
+    config = {"network": {"name": "sgu", "layout": "slslsl", "window": None}, "policy": {"delay": 18}}
+    pool = SnapshotPool(str(tmp_path), keep=12)
+    new = pool.save(Stub(), 100, config, {"Master Player": 1})
+    saved = _torch.load(new, weights_only=True)   # the league reads with weights_only
+    assert saved["config"] == config and saved["state"]["name_map"] == {"Master Player": 1}
+    old = f"{tmp_path}/snapshot-0000050.pt"
+    _torch.save({"w": _torch.zeros(2)}, old)
+    weights = MemberWeights(lambda member: member)
+    assert _torch.equal(weights._load(new)["w"], _torch.ones(2))
+    assert _torch.equal(weights._load(old)["w"], _torch.zeros(2))
+
+
+def test_captured_agent_matches_uncaptured(monkeypatch):
+    """A DelayedAgent serving through its captured CUDA graph emits the same
+    controllers as the plain forward, frame for frame, across a game reset."""
+    import pytest
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA graphs need a GPU")
+    from smashbot import embed as embed_lib
+    from smashbot.eval.agent import DelayedAgent
+    from smashbot.tests.test_ppo import _tiny_policy
+
+    monkeypatch.setattr(
+        embed_lib.OneHotEmbedding, "sample",
+        lambda self, logits, temperature=None: logits.argmax(-1).to(
+            {"uint8": torch.uint8, "int32": torch.int32}[np.dtype(self.dtype).name]
+        ),
+    )
+    monkeypatch.setattr(
+        embed_lib.BoolEmbedding, "sample",
+        lambda self, logits, temperature=None: logits.squeeze(-1) > 0,
+    )
+
+    class StubParser:
+        def __init__(self, seq):
+            self.seq, self.i = seq, 0
+
+        def get_game(self, _gs):
+            self.i += 1
+            return self.seq[(self.i - 1) % len(self.seq)]
+
+    embed_game = embed_lib.EmbedConfig().make_game_embedding()
+    rng = np.random.default_rng(5)
+    frames = [_rand_raw_game(embed_game, (), rng) for _ in range(12)]
+
+    def play(capture):
+        torch.manual_seed(0)
+        policy = _tiny_policy(seed=0).to("cuda")
+        policy.delay = 4
+        agent = DelayedAgent(policy, own_port=1, opponent_port=2, device="cuda")
+        if capture:
+            agent.capture()
+        outs = []
+        for _ in range(2):   # two games: the reset must restart the carried state
+            agent.reset()
+            agent.parser = StubParser(frames)
+            outs += [agent.step(None) for _ in range(12)]
+        return outs
+
+    for a, b in zip(play(False), play(True)):
+        tree.map_structure(lambda x, y: np.testing.assert_array_equal(np.asarray(x), np.asarray(y)), a, b)

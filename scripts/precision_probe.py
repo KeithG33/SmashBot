@@ -140,6 +140,7 @@ def build_learner(
     from smashbot import saving
     from smashbot.eval.game import load_policy
     from smashbot.networks import check_loadable
+    from smashbot.rl.pool import snapshot_weights
     from smashbot.rl.ppo import Learner, RLConfig
     from smashbot.rl.train_rl import build_value_function
 
@@ -147,7 +148,7 @@ def build_learner(
     assert src, "need --ckpt or --config-from"
     policy, _, step = load_policy(src, device)
     if snapshot:
-        state = torch.load(snapshot, map_location=device, weights_only=True)
+        state = snapshot_weights(torch.load(snapshot, map_location=device, weights_only=True))
         check_loadable({}, state)   # a bare snapshot has no config: only today's names pass
         policy.load_state_dict(state)
         step = int(

@@ -21,6 +21,12 @@ import torch
 IMPORT_KEY_PREFIX = "import:"
 
 
+def snapshot_weights(saved: dict) -> dict:
+    """A loaded snapshot's policy state dict: the checkpoint layout, or a
+    bare state dict (archives from before 2026-10-02)."""
+    return saved["state"]["policy"] if "config" in saved else saved
+
+
 def _is_import_key(key: str) -> bool:
     """League-member key of an imported frozen checkpoint ("import:NAME").
     Import rows are permanent: never pruned by thinning (which only touches
@@ -174,10 +180,14 @@ class SnapshotPool:
             return float(entry["wins_d"] / entry["games_d"])
         return float(entry["wins"] / entry["games"])
 
-    def save(self, policy, step: int) -> str:
+    def save(self, policy, step: int, config: dict, name_map: dict) -> str:
+        """A self-contained checkpoint, laid out like every other one; read
+        it with snapshot_weights (archives from before 2026-10-02 hold bare
+        state dicts)."""
         path = os.path.join(self.dir, f"snapshot-{step:07d}.pt")
         tmp = path + ".tmp"
-        torch.save(policy.state_dict(), tmp)
+        torch.save({"config": config,
+                    "state": {"policy": policy.state_dict(), "name_map": name_map, "step": step}}, tmp)
         os.replace(tmp, path)
         if path not in self.archive:  # crash-restore can re-save a step
             self.archive.append(path)

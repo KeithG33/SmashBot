@@ -25,7 +25,7 @@ import typing as tp
 
 import torch
 
-from smashbot.rl.pool import SnapshotPool, _is_import_key
+from smashbot.rl.pool import SnapshotPool, _is_import_key, snapshot_weights
 
 
 class MemberWeights:
@@ -37,8 +37,8 @@ class MemberWeights:
         self._inflight: dict[str, threading.Thread] = {}
 
     def _load(self, member: str) -> dict:
-        return torch.load(self._path_of(member), map_location="cpu",
-                          weights_only=True)
+        return snapshot_weights(torch.load(self._path_of(member), map_location="cpu",
+                                           weights_only=True))
 
     def _put(self, member: str, sd: dict) -> None:
         with self._lock:
