@@ -10,6 +10,9 @@ least-squares fits on real frames from core's data bridge them:
   - the head's to_residual, so core's output (through that input layer)
     lands where io's head had its residual, on the delay-aligned stream the
     new model trains on (the first batch warms the recurrent state).
+An enhanced embed's character and action tables come from core's own one-hot
+columns when core has none (factor_enhanced_tables), else io's at their init
+std (rescale_enhanced).
 The value net is core's, its previous-stick input columns remapped to io's
 stick encoding when that changed: each bucket's column is the grid's x and y
 columns at the bucket's position.
@@ -91,6 +94,33 @@ def rescale_enhanced(policy) -> dict:
         for table in tables:
             table.weight.mul_(scale)
     return scales
+
+
+@torch.no_grad()
+def factor_enhanced_tables(core, target) -> dict:
+    """target's enhanced character and action tables from core's own one-hot
+    encoder columns: each value's columns across the four player slots (the
+    tables are shared by them), factored by SVD to the table width, at the
+    tables' init std (dims past the rank random at that std, so they can
+    train); the joint table at its zero init. The bridge then fits the
+    readout. Returns the fraction of each block's energy kept."""
+    enhanced = target.network.enhanced
+    width = enhanced.embed_char.weight.shape[1]
+    std = width ** -0.5
+    cols = leaf_columns(core.network.embed_state_action)
+    weight = core.network.core.encoder.weight.double()
+    kept = {}
+    for leaf, table in (("character", enhanced.embed_char), ("action", enhanced.embed_action)):
+        slots = [path for path in cols if path[0] == "state" and path[-1] == leaf]
+        assert len(slots) == 4, slots
+        u, s, vh = torch.linalg.svd(torch.cat([weight[:, cols[p]] for p in slots]), full_matrices=False)
+        rank = min(width, len(s))
+        codes = (s[:rank, None].sqrt() * vh[:rank]).T
+        codes = torch.cat([codes * std / codes.std(), torch.randn(len(codes), width - rank, dtype=codes.dtype) * std], 1)
+        table.weight.copy_(codes.float())
+        kept[f"{leaf}_energy_kept"] = ((s[:rank] ** 2).sum() / (s ** 2).sum()).item()
+    enhanced.embed_char_action.weight.zero_()
+    return kept
 
 
 @torch.no_grad()
@@ -177,8 +207,11 @@ def warm_start(core_path: str, io_path: str, out_path: str, n_batches: int = 5, 
     for p in (core, io, target):
         p.eval()
     batches = fit_batches(core_ckpt, target.delay, n_batches)
-    scales = rescale_enhanced(target)
-    report = {**bridge_policy(core, io, target, batches, head_rows), **scales}
+    if target.network.enhanced is not None and core.network.enhanced is None:
+        tables = factor_enhanced_tables(core, target)
+    else:
+        tables = rescale_enhanced(target)
+    report = {**bridge_policy(core, io, target, batches, head_rows), **tables}
 
     src_value, value = build_value_function(core_ckpt["config"], "cpu"), build_value_function(config, "cpu")
     src_value.load_state_dict(core_ckpt["state"]["value"])
