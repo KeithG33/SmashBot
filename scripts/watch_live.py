@@ -10,7 +10,7 @@ policy's delay-queue slack (18/21 frames = ~300ms of cushion), and the
 emitted action sequence is identical to the sync agent's.
 
 Player 1 is --p1 (or --p1-snapshot), as Fox; player 2 defaults to Phillip
-(medium-v2, random main-12 character). Final Destination, 1 game,
+(medium-v2, random main-12 character). A random legal stage each game, 1 game,
 replays saved, audio muted, torch.compile on (both policies warmed BEFORE
 Dolphin boots, so there is no compile stall at game start).
 
@@ -111,6 +111,21 @@ def resolve_specs(args) -> dict[int, SideSpec]:
             default_ckpt=DEFAULT_P2,
         ),
     }
+
+
+# the sim's six (melee_sim.config.Stage), which the RL bot trains on
+LEGAL_STAGES = ("FINAL_DESTINATION", "BATTLEFIELD", "YOSHIS_STORY", "DREAMLAND",
+                "POKEMON_STADIUM", "FOUNTAIN_OF_DREAMS")
+
+
+def resolve_stage(spec: str) -> str:
+    """'random' (or empty) draws a legal stage; otherwise validate the name."""
+    if not spec or spec.lower() == "random":
+        return random.choice(LEGAL_STAGES)
+    name = spec.upper()
+    if name not in melee.Stage.__members__:
+        raise ValueError(f"unknown stage {spec!r}")
+    return name
 
 
 def resolve_char(spec: str, rng=None) -> str:
@@ -246,7 +261,8 @@ def parse_args(argv=None):
                     help="player 1 character ('random' = random main-12)")
     ap.add_argument("--p2-char", default="random",
                     help="player 2 character (default: random main-12)")
-    ap.add_argument("--stage", default="FINAL_DESTINATION")
+    ap.add_argument("--stage", default="random",
+                    help="a stage name, or 'random' = a random legal stage each game")
     ap.add_argument("--games", type=int, default=1,
                     help="games to play; 0 = play forever (close the window "
                          "to stop)")
@@ -316,6 +332,7 @@ def main(argv=None) -> None:
     try:
         specs = resolve_specs(args)
         chars = {1: resolve_char(args.p1_char), 2: resolve_char(args.p2_char)}
+        stage = resolve_stage(args.stage)
     except ValueError as e:
         sys.exit(f"error: {e}")
 
@@ -333,7 +350,8 @@ def main(argv=None) -> None:
         print(f"P{port}: {info.label}{step}")
         print(f"    char {chars[port]} | delay {info.delay} | "
               f"{args.name!r} -> code {info.name_code}")
-    print(f"stage {args.stage} | games {args.games or 'forever'} | "
+    print(f"stage {stage}{' (random each game)' if stage != args.stage.upper() else ''} | "
+          f"games {args.games or 'forever'} | "
           f"device {device} | "
           f"compile {'on (warmed)' if args.compile else 'off'} | "
           f"mute {'on' if args.mute else 'off'} | "
@@ -355,7 +373,7 @@ def main(argv=None) -> None:
     dolphin = game_lib.make_dolphin(
         players,
         headless=False,
-        stage=args.stage,
+        stage=stage,
         fullscreen=args.fullscreen,
         gfx_backend=args.gfx_backend,
         mute=args.mute,
@@ -393,7 +411,9 @@ def main(argv=None) -> None:
             dolphin, agents, num_games=args.games, on_frame=on_frame
         ):
             records.append(record)
-            print(_describe(record, len(records)))
+            print(f"{_describe(record, len(records))} on {stage}")
+            stage = resolve_stage(args.stage)   # the next game's, chosen before its stage select
+            dolphin.stage = melee.Stage[stage]
     except EnetDisconnected:
         print(f"window closed, {len(records)} game"
               f"{'s' * (len(records) != 1)} recorded")
