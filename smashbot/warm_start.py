@@ -75,6 +75,25 @@ def _with_ones(x: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
+def rescale_enhanced(policy) -> dict:
+    """The enhanced embed's character table, and its action table with the
+    joint table (their sum is one input block), scaled to the tables' init
+    std; the bridge refits the input layer, so the bridged model computes the
+    same. Runs before 435101b trained tables from torch's N(0, 1) init."""
+    enhanced = policy.network.enhanced
+    if enhanced is None:
+        return {}
+    std = enhanced.embed_action.weight.shape[1] ** -0.5
+    scales = {}
+    for name, tables in (("char", (enhanced.embed_char,)),
+                         ("action", (enhanced.embed_action, enhanced.embed_char_action))):
+        scales[f"{name}_table_scale"] = scale = std / tables[0].weight.std().item()
+        for table in tables:
+            table.weight.mul_(scale)
+    return scales
+
+
+@torch.no_grad()
 def bridge_policy(core, io, target, batches, head_rows: int) -> dict:
     """target (io's config, io's weights on entry) gets core's recurrent
     layers and the two fitted layers; returns the fits' relative errors."""
@@ -158,7 +177,8 @@ def warm_start(core_path: str, io_path: str, out_path: str, n_batches: int = 5, 
     for p in (core, io, target):
         p.eval()
     batches = fit_batches(core_ckpt, target.delay, n_batches)
-    report = bridge_policy(core, io, target, batches, head_rows)
+    scales = rescale_enhanced(target)
+    report = {**bridge_policy(core, io, target, batches, head_rows), **scales}
 
     src_value, value = build_value_function(core_ckpt["config"], "cpu"), build_value_function(config, "cpu")
     src_value.load_state_dict(core_ckpt["state"]["value"])
