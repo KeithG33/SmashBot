@@ -30,10 +30,5 @@ measured with cudagraph compilation (the setting we run) on GPU, in ms per call.
 jigglypuff, cptfalcon, peach, yoshi, popo, luigi, pikachu, samus).
 - Table is on the full 841,682-replay dataset
 - Eval @Nk is the average of the ±3 evals around step N.
-- **The scaled Transformer had to drop to batch 352** to fit VRAM; the other two
-  ran 512. That is a real confound in its favour on a per-step basis (smaller
-  batch = more steps per epoch) and against it on wall-clock — it still loses to
-  SGU on both. Its run is named `transformer576-b382`, but the recorded config
-  says 352; the name is wrong.
 - `ffw+lstm` = tx_like = slippi-ai's / Phillip's architecture (LSTM recurrent core).
 - Params are totals (network + controller head + value head).
