@@ -18,6 +18,12 @@ measured with cudagraph compilation (the setting we run) on GPU, in ms per call.
 \* Largest batch that fit in memory
 <br>
 
+### Head-to-head dittos
+
+| Matchup                                     | Steps              | Games | W–L–D   | Win rate  | Stocks / game |
+|---------------------------------------------|:------------------:|------:|:-------:|----------:|--------------:|
+| Hybrid `slslsl` vs ffw+lstm (Phillip) fp32  | 666,890 vs 878,627 | 96    | 63–32–1 | **65.6%** | +0.62         |
+
 ## Notes
 
 - Both tables train on the **same 12 characters** (fox, falco, marth, sheik,
