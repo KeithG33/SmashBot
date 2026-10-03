@@ -20,13 +20,24 @@ measured with cudagraph compilation (the setting we run) on GPU, in ms per call.
 
 ### Head-to-head dittos
 
-| Matchup                                     | Steps              | Games | W–L–D   | Win rate  | Stocks / game |
-|---------------------------------------------|:------------------:|------:|:-------:|----------:|--------------:|
-| Hybrid `slslsl` vs ffw+lstm (Phillip) fp32  | 666,890 vs 878,627 | 96    | 63–32–1 | **65.6%** | +0.62         |
-
-| Matchup                                     | Fox | Falco | Marth | Sheik | Puff | Falcon | Peach | Yoshi | ICs | Luigi | Pikachu | Samus |
-|---------------------------------------------|:---:|:-----:|:-----:|:-----:|:----:|:------:|:-----:|:-----:|:---:|:-----:|:-------:|:-----:|
-| Hybrid `slslsl` vs ffw+lstm (Phillip) fp32  | 5–3 | 4–4   | 6–2   | 4–4   | 4–4  | 6–2    | 5–3   | 3–5   | 7–1 | 6–1–1 | 7–1     | 6–2   |
+|                   | Hybrid `slslsl` vs ffw+lstm (Phillip) fp32 |
+|-------------------|:------------------------------------------:|
+| Steps             | 666,890 vs 878,627                         |
+| Fox               | 5–3                                        |
+| Falco             | 4–4                                        |
+| Marth             | 6–2                                        |
+| Sheik             | 4–4                                        |
+| Puff              | 4–4                                        |
+| Falcon            | 6–2                                        |
+| Peach             | 5–3                                        |
+| Yoshi             | 3–5                                        |
+| ICs               | 7–1                                        |
+| Luigi             | 6–1–1                                      |
+| Pikachu           | 7–1                                        |
+| Samus             | 6–2                                        |
+| **Total (96)**    | **63–32–1**                                |
+| Win rate          | **65.6%**                                  |
+| Stocks / game     | +0.62                                      |
 
 ## Notes
 
