@@ -24,6 +24,10 @@ measured with cudagraph compilation (the setting we run) on GPU, in ms per call.
 |---------------------------------------------|:------------------:|------:|:-------:|----------:|--------------:|
 | Hybrid `slslsl` vs ffw+lstm (Phillip) fp32  | 666,890 vs 878,627 | 96    | 63–32–1 | **65.6%** | +0.62         |
 
+| Matchup                                     | Fox | Falco | Marth | Sheik | Puff | Falcon | Peach | Yoshi | ICs | Luigi | Pikachu | Samus |
+|---------------------------------------------|:---:|:-----:|:-----:|:-----:|:----:|:------:|:-----:|:-----:|:---:|:-----:|:-------:|:-----:|
+| Hybrid `slslsl` vs ffw+lstm (Phillip) fp32  | 5–3 | 4–4   | 6–2   | 4–4   | 4–4  | 6–2    | 5–3   | 3–5   | 7–1 | 6–1–1 | 7–1     | 6–2   |
+
 ## Notes
 
 - Both tables train on the **same 12 characters** (fox, falco, marth, sheik,
