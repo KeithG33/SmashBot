@@ -16,6 +16,7 @@ import torch.utils.checkpoint
 from torch import nn
 
 from smashbot.causal_conv import causal_conv, causal_conv_ring, ring_taps
+from smashbot.cudnn_lstm import cudnn_lstm
 
 RecurrentState = tp.Any
 
@@ -732,6 +733,21 @@ def keep_sgu_activations(module: nn.Module) -> None:
             m.recompute_uv = False
 
 
+def use_cudnn_lstm_op(module: nn.Module) -> None:
+    """For BC: the hybrid's LSTM layers run as one traceable cuDNN op
+    (cudnn_lstm.py, bit-identical to nn.LSTM), so the compiled core no longer
+    breaks its graph around them and fuses the glue (-2.3% BC step time). RL
+    keeps nn.LSTM: without the break each of its many core variants becomes a
+    whole-graph compile, which made the RL dry run slower."""
+    for m in module.modules():
+        if isinstance(m, RecurrentBlock):
+            m.cudnn_op = True
+    # compiled code reaches the LSTM's parameters, and the op's reserve buffer
+    # has a data-dependent size
+    torch._dynamo.config.allow_rnn = True
+    torch._dynamo.config.capture_dynamic_output_shape_ops = True
+
+
 def use_packed_encoder(module: nn.Module) -> None:
     """For the learners: each network's packed input embedding and its core's
     encoder run as one (PackedStructForward.encode), so the one-hot input is
@@ -780,6 +796,7 @@ class RecurrentBlock(nn.Module):
         nn.init.zeros_(self.down.weight)
 
     manual_step: bool = False   # serving: see RecurrentWrapper.manual_step
+    cudnn_op: bool = False      # BC: see use_cudnn_lstm_op
 
     def mix(self, x, h):
         """x [B, T, d], h [B, *state_shape] fp32 -> (x, h)."""
@@ -795,7 +812,10 @@ class RecurrentBlock(nn.Module):
                     out = h[:, None]
             else:
                 xt = xn.float().transpose(0, 1).contiguous()
-                if isinstance(self.rnn, nn.LSTM):
+                if self.cudnn_op and xt.is_cuda and isinstance(self.rnn, nn.LSTM):
+                    out, hn, cn = cudnn_lstm(self.rnn, xt, *(t[None].contiguous() for t in h.unbind(1)))
+                    h = torch.stack([hn[0], cn[0]], dim=1)
+                elif isinstance(self.rnn, nn.LSTM):
                     out, (hn, cn) = self.rnn(xt, tuple(t[None].contiguous() for t in h.unbind(1)))
                     h = torch.stack([hn[0], cn[0]], dim=1)
                 else:

@@ -29,7 +29,7 @@ from smashbot import configs, embed as embed_lib, saving
 from smashbot.data import loader
 from smashbot.delay import slice_delayed_frames
 from smashbot.networks import (check_loadable, keep_sgu_activations, use_bf16_cells,
-                               use_chunk_start_resets, use_packed_encoder)
+                               use_chunk_start_resets, use_cudnn_lstm_op, use_packed_encoder)
 from smashbot.policy import ActionLoss, EnergyScore, StickScorer, build_policy, imitation_metrics, stick_metrics
 from smashbot.training import GradClipper, compile_cores, resolve_restore
 from smashbot.value import build_value_function
@@ -289,6 +289,8 @@ def main(config: TrainConfig) -> None:
     use_chunk_start_resets(value_fn)
     keep_sgu_activations(policy)
     keep_sgu_activations(value_fn)
+    use_cudnn_lstm_op(policy)
+    use_cudnn_lstm_op(value_fn)
     use_packed_encoder(policy)
     use_packed_encoder(value_fn)
     if config.learner.bf16_cells:

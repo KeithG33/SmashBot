@@ -123,7 +123,8 @@ def compile_cores(policy, value_fn, teacher=None) -> None:
     """Compile the pieces with a fixed structure, dynamic over the chunk
     length: the packed input embeddings and their encode (in eager each of
     their out-of-place writes copies the whole input), an SGU core's
-    per-chunk forward (cuDNN recurrent layers stay eager inside it), the
+    per-chunk forward (cuDNN recurrent layers stay eager inside it unless
+    use_cudnn_lstm_op made them one traced op), the
     enhanced embed (the big Phillips' input layer), a
     tx_like core's stateless layers (the encoder and the FFW blocks between
     its LSTMs), the controller head, and the value net's return recursion
