@@ -257,14 +257,15 @@ def test_grid_ring_matches_canonical_under_capture(layout, read):
 @GPU
 def test_fp16_grid_keeps_norm_weights_fp32():
     """The grid's fp16 weight stack keeps the norms' weights fp32, so the
-    fp32 norms stay on the fused kernel; every matrix is fp16."""
+    fp32 norms stay on the fused kernel, and the controller head's (it runs
+    in fp32, Policy.fp32_head); every other matrix is fp16."""
     from smashbot.rl.agent import LeagueAgent
     grid = LeagueAgent(_policy("sls", "cuda"), 2, 4, 1, "cuda", weights_dtype=torch.float16,
                        state_dtype=torch.float16)
-    norms = [k for k in grid._stacked_params if "norm" in k]
-    assert norms and all(grid._stacked_params[k].dtype == torch.float32 for k in norms)
+    fp32 = [k for k in grid._stacked_params if "norm" in k or k.startswith("controller_head.")]
+    assert fp32 and all(grid._stacked_params[k].dtype == torch.float32 for k in fp32)
     assert all(t.dtype == torch.float16 for k, t in grid._stacked_params.items()
-               if k not in norms and t.dim() > 2)
+               if k not in fp32 and t.dim() > 2)
 
 
 @GPU
