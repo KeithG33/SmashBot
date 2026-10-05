@@ -275,6 +275,37 @@ def test_worker_side_encode_matches_policy_encode():
     worker_embed.from_state(scalar_game)  # must not raise
 
 
+def test_game_outcome_breaks_level_stocks_on_percent():
+    from smashbot.rl.rollouts import game_outcome
+
+    assert game_outcome(2, 1, 150.0, 0.0) == 1
+    assert game_outcome(0, 3, 0.0, 0.0) == -1
+    assert game_outcome(2, 2, 40.9, 75.0) == 1      # the timer: lower percent wins
+    assert game_outcome(1, 1, 99.0, 12.0) == -1
+    assert game_outcome(1, 1, 60.2, 60.8) == 0      # same whole percent on the HUD
+    assert game_outcome(0, 0, 10.0, 80.0) == 0      # a double KO on the last stock
+
+
+def test_tracker_counts_tiebroken_timeouts():
+    from smashbot.rl.rollouts import GameTracker
+
+    t = GameTracker(window=4)
+    t.add_game((2, 2), opp_char="FOX", outcome=1)
+    t.add_game((1, 1), opp_char="FOX", outcome=-1)
+    t.add_game((3, 0), opp_char="FOX")
+    assert (t.wins, t.losses, t.draws) == (2, 1, 0)
+    assert t.stats()["win_rate_recent"] == pytest.approx(2 / 3)
+    assert t.stats()["avg_stock_diff"] == pytest.approx(1.0)
+    assert t.by_char["FOX"] == (2, 3)
+
+    restored = GameTracker(window=4)
+    restored.load_state(t.state())
+    assert restored.stats() == t.stats()
+    before_tiebreak = GameTracker(window=4)
+    before_tiebreak.load_state({"diffs": [2, 0, -1], "wins": 1, "losses": 1, "draws": 1})
+    assert list(before_tiebreak.outcomes) == [1, 0, -1]
+
+
 def test_game_tracker():
     from smashbot.rl.rollouts import GameTracker
 

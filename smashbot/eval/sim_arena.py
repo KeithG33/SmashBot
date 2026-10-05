@@ -109,6 +109,7 @@ class MatchSet:
                          msl.PlayerConfig(msl.Character[b], controller_port=1 - port)),
                 seed=rng.getrandbits(31), max_frame=MAX_GAME_FRAMES))
         self.results: list = [None] * len(self.slate)   # game -> (student stocks, opponent stocks)
+        self.outcomes: list = [None] * len(self.slate)  # game -> rollouts.game_outcome, student's view
         self.kill_percents: list = [[] for _ in self.slate]    # game -> opponent % at our kills
         self.death_percents: list = [[] for _ in self.slate]   # game -> our % at our deaths
         unplayed = iter(range(len(self.slate)))
@@ -119,10 +120,11 @@ class MatchSet:
 
         # game_info[env]: the slate game the env's frames belong to (None for
         # a filler), held until the next game's first frame
-        def on_game(env, gid, s0, s1):
+        def on_game(env, gid, s0, s1, outcome):
             game = self.worker.game_info[env]
             if game is not None:
                 self.results[game] = (s0, s1)
+                self.outcomes[game] = outcome
 
         def on_event(env, gid, kind, percent):
             game = self.worker.game_info[env]
@@ -145,8 +147,8 @@ class MatchSet:
 
     def stats(self) -> dict:
         games = len(self.results)
-        wins = sum(s0 > s1 for s0, s1 in self.results)
-        losses = sum(s0 < s1 for s0, s1 in self.results)
+        wins = sum(o > 0 for o in self.outcomes)
+        losses = sum(o < 0 for o in self.outcomes)
         kills = [p for game in self.kill_percents for p in game]
         deaths = [p for game in self.death_percents for p in game]
         mean = lambda xs: sum(xs) / len(xs) if xs else float("nan")

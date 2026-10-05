@@ -17,6 +17,7 @@ Dolphin remains for human play/watching via eval/game.py.
 
 from __future__ import annotations
 
+import math
 import typing as tp
 
 import numpy as np
@@ -266,6 +267,19 @@ def compute_reward(
     return torch.where(is_resetting, torch.zeros_like(reward), reward)
 
 
+def game_outcome(s0: int, s1: int, p0: float, p1: float) -> int:
+    """Seat 0's result, +1 / -1 / 0. More stocks wins; stocks level at the
+    timer go to the lower whole percent, as tournament rules and Slippi score
+    a timeout. A draw needs level percents too, or a double KO on the last
+    stock."""
+    if s0 != s1:
+        return 1 if s0 > s1 else -1
+    if s0 == 0:
+        return 0
+    a, b = math.floor(p0), math.floor(p1)
+    return (a < b) - (a > b)
+
+
 class GameTracker:
     """Game-outcome metrics vs the CURRENT training opponent (teacher now,
     snapshot pool later); fixed-yardstick evals stay in the M8 batteries.
@@ -283,6 +297,7 @@ class GameTracker:
         import collections
 
         self.diffs = collections.deque(maxlen=window)  # per finished game
+        self.outcomes = collections.deque(maxlen=window)
         self.kill_percents = collections.deque(maxlen=event_window)
         self.death_percents = collections.deque(maxlen=event_window)
         self.wins = self.losses = self.draws = 0
@@ -294,23 +309,27 @@ class GameTracker:
         self.by_char: dict[str, tuple[int, int]] = {}
 
     def add_game(self, final_stocks: tuple[int, int],
-                 opp_char: str | None = None) -> None:
+                 opp_char: str | None = None, outcome: int | None = None) -> None:
+        """outcome: game_outcome's result (default: the stocks alone)."""
         bot, opp = final_stocks
         diff = bot - opp
+        if outcome is None:
+            outcome = (diff > 0) - (diff < 0)
         # Winrate by OPPONENT character (locked members excluded at the
         # call site: their identity would pollute their char's column).
-        if opp_char and diff != 0:
+        if opp_char and outcome:
             w, g = self.by_char.get(opp_char, (0, 0))
-            self.by_char[opp_char] = (w + (1 if diff > 0 else 0), g + 1)
+            self.by_char[opp_char] = (w + (outcome > 0), g + 1)
         self.diffs.append(diff)
-        if bot > opp:
+        self.outcomes.append(outcome)
+        if outcome > 0:
             self.wins += 1
-        elif opp > bot:
+        elif outcome < 0:
             self.losses += 1
         else:
             self.draws += 1
-        if diff != 0:  # EMA over decided games, matching win_rate_recent
-            self.win_ema = self._ema_step(self.win_ema, 1.0 if diff > 0 else 0.0,
+        if outcome:  # EMA over decided games, matching win_rate_recent
+            self.win_ema = self._ema_step(self.win_ema, float(outcome > 0),
                                           self.wins + self.losses)
         self.diff_ema = self._ema_step(self.diff_ema, diff,
                                        self.wins + self.losses + self.draws)
@@ -333,6 +352,7 @@ class GameTracker:
                 "wins": self.wins, "losses": self.losses,
                 "draws": self.draws,
                 "diffs": [int(d) for d in self.diffs],
+                "outcomes": [int(o) for o in self.outcomes],
                 "kill_percents": [float(p) for p in self.kill_percents],
                 "death_percents": [float(p) for p in self.death_percents]}
 
@@ -342,7 +362,10 @@ class GameTracker:
         self.wins = st.get("wins", 0)
         self.losses = st.get("losses", 0)
         self.draws = st.get("draws", 0)
-        self.diffs.extend(st.get("diffs", ()))
+        diffs = st.get("diffs", ())
+        self.diffs.extend(diffs)
+        # states saved before the percent tiebreak: the stocks' verdicts
+        self.outcomes.extend(st.get("outcomes", [(d > 0) - (d < 0) for d in diffs]))
         self.kill_percents.extend(st.get("kill_percents", ()))
         self.death_percents.extend(st.get("death_percents", ()))
 
@@ -354,11 +377,11 @@ class GameTracker:
 
     def stats(self) -> dict:
         mean = lambda xs: float(sum(xs) / len(xs)) if xs else 0.0
-        decided = [d for d in self.diffs if d != 0]
+        decided = [o for o in self.outcomes if o]
         return {
             "games_played": self.wins + self.losses + self.draws,
             "win_rate_recent": (
-                sum(1 for d in decided if d > 0) / len(decided) if decided else 0.5
+                sum(1 for o in decided if o > 0) / len(decided) if decided else 0.5
             ),
             "avg_stock_diff": mean(self.diffs),
             "avg_percent_at_kill": mean(self.kill_percents),

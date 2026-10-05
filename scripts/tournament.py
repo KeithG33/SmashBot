@@ -69,8 +69,8 @@ def main():
         print(f"  {a} vs {b}: {st['wins']}-{st['losses']}-{st['draws']} of {st['games']} "
               f"(stockdiff {st['avg_stock_diff']:+.2f}, {seconds / 60:.1f} min)", flush=True)
         by_char = collections.defaultdict(lambda: [0, 0, 0])
-        for (char, _), (s0, s1) in zip(ms.slate, ms.results):
-            by_char[char][0 if s0 > s1 else 1 if s1 > s0 else 2] += 1
+        for (char, _), outcome in zip(ms.slate, ms.outcomes):
+            by_char[char][0 if outcome > 0 else 1 if outcome < 0 else 2] += 1
         print("    by " + a + "'s character: " + ", ".join(
             f"{c} {w}-{l}" + (f"-{d}" if d else "") for c, (w, l, d) in by_char.items()), flush=True)
 

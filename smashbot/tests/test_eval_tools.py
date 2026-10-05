@@ -11,6 +11,7 @@ import torch
 from smashbot import train_bc
 from smashbot.eval import sim_arena
 from smashbot.eval.sim_arena import load_player, unique_labels
+from smashbot.rl.rollouts import game_outcome
 from smashbot.tests.test_restart_guard import _config
 
 
@@ -41,9 +42,11 @@ def test_labels_keep_same_named_checkpoints_apart():
         unique_labels(["/r/a/best.pt", "/r/./a/best.pt"])
 
 
-# slate game -> (frames it lasts, final stocks); a stock lost to 0 is an event on its last frame
-SCRIPT = [(10, (0, 2)), (50, (1, 1)), (10, (3, 0)), (10, (2, 1)), (60, (0, 1))]
-FILLER = (5, (0, 3))
+# slate game -> (frames it lasts, final stocks, final percents); a stock lost
+# to 0 is an event on its last frame; the level-stocks game goes to the timer
+SCRIPT = [(10, (0, 2), (0, 30)), (50, (1, 1), (85.6, 60.2)), (10, (3, 0), (40, 0)),
+          (10, (2, 1), (12, 99)), (60, (0, 1), (0, 70))]
+FILLER = (5, (0, 3), (0, 0))
 
 
 class _ScriptedWorker:
@@ -71,12 +74,12 @@ class _ScriptedWorker:
                     continue
                 self.left[env] -= 1
                 if self.left[env] == 0:
-                    s0, s1 = self._script(env)[1]
+                    _, (s0, s1), (p0, p1) = self._script(env)
                     if s0 == 0:
                         self.event_fn(env, "opponent", "death", 40.0)
                     if s1 == 0:
                         self.event_fn(env, "opponent", "kill", 90.0)
-                    self.record_fn(env, "opponent", s0, s1)
+                    self.record_fn(env, "opponent", s0, s1, game_outcome(s0, s1, p0, p1))
                     self.pending[env] = self.match_fn(env, "opponent")[1]
         return [], []
 
@@ -93,9 +96,10 @@ def test_matchset_counts_each_slate_game_once_and_never_a_filler(monkeypatch):
     monkeypatch.setattr("smashbot.rl.sim_league.MultiOpponentSimWorker", _ScriptedWorker)
     ms = sim_arena.MatchSet(None, None, sim_arena.stratified(len(SCRIPT)), "", envs=2, unroll=8)
     ms.run()   # env 1 plays fillers from frame ~50 while env 0 plays the last game to ~95
-    assert ms.results == [outcome for _, outcome in SCRIPT]
+    assert ms.results == [stocks for _, stocks, _ in SCRIPT]
+    assert ms.outcomes == [-1, -1, 1, 1, -1]   # level stocks at 85% vs 60%: a loss
     assert [len(d) for d in ms.death_percents] == [1, 0, 0, 0, 1]
     assert [len(k) for k in ms.kill_percents] == [0, 0, 1, 0, 0]
     st = ms.stats()
-    assert (st["games"], st["wins"], st["losses"], st["draws"]) == (5, 2, 2, 1)
+    assert (st["games"], st["wins"], st["losses"], st["draws"]) == (5, 2, 3, 0)
     assert (st["avg_percent_at_kill"], st["avg_percent_at_death"]) == (90.0, 40.0)
