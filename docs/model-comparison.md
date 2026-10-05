@@ -46,4 +46,4 @@ jigglypuff, cptfalcon, peach, yoshi, popo, luigi, pikachu, samus).
 - Table is on the full 841,682-replay dataset
 - Eval @Nk is the average of the ±3 evals around step N.
 - `ffw+lstm` = tx_like = slippi-ai's / Phillip's architecture (LSTM recurrent core).
-- Params are totals (network + controller head + value head).
+- Params are the policy's parameters (network + embeddings + controller head), as each run prints them; the separate value net is not counted.
