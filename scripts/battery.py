@@ -4,7 +4,7 @@ opponents on melee-sim-light. Every opponent plays the same fixed games
 each played to its end and counted once. The JSON report is rewritten after
 every opponent, so a failure keeps the results before it.
 
-Default slate: the five Phillip tiers, the fixed opponents RL trains and
+Default slate: the twelve Phillip tiers, the fixed opponents RL trains and
 measures against.
 
   .venv/bin/python scripts/battery.py --ckpt <student.pt> [--games 96]
@@ -22,14 +22,10 @@ import torch
 
 from smashbot import paths
 from smashbot.eval.sim_arena import MatchSet, full_grid, load_player, stratified
+from smashbot.rl.train_sim import PHILLIP_FILES, SimRolloutConfig
 
-SLATE = {
-    "medium":  paths.MODELS_DIR / "medium-v2-torch.pt",
-    "plat":    paths.MODELS_DIR / "plat-torch.pt",
-    "diamond": paths.MODELS_DIR / "diamond-torch.pt",
-    "master":  paths.MODELS_DIR / "master-torch.pt",
-    "gm":      paths.MODELS_DIR / "gm-torch.pt",
-}
+SLATE = {tier: paths.MODELS_DIR / PHILLIP_FILES.get(tier, (f"{tier}-torch.pt",))[0]
+         for tier in SimRolloutConfig.phillip_tiers}
 
 
 def _write(path: str, report: dict) -> None:
