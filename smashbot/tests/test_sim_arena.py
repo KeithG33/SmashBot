@@ -1,6 +1,6 @@
-"""MatchSet plays a fixed slate: every game once and to its end, each
-counted once, and a game's kills and deaths on that game, its last stock
-included."""
+"""MatchSet plays a fixed slate for each player of a stacked grid: every
+game once and to its end, each counted once for its player, and a game's
+kills and deaths on that game, its last stock included."""
 import sys
 
 import pytest
@@ -23,14 +23,17 @@ def test_every_game_of_the_slate_is_played_to_its_end_and_counted_once(monkeypat
     monkeypatch.setattr(msl, "MatchConfig", lambda **kw: one_stock(**{**kw, "stocks": 1}))
     monkeypatch.setattr(sim_arena, "MAX_GAME_FRAMES", 900)   # 15 s: some games end on the timer
     torch.manual_seed(1)
-    ms = sim_arena.MatchSet(_tiny_policy(0), _tiny_policy(1), sim_arena.stratified(4, seed=3),
-                            str(paths.MSL_DATA_DIR), envs=2)   # the last two games go to whichever env frees first
+    players = [(_tiny_policy(0), 1), (_tiny_policy(2), 1)]   # one grid, two slices
+    ms = sim_arena.MatchSet(players, _tiny_policy(1), sim_arena.stratified(4, seed=3),
+                            str(paths.MSL_DATA_DIR), envs=2)   # a player's last two games go to whichever of its seats frees first
     ms.run()
     ms.close()
-    assert None not in ms.results
-    assert any(0 in r for r in ms.results) and (1, 1) in ms.results   # both ways a game ends
-    for (s0, s1), deaths, kills in zip(ms.results, ms.death_percents, ms.kill_percents):
-        assert (len(deaths), len(kills)) == (1 - s0, 1 - s1)   # a game's last stock is its own
-    st = ms.stats()
-    assert (st["games"], st["wins"] + st["losses"] + st["draws"]) == (4, 4)
-    assert st["win_rate"] == st["wins"] / 4
+    for p in range(2):
+        assert None not in ms.results[p]
+        for (s0, s1), deaths, kills in zip(ms.results[p], ms.death_percents[p], ms.kill_percents[p]):
+            assert (len(deaths), len(kills)) == (1 - s0, 1 - s1)   # a game's last stock is its own
+        st = ms.stats(p)
+        assert (st["games"], st["wins"] + st["losses"] + st["draws"]) == (4, 4)
+        assert st["win_rate"] == st["wins"] / 4
+    results = ms.results[0] + ms.results[1]
+    assert any(0 in r for r in results) and (1, 1) in results   # both ways a game ends

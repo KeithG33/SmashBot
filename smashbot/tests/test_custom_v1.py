@@ -151,7 +151,7 @@ def test_grid_serves_each_phillip_as_it_would_alone():
 
 
 def test_phillip_tiers_group_into_grids_by_architecture():
-    from smashbot.rl.train_sim import group_by_architecture
+    from smashbot.rl.sim_league import group_by_architecture
 
     def small():
         return build_policy(

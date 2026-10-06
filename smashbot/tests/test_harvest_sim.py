@@ -51,7 +51,7 @@ def test_grid_seat_is_harvested_as_what_it_pressed(monkeypatch):
     grid.load(0, "opponent", lambda key: opponent.state_dict())
     grid.assign_static([list(range(N))])
     worker = sim_league.MultiOpponentSimWorker(
-        student, [], N, T, str(paths.MSL_DATA_DIR), msl.Stage.FINAL_DESTINATION,
+        student, N, T, str(paths.MSL_DATA_DIR), msl.Stage.FINAL_DESTINATION,
         [(msl.Character.FOX, msl.Character.FALCON)] * N, name_code=1, grids=[grid],
         max_frame=50)   # games end on the timer: resets inside the run
     _, chunks = worker.collect(12 * T)
@@ -86,7 +86,7 @@ def test_self_play_second_seat_plays_but_is_not_a_learner_row(monkeypatch):
 
     monkeypatch.setattr(sim_env, "write_controller_rows", record)
     worker = sim_league.MultiOpponentSimWorker(
-        student, [], N, T, str(paths.MSL_DATA_DIR), msl.Stage.FINAL_DESTINATION,
+        student, N, T, str(paths.MSL_DATA_DIR), msl.Stage.FINAL_DESTINATION,
         [(msl.Character.FOX, msl.Character.FALCON)] * N, name_code=1,
         self_idx=range(N), max_frame=50)
     executed = []
@@ -127,7 +127,7 @@ def test_sharded_sim_steps_as_one_batch():
     def run(shards):
         student = _policy(delay=2, seed=0)
         worker = sim_league.MultiOpponentSimWorker(
-            student, [], N, T, str(paths.MSL_DATA_DIR), None, None, name_code=1,
+            student, N, T, str(paths.MSL_DATA_DIR), None, None, name_code=1,
             self_idx=range(N), match_fn=match, shards=shards)
         torch.manual_seed(1)
         chunks, _ = worker.collect(12 * T)

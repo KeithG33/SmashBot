@@ -1,16 +1,17 @@
-"""Sim eval battery: a student checkpoint against a slate of reference
-opponents on melee-sim-light. Every opponent plays the same fixed games
-(--games of them, stratified over the 12 characters, or the 144-pair grid),
-each played to its end and counted once. The JSON report is rewritten after
-every opponent, so a failure keeps the results before it.
+"""Sim eval battery: student checkpoints against a slate of reference
+opponents on melee-sim-light. Every checkpoint plays the same fixed games
+against every opponent (--games of them, stratified over the 12 characters,
+or the 144-pair grid), each played to its end and counted once. The
+checkpoints play together, as slices of one stacked grid (one vmapped
+forward per frame, as RL serves its league), so on the GPU a dozen cost
+about what one does. The JSON report is rewritten after every opponent, so
+a failure keeps the results before it.
 
 Default slate: the twelve Phillip tiers, the fixed opponents RL trains and
 measures against.
 
-  .venv/bin/python scripts/battery.py --ckpt <student.pt> [--games 96]
-      [--device cpu] [--opponents gm,master] [--out report.json]
-
-CPU-friendly (runs alongside GPU training); GPU when free is ~10x faster.
+  .venv/bin/python scripts/battery.py --ckpt <a.pt> [<b.pt> ...] [--games 96]
+      [--device cuda] [--envs 144] [--opponents gm,master] [--out report.json]
 """
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ import time
 import torch
 
 from smashbot import paths
-from smashbot.eval.sim_arena import MatchSet, full_grid, load_player, stratified
+from smashbot.eval.sim_arena import MatchSet, full_grid, load_player, stratified, unique_labels
 from smashbot.rl.train_sim import PHILLIP_FILES, SimRolloutConfig
 
 SLATE = {tier: paths.MODELS_DIR / PHILLIP_FILES.get(tier, (f"{tier}-torch.pt",))[0]
@@ -37,8 +38,8 @@ def _write(path: str, report: dict) -> None:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", required=True,
-                    help="student checkpoint (full, or bare weights with --config-from)")
+    ap.add_argument("--ckpt", nargs="+", required=True,
+                    help="student checkpoints (full, or bare weights with --config-from)")
     ap.add_argument("--config-from", default="",
                     help="full checkpoint whose config builds a bare --ckpt")
     ap.add_argument("--games", type=int, default=96,
@@ -47,7 +48,7 @@ def main():
                     help="the full 144-pair character grid instead, --grid-games "
                          "per pair, per-pair results in the report")
     ap.add_argument("--grid-games", type=int, default=1)
-    ap.add_argument("--envs", type=int, default=48, help="games played at once")
+    ap.add_argument("--envs", type=int, default=48, help="games played at once per checkpoint")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--threads", type=int, default=16)
     ap.add_argument("--opponents", default="",
@@ -63,32 +64,37 @@ def main():
     unknown = [n for n in names if n not in SLATE]
     if unknown:
         ap.error(f"unknown opponents {unknown}; the slate is {list(SLATE)}")
-    student, student_code, step = load_player(args.ckpt, args.device, args.config_from)
-    opponents = {n: load_player(str(SLATE[n]), args.device) for n in names}   # a bad slate fails before any game
+    labels = unique_labels(args.ckpt)
+    students = [load_player(path, "cpu", args.config_from) for path in args.ckpt]   # the grid copies them
+    opponents = {n: load_player(str(SLATE[n]), "cpu") for n in names}   # a bad slate fails before any game
     pairs = full_grid(args.seed) if args.grid else stratified(args.games, args.seed)
     slate = pairs * args.grid_games if args.grid else pairs
-    print(f"battery: {args.ckpt} (step {step}) vs {names} | {len(slate)} games each "
-          f"on {args.device}", flush=True)
+    print(f"battery: {', '.join(f'{l} (step {s})' for l, (_, _, s) in zip(labels, students))} "
+          f"vs {names} | {len(slate)} games each on {args.device}", flush=True)
 
-    report = {"ckpt": args.ckpt, "step": step, "seed": args.seed, "games": len(slate),
-              "opponents": {}}
+    report = {"seed": args.seed, "games": len(slate), "checkpoints": {
+        label: {"ckpt": path, "step": step, "opponents": {}}
+        for label, path, (_, _, step) in zip(labels, args.ckpt, students)}}
     for name, (opponent, opponent_code, _) in opponents.items():
-        ms = MatchSet(student, opponent, slate, args.data_dir, args.envs, args.device,
-                      student_name_code=student_code, opp_name_code=opponent_code)
         print(f"  vs {name}", flush=True)
         start = time.perf_counter()
+        ms = MatchSet([(policy, code) for policy, code, _ in students], opponent, slate,
+                      args.data_dir, args.envs, args.device, opp_name_code=opponent_code)
         ms.run()
-        seconds = time.perf_counter() - start
         ms.close()
-        st = ms.stats()
-        if args.grid:
-            st["pairs"] = {f"{a}|{b}": [list(r) for r in ms.results[i::len(pairs)]]
-                           for i, (a, b) in enumerate(pairs)}
-        report["opponents"][name] = st
-        print(f"  vs {name:11s} win {st['win_rate']:.3f} ({st['wins']}-{st['losses']}"
-              f"-{st['draws']} of {st['games']}) | stockdiff {st['avg_stock_diff']:+.2f} | "
-              f"kill@{st['avg_percent_at_kill']:.0f}% die@{st['avg_percent_at_death']:.0f}% | "
-              f"{seconds / 60:.1f} min", flush=True)
+        opponent.to("cpu")
+        seconds = time.perf_counter() - start
+        for i, label in enumerate(labels):
+            st = ms.stats(i)
+            if args.grid:
+                st["pairs"] = {f"{a}|{b}": [list(r) for r in ms.results[i][k::len(pairs)]]
+                               for k, (a, b) in enumerate(pairs)}
+            report["checkpoints"][label]["opponents"][name] = st
+            print(f"  {label} vs {name}: win {st['win_rate']:.3f} ({st['wins']}-{st['losses']}"
+                  f"-{st['draws']} of {st['games']}) | stockdiff {st['avg_stock_diff']:+.2f} | "
+                  f"kill@{st['avg_percent_at_kill']:.0f}% die@{st['avg_percent_at_death']:.0f}%",
+                  flush=True)
+        print(f"  vs {name}: {seconds / 60:.1f} min", flush=True)
         if args.out:
             _write(args.out, report)
     if args.out:

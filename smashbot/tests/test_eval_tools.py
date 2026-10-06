@@ -1,5 +1,6 @@
 """The eval tools: MatchSet's bookkeeping over a scripted worker (every slate
-game counted once, fillers never, the run held until the last game ends); a
+game counted once for its player, fillers never, the run held until the
+last game ends, results turned to the players' side); a
 full checkpoint loads alone, bare snapshot weights take the config of a full
 checkpoint, a refused checkpoint raises its own error; two runs' best.pt stay
 two entries."""
@@ -42,28 +43,38 @@ def test_labels_keep_same_named_checkpoints_apart():
         unique_labels(["/r/a/best.pt", "/r/./a/best.pt"])
 
 
-# slate game -> (frames it lasts, final stocks, final percents); a stock lost
-# to 0 is an event on its last frame; the level-stocks game goes to the timer
+# slate game -> (frames it lasts, final stocks, final percents), seat 0 (the
+# opponent) first; a stock lost to 0 is an event on its last frame; the
+# level-stocks game goes to the timer. Player 1's games are the mirror.
 SCRIPT = [(10, (0, 2), (0, 30)), (50, (1, 1), (85.6, 60.2)), (10, (3, 0), (40, 0)),
           (10, (2, 1), (12, 99)), (60, (0, 1), (0, 70))]
 FILLER = (5, (0, 3), (0, 0))
 
 
 class _ScriptedWorker:
-    """MultiOpponentSimWorker's protocol with scripted games: match_fn at boot
-    and at every game end, record_fn at the end, the next game's info
-    committed on the frame after (the entry frame)."""
+    """MultiOpponentSimWorker's protocol with scripted games: each env's
+    player is the grid member seated on it, match_fn at boot and at every
+    game end, record_fn at the end, the next game's info committed on the
+    frame after (the entry frame)."""
 
-    def __init__(self, student, opponents, n, unroll, data_dir, stage, char_pairs, *,
-                 record_fn, event_fn, match_fn, **_):
+    def __init__(self, opponent, n, unroll, data_dir, stage, char_pairs, *,
+                 grids, record_fn, event_fn, match_fn, **_):
         self.record_fn, self.event_fn, self.match_fn = record_fn, event_fn, match_fn
-        self.game_info = [match_fn(e, "opponent")[1] for e in range(n)]
+        self.player = [None] * n
+        for gr in grids:
+            for c in range(gr.S * gr.Nc):
+                if gr.valid[c]:
+                    self.player[gr.cell_env[c]] = gr.members[c // gr.Nc]
+        self.game_info = [match_fn(e, self.player[e])[1] for e in range(n)]
         self.left = [self._script(e)[0] for e in range(n)]
         self.pending = {}
 
     def _script(self, env):
         game = self.game_info[env]
-        return FILLER if game is None else SCRIPT[game]
+        frames, stocks, percents = FILLER if game is None else SCRIPT[game]
+        if self.player[env] == 1:
+            stocks, percents = stocks[::-1], percents[::-1]
+        return frames, stocks, percents
 
     def collect(self, frames):
         for _ in range(frames):
@@ -75,31 +86,37 @@ class _ScriptedWorker:
                 self.left[env] -= 1
                 if self.left[env] == 0:
                     _, (s0, s1), (p0, p1) = self._script(env)
+                    player = self.player[env]
                     if s0 == 0:
-                        self.event_fn(env, "opponent", "death", 40.0)
+                        self.event_fn(env, player, "death", 40.0)
                     if s1 == 0:
-                        self.event_fn(env, "opponent", "kill", 90.0)
-                    self.record_fn(env, "opponent", s0, s1, game_outcome(s0, s1, p0, p1))
-                    self.pending[env] = self.match_fn(env, "opponent")[1]
+                        self.event_fn(env, player, "kill", 90.0)
+                    self.record_fn(env, player, s0, s1, game_outcome(s0, s1, p0, p1))
+                    self.pending[env] = self.match_fn(env, player)[1]
         return [], []
 
     def close(self):
         pass
 
 
-def test_matchset_counts_each_slate_game_once_and_never_a_filler(monkeypatch):
+def test_matchset_counts_each_slate_game_once_per_player_and_never_a_filler(monkeypatch):
+    from smashbot.tests.test_ppo import _tiny_policy
     fake_sim = types.SimpleNamespace(
         Stage=["FD", "BF"], Character={c: c for c in sim_arena.MAIN_12_MSL},
         PlayerConfig=lambda character, controller_port: (character, controller_port),
         MatchConfig=lambda **kw: kw)
     monkeypatch.setitem(__import__("sys").modules, "melee_sim", fake_sim)
     monkeypatch.setattr("smashbot.rl.sim_league.MultiOpponentSimWorker", _ScriptedWorker)
-    ms = sim_arena.MatchSet(None, None, sim_arena.stratified(len(SCRIPT)), "", envs=2, unroll=8)
-    ms.run()   # env 1 plays fillers from frame ~50 while env 0 plays the last game to ~95
-    assert ms.results == [stocks for _, stocks, _ in SCRIPT]
-    assert ms.outcomes == [-1, -1, 1, 1, -1]   # level stocks at 85% vs 60%: a loss
-    assert [len(d) for d in ms.death_percents] == [1, 0, 0, 0, 1]
-    assert [len(k) for k in ms.kill_percents] == [0, 0, 1, 0, 0]
-    st = ms.stats()
-    assert (st["games"], st["wins"], st["losses"], st["draws"]) == (5, 2, 3, 0)
-    assert (st["avg_percent_at_kill"], st["avg_percent_at_death"]) == (90.0, 40.0)
+    players = [(_tiny_policy(0), 1), (_tiny_policy(1), 1)]
+    ms = sim_arena.MatchSet(players, _tiny_policy(2), sim_arena.stratified(len(SCRIPT)), "",
+                            envs=2, unroll=8)
+    ms.run()   # a seat plays fillers from frame ~50 while its sibling plays the last game to ~95
+    assert ms.results[0] == [stocks[::-1] for _, stocks, _ in SCRIPT]   # the player is seat 1
+    assert ms.outcomes[0] == [1, 1, -1, -1, 1]   # level stocks, opponent at 85% vs 60%: a win
+    assert [len(k) for k in ms.kill_percents[0]] == [1, 0, 0, 0, 1]   # the opponent's deaths
+    assert [len(d) for d in ms.death_percents[0]] == [0, 0, 1, 0, 0]
+    st = ms.stats(0)
+    assert (st["games"], st["wins"], st["losses"], st["draws"]) == (5, 3, 2, 0)
+    assert (st["avg_percent_at_kill"], st["avg_percent_at_death"]) == (40.0, 90.0)
+    assert ms.results[1] == [stocks for _, stocks, _ in SCRIPT]   # player 1 played the mirror
+    assert ms.outcomes[1] == [-1, -1, 1, 1, -1]

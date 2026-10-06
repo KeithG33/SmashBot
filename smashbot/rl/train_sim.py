@@ -20,16 +20,6 @@ import random
 import time
 
 MODELS = "/home/kage/drive2/ShineBot/models"
-def group_by_architecture(policies: dict) -> list[list[str]]:
-    """Tiers whose policies stack into one grid (same parameter shapes,
-    delay and observation), in the order given."""
-    groups: dict = {}
-    for tier, policy in policies.items():
-        key = (tuple((k, tuple(v.shape)) for k, v in policy.state_dict().items()),
-               policy.delay, policy.network.tech_mask_window)
-        groups.setdefault(key, []).append(tier)
-    return list(groups.values())
-
 
 # tiers whose checkpoint isn't <tier>-torch.pt or whose RL run conditioned on
 # another name: tier -> (checkpoint, name)
@@ -211,21 +201,16 @@ class SimLeagueWorker:
         self._stages = list(msl.Stage)
         self.part = self.lg.layout(N)
         from smashbot.rl.league import LeagueSeats
-        from smashbot.rl.sim_league import MultiOpponentSimWorker, PfspGrid
+        from smashbot.rl.sim_league import MultiOpponentSimWorker, PfspGrid, static_grids
         # --- phillip grids: the tiers of one architecture on ONE stacked
         # forward (their LSTM steps via the hand-rolled cell — cuDNN has no
         # vmap rule); static cells, slices padded to the largest tier
-        self._phillip_grids = []
-        for tiers in group_by_architecture({t: self.lg.phillips[t][0] for t in cfg.phillip_tiers}):
-            rows = [self.part[f"phillip:{t}"] for t in tiers]
-            tmpl = self.lg.phillips[tiers[0]][0]
-            grid = PfspGrid(tmpl, len(tiers), max(len(r) for r in rows), self.name_code, self.device)
-            for s, t in enumerate(tiers):
-                grid.load(s, f"phillip:{t}", lambda k: self.lg.phillips[k.split(':', 1)[1]][0].state_dict())
-                grid.agent._name[s] = self.lg.phillips[t][2]
-            grid.assign_static(rows)
-            self._phillip_grids.append(grid)
-            print(f"phillip grid: {', '.join(tiers)} x {grid.Nc} cells (delay {tmpl.delay})", flush=True)
+        tiers = {f"phillip:{t}": self.lg.phillips[t] for t in cfg.phillip_tiers}
+        self._phillip_grids = static_grids({k: (pol, code) for k, (pol, _, code) in tiers.items()},
+                                           {k: self.part[k] for k in tiers}, self.device)
+        for grid in self._phillip_grids:
+            print(f"phillip grid: {', '.join(m.split(':', 1)[1] for m in grid.members)} x {grid.Nc} cells "
+                  f"(delay {grid.agent.delay})", flush=True)
         for t in cfg.phillip_tiers:   # weights live in the grid stacks now; free the GPU copies
             self.lg.phillips[t][0].to("cpu")
         # --- PFSP grid: S slices x Nc cells with one slice's worth of slack
@@ -245,7 +230,7 @@ class SimLeagueWorker:
         print(f"pfsp grid: {S} slices x {Nc} cells for {len(pfsp_envs)} envs; "
               f"boot seated {seats.occupancy()} ({seats.loads} slice loads)", flush=True)
         self._worker = MultiOpponentSimWorker(
-            self.policy, [], N, cfg.unroll_length, cfg.data_dir, None, None,
+            self.policy, N, cfg.unroll_length, cfg.data_dir, None, None,
             name_code=self.name_code, device=self.device,
             record_fn=self._on_game, precision=cfg.rollout_precision,
             burn_in=cfg.imitation_burn_in,

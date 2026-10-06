@@ -121,33 +121,43 @@ class PfspGrid:
             self._dirty = False
 
 
-class _Group:
-    """One opponent identity serving a fixed subset of env rows (the eval
-    arena's single opponent; not used by training)."""
+def group_by_architecture(policies: dict) -> list[list]:
+    """Keys whose policies stack into one grid (same parameter shapes, delay
+    and observation), in the order given."""
+    groups: dict = {}
+    for key, policy in policies.items():
+        shape = (tuple((k, tuple(v.shape)) for k, v in policy.state_dict().items()),
+                 policy.delay, policy.network.tech_mask_window)
+        groups.setdefault(shape, []).append(key)
+    return list(groups.values())
 
-    def __init__(self, gid, policy, env_idx, device, name_code,
-                 precision="fp32", state_dtype=None, capture=False):
-        self.gid = gid
-        self.env_idx = np.asarray(env_idx, dtype=np.int64)
-        self.idx_t = torch.as_tensor(self.env_idx, device=device)
-        self.n = len(self.env_idx)
-        self.agent = BatchedPolicyAgent(policy, self.n, name_code=name_code,
-                                        device=device, precision=precision,
-                                        state_dtype=state_dtype, capture=capture)
-        self._reset = np.ones(self.n, dtype=bool)
+
+def static_grids(members: dict, rows: dict, device) -> list[PfspGrid]:
+    """Fixed members on fixed env rows: one PfspGrid per architecture, each
+    member a slice of its group's grid seated on rows[key].
+    members: {key: (policy, name_code)}; the key is the gid its games report."""
+    grids = []
+    for keys in group_by_architecture({k: policy for k, (policy, _) in members.items()}):
+        grid = PfspGrid(members[keys[0]][0], len(keys), max(len(rows[k]) for k in keys),
+                        members[keys[0]][1], device)
+        for s, k in enumerate(keys):
+            grid.load(s, k, lambda key: members[key][0].state_dict())
+            grid.agent._name[s] = members[k][1]
+        grid.assign_static([rows[k] for k in keys])
+        grids.append(grid)
+    return grids
 
 
 class MultiOpponentSimWorker:
-    def __init__(self, student_policy, opponents, batch_size, unroll_length, data_dir,
+    def __init__(self, student_policy, batch_size, unroll_length, data_dir,
                  stage, char_pairs, name_code=1, device="cpu", record_fn=None,
                  precision="fp32", grids=(), event_fn=None, self_idx=(),
                  league=None, pfsp_grid=None, match_fn=None, max_frame=28800,
-                 seed=0, capture=False, burn_in=0, shards=1):
-        """opponents: [(gid, policy, env_idx, name_code)] fixed groups (eval
-        arena; not harvested). grids: static PfspGrids (phillip tiers), env ->
-        gid via gid_of_env below. self_idx: envs whose player-1 seat is the
-        student too, served as rows N.. of the student forward; learner rows
-        are the first N (one per game).
+                 seed=0, capture=False, burn_in=0, shards=1, learn=True):
+        """grids: static PfspGrids (the phillip tiers; the eval arena's
+        opponents), env -> gid = its slice's member. self_idx: envs whose
+        player-1 seat is the student too, served as rows N.. of the student
+        forward; learner rows are the first N (one per game).
         league/pfsp_grid: per-match PFSP routing (rl/league.League) over a
         dynamic PfspGrid. match_fn(env, member) -> (MatchConfig, info): the
         match for env's NEXT game (called at boot and every game end);
@@ -155,7 +165,8 @@ class MultiOpponentSimWorker:
         record_fn(env, gid, s0, s1, outcome) / event_fn(env, gid, kind, pct) are
         called with the gid of the game the frames belong to; game_info[env]
         holds match_fn's info for that game. shards: the envs are split into
-        that many sim batches, stepped in parallel (sim_env.ShardedEnvBatch)."""
+        that many sim batches, stepped in parallel (sim_env.ShardedEnvBatch).
+        learn=False (eval): games only — no learner chunks, harvests or rewards."""
         import melee_sim as msl
         self.msl = msl
         self.N = batch_size
@@ -163,6 +174,7 @@ class MultiOpponentSimWorker:
         self.device = device
         self.record_fn = record_fn
         self.event_fn = event_fn
+        self.learn = learn
         self.grids = list(grids)
         self.pfsp_grid = pfsp_grid
         self.league = league
@@ -186,17 +198,12 @@ class MultiOpponentSimWorker:
         self._pushed = 0
         self._prev = None
         self._reset_mask = np.ones(batch_size, dtype=bool)
-        self.groups = [_Group(gid, pol, idx, device, nc, precision=precision, capture=capture)
-                       for (gid, pol, idx, nc) in opponents]
         self.harvests = [
             HarvestAssembler(unroll_length, student_policy.delay,
                              student_policy.controller_head.controller_embedding, name_code,
                              burn_in, view=self.ff.view,
                              source="pfsp" if gr is self.pfsp_grid else "phillip")
-            for gr in self._all_grids()]
-        for g in self.groups:
-            g.agent.set_flat_controllers(True)
-            g.agent.set_flat_inputs(self.ff.view)
+            for gr in self._all_grids()] if learn else []
         # env -> gid of the game its frames belong to (committed at the
         # entry frame; pending between a game's end and its successor's
         # first frame so terminal-transition events credit the right game)
@@ -204,8 +211,6 @@ class MultiOpponentSimWorker:
         self.game_info = [None] * batch_size
         self._pending: dict[int, tuple] = {}
         self.env_opp[self.self_idx] = "self"
-        for g in self.groups:
-            self.env_opp[g.env_idx] = g.gid
         for gr in self.grids:
             for s in range(gr.S):
                 for n in range(gr.Nc):
@@ -218,8 +223,7 @@ class MultiOpponentSimWorker:
                 self.env_opp[e] = m
                 self._pfsp_envs.add(e)
         covered = np.concatenate(
-            [self.self_idx] + [g.env_idx for g in self.groups]
-            + [gr.cell_env[gr.valid] for gr in self.grids]
+            [self.self_idx] + [gr.cell_env[gr.valid] for gr in self.grids]
             + ([pfsp_grid.cell_env[pfsp_grid.valid]] if pfsp_grid is not None else []))
         assert sorted(covered.tolist()) == list(range(batch_size)), \
             "seats must partition all envs"
@@ -289,17 +293,12 @@ class MultiOpponentSimWorker:
             else:
                 row_flats = flats
             states = self.ff.view(row_flats)
-            want = (self._pushed % T == 0)
+            want = self.learn and self._pushed % T == 0
 
             # ---- opponent seats (player 1): what they press now ----
             p1_rows = np.empty((N, 13), dtype=np.float32)
             if len(self.self_idx):
                 p1_rows[self.self_idx] = rows[N:]
-            group_resets = []
-            for g in self.groups:
-                p1_rows[g.env_idx] = np.stack(
-                    g.agent.execute(np.nonzero(g._reset)[0].tolist()))
-                group_resets.append(torch.as_tensor(g._reset, device=dev))
             grid_seats = []
             for gr in self._all_grids():
                 gr.sync()
@@ -326,9 +325,6 @@ class MultiOpponentSimWorker:
             if len(self.self_idx):
                 learner_rows = lambda s: Learner._rows_take(s, 0, N, self.student.num_envs)
                 records, hidden_before = [learner_rows(r) for r in records], learner_rows(hidden_before)
-            for g, g_reset in zip(self.groups, group_resets):
-                gflats = tuple(t.index_select(0, g.idx_t) for t in opp_flats)
-                g.agent.launch(self.ff.view(gflats), g_reset, want_snapshot=False, flats=gflats)
             grid_flats = []
             for gr, (_, gr_reset, _) in zip(self._all_grids(), grid_seats):
                 gflats = tuple(t.index_select(0, gr.idx_t).view(gr.S, gr.Nc, t.shape[-1])
@@ -346,7 +342,7 @@ class MultiOpponentSimWorker:
                 for i in np.nonzero(live & (stocks[:, 0] < ps[:, 0]))[0]:
                     self.event_fn(int(i), self.env_opp[i], "death", float(pp[i, 0]))
             reward = None
-            if self._prev is not None:
+            if self._prev is not None and self.learn:
                 reward = compute_reward(
                     torch.as_tensor(self._prev[0]), torch.as_tensor(stocks),
                     torch.as_tensor(self._prev[1]), torch.as_tensor(percent),
@@ -356,8 +352,6 @@ class MultiOpponentSimWorker:
 
             is_resetting, term = stepped.result()
             self.student.settle()
-            for g in self.groups:
-                g.agent.settle()
             for gr in self._all_grids():
                 gr.agent.settle()
 
@@ -369,7 +363,7 @@ class MultiOpponentSimWorker:
                 harvest.push_frame(gflats, rows_all, gr_reset, tenure)
                 if reward is not None:
                     harvest.push_reward((-reward[gr.idx_t]).clone())
-            for rec in records:
+            for rec in records if self.learn else ():
                 snap = hidden_before if self._pushed % T == 0 else None
                 self.assembler.push_frame(rec, reset_rows[:N], snap)
                 self._pushed += 1
@@ -381,8 +375,6 @@ class MultiOpponentSimWorker:
                 for i in np.nonzero(done)[0]:
                     s0, s1 = int(fs[i, 0]), int(fs[i, 1])
                     self._on_done(int(i), s0, s1, game_outcome(s0, s1, fp[i, 0], fp[i, 1]))
-            for g in self.groups:
-                g._reset = self._reset_mask[g.env_idx]
 
             if self.assembler.ready():
                 ppo_out.append(self.assembler.emit())
