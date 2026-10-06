@@ -13,12 +13,18 @@ from __future__ import annotations
 
 import os
 import random
+import time
 
 import torch
 
 MAIN_12_MSL = ["FOX", "FALCO", "MARTH", "SHEIK", "JIGGLYPUFF", "FALCON",
                "PEACH", "YOSHI", "ICE_CLIMBERS", "LUIGI", "PIKACHU", "SAMUS"]
 MAX_GAME_FRAMES = 28800   # Melee's 8-minute timer, so every game ends
+
+
+def _clock(seconds: float) -> str:
+    s = int(seconds)
+    return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}"
 
 
 def full_grid(seed: int = 3) -> list[tuple[str, str]]:
@@ -136,11 +142,24 @@ class MatchSet:
             student, [("opponent", opponent, list(range(n)), opp_name_code)],
             n, unroll, data_dir, None, None, name_code=student_name_code, device=device,
             record_fn=on_game, event_fn=on_event, match_fn=next_game, max_frame=MAX_GAME_FRAMES)
-        self._unroll = unroll
+        self._envs, self._unroll = n, unroll
 
-    def run(self) -> None:
+    def run(self, progress_every: float = 60.0) -> None:
+        """Plays the slate out, printing games done, frames per second and an
+        ETA every progress_every seconds."""
+        start = last = time.perf_counter()
+        frames = 0
         while None in self.results:
             self.worker.collect(self._unroll)
+            frames += self._envs * self._unroll
+            now = time.perf_counter()
+            if now - last >= progress_every:
+                last = now
+                total = len(self.results)
+                done = total - self.results.count(None)
+                eta = _clock((now - start) * (total - done) / done) if done else "?"
+                print(f"  {done}/{total} games | {frames / (now - start):.0f} fps | "
+                      f"{_clock(now - start)} elapsed, eta {eta}", flush=True)
 
     def close(self):
         self.worker.close()

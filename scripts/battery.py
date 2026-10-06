@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 
 import torch
 
@@ -74,17 +75,20 @@ def main():
     for name, (opponent, opponent_code, _) in opponents.items():
         ms = MatchSet(student, opponent, slate, args.data_dir, args.envs, args.device,
                       student_name_code=student_code, opp_name_code=opponent_code)
+        print(f"  vs {name}", flush=True)
+        start = time.perf_counter()
         ms.run()
+        seconds = time.perf_counter() - start
         ms.close()
         st = ms.stats()
         if args.grid:
             st["pairs"] = {f"{a}|{b}": [list(r) for r in ms.results[i::len(pairs)]]
                            for i, (a, b) in enumerate(pairs)}
         report["opponents"][name] = st
-        print(f"  vs {name:8s} win {st['win_rate']:.3f} ({st['wins']}-{st['losses']}"
+        print(f"  vs {name:11s} win {st['win_rate']:.3f} ({st['wins']}-{st['losses']}"
               f"-{st['draws']} of {st['games']}) | stockdiff {st['avg_stock_diff']:+.2f} | "
-              f"kill@{st['avg_percent_at_kill']:.0f}% die@{st['avg_percent_at_death']:.0f}%",
-              flush=True)
+              f"kill@{st['avg_percent_at_kill']:.0f}% die@{st['avg_percent_at_death']:.0f}% | "
+              f"{seconds / 60:.1f} min", flush=True)
         if args.out:
             _write(args.out, report)
     if args.out:
