@@ -58,6 +58,9 @@ class NetworkConfig:
     # sgu only: one letter per layer, s = SGU block, g = GRU, l = LSTM (a
     # residual fp32 cell in place of the conv + attention mixing); empty = all SGU
     layout: str = ""
+    # sgu only: RMS-normalize each tiny-attention head's q and k (QK-norm), so
+    # its logits stay bounded however attn_qkv grows; the value net follows
+    qk_norm: bool = False
     # tx_like only: the FFW blocks' GELU as the tanh approximation
     gelu_approximate: bool = False
     # the input embedding: "simple" (every leaf's default embedding) or

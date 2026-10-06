@@ -295,3 +295,31 @@ def test_sgu_hard_window_cutoff():
     assert not torch.allclose(out_a[:, 7], out_b[:, 7])
     torch.testing.assert_close(out_a[:, 8], out_b[:, 8])
     torch.testing.assert_close(out_a[:, -1], out_b[:, -1])
+
+
+@pytest.mark.parametrize("qk_norm", [False, True])
+def test_sgu_qk_norm_makes_attention_blind_to_qk_scale(qk_norm):
+    """With QK-norm the tiny attention reads only q and k's directions:
+    scaling attn_qkv's q and k rows changes nothing. Without it, it does
+    (the logit growth QK-norm exists to stop)."""
+    torch.manual_seed(0)
+    net = SGUCore(input_size=4, hidden_size=16, num_layers=1, window=8, attn_heads=2,
+                  attn_head_dim=4, qk_norm=qk_norm)
+    for p in net.parameters():
+        torch.nn.init.normal_(p, std=0.5)
+    net.eval()
+    inputs = torch.randn(2, 12, 4)
+    reset = torch.zeros(2, 12, dtype=torch.bool)
+    with torch.no_grad():
+        before, _ = net.unroll(inputs, reset, net.initial_state(2))
+        net.blocks[0].attn_qkv.weight[: 2 * net.attn_width] *= 7.0
+        after, _ = net.unroll(inputs, reset, net.initial_state(2))
+    assert torch.allclose(before, after, atol=1e-5) == qk_norm
+
+
+def test_sgu_without_qk_norm_keeps_its_parameters():
+    """qk_norm off (every checkpoint saved before it) builds exactly the old
+    parameters, so those checkpoints load and run unchanged."""
+    names = lambda **kw: {k for k, _ in SGUCore(4, 16, 2, 8, layout="sl", **kw).named_parameters()}
+    assert not any("q_norm" in k or "k_norm" in k for k in names())
+    assert names(qk_norm=True) - names() == {"blocks.0.q_norm.weight", "blocks.0.k_norm.weight"}

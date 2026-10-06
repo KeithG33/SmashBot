@@ -14,7 +14,12 @@ from smashbot.networks import SGUCore
 
 B, D, H, W = 8, 24, 32, 16
 FRAMES = 3 * (W - 1) + 7  # three full wraps and a bit
-LAYOUTS = ["sss", "sls"]
+LAYOUTS = ["sss", "sls", "sls+qk"]   # "+qk": the SGU blocks with QK-norm
+
+
+def _shape(layout):
+    layout, _, qk = layout.partition("+")
+    return layout, qk == "qk"
 
 
 def _randomize(blocks):
@@ -24,8 +29,9 @@ def _randomize(blocks):
 
 
 def _core(layout, seed=0):
+    layout, qk_norm = _shape(layout)
     torch.manual_seed(seed)
-    core = SGUCore(D, H, len(layout), W, layout=layout)
+    core = SGUCore(D, H, len(layout), W, layout=layout, qk_norm=qk_norm)
     _randomize(core.blocks)
     return core
 
@@ -135,11 +141,12 @@ GPU = pytest.mark.skipif(
 def _policy(layout, dev, seed=0):
     from smashbot import configs, embed as embed_lib
     from smashbot.policy import build_policy
+    layout, qk_norm = _shape(layout)
     torch.manual_seed(seed)
     pol = build_policy(
         embed_config=embed_lib.EmbedConfig(), controller_config=embed_lib.ControllerConfig(),
         network_config=configs.NetworkConfig(name="sgu", num_layers=len(layout), layout=layout,
-                                             hidden_size=64, window=W),
+                                             hidden_size=64, window=W, qk_norm=qk_norm),
         head_config=configs.ControllerHeadConfig(), policy_config=configs.PolicyConfig(),
         num_names=16).to(dev)
     _randomize(pol.network.core.blocks)

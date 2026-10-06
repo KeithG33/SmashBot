@@ -33,6 +33,20 @@ class RMSNorm(nn.RMSNorm):
         return super().forward(x.float()).to(x.dtype)
 
 
+class HeadRMSNorm(nn.Module):
+    """RMSNorm over each head's slice of the last dim, with a gain per head
+    and feature: [..., heads * dim] -> the same shape."""
+
+    def __init__(self, heads: int, dim: int):
+        super().__init__()
+        self.norm = RMSNorm(dim, elementwise_affine=False)
+        self.weight = nn.Parameter(torch.ones(heads, dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.norm(x.unflatten(-1, self.weight.shape))
+        return (x * self.weight.to(x.dtype)).flatten(-2)
+
+
 def _mask_state(reset: torch.Tensor, initial, prev):
     """Replace state with initial where reset is True. reset: [B].
 
@@ -525,7 +539,8 @@ class SGUBlock(nn.Module):
     GELU and v is normalized before the temporal mix.
     """
 
-    def __init__(self, d: int, window: int, attn_heads: int = 1, attn_head_dim: int = 64):
+    def __init__(self, d: int, window: int, attn_heads: int = 1, attn_head_dim: int = 64,
+                 qk_norm: bool = False):
         super().__init__()
         self.window = window
         self.attn_heads = attn_heads
@@ -545,6 +560,10 @@ class SGUBlock(nn.Module):
         self.attn_qkv = nn.Linear(d, 3 * self.attn_width, bias=False)
         self.attn_out = nn.Linear(self.attn_width, d, bias=False)
         nn.init.zeros_(self.attn_out.weight)
+        self.qk_norm = qk_norm
+        if qk_norm:
+            self.q_norm = HeadRMSNorm(attn_heads, attn_head_dim)
+            self.k_norm = HeadRMSNorm(attn_heads, attn_head_dim)
 
         self.mix_out = nn.Linear(d, d, bias=False)
         nn.init.zeros_(self.mix_out.weight)
@@ -564,6 +583,8 @@ class SGUBlock(nn.Module):
 
     def _qkv(self, xn):
         q, k, va = self.attn_qkv(xn).chunk(3, dim=-1)
+        if self.qk_norm:
+            q, k = self.q_norm(q), self.k_norm(k)
         return q, torch.cat([k, va], dim=-1)
 
     def _attend_over(self, q, kv, attn_mask):
@@ -776,6 +797,7 @@ class SGUCore(Network):
         attn_heads: int = 1,
         attn_head_dim: int = 64,
         layout: str = "",
+        qk_norm: bool = False,
     ):
         super().__init__()
         layout = layout or "s" * num_layers
@@ -785,7 +807,7 @@ class SGUCore(Network):
         self.attn_width = attn_heads * attn_head_dim
         self.encoder = nn.Linear(input_size, hidden_size)
         self.blocks = nn.ModuleList(
-            [SGUBlock(hidden_size, window, attn_heads, attn_head_dim) if kind == "s"
+            [SGUBlock(hidden_size, window, attn_heads, attn_head_dim, qk_norm) if kind == "s"
              else RecurrentBlock(hidden_size, {"g": "gru", "l": "lstm"}[kind])
              for kind in layout]
         )
@@ -1119,6 +1141,7 @@ def build_embed_network(
             attn_heads=network_config.attn_heads,
             attn_head_dim=network_config.attn_head_dim,
             layout=network_config.layout,
+            qk_norm=network_config.qk_norm,
         )
     else:
         raise ValueError(f"unknown network name: {name}")

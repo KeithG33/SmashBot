@@ -47,6 +47,7 @@ def value_network_config(network: dict, value: dict):
         num_heads=network["num_heads"],
         window=value.get("window", 0) or network["window"],
         layout=value.get("layout", ""),
+        qk_norm=network.get("qk_norm", False),
         **inputs,
     )
 
