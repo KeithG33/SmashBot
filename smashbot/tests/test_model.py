@@ -1,4 +1,4 @@
-"""M3 gates: embeddings, tx_like network, autoregressive head, delay math."""
+"""Embeddings, the cores, the autoregressive head and the delay math."""
 
 import numpy as np
 import pytest

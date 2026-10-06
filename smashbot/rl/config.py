@@ -46,7 +46,7 @@ class RLConfig:
     # "fp32", or "fp16" (CUDA only; CPU warns and runs fp32): fp16 autocast
     # around the policy forwards (policy, teacher, imitation) and a GradScaler
     # on the policy optimizer. The value net stays fp32: it was the weakest
-    # fp16 arm in scripts/precision_probe.py, for a small share of the compute.
+    # arm of the fp16 probe, for a small share of the compute.
     precision: str = "fp32"
     # the PPO policy pass in this many row chunks with gradient accumulation:
     # the same update in ~1/k the activation memory, ~20 ms/step slower at k=2

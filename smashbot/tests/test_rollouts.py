@@ -1,4 +1,4 @@
-"""Rollout machinery tests (Dolphin-free): chunk assembly alignment, reward
+"""Rollout machinery tests: chunk assembly alignment, reward
 delay-shifting, rows of the batched agent staying independent, the Dolphin
 agents (sync, async), and end-to-end assembled-trajectory -> learner
 compatibility."""
@@ -172,7 +172,7 @@ def test_batched_agent_matches_independent_runs(monkeypatch):
 
 
 def test_assembled_trajectory_feeds_learner():
-    """Full loop sans Dolphin: batched agent rollout -> assembler -> learner,
+    """Full loop: batched agent rollout -> assembler -> learner,
     with the fresh-learner invariants (ratio == 1, actor KL == 0)."""
     torch.manual_seed(0)
     policy = _tiny_policy(seed=0)
@@ -252,7 +252,7 @@ def test_encoded_perspective_swap_commutes():
 
 
 def test_worker_side_encode_matches_policy_encode():
-    """An independently-built embed tree (env process) must encode identically
+    """An independently-built embed tree (sim_env's) must encode identically
     to the policy's own (same EmbedConfig -> same schema)."""
     from smashbot import embed as embed_lib
     from smashbot.tests.test_ppo import _tiny_policy
@@ -650,9 +650,8 @@ def test_tracker_ema_starts_as_the_plain_mean():
 
 
 def test_tracker_records_winrate_by_opponent_character():
-    """Per-character record: the hardest league members are all locked to
-    one character, so a rising overall winrate can be matchup-specific.
-    Draws are excluded, matching the win_rate_recent convention."""
+    """Per-character record: a rising overall winrate can hide a weak
+    matchup. Draws are excluded, matching the win_rate_recent convention."""
     from smashbot.rl.rollouts import GameTracker
 
     t = GameTracker()
