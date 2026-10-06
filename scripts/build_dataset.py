@@ -9,9 +9,9 @@ Resumable: already-parsed shards are recorded in <root>/raw.json and skipped;
 interrupted downloads resume via huggingface_hub.
 
 Usage:
-  .venv/bin/python scripts/download_fox.py                  # ALL shards (1.4TB dl)
-  .venv/bin/python scripts/download_fox.py --chars FOX      # one character
-  .venv/bin/python scripts/download_fox.py --limit 2        # trial run
+  .venv/bin/python scripts/build_dataset.py                  # ALL shards (1.4TB dl)
+  .venv/bin/python scripts/build_dataset.py --chars FOX      # one character
+  .venv/bin/python scripts/build_dataset.py --limit 2        # trial run
 """
 
 import os
