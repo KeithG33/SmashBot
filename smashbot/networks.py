@@ -984,7 +984,7 @@ class SGUCore(Network):
 class StateActionNetwork(Network):
     """Embeds StateAction structs, then runs the core network."""
 
-    def __init__(self, embed_game, embed_state_action, core: Network, packed: bool = True,
+    def __init__(self, embed_game, embed_state_action, core: Network,
                  enhanced=None, tech_mask_window: int = 0):
         super().__init__()
         from smashbot import embed as embed_lib
@@ -995,7 +995,7 @@ class StateActionNetwork(Network):
         self.enhanced = enhanced   # an EnhancedEmbed in place of the leaves' embedding
         self.tech_mask_window = tech_mask_window   # see _mask_tech
         self.packed_embed = (
-            embed_lib.PackedStructForward(embed_state_action) if packed and enhanced is None else None
+            embed_lib.PackedStructForward(embed_state_action) if enhanced is None else None
         )
 
     packed_encoder: bool = False   # see use_packed_encoder
@@ -1149,7 +1149,6 @@ def build_embed_network(
         embed_game,
         embed_state_action,
         core,
-        packed=getattr(embed_config, "packed", True),
         enhanced=enhanced,
         tech_mask_window=getattr(network_config, "tech_mask_window", 0),
     )

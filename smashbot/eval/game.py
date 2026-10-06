@@ -1,7 +1,5 @@
-"""Core game engine shared by live play (play.py) and eval batteries
-one implementation of policy loading, Dolphin setup, and the
-gamestate -> agent -> controller loop, so eval measures exactly the bot that
-plays.
+"""Dolphin play shared by play.py and scripts/watch_live.py: policy loading,
+Dolphin setup, and the gamestate -> agent -> controller loop.
 
 A "game" here is one stock match; the Dolphin wrapper auto-restarts into the
 next game, and `run_games` yields a GameRecord at each game boundary.
@@ -10,6 +8,7 @@ next game, and `run_games` yields a GameRecord at each game boundary.
 from __future__ import annotations
 
 import dataclasses
+import os
 import time
 import typing as tp
 
@@ -20,9 +19,9 @@ from slippi_ai import dolphin as dolphin_lib
 
 from smashbot import saving
 from smashbot.eval.agent import DelayedAgent
-from smashbot.eval.dolphin_setup import make_dolphin  # noqa: F401  (re-export)
 from smashbot.eval.naming import resolve_name_code  # noqa: F401  (re-export)
 from smashbot.networks import check_loadable
+from smashbot.paths import EXIAI_APPIMAGE, MELEE_ISO, NETPLAY_APPIMAGE
 from smashbot.policy import build_policy_from_config
 
 
@@ -62,6 +61,54 @@ def compile_policy(policy) -> None:
     torch._dynamo.config.recompile_limit = 128
 
 
+def make_dolphin(
+    players: dict,
+    headless: bool,
+    stage: str = "FINAL_DESTINATION",
+    fullscreen: bool = False,
+    gfx_backend: str = "OGL",
+    online_delay: int = 0,
+    mute: bool = False,
+    save_replays: bool = False,
+    replay_dir: str = "",
+) -> dolphin_lib.Dolphin:
+    """One Dolphin. Headless uses the ExiAI build (null video, fast-forward);
+    visible play uses the standard netplay build. save_replays writes .slp
+    files (headless included: run fast, watch later in Slippi at 60fps)."""
+    console_kwargs: dict = {"stage": melee.Stage[stage.upper()]}
+    if save_replays:
+        console_kwargs["save_replays"] = True
+        if replay_dir:
+            console_kwargs["replay_dir"] = replay_dir
+    # Slippi builds open slippi.gg/online/enable in a browser when their
+    # (fresh temp) user dir has no linked account. Our games are all local
+    # direct mode, so URL-opening is a no-op for every Dolphin we spawn.
+    # $BROWSER alone is not enough: on KDE, xdg-open delegates to kde-open and
+    # ignores it, so the openers are also shadowed via PATH (exit-0 shims).
+    os.environ["BROWSER"] = "true"
+    noopen = "/home/kage/drive2/ShineBot/noopen"
+    if not os.environ.get("PATH", "").startswith(noopen):
+        os.environ["PATH"] = noopen + os.pathsep + os.environ.get("PATH", "")
+    if headless:
+        path = EXIAI_APPIMAGE
+    else:
+        path = NETPLAY_APPIMAGE
+        console_kwargs["fullscreen"] = fullscreen
+        if gfx_backend:
+            console_kwargs["gfx_backend"] = gfx_backend
+        if mute:
+            # Pulse underruns ("Dropping OutputStream") disturb Dolphin's
+            # frame pacing; muting removes the audio path entirely
+            console_kwargs["disable_audio"] = True
+    return dolphin_lib.Dolphin(
+        path=str(path),
+        iso=str(MELEE_ISO),
+        players=players,
+        headless=headless,
+        online_delay=online_delay,
+        emulation_speed=0 if headless else 1,
+        **console_kwargs,
+    )
 
 
 @dataclasses.dataclass
@@ -170,4 +217,3 @@ def run_games(
         if on_frame is not None:
             if on_frame(gamestate, frames_this_game, step_seconds):
                 return
-

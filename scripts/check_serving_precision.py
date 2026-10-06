@@ -10,9 +10,7 @@ the production student (CUDA-graph capture, fp16 static buffers), the eager
 student with and without the hand-rolled cells, and bf16. Each arm samples
 its own actions (temperature 1e-3), so after a near-tie flip an arm's later
 inputs differ from the reference's: agreement measures play, not numerics
-alone. The fp32 cuDNN arm is the floor for that effect. scripts/check_fp16_state.py compared fp16
-vs fp32 STATE with the forward in fp16 both times; this compares against a
-true fp32 forward.
+alone. The fp32 cuDNN arm is the floor for that effect.
 
     PYTHONPATH=.:vendor/melee-sim-light MSL_DATA_DIR=/home/kage/drive2/ShineBot/msl-data \
         python scripts/check_serving_precision.py <checkpoint.pt | phillip tier> [frames]
@@ -27,6 +25,7 @@ import torch
 import tree
 
 import melee_sim as msl
+from smashbot import paths
 from smashbot.eval.game import load_policy, resolve_name_code
 from smashbot.networks import use_manual_recurrent_step
 from smashbot.rl.agent import BatchedPolicyAgent, LeagueAgent
@@ -34,8 +33,7 @@ from smashbot.rl import sim_env
 from smashbot.rl.sim_env import states_to_torch as _states_to_torch
 
 DEV = "cuda"
-MODELS = "/home/kage/drive2/ShineBot/models"
-DRIVER = f"{MODELS}/master-torch.pt"   # any loadable policy: it only makes the observation stream realistic
+DRIVER = str(paths.MODELS_DIR / "master-torch.pt")   # any loadable policy: it only makes the observation stream realistic
 NENV = 8
 
 
@@ -133,7 +131,7 @@ def compare(name, ref_logits, arm_logits, stats):
 def main():
     target = sys.argv[1] if len(sys.argv) > 1 else "gm"
     frames = int(sys.argv[2]) if len(sys.argv) > 2 else 1200
-    path = target if target.endswith(".pt") else f"{MODELS}/{target}-torch.pt"
+    path = target if target.endswith(".pt") else str(paths.MODELS_DIR / f"{target}-torch.pt")
     stream, resets = record_stream(frames)
     print(f"recorded {len(stream)} frames x {NENV} envs")
 

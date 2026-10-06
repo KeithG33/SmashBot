@@ -1,9 +1,6 @@
-"""Sim-backed match engine for evaluation: a fixed slate of games between two
-policies on melee-sim-light, every game played to its end and counted once.
-
-This is the measurement backend for battery.py and tournament.py (the
-Dolphin fleet versions were retired once training and eval both moved to
-the sim; Dolphin remains for human play/watching via eval/game.py).
+"""Sim-backed match engine for evaluation (scripts/battery.py and
+tournament.py): fixed slates of games on melee-sim-light, every game played
+to its end and counted once.
 
 Determinism: stages, ports and game seeds come from a seeded RNG, the sim
 itself is deterministic, and policy sampling uses torch's global RNG — seed
@@ -28,8 +25,7 @@ def _clock(seconds: float) -> str:
 
 
 def full_grid(seed: int = 3) -> list[tuple[str, str]]:
-    """All 144 (student_char, opponent_char) pairs, order shuffled by seed
-    (matches the v10-vs-gm baseline slate)."""
+    """All 144 (student_char, opponent_char) pairs, order shuffled by seed."""
     pairs = [(a, b) for a in MAIN_12_MSL for b in MAIN_12_MSL]
     random.Random(seed).shuffle(pairs)
     return pairs

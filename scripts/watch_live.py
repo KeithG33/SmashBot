@@ -1,8 +1,6 @@
 """Watch two policies fight each other live at ~60fps.
 
-Bot-vs-bot exhibition mode. The old way to watch bot-vs-bot was the rollout
-worker's watch path, which runs BOTH inferences serially inside the
-frame-sync loop (20-30fps). Here both brains are AsyncDelayedAgents
+Bot-vs-bot exhibition mode. Both brains are AsyncDelayedAgents
 (smashbot/eval/agent.py): each policy gets a persistent in-order compute
 thread, step() just submits the frame and pops the delay queue, so Dolphin
 never waits on inference. Occasional slow samples are absorbed by each
@@ -49,8 +47,7 @@ performance notes:
   * `system76-power profile performance` before watching helps hold 60fps
     (run it yourself; this script never touches power profiles).
   * both brains run on background compute threads (AsyncDelayedAgent), so
-    the frame-sync loop only pays two queue pops per frame -- expect ~60fps
-    where the serial rollout-worker watch path got 20-30.
+    the frame-sync loop only pays two queue pops per frame -- expect ~60fps.
   * --pin-cores separates inference cores from Dolphin's like play.py does;
     leave it off while the RL training run owns most of the machine.
 """

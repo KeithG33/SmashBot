@@ -108,11 +108,11 @@ class Policy(nn.Module):
     ) -> tuple[SampleOutputs, RecurrentState]:
         """forward == sample, so torch.func.functional_call (which dispatches
         to forward) can run inference with stacked per-slot parameters.
-        Calls the CLASS method, not self.sample: train_rl monkeypatches
+        Calls the CLASS method, not self.sample: train_sim monkeypatches
         instances with torch.compile'd wrappers, and vmap tracing through a
-        compiled wrapper blows dynamo's per-code-object cache (which is shared
-        with the student's compiled sample) and stalls cudagraph trees —
-        live-caught as a 22GB OOM. The capture path wants pure eager here."""
+        compiled wrapper blows dynamo's per-code-object cache (shared with the
+        student's compiled sample) and stalls cudagraph trees (a 22 GB OOM).
+        The capture path wants pure eager here."""
         return Policy.sample(self, state_action, initial_state, is_resetting, temperature)
 
     # the league grids sample in fp32 behind an fp16 trunk: the ported

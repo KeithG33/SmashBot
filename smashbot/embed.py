@@ -777,9 +777,6 @@ class EmbedConfig:
     with_randall: bool = True
     with_fod: bool = True
     items: ItemsConfig = dataclasses.field(default_factory=ItemsConfig)
-    # Vectorized state-action forward (PackedStructForward); bitwise-identical
-    # to the per-leaf path, kill switch only.
-    packed: bool = True
 
     def make_game_embedding(self) -> StructEmbedding[Game]:
         return make_game_embedding(
@@ -872,10 +869,8 @@ class EnhancedEmbed(nn.Module):
     # _joint_index_as_slippi_ai (network.embed_joint_index_wraps, set only by
     # scripts/port_jax_phillip.py).
     #
-    # TODO(training): a model we train uses _joint_index, the per-character
-    # table slippi-ai meant; never set embed_joint_index_wraps for one. That
-    # path has not been trained yet: check it on the first run with the
-    # enhanced embed.
+    # A model we train uses _joint_index, the per-character table slippi-ai
+    # meant; never set embed_joint_index_wraps for one.
     # ==========================================================================
     def _joint_index(self, char, action):
         return char * self._actions + action

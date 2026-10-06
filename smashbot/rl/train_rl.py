@@ -3,7 +3,7 @@ rollouts (rl/train_sim.py drives the loop).
 
 Usage:
   python -m smashbot.rl.train_rl --ckpt /path/to/teacher.pt \
-      --sim.num-envs 448 --runtime.steps 100000
+      --runtime.device cuda --runtime.steps 100000
 
 The checkpoint provides everything: policy init, frozen teacher, critic init,
 and the config/name_map (RL checkpoints stay play.py-compatible).
@@ -38,7 +38,7 @@ class RuntimeConfig:
     name: str = "Master Player"
     compile: bool = True  # compile the serving copy's sample and the learner cores
     restore: str = ""  # RL checkpoint path, or "auto" for <run_dir>/<tag>/latest.pt
-    device: str = "cpu"  # rollouts are CPU-bound; learner device
+    device: str = "cuda"  # the sim backend trains on CUDA only
 
 
 @dataclasses.dataclass
@@ -74,8 +74,6 @@ def _save_rl_checkpoint(
 ) -> None:
     """Same schema as BC checkpoints (config already a dict), so play.py and
     the eval harness load RL checkpoints unchanged."""
-    import os
-
     import torch
 
     from smashbot import saving
@@ -106,9 +104,6 @@ def _save_rl_checkpoint(
 
 
 def main() -> None:
-    """Sim-backend RL training (see rl/train_sim.py). The Dolphin RL fleet
-    was removed after the sim backend validated; Dolphin remains for
-    watch/play/eval (smashbot/eval/)."""
     args = tyro.cli(Config)
     from smashbot.rl import train_sim
     return train_sim.run(args)

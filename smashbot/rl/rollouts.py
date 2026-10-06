@@ -10,13 +10,12 @@
 - GameTracker: per-opponent-class win/stock/kill-percent statistics.
 
 Consumed by the sim training worker (rl/sim_league.py) and the sim eval
-arena (eval/sim_arena.py). The Dolphin RL fleet that lived here was removed
-after training AND eval moved to melee-sim-light (git history has it);
-Dolphin remains for human play/watching via eval/game.py.
+arena (eval/sim_arena.py).
 """
 
 from __future__ import annotations
 
+import collections
 import math
 import typing as tp
 
@@ -281,21 +280,17 @@ def game_outcome(s0: int, s1: int, p0: float, p1: float) -> int:
 
 
 class GameTracker:
-    """Game-outcome metrics vs the CURRENT training opponent (teacher now,
-    snapshot pool later); fixed-yardstick evals stay in the M8 batteries.
+    """Game-outcome metrics against one opponent class.
 
     Time-free by design: a win is a win at 2 minutes or 7. Tracks rolling
     win rate, average final stock differential (-4..+4 dominance scale),
     average opponent percent at our kills (low = early kills, strong punish
     game), and average own percent at our deaths (high = hard to kill)."""
 
-    # ema_alpha 0.008 ~ a 250-game horizon: several full fleet waves, so
-    # the EMA reflects rounds rather than single-batch luck. Restored
-    # checkpoints store EMA values only, so alpha changes apply cleanly.
+    # ema_alpha 0.008 ~ a 250-game horizon. Checkpoints store EMA values
+    # only, so alpha changes apply cleanly on restore.
     def __init__(self, window: int = 250, event_window: int = 200,
                  ema_alpha: float = 0.008):
-        import collections
-
         self.diffs = collections.deque(maxlen=window)  # per finished game
         self.outcomes = collections.deque(maxlen=window)
         self.kill_percents = collections.deque(maxlen=event_window)
@@ -315,9 +310,7 @@ class GameTracker:
         diff = bot - opp
         if outcome is None:
             outcome = (diff > 0) - (diff < 0)
-        # Winrate by OPPONENT character (locked members excluded at the
-        # call site: their identity would pollute their char's column).
-        if opp_char and outcome:
+        if opp_char and outcome:   # winrate by opponent character
             w, g = self.by_char.get(opp_char, (0, 0))
             self.by_char[opp_char] = (w + (outcome > 0), g + 1)
         self.diffs.append(diff)
@@ -389,5 +382,3 @@ class GameTracker:
             "win_rate_ema": self.win_ema if self.win_ema is not None else 0.5,
             "stock_diff_ema": self.diff_ema if self.diff_ema is not None else 0.0,
         }
-
-

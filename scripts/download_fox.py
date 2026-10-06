@@ -1,4 +1,4 @@
-"""M7 dataset builder: pipelined download -> repack -> parse for ranked shards.
+"""Dataset builder: pipelined download -> repack -> parse for ranked shards.
 
 Producer threads download tar.gz shards from HuggingFace and repack the .slp
 files into stored zips under <root>/Raw/. The main loop runs slippi_db's

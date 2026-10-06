@@ -1,9 +1,8 @@
 """melee-sim-light backend: batched, deterministic Melee for RL rollouts.
 
-Replaces the Dolphin fleet (env_process.py + DolphinRolloutWorker) with a
-single-process batched sim. One EnvBatch steps N games per frame far faster
-than the GPU can serve inference, so rollout collection becomes a synchronous
-vectorized loop and the GPU is the bottleneck.
+One EnvBatch steps N games per frame far faster than the GPU can serve
+inference, so rollout collection is a synchronous vectorized loop and the
+GPU is the bottleneck.
 
 This module is the seam between the sim and our stack:
   * obs_to_game / encode_obs : MslObservation (numpy struct) -> our encoded
@@ -81,8 +80,8 @@ def _items(items: np.ndarray) -> object:
 
 
 class ItemSlots:
-    """Keeps each item in one slot for its lifetime, as the replays and Dolphin
-    do (slippi_db's ItemAssigner, one per game). The sim lists live items
+    """Keeps each item in one slot for its lifetime, as the replays do
+    (slippi_db's ItemAssigner, one per game). The sim lists live items
     packed, so without this an item shifts slots whenever an earlier one
     vanishes."""
 
@@ -149,8 +148,8 @@ def encode_obs(obs: np.ndarray, items: np.ndarray, self_slot: int = 0, opp_slot:
     return _EMBED.from_state(obs_to_game(obs, items, self_slot, opp_slot))
 
 
-# ---- flat encoding (the dolphin worker's 3-tensor path, batched) ----
-# One encode + THREE host->GPU copies per frame; perspective swap is a
+# ---- flat encoding ----
+# One encode + three host->GPU copies per frame; perspective swap is a
 # column permutation, per-group views are 3 row gathers + struct views
 # (encode.unflatten_typed_torch) instead of ~120 per-leaf launches each.
 from smashbot import encode as _encode  # noqa: E402
@@ -264,12 +263,8 @@ class ShardedEnvBatch:
 
 
 def write_controller_rows(env, rows: np.ndarray, player: int) -> None:
-    """Flat [N, 13] controller rows -> MslInputat
-    (encode.controller_rows / BatchedPolicyAgent flat_controllers /
-    LeagueAgent.execute). Writes ONLY the current step's row of the action
-    ring via env.current_action_frame -- the previous version built a full
-    [length, N] neutral controller and whole-buffer-assigned it through
-    msl.write_controller, ~240x the numpy traffic, per player, per frame."""
+    """Flat [N, 13] controller rows (encode.controller_rows, as the agents
+    execute them) -> the current step's row of the sim's action ring only."""
     if isinstance(env, ShardedEnvBatch):
         for s, lo, hi in env._spans():
             _write_rows(s, rows[lo:hi], player)
@@ -288,10 +283,10 @@ def _write_rows(env, rows: np.ndarray, player: int) -> None:
     for j, name in enumerate(_BUTTONS):
         b[name] = rows[:, 5 + j] > 0.5
 
+
 def states_to_torch(encoded, device):
     """Encoded struct (numpy leaves) -> torch on device (int64/bool/float32,
-    the learner's conventions). The flat path (FlatFrames) supersedes this
-    in the training loop; kept for evals and probes."""
+    the learner's conventions); the worker uses FlatFrames instead."""
     import torch
     import tree
 
