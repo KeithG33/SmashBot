@@ -667,7 +667,7 @@ def test_grad_scaler_growth_interval_is_configurable():
     """The doubling interval must be settable: torch's 2000-step default
     is ~16h at our step rate, long enough for a sparse fault rate to pin
     the scale down permanently."""
-    from smashbot.rl.config import RLConfig
+    from smashbot.rl.ppo import RLConfig
 
     assert RLConfig().grad_scaler_growth_interval == 500
     learner, _ = _make_learner(learning_rate=1e-3, precision="fp16")

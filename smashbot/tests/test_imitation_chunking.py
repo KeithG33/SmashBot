@@ -9,7 +9,7 @@ import pytest
 import torch
 import tree
 
-from smashbot.rl.config import RLConfig
+from smashbot.rl.ppo import RLConfig
 from smashbot.rl.ppo import Learner
 from smashbot.tests.test_ppo import _rollout, _tiny_policy, _tiny_value
 

@@ -21,6 +21,7 @@ import torch
 
 from slippi_ai import dolphin as dolphin_lib
 
+from smashbot import saving
 from smashbot.eval import game as game_lib
 from smashbot.eval import agent as agent_lib
 
@@ -81,7 +82,7 @@ def main() -> None:
     policy, name_map, step = game_lib.load_policy(args.ckpt, args.device)
     if args.compile:
         game_lib.compile_policy(policy)
-    name_code = game_lib.resolve_name_code(name_map, args.name)
+    name_code = saving.resolve_name_code(name_map, args.name)
     print(f"loaded {args.ckpt} (train step {step}), delay={policy.delay}, "
           f"conditioning on {args.name!r} -> code {name_code} (map: {name_map})")
 

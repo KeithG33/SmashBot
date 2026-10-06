@@ -5,7 +5,6 @@ it."""
 
 import dataclasses
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from slippi_ai.types import Controller

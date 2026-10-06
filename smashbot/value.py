@@ -14,8 +14,8 @@ from torch import nn
 
 from slippi_ai.types import Frames
 
-from smashbot import delay as delay_lib
-from smashbot.networks import RecurrentState, StateActionNetwork
+from smashbot import delay as delay_lib, embed as embed_lib
+from smashbot.networks import RecurrentState, StateActionNetwork, build_embed_network
 
 
 class ValueOutputs(tp.NamedTuple):
@@ -139,3 +139,20 @@ class ValueFunction(nn.Module):
             final_state=final_state,
             metrics=metrics,
         )
+
+
+def build_value_function(cfg: dict, device: str) -> ValueFunction:
+    """The value net a saved (or asdict'd) training config describes."""
+    net_cfg = value_network_config(cfg["network"], cfg["value"])
+    return ValueFunction(
+        build_embed_network(
+            embed_config=embed_lib.EmbedConfig(),
+            controller_embedding=embed_lib.ControllerConfig(
+                axis_spacing=cfg["head"]["axis_spacing"],
+                shoulder_spacing=cfg["head"]["shoulder_spacing"],
+                type=cfg["head"].get("controller_type", "default"),
+            ).make_embedding(),
+            num_names=cfg["data"]["max_names"],
+            network_config=net_cfg,
+        )
+    ).to(device)

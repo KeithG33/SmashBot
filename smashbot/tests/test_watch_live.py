@@ -13,7 +13,6 @@ import torch
 from smashbot import configs, embed as embed_lib, saving
 from smashbot.eval.agent import AsyncDelayedAgent
 from smashbot.policy import build_policy
-from smashbot.rl.config import MAIN_12
 
 _WATCH_PATH = (
     pathlib.Path(__file__).resolve().parents[2] / "scripts" / "watch_live.py"
@@ -164,9 +163,9 @@ def test_cli_defaults_resolve():
 def test_resolve_char():
     assert watch.resolve_char("marth") == "MARTH"
     assert watch.resolve_char("FOX") == "FOX"
-    assert watch.resolve_char("random") in MAIN_12
-    assert watch.resolve_char("") in MAIN_12
+    assert watch.resolve_char("random") in watch.MAIN_12
+    assert watch.resolve_char("") in watch.MAIN_12
     rng = __import__("random").Random(0)
-    assert watch.resolve_char("random", rng) in MAIN_12
+    assert watch.resolve_char("random", rng) in watch.MAIN_12
     with pytest.raises(ValueError):
         watch.resolve_char("GOKU")

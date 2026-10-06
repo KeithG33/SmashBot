@@ -272,10 +272,11 @@ def run(args) -> None:
     import torch
 
     from smashbot import saving
-    from smashbot.eval.game import load_policy, resolve_name_code
+    from smashbot.eval.game import load_policy
     from smashbot.rl.ppo import Learner
     from smashbot.rl.sim_league import SimLeague
-    from smashbot.rl.train_rl import build_value_function, _save_rl_checkpoint
+    from smashbot.rl.train_rl import _save_rl_checkpoint
+    from smashbot.value import build_value_function
     from smashbot.training import compile_cores, resolve_restore
     from smashbot.networks import check_loadable, use_manual_recurrent_step, use_packed_encoder
 
@@ -298,7 +299,7 @@ def run(args) -> None:
     value_fn = build_value_function(ckpt["config"], device)
     check_loadable({}, ckpt["state"]["value"])
     value_fn.load_state_dict(ckpt["state"]["value"])
-    name_code = resolve_name_code(name_map, args.runtime.name)
+    name_code = saving.resolve_name_code(name_map, args.runtime.name)
     print(f"teacher/init: {args.ckpt} (BC step {step}); conditioning code {name_code}")
 
     learner = Learner(args.learner, policy, teacher, value_fn)
@@ -370,7 +371,7 @@ def run(args) -> None:
         pol.requires_grad_(False)
         pol.eval()
         # all tiers serve from the phillip grid (one stacked forward)
-        phillips[tier] = (pol, frac, resolve_name_code(pnm, name))
+        phillips[tier] = (pol, frac, saving.resolve_name_code(pnm, name))
         print(f"phillip:{tier} <- {fname} ({frac:.2%} of envs)")
     league = SimLeague(
         snap_dir, phillips=phillips,

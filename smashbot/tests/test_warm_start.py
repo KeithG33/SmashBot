@@ -12,7 +12,7 @@ import torch
 from smashbot import configs, saving, train_bc, warm_start
 from smashbot.data import loader
 from smashbot.policy import build_policy_from_config
-from smashbot.rl.train_rl import build_value_function
+from smashbot.value import build_value_function
 from smashbot.tests.test_resume import _config, _latest
 
 SGU = dict(name="sgu", num_layers=1, hidden_size=32, num_heads=1, window=4, attn_heads=1, attn_head_dim=8)

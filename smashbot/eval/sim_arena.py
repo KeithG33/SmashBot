@@ -47,7 +47,6 @@ def load_player(path: str, device: str, config_from: str = ""):
     weights (a league snapshot) built with the config of the full checkpoint
     `config_from`."""
     from smashbot import saving
-    from smashbot.eval.naming import resolve_name_code
     from smashbot.networks import check_loadable
     from smashbot.policy import build_policy_from_config
 
@@ -55,7 +54,7 @@ def load_player(path: str, device: str, config_from: str = ""):
     if "config" in ckpt:
         ckpt = saving.upgrade_checkpoint(ckpt)
         config, weights, network_cfg = ckpt["config"], ckpt["state"]["policy"], ckpt["config"]["network"]
-        code = resolve_name_code(ckpt["state"].get("name_map", {}), "Master Player", verbose=False)
+        code = saving.resolve_name_code(ckpt["state"].get("name_map", {}), "Master Player", verbose=False)
         step = ckpt["state"].get("step")
     else:
         if not config_from:

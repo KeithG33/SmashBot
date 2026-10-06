@@ -31,13 +31,18 @@ import melee
 import torch
 from melee.slippstream import EnetDisconnected
 
+from smashbot import saving
 from smashbot.eval import game as game_lib
 from smashbot.networks import check_loadable
 from smashbot.eval.agent import AsyncDelayedAgent
-from smashbot.rl.config import MAIN_12
 from smashbot.rl.pool import snapshot_weights
 
 from slippi_ai import dolphin as dolphin_lib
+
+MAIN_12 = [
+    "FOX", "FALCO", "MARTH", "SHEIK", "JIGGLYPUFF", "CPTFALCON",
+    "PEACH", "YOSHI", "POPO", "LUIGI", "PIKACHU", "SAMUS",
+]
 
 DEFAULT_P2 = "/home/kage/drive2/ShineBot/models/medium-v2-torch.pt"
 DEFAULT_REPLAY_DIR = "/home/kage/drive2/ShineBot/replays/exhibition"
@@ -191,7 +196,7 @@ def build_agents(
         if compile_policies:
             game_lib.compile_policy(policy)
             policy.sample = _race_guarded(policy.sample)
-        code = game_lib.resolve_name_code(name_map, name)
+        code = saving.resolve_name_code(name_map, name)
         (opponent,) = [p for p in ports if p != port]
         agents[port] = AsyncDelayedAgent(
             policy,

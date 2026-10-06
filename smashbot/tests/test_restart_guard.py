@@ -12,7 +12,7 @@ from slippi_ai.paths import TOY_DATASET
 
 from smashbot import configs, train_bc
 from smashbot.rl import train_rl, train_sim
-from smashbot.rl.config import RLConfig
+from smashbot.rl.ppo import RLConfig
 from smashbot.rl.ppo import Learner
 from smashbot.tests.test_ppo import _tiny_policy, _tiny_value
 from smashbot.training import resolve_restore

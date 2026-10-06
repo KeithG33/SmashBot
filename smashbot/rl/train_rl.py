@@ -16,7 +16,7 @@ import os
 
 import tyro
 
-from smashbot.rl.config import RLConfig
+from smashbot.rl.ppo import RLConfig
 from smashbot.rl.train_sim import SimRolloutConfig
 
 
@@ -47,26 +47,6 @@ class Config:
     learner: RLConfig = dataclasses.field(default_factory=RLConfig)
     runtime: RuntimeConfig = dataclasses.field(default_factory=RuntimeConfig)
     sim: SimRolloutConfig = dataclasses.field(default_factory=SimRolloutConfig)
-
-
-def build_value_function(cfg: dict, device: str):
-    from smashbot import embed as embed_lib
-    from smashbot.networks import build_embed_network
-    from smashbot.value import ValueFunction, value_network_config
-
-    net_cfg = value_network_config(cfg["network"], cfg["value"])
-    return ValueFunction(
-        build_embed_network(
-            embed_config=embed_lib.EmbedConfig(),
-            controller_embedding=embed_lib.ControllerConfig(
-                axis_spacing=cfg["head"]["axis_spacing"],
-                shoulder_spacing=cfg["head"]["shoulder_spacing"],
-                type=cfg["head"].get("controller_type", "default"),
-            ).make_embedding(),
-            num_names=cfg["data"]["max_names"],
-            network_config=net_cfg,
-        )
-    ).to(device)
 
 
 def _save_rl_checkpoint(

@@ -15,7 +15,7 @@ from smashbot import configs, saving
 from smashbot.data import loader
 from smashbot.networks import use_chunk_start_resets, use_packed_encoder
 from smashbot.policy import StickScorer, build_policy_from_config
-from smashbot.rl.train_rl import build_value_function
+from smashbot.value import build_value_function
 from smashbot.train_bc import RuntimeConfig, score
 
 

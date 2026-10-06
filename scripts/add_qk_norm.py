@@ -19,7 +19,6 @@ import copy
 import dataclasses
 
 import torch
-import tree
 from slippi_ai.data import DatasetConfig
 
 from smashbot import configs, saving
@@ -27,7 +26,7 @@ from smashbot.data import loader
 from smashbot.delay import slice_delayed_frames
 from smashbot.networks import SGUBlock
 from smashbot.policy import build_policy_from_config
-from smashbot.rl.train_rl import build_value_function
+from smashbot.value import build_value_function
 
 
 def frame_batches(cfg: dict, name_map: dict, data_dir: str, meta_path: str, rows: int, n: int, seed: int):

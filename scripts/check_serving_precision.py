@@ -26,7 +26,8 @@ import tree
 
 import melee_sim as msl
 from smashbot import paths
-from smashbot.eval.game import load_policy, resolve_name_code
+from smashbot.eval.game import load_policy
+from smashbot.saving import resolve_name_code
 from smashbot.networks import use_manual_recurrent_step
 from smashbot.rl.agent import BatchedPolicyAgent, LeagueAgent
 from smashbot.rl import sim_env

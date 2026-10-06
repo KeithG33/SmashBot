@@ -79,7 +79,6 @@ def test_protocol_boundary_reseats_for_drawn_member_and_counts_fallback():
     seats, loads = _seats(S=2, N=1)             # only 2 seats for 2 envs: tight
     lg = League(pool, seats, random.Random(0))
     lg.boot([0, 1])
-    before = dict(lg.member_now)
     for _ in range(6):
         for e in (0, 1):
             seat = lg.on_boundary(e)

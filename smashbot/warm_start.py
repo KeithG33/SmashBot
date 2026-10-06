@@ -21,7 +21,6 @@ columns at the bucket's position.
 """
 from __future__ import annotations
 
-import copy
 import dataclasses
 import sys
 
@@ -34,7 +33,7 @@ from smashbot import configs, embed as embed_lib, saving
 from smashbot.data import loader
 from smashbot.delay import slice_delayed_frames
 from smashbot.policy import build_policy_from_config
-from smashbot.rl.train_rl import build_value_function
+from smashbot.value import build_value_function
 
 
 def leaf_columns(embedding) -> dict[tuple, slice]:

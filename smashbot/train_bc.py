@@ -28,11 +28,11 @@ import tyro
 from smashbot import configs, embed as embed_lib, saving
 from smashbot.data import loader
 from smashbot.delay import slice_delayed_frames
-from smashbot.networks import (build_embed_network, check_loadable, keep_sgu_activations,
+from smashbot.networks import (check_loadable, keep_sgu_activations,
                                use_chunk_start_resets, use_packed_encoder)
 from smashbot.policy import ActionLoss, EnergyScore, StickScorer, build_policy, imitation_metrics, stick_metrics
 from smashbot.training import GradClipper, compile_cores, resolve_restore
-from smashbot.value import ValueFunction, value_network_config
+from smashbot.value import build_value_function
 
 
 @dataclasses.dataclass
@@ -282,20 +282,7 @@ def main(config: TrainConfig) -> None:
         num_names=config.data.max_names,
     ).to(device)
 
-    value_net_config = value_network_config(dataclasses.asdict(config.network),
-                                            dataclasses.asdict(config.value))
-    value_fn = ValueFunction(
-        build_embed_network(
-            embed_config=embed_lib.EmbedConfig(),
-            controller_embedding=embed_lib.ControllerConfig(
-                axis_spacing=config.head.axis_spacing,
-                shoulder_spacing=config.head.shoulder_spacing,
-                type=config.head.controller_type,
-            ).make_embedding(),
-            num_names=config.data.max_names,
-            network_config=value_net_config,
-        )
-    ).to(device)
+    value_fn = build_value_function(dataclasses.asdict(config), device)
 
     use_chunk_start_resets(policy)
     use_chunk_start_resets(value_fn)

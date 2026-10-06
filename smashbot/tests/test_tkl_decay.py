@@ -7,7 +7,7 @@ import math
 import pytest
 import torch
 
-from smashbot.rl.config import RLConfig
+from smashbot.rl.ppo import RLConfig
 from smashbot.rl.ppo import Learner
 from smashbot.tests.test_ppo import _rollout, _tiny_policy, _tiny_value
 

@@ -19,7 +19,6 @@ from slippi_ai import dolphin as dolphin_lib
 
 from smashbot import saving
 from smashbot.eval.agent import DelayedAgent
-from smashbot.eval.naming import resolve_name_code  # noqa: F401  (re-export)
 from smashbot.networks import check_loadable
 from smashbot.paths import EXIAI_APPIMAGE, MELEE_ISO, NETPLAY_APPIMAGE
 from smashbot.policy import build_policy_from_config
