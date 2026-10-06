@@ -4,8 +4,7 @@ Bot (Fox) on port 1; opponent on port 2 is an in-game CPU by default, or a
 human with --opponent human (plug in a controller / configure inputs in the
 Dolphin window).
 
-Thin wrapper over eval/game.py — live play and eval batteries share one
-gamestate -> agent -> controller path, so they can never drift apart.
+A thin wrapper over eval/game.py, the Dolphin loop watch_live shares.
 
 Usage:
   .venv/bin/python -m smashbot.eval.play --ckpt <best.pt>                  # vs CPU 9, visible

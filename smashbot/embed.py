@@ -129,9 +129,6 @@ class BoolEmbedding(Embedding[bool, np.bool_]):
         )
 
 
-embed_bool = BoolEmbedding()
-
-
 class FloatEmbedding(Embedding[float, np.float32]):
     dtype = np.float32
     size = 1
