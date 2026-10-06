@@ -29,6 +29,7 @@ import contextlib
 import copy
 import math
 import random
+import time
 import typing as tp
 
 import torch
@@ -43,7 +44,6 @@ from smashbot.training import GradClipper
 from smashbot.value import ValueFunction
 
 
-
 def _decay(start: float, final: float, progress: float, path: str) -> float:
     """start at progress 0 to final at 1, clamped, along a line or
     geometrically ("exponential"); start throughout while final is negative."""
@@ -53,6 +53,7 @@ def _decay(start: float, final: float, progress: float, path: str) -> float:
     if path == "exponential":
         return start * (final / start) ** progress
     return start + (final - start) * progress
+
 
 class ActionData(tp.NamedTuple):
     # prev-action stream: controller_state[t] = the action sampled at frame
@@ -282,16 +283,11 @@ class Learner:
             value_function.parameters(), lr=config.learning_rate
         )
         self._ops = _StructOps(policy.controller_head.controller_embedding)
-        # Imitation row-cap sampling RNG; seeded for reproducibility,
-        # reseedable in tests.
-        self._imit_rng = random.Random(0)
-        # Current teacher-KL leash weight; refreshed from the decay
-        # schedule at each step() (constant when decay is disabled).
-        # Initialized here so direct _policy_loss calls (tests) work.
+        self._imit_rng = random.Random(0)   # the imitation row-cap sample
+        # the leash weights now; step() sets them from the decay schedule
         self._kl_teacher_w = config.kl_teacher_weight
         self._reverse_kl_teacher_w = config.reverse_kl_teacher_weight
-        # Persistent trust-region snapshot buffers (see step): tensor
-        # storages allocated once and copied into per step.
+        # trust-region snapshot buffers, allocated once and copied into per step
         self._snap_buffers: dict = {}
 
     def set_learning_rate(self, lr: float) -> set:
@@ -342,18 +338,15 @@ class Learner:
         return out
 
     def _autocast(self):
-        """fp16-mode autocast for POLICY forward regions; a plain null
-        context in fp32 mode (byte-identical legacy behavior: no autocast
-        object is ever constructed)."""
+        """fp16 autocast for the policy forwards; no autocast at all in fp32."""
         if not self._amp_enabled:
             return contextlib.nullcontext()
         return torch.autocast(self._device_type, dtype=torch.float16)
 
     def _backward(self, loss: torch.Tensor) -> None:
-        """Policy-loss backward: scaled through the GradScaler in fp16 mode
-        (gradients underflow fp16 without it — the probe's unscaled fp16 arm
-        lost 2/3 of the policy grad norm, 0.0206 vs fp32's 0.0597; the
-        scaled arm recovered it, 0.0601), plain backward in fp32."""
+        """Policy-loss backward, through the GradScaler in fp16 mode: unscaled
+        fp16 gradients underflow (the probe's unscaled arm lost 2/3 of the
+        policy grad norm)."""
         if self.grad_scaler is not None:
             self.grad_scaler.scale(loss).backward()
         else:
@@ -426,17 +419,14 @@ class Learner:
         a value-net update), and the actor's own log-probs — plus carried
         recurrent states.
 
-        The expensive forwards (teacher unroll, value fwd+bwd, log-probs)
-        run in row chunks of ceil(B / micro_batches): the unchunked fp32
-        value backward over the full batch was the learner's largest
-        constant VRAM block (micro_batches never touched it). Chunking is
-        exact — rows are independent through every core, value-loss chunks
-        accumulate weighted by their ROW share (the loss is a plain mean
-        and T is constant across row chunks), the value optimizer steps
-        ONCE per trajectory after all chunks, and per-row outputs/carried
+        The forwards run in row chunks of ceil(B / micro_batches), else the
+        full-batch fp32 value backward is the learner's largest VRAM block.
+        Chunking is exact: rows are independent through every core, value-loss
+        chunks accumulate weighted by their row share (a plain mean, T fixed),
+        the value optimizer steps once per trajectory, and per-row outputs and
         states are stitched back in row order. Merged metrics: counts sum,
-        absmax takes max, means are row-weighted (uev approximately — its
-        variance denominator is per-chunk; diagnostics only)."""
+        absmax takes max, means are row-weighted (uev only approximately: its
+        variance denominator is per-chunk)."""
         frames = self._frames(traj)
         batch_size = traj.rewards.shape[0]
 
@@ -465,10 +455,8 @@ class Learner:
                     cframes,
                     self._rows_take(state.teacher, lo, hi, batch_size),
                 )
-            # VALUE island: everything from here through the value
-            # optimizer step stays entirely fp32 — deliberately OUTSIDE
-            # any autocast scope (fp16's weakest probe arm; small compute
-            # share). No scaler either: fp32 gradients don't underflow.
+            # the value net stays fp32 through its optimizer step: outside any
+            # autocast, and unscaled (fp32 gradients don't underflow)
             value_out = self.value_function.outputs(
                 cframes,
                 self._rows_take(state.value, lo, hi, batch_size),
@@ -727,9 +715,7 @@ class Learner:
               f"env-has-reset={[bool(near_reset[e]) for e, _ in idx]}")
         if Learner._anomaly_dumps < 3:
             Learner._anomaly_dumps += 1
-            import time as _time
-
-            path = f"/tmp/smashbot-anomaly-{int(_time.time())}.pt"
+            path = f"/tmp/smashbot-anomaly-{int(time.time())}.pt"
             torch.save(
                 {"log_rhos": log_rhos.detach().cpu(),
                  "actor_log_probs": fixed.actor_log_probs.cpu(),
@@ -742,7 +728,7 @@ class Learner:
     def kl_teacher_weight_at(self, progress: float) -> float:
         """Teacher-KL leash coefficient at run fraction `progress`: from
         kl_teacher_weight to kl_teacher_weight_final along kl_teacher_decay;
-        constant (the historical behavior) while the final is negative."""
+        constant while the final is negative."""
         cfg = self.config
         return _decay(cfg.kl_teacher_weight, cfg.kl_teacher_weight_final, progress, cfg.kl_teacher_decay)
 
@@ -769,18 +755,12 @@ class Learner:
         """Fixed pass for one harvested opponent trajectory: critic update on
         its states (targets = discounted returns G_t along the opponent's
         seat), and detached MARWIL weights w from A = G - V. Returns None
-        (trajectory dropped) on nonfinite inputs — anomaly armor.
+        (trajectory dropped) on nonfinite inputs.
 
-        The critic forward+backward runs in row chunks of `row_budget`
-        (<=0: whole trajectory): harvest volume varies per step, and an
-        unchunked fp32 backward over a max-harvest step is what set the
-        learner's VRAM high-water mark (micro_batches never touched this
-        pass). Chunking is exact: rows are independent through the value
-        net, chunk losses accumulate weighted by their ROW share (the
-        loss is a plain mean over all positions), the optimizer steps ONCE per
-        trajectory after all chunks, and the MARWIL normalization runs on
-        the CONCATENATED advantages — identical weights to the unchunked
-        pass."""
+        The critic forward+backward runs in row chunks of `row_budget` (<=0:
+        whole trajectory), else a max-harvest step's fp32 backward sets the
+        learner's VRAM high-water mark. Chunking is exact, as in _fixed_pass,
+        and the MARWIL normalization runs on the concatenated advantages."""
         frames = self._frames(traj)
         finite = all(
             bool(torch.isfinite(leaf).all())
@@ -813,12 +793,7 @@ class Learner:
             value_out = self.value_function.outputs(
                 cf, value_state, discount=self.config.discount, detail=False,
             )
-            # chunk share of the full-trajectory mean loss (a plain .mean()
-            # over ALL positions — see value.py — so the share is the ROW
-            # fraction): accumulating these reproduces the unchunked
-            # gradient exactly
-            share = (hi - lo) / batch_size
-            (value_out.loss * share).backward()
+            (value_out.loss * ((hi - lo) / batch_size)).backward()   # its row share of the mean
             adv_chunks.append(value_out.advantages)
         # The critic trains on these states with G_t targets (same guard as
         # the on-policy value update).
@@ -894,31 +869,10 @@ class Learner:
         hold the whole fixed pass on the card twice)."""
         n = fixed.valid.shape[0]
         bounds = [round(j * n / k) for j in range(k + 1)]
-
-        def take(t, lo, hi):
-            if not isinstance(t, torch.Tensor):
-                return t
-            # Batch is dim 0 everywhere EXCEPT torch RNN states, which are
-            # [layers, B, H] — same disambiguation _mask_state uses. Slicing
-            # dim 0 there would hand every chunk the full state and give the
-            # last chunks an empty one.
-            if t.dim() >= 1 and t.shape[0] == n:
-                return t[lo:hi]
-            if t.dim() >= 2 and t.shape[1] == n:
-                return t[:, lo:hi]
-            return t
-
-        def rng(lo, hi):
-            return _Fixed(*(
-                tree.map_structure(lambda t: take(t, lo, hi), field)
-                for field in fixed
-            ))
-
         return [
-            rng(bounds[j], bounds[j + 1])
+            _Fixed(*(cls._rows_take(field, bounds[j], bounds[j + 1], n) for field in fixed))
             for j in range(k) if bounds[j + 1] > bounds[j]
         ]
-
 
     def _plan_imitation(
         self, imit_trajs: list[Trajectory], row_budget: int = 0,
@@ -982,12 +936,8 @@ class Learner:
         imitation_rows == 0. `progress` (run fraction) drives lambda decay.
         """
         cfg = self.config
-        ppo_trajs = [
-            t for t in trajectories if getattr(t, "kind", "ppo") != "imitation"
-        ]
-        imit_trajs = [
-            t for t in trajectories if getattr(t, "kind", "ppo") == "imitation"
-        ]
+        ppo_trajs = [t for t in trajectories if t.kind != "imitation"]
+        imit_trajs = [t for t in trajectories if t.kind == "imitation"]
 
         fixed_list: list[_Fixed] = []
         value_metrics: list[dict] = []

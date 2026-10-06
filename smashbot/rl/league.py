@@ -1,5 +1,5 @@
-"""Per-match league routing on the PFSP grid (v5 design, ported from the
-Dolphin fleet — AlphaStar draws the opponent per MATCH).
+"""Per-match league routing on the PFSP grid (AlphaStar draws the opponent
+per match).
 
 - MemberWeights: member key -> state_dict (CPU) through an LRU; warm()
   loads in a background thread a game ahead, so seating never stalls the
@@ -25,7 +25,7 @@ import typing as tp
 
 import torch
 
-from smashbot.rl.pool import SnapshotPool, _is_import_key, snapshot_weights
+from smashbot.rl.pool import SnapshotPool, snapshot_weights
 
 
 class MemberWeights:
@@ -113,9 +113,6 @@ class LeagueSeats:
     def seat_of(self, env: int) -> Seat | None:
         return self._seat_of.get(env)
 
-    def member_at(self, s: int) -> str | None:
-        return self.slices[s].member
-
     def occupancy(self) -> int:
         return len(self._seat_of)
 
@@ -131,7 +128,7 @@ class LeagueSeats:
         DRAINING: closed to new seats, so they empty within about one game
         and reload for fresh draws. Sticky per slice until it empties.
         Without this, wide slices never empty and the resident set
-        ossifies at the boot draw (v5's 36 thin slices drained by themselves)."""
+        ossifies at the boot draw."""
         self._drain = {p for p in self._drain if p.occupants}
         if any(not p.occupants for p in self.slices):
             return self._drain
@@ -240,15 +237,13 @@ class League:
     """boot(envs) seats the first members; on_boundary(env) at each env's
     game end re-seats it for the member drawn a game ahead. member_now[env]
     is the payoff label of the game being played; member_next[env] the one
-    the next game will be configured for (char locks)."""
+    drawn for its next game."""
 
-    def __init__(self, pool: SnapshotPool, seats: LeagueSeats,
-                 locks: dict[str, str], rng: random.Random,
+    def __init__(self, pool: SnapshotPool, seats: LeagueSeats, rng: random.Random,
                  warm: tp.Callable[[str], None] | None = None,
                  ready: tp.Callable[[str], bool] | None = None):
         self.pool = pool
         self.seats = seats
-        self.locks = locks
         self.rng = rng
         self.warm = warm            # start a background disk read
         self.ready = ready or (lambda m: True)   # weights cached (no stall)?
@@ -258,9 +253,6 @@ class League:
         self.member_next: dict[int, str] = {}
         self.draws = 0
         self.fallbacks = 0
-
-    def lock_of(self, member: str) -> str | None:
-        return self.locks.get(member) if _is_import_key(member) else None
 
     def _keys(self) -> list[str]:
         return list(self.pool.league_members) + list(self.pool.archive)

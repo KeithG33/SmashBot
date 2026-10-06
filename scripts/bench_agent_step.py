@@ -98,7 +98,6 @@ def main():
                                capture=args.capture,
                                precision=args.precision,
                                state_dtype=torch.float16 if args.state_fp16 else None)
-    agent.set_flat_controllers(True)
     game = embed_lib.EmbedConfig().make_game_embedding()
     rng = np.random.default_rng(0)
 

@@ -1,61 +1,28 @@
-"""Batched policy agent for RL rollouts: one forward pass drives N envs.
+"""Batched policy agents for RL rollouts: one forward pass drives N envs.
 
-Interface is ENCODED states (the env thread owns libmelee parsing), which
-keeps this module Dolphin-free and unit-testable. Per-env delay queues and
-recurrent-state resets are handled here; every step also emits the streams
-the PPO Trajectory needs (prev-action inputs, sample-time logits).
-
+Inputs are encoded states; per-env delay queues hold 13-float controller
+rows (encode.controller_rows) and recurrent state resets per env. Every step
+also emits the streams the PPO Trajectory needs (prev-action inputs,
+sample-time logits).
 """
 
 from __future__ import annotations
 
 import collections
+import copy
 import typing as tp
 
 import numpy as np
 import torch
 import tree
 
-from slippi_ai.types import Controller, StateAction
+from slippi_ai.types import StateAction
 
+from smashbot import encode
 from smashbot.causal_conv import ring_taps
 from smashbot.eval.agent import _neutral_controller
 from smashbot.networks import current_names, use_manual_recurrent_step
 from smashbot.policy import Policy
-
-
-def _make_builder(struct):
-    """Compile a structure (nested NamedTuples/dicts/lists of leaves) into
-    a function leaves_iter -> struct, walking the structure ONCE so per-row
-    rebuilds are plain constructor calls (dm-tree's unflatten_as re-walks
-    with isinstance checks every time)."""
-    if isinstance(struct, tuple) and hasattr(struct, "_fields"):
-        kids = [_make_builder(v) for v in struct]
-        ctor = type(struct)
-        return lambda it: ctor(*[k(it) for k in kids])
-    if isinstance(struct, dict):
-        keys = list(struct.keys())
-        kids = [_make_builder(struct[k]) for k in keys]
-        return lambda it: {k: b(it) for k, b in zip(keys, kids)}
-    if isinstance(struct, (list, tuple)):
-        kids = [_make_builder(v) for v in struct]
-        ctor = type(struct)
-        return lambda it: ctor(k(it) for k in kids)
-    return next
-
-
-_BUILDERS: dict = {}
-
-
-def _split_rows(struct, n: int) -> list:
-    """Per-row structs of a batched struct: one flatten plus n cheap
-    rebuilds through a cached compiled constructor."""
-    leaves = tree.flatten(struct)
-    key = id(type(struct)), len(leaves)
-    builder = _BUILDERS.get(key)
-    if builder is None:
-        builder = _BUILDERS[key] = _make_builder(struct)
-    return [builder(iter([leaf[i] for leaf in leaves])) for i in range(n)]
 
 
 class FrameRecord(tp.NamedTuple):
@@ -126,20 +93,15 @@ class BatchedPolicyAgent:
         self.num_envs = num_envs
         self.device = device
         self.temperature = temperature
-        # fp16 carried state — OPPONENT seats only (nothing downstream of
-        # them enters a loss; the student's logits feed the PPO ratio). The
-        # fp16-autocast forward computes state in fp16 anyway; seeding the
-        # initial zeros fp16 keeps the KV cat in fp16 (fp32 zeros would
-        # promote it back). Bit-identical vs fp32 storage:
-        # scripts/check_fp16_state.py.
+        # fp16 carried state: the fp16-autocast forward computes it in fp16
+        # anyway, and fp16 initial zeros keep the KV cat in fp16 (fp32 zeros
+        # would promote it back) — bit-identical to fp32 storage
         assert state_dtype is None or precision in ("fp16", "bf16"), (
             "state_dtype override requires a half-precision autocast forward"
         )
         self.state_dtype = state_dtype
         # "fp16": the network runs under fp16 autocast (sampling math stays
-        # fp32 — embed.py casts logits up); logits are stored fp16. Gated by
-        # the precision probe (docs/precision): the learner's ratio
-        # invariant must hold on batches captured this way.
+        # fp32 — embed.py casts logits up); logits are stored fp16
         assert precision in ("fp32", "fp16", "bf16"), precision
         self.precision = precision
         self.delay = policy.delay
@@ -159,14 +121,10 @@ class BatchedPolicyAgent:
 
         self.hidden = self._cast_state(policy.initial_state(num_envs, device))
         self._prev_action = tree.map_structure(lambda t: t.clone(), self._neutral_encoded)
-        # flat_controllers=True (the rollout worker): queues hold 13-float
-        # rows and step() returns rows (env rebuilds the struct) — no
-        # per-env struct construction on the worker
-        self.flat_controllers = False
-        self._queues: list[collections.deque[Controller]] = [
-            collections.deque([_neutral_controller()] * self.delay)
-            for _ in range(num_envs)
-        ]
+        self._neutral_row = encode.controller_rows(
+            tree.map_structure(lambda x: np.asarray(x)[None], _neutral_controller()))[0]
+        self._queues = [collections.deque([self._neutral_row] * self.delay)
+                        for _ in range(num_envs)]
         self._to_host = _HostCopy()
         # manual CUDA-graph capture with STATIC buffers.
         # torch.compile's cudagraph trees hand back outputs that the next
@@ -196,53 +154,23 @@ class BatchedPolicyAgent:
             return state
         return self.policy.network.cache_state(state, self.state_dtype)
 
-    @torch.no_grad()
-    def set_flat_controllers(self, flat: bool = True) -> None:
-        """Switch the controller output format (rows vs structs); the
-        pre-filled delay queues are rebuilt in the new format."""
-        self.flat_controllers = flat
-        self._queues = [
-            collections.deque([self._neutral()] * self.delay)
-            for _ in range(self.num_envs)
-        ]
-
-    def _neutral(self):
-        if self.flat_controllers:
-            from smashbot import encode
-
-            return encode.controller_rows(
-                tree.map_structure(lambda x: np.asarray(x)[None], _neutral_controller())
-            )[0]
-        return _neutral_controller()
-
-    def _enqueue(self, decoded) -> None:
-        if self.flat_controllers:
-            from smashbot import encode
-
-            rows = encode.controller_rows(decoded)
-            for i in range(self.num_envs):
-                self._queues[i].append(rows[i])
-        else:
-            for i, c in enumerate(_split_rows(decoded, self.num_envs)):
-                self._queues[i].append(c)
-
     def execute(self, reset_indices: tp.Sequence[int] = ()) -> list:
-        """Controllers to execute NOW: one pop per env from the delay
+        """Controller rows to execute NOW: one pop per env from the delay
         queues (envs whose game just reset get a fresh neutral queue first).
         Instant — never waits on inference — so the worker sends these
         BEFORE running this frame's forward and the envs step while the
-        GPU works. The controller popped is the same whether infer() has
-        appended this frame's output yet or not (FIFO of length delay)."""
+        GPU works. The row popped is the same whether infer() has appended
+        this frame's output yet or not (FIFO of length delay)."""
         for i in reset_indices:
-            self._queues[i] = collections.deque([self._neutral()] * self.delay)
+            self._queues[i] = collections.deque([self._neutral_row] * self.delay)
         return [self._queues[i].popleft() for i in range(self.num_envs)]
 
     def step(
         self, states: tp.Any, resets: torch.Tensor | None = None,
         reset_indices: tp.Sequence[int] | None = None,
         want_snapshot: bool = True,
-    ) -> tuple[list[Controller], list[FrameRecord], tp.Any]:
-        """execute() then infer(): returns (controllers to execute now,
+    ) -> tuple[list[np.ndarray], list[FrameRecord], tp.Any]:
+        """execute() then infer(): returns (controller rows to execute now,
         flushed FrameRecords, recurrent snapshot). Convenience for callers
         that do not pipeline the send (tests, eval)."""
         if resets is None:
@@ -320,7 +248,9 @@ class BatchedPolicyAgent:
     def settle(self) -> None:
         """Waits for the last launch()'s sampled controllers and appends them
         to the delay queues."""
-        self._enqueue(self._embed_controller.decode(self._to_host.wait()))
+        rows = encode.controller_rows(self._embed_controller.decode(self._to_host.wait()))
+        for q, row in zip(self._queues, rows):
+            q.append(row)
 
     def _autocast(self):
         dev = torch.device(self.device).type
@@ -437,9 +367,8 @@ class LeagueAgent:
 
     A slice holds one league member's weights (a stacked copy, loaded in
     place by load_slice); a cell is a seat with its own recurrent state,
-    prev action and delay queue. Who sits where is the worker's business
-    (rollouts._Grid routes envs to cells per match); this class only knows
-    the [S, N] batch. CUDA: the vmap forward over the stacked parameters is
+    prev action and delay queue. Who sits where is sim_league.PfspGrid's
+    business; this class only knows the [S, N] batch. CUDA: the vmap forward over the stacked parameters is
     captured once into a manual CUDA graph and replayed per frame. CPU: the
     same vmap forward runs eagerly — one code path, no per-slice loop.
     """
@@ -451,8 +380,6 @@ class LeagueAgent:
         state_dtype: torch.dtype | None = None,
         ring: bool | None = None,
     ):
-        import copy
-
         self.S, self.N = slices, cells
         self.device = torch.device(device)
         self.temperature = temperature
@@ -472,10 +399,9 @@ class LeagueAgent:
         )
         self.delay = template.delay
         self._embed_controller = template.controller_head.controller_embedding
-        # functional_call's skeleton: a THROWAWAY copy (never read back).
-        # The policy has tied parameters, and functional_call under vmap
-        # leaves a tied template holding an escaped BatchedTensor — so the
-        # template must be a throwaway copy.
+        # functional_call's skeleton must be a throwaway copy: the policy has
+        # tied parameters, and functional_call under vmap leaves a tied
+        # template holding an escaped BatchedTensor
         self._template = copy.deepcopy(template).to("cpu")
         self._template.__dict__.pop("sample", None)  # any compiled wrapper
         self._template.requires_grad_(False).eval()
@@ -529,8 +455,6 @@ class LeagueAgent:
             self._embed_controller.from_state(neutral),
         )
         self._prev = tree.map_structure(lambda t: t.clone(), self._neutral)
-        from smashbot import encode
-
         self._neutral_row = encode.controller_rows(
             tree.map_structure(lambda x: np.asarray(x)[None], _neutral_controller())
         )[0]
@@ -540,7 +464,6 @@ class LeagueAgent:
         ]
         self._graph = None
         self._vm = self._make_vmap()
-        self._timer = None  # optional profiler callback (name) -> None
         self._to_host = _HostCopy()
         # eager-path recurrent state [S, N, ...]; the captured path keeps
         # state in its static in/out buffers — lazy, so capture-mode never
@@ -644,14 +567,12 @@ class LeagueAgent:
                 lambda t: t.clone() if t.dtype == torch.bool else t.long().clone(), ctrl
             )
             self._to_host.start(tree.map_structure(self._flat, ctrl))
-        if self._timer is not None:
-            self._timer("forward")
         if not record:
             return None
         if views is None:
             views = self._view_fn(flats)
         flat = self._flat
-        frame = FrameRecord(
+        return FrameRecord(
             state=tree.map_structure(flat, views),
             prev_action=tree.map_structure(
                 lambda x: flat(x.clone() if x.dtype == torch.bool else x.long().clone()),
@@ -660,23 +581,13 @@ class LeagueAgent:
             logits=tree.map_structure(lambda t: flat(t.clone()), logits),
             name=flat(self._name).clone(),
         )
-        if self._timer is not None:
-            self._timer("record")
-        return frame
 
     def settle(self) -> None:
         """Waits for the last launch()'s sampled controllers and appends them
         to the delay queues."""
-        from smashbot import encode
-
-        encoded_np = self._to_host.wait()
-        if self._timer is not None:
-            self._timer("to_cpu")
-        rows = encode.controller_rows(self._embed_controller.decode(encoded_np))
+        rows = encode.controller_rows(self._embed_controller.decode(self._to_host.wait()))
         for q, row in zip(self._queues, rows):
             q.append(row)
-        if self._timer is not None:
-            self._timer("decode+queues")
 
     # ---------------------------------------------------------- forward
 

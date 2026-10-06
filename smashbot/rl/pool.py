@@ -2,11 +2,11 @@
 
 save() freezes policies as league members; draw_member() picks opponents
 weighted by AlphaStar's f_hard/f_var over the decayed-count payoff table
-(pfsp.json). The Dolphin env-partition machinery that shared this module
-left with the Dolphin fleet."""
+(pfsp.json)."""
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import random
@@ -92,12 +92,9 @@ class SnapshotPool:
             f"valid: '{IMPORT_KEY_PREFIX}NAME'"
         )
         self.league_members = list(league_members)
+        self.payoff_autosave = True   # False: the caller flushes the table itself
         os.makedirs(directory, exist_ok=True)
-        # Adopt snapshots already on disk (restarts must not amnesia the
-        # league: without this, every resume served only its own boot's
-        # saves and orphaned the older ghosts).
-        import glob
-
+        # adopt the snapshots already on disk, so a resume keeps its whole league
         self.archive: list[str] = sorted(
             glob.glob(os.path.join(directory, "snapshot-*.pt")),
             key=self._step_of,
@@ -140,30 +137,19 @@ class SnapshotPool:
         """One decided game vs the member keyed by `path` — a snapshot path
         or a special league member key (won = student won).
 
-        Estimator: DECAYED COUNTS (AlphaStar-payoff style), not an EMA of
-        the rate. wins_d/games_d with per-game 0.99 decay equals the exact
-        empirical mean at small n and a ~100-game recency window at large n
-        — an EMA of the rate mostly reports its own seed below ~1/alpha
-        games (live-caught: a 9-of-13 member displayed 0.963)."""
+        Estimator: decayed counts (AlphaStar-payoff style), not an EMA of the
+        rate: wins_d/games_d with per-game 0.99 decay is the exact empirical
+        mean at small n and a ~100-game recency window at large n, where an
+        EMA of the rate mostly reports its own seed below ~1/alpha games."""
         entry = self.payoff.setdefault(
             path, {"wins": 0, "games": 0, "wins_d": 0.0, "games_d": 0.0}
         )
         entry["games"] += 1
         entry["wins"] += int(won)
-        if "wins_d" not in entry:  # legacy row (rate-EMA era): adopt its
-            # lifetime record at a capped effective count so old members
-            # rejoin with their raw rate, not their seed-polluted EMA
-            eff = min(float(entry["games"] - 1), 1.0 / (1 - self.PAYOFF_DECAY))
-            rate = entry["wins"] / max(1, entry["games"])
-            entry["games_d"] = eff
-            entry["wins_d"] = rate * eff
-            entry.pop("win_ema", None)
         d = self.PAYOFF_DECAY
         entry["wins_d"] = d * entry["wins_d"] + float(won)
         entry["games_d"] = d * entry["games_d"] + 1.0
-        # payoff_autosave=False (sim worker): the caller flushes at
-        # checkpoint cadence instead of json-dumping per decided game
-        if getattr(self, "payoff_autosave", True):
+        if self.payoff_autosave:
             self._save_payoff()
 
     # ~100-game effective recency window at large n; exact mean at small n
@@ -171,14 +157,11 @@ class SnapshotPool:
 
     def win_estimate(self, path: str) -> float:
         """Student's estimated win rate vs this snapshot; 0.5 prior below
-        PRIOR_GAMES decided games. Legacy rate-EMA rows (no decayed counts)
-        fall back to their raw lifetime rate."""
+        PRIOR_GAMES decided games."""
         entry = self.payoff.get(path)
         if entry is None or entry["games"] < self.PRIOR_GAMES:
             return 0.5
-        if entry.get("games_d"):
-            return float(entry["wins_d"] / entry["games_d"])
-        return float(entry["wins"] / entry["games"])
+        return float(entry["wins_d"] / entry["games_d"])
 
     def save(self, policy, step: int, config: dict, name_map: dict) -> str:
         """A self-contained checkpoint, laid out like every other one; read
@@ -246,9 +229,8 @@ class SnapshotPool:
         """ONE per-match PFSP draw over the whole league (AlphaStar draws
         the opponent per match, not per generation).
 
-        Two-stage class weighting (user-chosen to stop ghost-mass swamping:
-        ~30 ghosts' collective weight must not outvote one hard external
-        member): stage 1 picks a class — "ghosts" (the whole snapshot
+        Two-stage class weighting, so ~30 ghosts' collective weight can't
+        outvote one hard external member: stage 1 picks a class — "ghosts" (the whole snapshot
         archive, latest included) or a singleton league member — with
         probability ∝ f(class hardness), f = f_hard or f_var per
         pfsp_hard_frac; stage 2 picks a ghost ∝ f(its own win estimate).

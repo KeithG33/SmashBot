@@ -48,7 +48,6 @@ def record_stream(frames):
     policy.eval()
     agent = BatchedPolicyAgent(policy, NENV, name_code=resolve_name_code(nm, "Master Player"),
                                device=DEV, precision="fp16")
-    agent.set_flat_controllers(True)
     env = msl.EnvBatch(batch_size=NENV, length=64, data_dir=os.environ["MSL_DATA_DIR"])
     env.configure_match(stage=msl.Stage.FINAL_DESTINATION,
                         players=[msl.PlayerConfig(msl.Character.FOX),

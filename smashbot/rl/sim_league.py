@@ -1,4 +1,4 @@
-"""Multi-opponent sim rollout (v10's league design on melee-sim-light).
+"""Multi-opponent sim rollout: the league on melee-sim-light.
 
 Env layout is STATIC: self envs / phillip-tier envs / PFSP envs, fixed for
 the run — no periods, no re-partition. Every game runs to its natural end
@@ -13,7 +13,8 @@ included). ONE student forward serves those seats plus each self env's
 second seat, which plays but is not learned from. Opponent seats: the
 phillip grid (static cells) and the PFSP grid (dynamic cells), one stacked
 forward each; every grid seat is harvested as a replay
-(rollouts.HarvestAssembler).
+(rollouts.HarvestAssembler). The eval arena (eval/sim_arena.py) runs the
+same worker without the learner side.
 """
 from __future__ import annotations
 
@@ -40,8 +41,8 @@ class PfspGrid:
     cell->env map that the per-frame gather uses; idle cells forward
     garbage against env 0 with reset held high and their rows are sliced
     out of every emitted chunk. Each seating starts a new tenure id
-    (-1: idle), which the harvest reads every frame (v10: a cell's rows
-    enter a chunk only if it was occupied for the WHOLE chunk).
+    (-1: idle), which the harvest reads every frame: a cell's rows enter a
+    chunk only if it was occupied for the whole chunk.
 
     Static use (the phillip tiers): assign_static() seats contiguous env
     rows once. Dynamic use (PFSP): rl/league.League drives seat changes at
@@ -64,7 +65,7 @@ class PfspGrid:
         self._tenures = 0
         self._cell_of: dict[int, int] = {}
         self._dirty = True
-        self.idx_t = self.valid_t = None
+        self.idx_t = None
         self.sync()
 
     # ---- weights ----
@@ -116,8 +117,6 @@ class PfspGrid:
     def sync(self):
         if self._dirty:
             self.idx_t = torch.as_tensor(self.cell_env, device=self.device)
-            self.valid_t = torch.as_tensor(np.nonzero(self.valid)[0],
-                                           device=self.device)
             self._dirty = False
 
 
@@ -188,7 +187,6 @@ class MultiOpponentSimWorker:
             # storage costs an up/down cast per layer per frame (12.9 -> 9.4 ms
             # at 400 rows) and the snapshot values are identical
             state_dtype=torch.float16 if capture and precision == "fp16" else None)
-        self.student.set_flat_controllers(True)
         self.ff = sim_env.FlatFrames(device)
         self.item_slots = sim_env.ItemSlots(batch_size)
         self.student.set_flat_inputs(self.ff.view)
@@ -470,7 +468,7 @@ class SimLeague:
         return out
 
     def make_league(self, seats, rng):
-        return League(self.league, seats, locks={}, rng=rng,
+        return League(self.league, seats, rng=rng,
                       warm=self.weights.warm, ready=self.weights.ready)
 
     def record(self, key, won: bool):

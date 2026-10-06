@@ -97,9 +97,8 @@ class ValueConfig:
     name: str = "match"  # match | tx_like | transformer | sgu
     hidden_size: int = 512
     num_layers: int = 1
-    # 0 = inherit the policy's window (back-compat with old checkpoints).
-    # Long windows mildly hurt value estimation (uev 0.337 @W256 vs 0.325
-    # @W64), so big trains pass an explicit smaller window here.
+    # 0 = the policy's window. Long windows mildly hurt value estimation (uev
+    # 0.337 at 256 vs 0.325 at 64), so big runs set a smaller one.
     window: int = 0
     # sgu only: one letter per layer as network.layout; empty = all SGU
     layout: str = ""

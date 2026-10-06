@@ -1,13 +1,13 @@
-"""Sim-backend RL training driver: melee-sim-light rollouts + the existing
-PPO learner. Reached via `train_rl` (its whole body); reuses train_rl's learner,
+"""Sim-backend RL training driver: melee-sim-light rollouts + the PPO
+learner. Reached via `train_rl` (its whole body); reuses train_rl's learner,
 checkpoint schema and overlap pipeline over SimLeague + MultiOpponentSimWorker.
 
-Pool design (locked): self-play 25% (both seats are learner rows, no
-harvest) / 12 fixed phillip tiers 50% (harvest; shares rise with strength
-within each architecture: the six 3/768 tiers, then the six big RL Phillips)
-/ PFSP pool 25% (the run's snapshots, harvest, drawn PER MATCH with
-replacement and routed on the PFSP grid at each env's own game boundary —
-rl/league.py). Env layout is static; every game runs to its end.
+Pool: self-play 25% (both seats are learner rows, no harvest) / 12 fixed
+phillip tiers 50% (harvest; shares rise with strength within each
+architecture: the six 3/768 tiers, then the six big RL Phillips) / PFSP pool
+25% (the run's snapshots, harvest, drawn per match with replacement and
+routed on the PFSP grid at each env's own game boundary — rl/league.py). Env
+layout is static; every game runs to its end.
 
 Logging: `rl/phillip/{tier}/*` per fixed tier, `rl/self/*`, `rl/snapshots/*`
 and per-ghost `rl/snapshots/s{step}` win estimates.
@@ -19,7 +19,7 @@ import os
 import random
 import time
 
-MODELS = "/home/kage/drive2/ShineBot/models"
+from smashbot import paths
 
 # tiers whose checkpoint isn't <tier>-torch.pt or whose RL run conditioned on
 # another name: tier -> (checkpoint, name)
@@ -40,27 +40,21 @@ _MSL_CHAR = {
 @dataclasses.dataclass
 class SimRolloutConfig:
     # learner rows = num_envs, one per game (a self env's second seat is
-    # served but not learned from); rows are the VRAM budget: v12 fit 400
-    # learner rows (449 ran out of memory at the first learner step), and
-    # the student forward also serves the self envs' second seats (500 rows
-    # at 400 envs). Shares of envs = shares of rows: self 25 / phillips 50 /
-    # pfsp 25; 100 pfsp envs over 40 slices = 2.5 games per loaded brain,
-    # about v10's 2.6. Sized for the 6/576 SGU: the hybrid's dry run
-    # re-derives envs and slices.
+    # served but not learned from); rows are the VRAM budget, and the student
+    # forward also serves the self envs' second seats (500 rows at 400 envs)
     num_envs: int = 400
     unroll_length: int = 240
     # frames of each harvested seat's own history the learner runs before
     # its imitation chunk, without gradients, so the chunk starts warm
     imitation_burn_in: int = 256
-    data_dir: str = "/home/kage/drive2/ShineBot/msl-data"
+    data_dir: str = str(paths.MSL_DATA_DIR)
     # sim batches stepped in parallel threads: one batch's step (~18 ms at
     # 400 envs) was the collect frame's critical path
     sim_shards: int = 2
     rollout_precision: str = "fp16"
-    # Manual static-buffer CUDA graph for the student forward. Its state
-    # buffers are fp16 (sim_league): with fp32 statics the graph paid an
-    # up/down cast per layer per frame and lost to cudagraph trees at fp16
-    # (12.9 vs 12.0 ms @400 rows); with fp16 statics it wins (9.4 ms).
+    # the student forward as a manual static-buffer CUDA graph with fp16 state
+    # buffers: 9.4 ms at 400 rows (fp32 statics cast every layer every frame
+    # and lose to cudagraph trees, 12.9 vs 12.0 ms)
     capture_serving: bool = True
     # --- pool shares (fractions of num_envs) ---
     self_frac: float = 0.25       # of envs = of learner rows
@@ -72,22 +66,19 @@ class SimRolloutConfig:
     phillip_fracs: tuple[float, ...] = (   # 50% of envs: 96 + 104 of 400
         0.025, 0.025, 0.0375, 0.0425, 0.05, 0.06,
         0.03, 0.035, 0.04, 0.045, 0.05, 0.06)
-    # everything left after self+phillips (25%) is the PFSP pool
-    # PFSP grid weight slices = resident members. v10 ran 36 slices x 4
-    # cells so a per-match draw usually found its member resident; each
-    # fp16 slice is ~54 MB; 40 slices for 100 pfsp envs = 2.5 envs/slice,
-    # about v10's 2.6, where per-match draws usually find their member
-    # resident; watch rl/league/* (fallback rate)
+    # everything left after self+phillips (25%) is the PFSP pool. Its grid's
+    # weight slices are the resident members (~54 MB each at fp16): ~2.5 envs
+    # per slice lets a per-match draw usually find its member resident;
+    # watch rl/league/fallback_rate
     pfsp_slices: int = 40
     max_game_frames: int = 28800  # Melee's 8-minute timer (60 fps)
-    # --- PFSP / snapshots (v10 values) ---
+    # --- PFSP / snapshots ---
     pfsp_hard_frac: float = 0.25
     pfsp_explore: float = 0.075
     snapshot_interval: int = 1500  # kept forever (keep=0): ~40 new ghosts by 100k
-    # seed a fresh run's snapshot dir from a previous run (symlinks + pfsp.json),
-    # curated: ghosts from seed_min_step on, the seed_keep_best HARDEST by
-    # ledger winrate (Keith: early ghosts are weak; fewer members keep the
-    # PFSP grid's fallback rate low)
+    # seed a fresh run's snapshot dir from a previous run (symlinks + pfsp.json):
+    # ghosts from seed_min_step on, the seed_keep_best hardest by ledger
+    # winrate (early ghosts are weak, and fewer members keep the fallback rate low)
     seed_snapshots_from: str = ""
     seed_min_step: int = 17000
     seed_keep_best: int = 30
@@ -179,7 +170,7 @@ class SimLeagueWorker:
 
     def _match(self, env_i: int, member: str):
         """The next match for env_i vs `member`: uniform chars, uniform stage,
-        student on port 1 or 2 at random (v10: cancels port priority in
+        student on port 1 or 2 at random (port priority cancels in
         aggregate), fresh engine seed, 8-min timer."""
         msl = _msl()
         student_c = self.rng.choice(self._chars)
@@ -214,7 +205,7 @@ class SimLeagueWorker:
         for t in cfg.phillip_tiers:   # weights live in the grid stacks now; free the GPU copies
             self.lg.phillips[t][0].to("cpu")
         # --- PFSP grid: S slices x Nc cells with one slice's worth of slack
-        # (v5 sizing) so seats float to demand; League routes per match
+        # so seats float to demand; League routes per match
         pfsp_envs = self.part["pfsp"]
         S = cfg.pfsp_slices
         Nc = -(-(len(pfsp_envs) + S) // S)
@@ -375,8 +366,7 @@ def run(args) -> None:
     phillips = {}
     for tier, frac in zip(scfg.phillip_tiers, scfg.phillip_fracs):
         fname, name = PHILLIP_FILES.get(tier, (f"{tier}-torch.pt", "Master Player"))
-        path = f"{MODELS}/{fname}"
-        pol, pnm, _ = load_policy(path, device)
+        pol, pnm, _ = load_policy(str(paths.MODELS_DIR / fname), device)
         pol.requires_grad_(False)
         pol.eval()
         # all tiers serve from the phillip grid (one stacked forward)
@@ -397,16 +387,10 @@ def run(args) -> None:
           f"{sum(len(v) for k, v in worker.part.items() if k.startswith('phillip'))}, "
           f"pfsp {len(worker.part['pfsp'])})", flush=True)
     if restored_trackers:
-        # dolphin-run kinds -> sim tracker keys ("reference" was the
-        # dedicated medium-v2 phillip in v10)
-        remap = {"snapshot": "snapshots", "reference": "phillip:medium"}
-        loaded = []
-        for kind, st in restored_trackers.items():
-            key = remap.get(kind, kind)
-            if key in worker.trackers:
-                worker.trackers[key].load_state(st)
-                loaded.append(key)
-        print(f"tracker EMAs restored for {sorted(loaded)}")
+        loaded = sorted(k for k in restored_trackers if k in worker.trackers)
+        for k in loaded:
+            worker.trackers[k].load_state(restored_trackers[k])
+        print(f"tracker EMAs restored for {loaded}")
     _save_rl_checkpoint.tracker_states = lambda: {
         k: t.state() for k, t in worker.trackers.items()
     }
@@ -534,8 +518,6 @@ def run(args) -> None:
                 state, metrics = fut.result()
                 _post_step(fut_i, metrics)
                 if fut_i < start_step + 6:
-                    # the footprint measurement IS the real run: launch with
-                    # --runtime.steps <start+6> --runtime.wandb-mode disabled
                     print(f"[vram] overlapped step {fut_i}: "
                           f"peak {torch.cuda.max_memory_allocated()/2**30:.2f} "
                           f"reserved {torch.cuda.memory_reserved()/2**30:.2f} GiB",

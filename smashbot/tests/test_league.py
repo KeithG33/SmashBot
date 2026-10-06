@@ -39,7 +39,7 @@ def test_compaction_donates_a_slice_exactly():
     assert seats.compactions == 1 and len(moves) == 1
     src, dst = moves[0]
     assert src[0] != dst[0]
-    assert {seats.member_at(0), seats.member_at(1)} == {"A", "B"}
+    assert {seats.slices[0].member, seats.slices[1].member} == {"A", "B"}
     assert all(seats.seat_of(e) is not None for e in (0, 2, 3))
 
 
@@ -67,25 +67,24 @@ class _Pool:
 def test_protocol_boot_seats_everyone_and_draws_next():
     pool = _Pool(["import:x"], archive=["g1", "g2"])
     seats, loads = _seats(S=3, N=2)
-    lg = League(pool, seats, {"import:x": "FOX"}, random.Random(0))
+    lg = League(pool, seats, random.Random(0))
     lg.boot([0, 1, 2, 3])
     assert all(seats.seat_of(e) is not None for e in range(4))
     assert set(lg.member_now.values()) <= {"import:x", "g1", "g2"}
     assert all(e in lg.member_next for e in range(4))
-    assert lg.lock_of("import:x") == "FOX" and lg.lock_of("g1") is None
 
 
 def test_protocol_boundary_reseats_for_drawn_member_and_counts_fallback():
     pool = _Pool(["a", "b", "c", "d"])
     seats, loads = _seats(S=2, N=1)             # only 2 seats for 2 envs: tight
-    lg = League(pool, seats, {}, random.Random(0))
+    lg = League(pool, seats, random.Random(0))
     lg.boot([0, 1])
     before = dict(lg.member_now)
     for _ in range(6):
         for e in (0, 1):
             seat = lg.on_boundary(e)
             assert seat == seats.seat_of(e)
-            assert seats.member_at(seat[0]) == lg.member_now[e]  # sits on its member
+            assert seats.slices[seat[0]].member == lg.member_now[e]  # sits on its member
     assert lg.draws >= 12
     # every seat change happened only through on_boundary; the grid never
     # held a member with occupants when its weights changed
