@@ -50,3 +50,22 @@ def test_stop_waits_out_a_draw_in_progress(monkeypatch):
     threading.Timer(6.0, release.set).start()   # outlasts the old 5 s join
     stream.stop()
     assert not stream._thread.is_alive() and alive_at_shutdown == [False]
+
+
+def test_a_draw_depends_only_on_its_eval_step(monkeypatch):
+    """Draw k is seeded by seed + k * interval, so a stream restarted at the
+    next eval step draws exactly the games the first stream drew there."""
+    picks = []
+    monkeypatch.setattr(loader, "seat_random", lambda split, span, rng, workers: picks.append(int(rng.integers(1 << 30))))
+
+    def draws(seed, n):
+        picks.clear()
+        stream = loader.RandomEvalStream(types.SimpleNamespace(shutdown=lambda: None), None, groups=1,
+                                         batches=0, span=10, seed=seed, num_workers=0, interval=2500)
+        for _ in range(n):
+            next(stream)
+        stream.stop()
+        return picks[:n]
+
+    from_start, after_restart = draws(7, 2), draws(7 + 2500, 1)
+    assert from_start[0] != from_start[1] and from_start[1] == after_restart[0]

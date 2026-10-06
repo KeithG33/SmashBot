@@ -236,7 +236,7 @@ def make_sources(
 
 def random_eval_stream(
     replays: list[data_lib.ReplayInfo], config: DataConfig, extra_frames: int, name_map: dict[str, int],
-    network, groups: int, rows: int, batches: int, seed: int,
+    network, groups: int, rows: int, batches: int, seed: int, interval: int = 0,
 ) -> "RandomEvalStream":
     """A RandomEvalStream over `replays` (the test split's), on a source of
     its own `rows` rows. Its decode workers only feed rows whose game
@@ -246,7 +246,7 @@ def random_eval_stream(
     eval_config = dataclasses.replace(config, batch_size=rows, num_workers=min(2, config.num_workers), random_offset=0)
     eval_split = _make_split(replays, eval_config, extra_frames, name_map, None)
     span = (batches + 1) * (config.unroll_length + extra_frames)
-    return RandomEvalStream(eval_split, network, groups, batches, span, seed, config.num_workers)
+    return RandomEvalStream(eval_split, network, groups, batches, span, seed, config.num_workers, interval)
 
 
 def batch_to_frames(batch: data_lib.Batch, network, pin: bool = False):
@@ -355,14 +355,15 @@ class RandomEvalStream:
     A draw is `groups` groups of the split's batch size in games, each row
     seated at a random mid-game point (seat_random) and read for `batches`
     consecutive batches of encoded Frames plus each stick's exact position.
-    The next draw waits ready while the current one is scored.
+    The next draw waits ready while the current one is scored. Draw k is
+    seeded by seed + k * interval (train_bc: its eval's step).
     """
 
     def __init__(self, split: Split, network, groups: int, batches: int, span: int, seed: int,
-                 num_workers: int):
+                 num_workers: int, interval: int = 0):
         self._split, self._network = split, network
         self._groups, self._batches, self._span = groups, batches, span
-        self._rng = np.random.default_rng(seed)
+        self._seed, self._interval = seed, interval
         self._num_workers = num_workers
         self._queue: queue.Queue = queue.Queue(maxsize=1)
         self._stop = threading.Event()
@@ -372,9 +373,11 @@ class RandomEvalStream:
 
     def _draw(self) -> tp.Optional[list]:
         """A draw, or None once stop() is called: it gives up between batches."""
+        rng = np.random.default_rng(self._seed)
+        self._seed += self._interval
         groups = []
         for _ in range(self._groups):
-            seat_random(self._split, self._span, self._rng, self._num_workers)
+            seat_random(self._split, self._span, rng, self._num_workers)
             group = []
             for _ in range(self._batches):
                 if self._stop.is_set():

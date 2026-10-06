@@ -396,11 +396,13 @@ def main(config: TrainConfig) -> None:
     eval_set = [next(eval_stream)[0] for _ in range(warm_batches + rt.eval_batches)]
     eval_stream.stop()
     sources.test.shutdown()
-    # seeded by the step too, so a resumed run draws games it hasn't scored yet
+    # seeded by each eval's step: an eval draws the same games whether or not
+    # the run restarted before it
     wide_stream = loader.random_eval_stream(
         sources.test.replays, config.data, config.policy.delay + 1, sources.name_map, policy.network,
         groups=rt.wide_eval_groups, rows=rt.wide_eval_rows, batches=warm_batches + rt.wide_eval_batches,
-        seed=config.data.dataset.seed * 1_000_003 + step) if rt.wide_eval_groups else None
+        seed=config.data.dataset.seed * 1_000_003 + (step // rt.eval_interval + 1) * rt.eval_interval,
+        interval=rt.eval_interval) if rt.wide_eval_groups else None
 
     def to_device(frames):
         return tree.map_structure(lambda t: t.to(device, non_blocking=True), frames)
