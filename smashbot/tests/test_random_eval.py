@@ -1,8 +1,6 @@
-"""The eval set is the same games at every eval, and a run resumed onto a
-different set starts its best over; the random-draw eval scores fresh random
-games at every eval, next to the eval set, and leaves training exactly as it
-would be without it: the same weights, optimizer state, data position and
-RNG states."""
+"""Every eval scores fresh random test games and leaves training exactly as
+it would be without it: the same weights, optimizer state, data position and
+RNG states; a run resumed onto a differently shaped eval starts its best over."""
 
 import dataclasses
 import threading
@@ -11,48 +9,33 @@ import types
 import numpy as np
 import torch
 
-from smashbot import configs, train_bc
+from smashbot import train_bc
 from smashbot.data import loader
 from smashbot.tests.test_resume import _assert_same, _config, _latest
-
-
-def _eval_losses(out: str, name: str = "eval") -> list[float]:
-    return [float(line.split("policy_loss ")[1].split(",")[0]) for line in out.splitlines()
-            if line.startswith(f"{name} @")]
-
-
-def test_a_frozen_model_scores_the_same_on_every_eval(tmp_path, capsys):
-    base = _config(str(tmp_path), "frozen", 6)
-    frozen = dataclasses.replace(base, learner=configs.LearnerConfig(learning_rate=0.0))
-    train_bc.main(frozen)
-    losses = _eval_losses(capsys.readouterr().out)
-    assert len(losses) == 3 and len(set(losses)) == 1
 
 
 def test_a_changed_eval_set_starts_best_over(tmp_path, capsys):
     base = _config(str(tmp_path), "run", 2)
     train_bc.main(base)
-    assert _latest(str(tmp_path), "run")["eval_set"].startswith("1x2 games")
+    assert _latest(str(tmp_path), "run")["eval_set"].startswith("random 1x2 games")
     resumed = dataclasses.replace(base, runtime=dataclasses.replace(
         base.runtime, steps=4, eval_rows=3, restore="auto"))
     capsys.readouterr()
     train_bc.main(resumed)
     out = capsys.readouterr().out
-    assert "eval set changed" in out and "(best eval inf)" in out
-    assert _latest(str(tmp_path), "run")["eval_set"].startswith("1x3 games")
+    assert "eval changed" in out and "(best eval inf)" in out
+    assert _latest(str(tmp_path), "run")["eval_set"].startswith("random 1x3 games")
 
 
-def test_random_eval_leaves_training_unchanged(tmp_path, capsys):
-    base = _config(str(tmp_path), "base", 4)
-    wide = dataclasses.replace(base, runtime=dataclasses.replace(
-        base.runtime, tag="wide", wide_eval_groups=2))
-    train_bc.main(base)
-    train_bc.main(wide)
-    out = capsys.readouterr().out
-    wide_lines = [line for line in out.splitlines() if line.startswith("eval_wide @")]
-    assert len(wide_lines) == 2 and all("nan" not in line for line in wide_lines)
+def test_evals_leave_training_unchanged(tmp_path, capsys):
+    evals = _config(str(tmp_path), "evals", 4)
+    none = dataclasses.replace(evals, runtime=dataclasses.replace(evals.runtime, tag="none", eval_interval=1000))
+    train_bc.main(evals)
+    train_bc.main(none)
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("eval_wide @")]
+    assert len(lines) == 2 and all("nan" not in line for line in lines)
 
-    a, b = _latest(str(tmp_path), "base"), _latest(str(tmp_path), "wide")
+    a, b = _latest(str(tmp_path), "evals"), _latest(str(tmp_path), "none")
     for key in ("policy", "value", "policy_opt", "value_opt", "train_data", "train_hidden", "value_hidden"):
         _assert_same(a[key], b[key], key)
     assert a["rng"]["python"] == b["rng"]["python"]
