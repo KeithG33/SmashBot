@@ -99,8 +99,9 @@ def test_percent_is_whole_as_in_replays():
 
 
 def test_randall_is_the_replay_parsers_cycle():
-    """The sim reports the cloud platform's own transform; the replays and
-    Dolphin give libmelee's position for the frame."""
+    """The sim reports the cloud's collision surface, a fraction of a unit
+    off libmelee's position for the frame; the replays and Dolphin give
+    libmelee's, so that is what we encode."""
     env = _env(msl.Stage.YOSHIS_STORY)
     differs = False
     for _ in range(400):
@@ -114,7 +115,7 @@ def test_randall_is_the_replay_parsers_cycle():
         dolphin_y, dolphin_left, dolphin_right = melee.randall_position(frame)
         assert game.randall.y[0] == np.float32(dolphin_y)
         assert game.randall.x[0] == np.float32((dolphin_left + dolphin_right) / 2)
-        differs |= abs(float(obs["stage"]["randall"]["y"][0]) - height) > 1
+        differs |= abs(float(obs["stage"]["randall"]["x"][0]) - (left + right) / 2) > 0.01
         env.step_and_reset()
     env.close()
     assert differs, "the sim's own Randall matched: the fixture tests nothing"

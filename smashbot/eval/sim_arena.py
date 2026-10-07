@@ -8,6 +8,7 @@ it for exactly reproducible results.
 """
 from __future__ import annotations
 
+import gc
 import os
 import random
 import time
@@ -145,7 +146,11 @@ class MatchSet:
         self._envs, self._unroll = P * cells, unroll
         cuda = torch.device(device).type == "cuda"
         opponent = opponent.to(device)
-        use_manual_recurrent_step(opponent)   # capturable, fp16-faithful one-frame cells (as RL serves)
+        # served as RL serves its grids: capturable, fp16-faithful one-frame
+        # cells, and the head sampling in fp32 (the big Phillips' logits reach
+        # ~1400, where fp16 rounds in steps of 1)
+        use_manual_recurrent_step(opponent)
+        opponent.fp32_head = True
         grids = static_grids(dict(enumerate(players)),
                              {p: range(p * cells, (p + 1) * cells) for p in range(P)}, device)
         self.worker = MultiOpponentSimWorker(
@@ -173,7 +178,13 @@ class MatchSet:
                       f"{_clock(now - start)} elapsed, eta {eta}", flush=True)
 
     def close(self):
+        """Ends the games and frees their GPU memory (the grids and captured
+        graphs); the results stay."""
         self.worker.close()
+        self.worker = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def stats(self, player: int = 0) -> dict:
         results, outcomes = self.results[player], self.outcomes[player]
