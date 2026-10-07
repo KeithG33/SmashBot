@@ -39,17 +39,18 @@ from smashbot.value import build_value_function
 class RuntimeConfig:
     steps: int = 20000
     eval_interval: int = 500
-    eval_batches: int = 8
-    # frames of each eval row's own history run (unscored) before its scored
-    # batches, so every eval starts from the current model's warm state
+    # the eval set (eval/*, which picks best.pt): eval_groups groups of
+    # eval_rows random test games, drawn once from a constant seed so every
+    # eval scores the same frames; each row runs eval_burn_in frames of its own
+    # history unscored, so the current model scores from its own warm state,
+    # then eval_batches scored batches
+    eval_groups: int = 4
+    eval_rows: int = 1024
+    eval_batches: int = 16
     eval_burn_in: int = 256
-    # the random-draw eval (eval_wide/*): every eval also scores
-    # wide_eval_groups groups of wide_eval_rows fresh random test games, each
-    # warmed like the fixed set, then scored for wide_eval_batches batches
-    # (0 groups: off)
+    # eval_wide/*: every eval also scores this many groups of fresh random
+    # test games, shaped like the eval set (0: off)
     wide_eval_groups: int = 0
-    wide_eval_rows: int = 1024
-    wide_eval_batches: int = 16
     log_interval: int = 50
     checkpoint_interval: int = 1000
     tag: str = "debug"
@@ -239,6 +240,8 @@ def main(config: TrainConfig) -> None:
         dataset.meta_path = os.path.join(os.path.dirname(dataset.data_dir.rstrip("/")), "meta.json")
     dataset.validate()
     rt = config.runtime
+    eval_set_id = (f"{rt.eval_groups}x{rt.eval_rows} games, {rt.eval_burn_in}+{rt.eval_batches}x"
+                   f"{config.data.unroll_length} frames, seed {config.data.dataset.seed}")
     run_dir = os.path.join(rt.run_dir, rt.tag)
     restore_path = resolve_restore(run_dir, rt.restore)
     os.makedirs(run_dir, exist_ok=True)
@@ -335,6 +338,9 @@ def main(config: TrainConfig) -> None:
                 state["step"] = state["step"].to(device=param.device, dtype=torch.float32)
         step = resume["step"]
         best_eval_loss = ckpt["best_eval_loss"]
+        if resume.get("eval_set") != eval_set_id:   # a best scored on other frames means nothing here
+            print(f"eval set changed ({resume.get('eval_set')} -> {eval_set_id}): best eval starts over")
+            best_eval_loss = math.inf
         print(f"restored from {restore_path} at step {step} (best eval {best_eval_loss:.4f})")
     elif init is not None:
         policy.load_state_dict(init["state"]["policy"])
@@ -369,27 +375,23 @@ def main(config: TrainConfig) -> None:
     train_stream = loader.TorchBatchStream(
         sources.train, config.data, encode_network=policy.network
     )
-    # The fixed eval set: the same frames every eval, each row a stretch of
-    # its own game from a seeded mid-game point, the first eval_burn_in
-    # frames unscored so the current model scores from its own warm state.
-    # Seeded by the split, so every run on the same split sees the same set.
+    sources.test.shutdown()   # the evals draw their own rows from its replays
     warm_batches = -(-rt.eval_burn_in // config.data.unroll_length)
-    loader.seat_mid_game(
-        sources.test, span=(warm_batches + rt.eval_batches + 1) * (config.data.unroll_length + config.policy.delay + 1),
-        seed=config.data.dataset.seed, num_workers=config.data.num_workers)
-    # with each stick's exact position, which eval scores both encodings against
-    eval_stream = loader.TorchBatchStream(sources.test, config.data, encode_network=policy.network,
-                                          with_sticks=True)
-    eval_set = [next(eval_stream)[0] for _ in range(warm_batches + rt.eval_batches)]
-    eval_stream.stop()
-    sources.test.shutdown()
-    # seeded by each eval's step: an eval draws the same games whether or not
-    # the run restarted before it
-    wide_stream = loader.random_eval_stream(
-        sources.test.replays, config.data, config.policy.delay + 1, sources.name_map, policy.network,
-        groups=rt.wide_eval_groups, rows=rt.wide_eval_rows, batches=warm_batches + rt.wide_eval_batches,
-        seed=config.data.dataset.seed * 1_000_003 + (step // rt.eval_interval + 1) * rt.eval_interval,
-        interval=rt.eval_interval) if rt.wide_eval_groups else None
+
+    def eval_stream(groups: int, seed: int, interval: int = 0):
+        return loader.random_eval_stream(
+            sources.test.replays, config.data, config.policy.delay + 1, sources.name_map, policy.network,
+            groups=groups, rows=rt.eval_rows, batches=warm_batches + rt.eval_batches, seed=seed,
+            interval=interval)
+
+    eval_seed = config.data.dataset.seed * 1_000_003
+    fixed = eval_stream(rt.eval_groups, eval_seed)
+    eval_set = next(fixed)
+    fixed.stop()
+    # a wide draw is seeded by its eval's step (never the eval set's seed), so
+    # it draws the same games whether or not the run restarted before it
+    wide_stream = eval_stream(rt.wide_eval_groups, eval_seed + (step // rt.eval_interval + 1) * rt.eval_interval,
+                              rt.eval_interval) if rt.wide_eval_groups else None
 
     def to_device(frames):
         return tree.map_structure(lambda t: t.to(device, non_blocking=True), frames)
@@ -421,6 +423,7 @@ def main(config: TrainConfig) -> None:
                 "value_hidden": _to(value_hidden, "cpu"),
                 "rng": _get_rng(),
                 "clip_history": {"policy": clip_policy.history},
+                "eval_set": eval_set_id,
             },
             best_eval_loss,
         )
@@ -440,10 +443,10 @@ def main(config: TrainConfig) -> None:
         return {**scores, "seconds": seconds}
 
     def run_eval() -> dict:
-        return score_groups([eval_set], B, "eval")
+        return score_groups(eval_set, rt.eval_rows, "eval")
 
     def run_wide_eval() -> dict:
-        return score_groups(next(wide_stream), rt.wide_eval_rows, "eval_wide")
+        return score_groups(next(wide_stream), rt.eval_rows, "eval_wide")
 
     from tqdm import tqdm
 

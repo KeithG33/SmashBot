@@ -25,7 +25,7 @@ def _config(run_dir, steps=5, eval_interval=1000):
         value=configs.ValueConfig(hidden_size=32, num_layers=1),
         head=configs.ControllerHeadConfig(residual_size=16, component_depth=1),
         runtime=train_bc.RuntimeConfig(
-            steps=steps, eval_interval=eval_interval, eval_batches=1, log_interval=1,
+            steps=steps, eval_interval=eval_interval, eval_groups=1, eval_rows=2, eval_batches=1, log_interval=1,
             checkpoint_interval=2, tag="run", run_dir=str(run_dir),
             wandb_mode="disabled", device="cpu", seed=0,
         ),

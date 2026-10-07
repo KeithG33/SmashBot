@@ -31,7 +31,7 @@ def _config(run_dir: str, tag: str, steps: int, autoclip: float = 0.0) -> train_
         value=configs.ValueConfig(hidden_size=32, num_layers=1),
         head=configs.ControllerHeadConfig(residual_size=16, component_depth=1),
         runtime=train_bc.RuntimeConfig(
-            steps=steps, eval_interval=2, eval_batches=1, log_interval=1,
+            steps=steps, eval_interval=2, eval_groups=1, eval_rows=2, eval_batches=1, log_interval=1,
             checkpoint_interval=1000, tag=tag, run_dir=run_dir,
             wandb_mode="disabled", device="cpu", seed=0,
         ),

@@ -38,7 +38,7 @@ def score_checkpoint(path: str, seed: int, groups: int, device: str) -> dict:
     warm_batches = -(-rt.eval_burn_in // data.unroll_length)
     stream = loader.random_eval_stream(
         test_replays, data, delay + 1, state["name_map"], policy.network,
-        groups=groups, rows=rt.wide_eval_rows, batches=warm_batches + rt.wide_eval_batches, seed=seed)
+        groups=groups, rows=rt.eval_rows, batches=warm_batches + rt.eval_batches, seed=seed)
     try:
         draw = next(stream)
     finally:
@@ -50,7 +50,7 @@ def score_checkpoint(path: str, seed: int, groups: int, device: str) -> dict:
         autocast = contextlib.nullcontext
     discount = 0.5 ** (1 / (cfg["value"]["reward_halflife"] * 60))
     return {"step": state["step"], **score(
-        policy, value_fn, StickScorer(policy.controller_head, device), draw, rt.wide_eval_rows,
+        policy, value_fn, StickScorer(policy.controller_head, device), draw, rt.eval_rows,
         delay, warm_batches, discount, autocast, device)}
 
 

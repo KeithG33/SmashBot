@@ -222,7 +222,7 @@ def make_sources(
     train_state: a Split.state() snapshot to resume from. A snapshot without
     rows (checkpoints that predate row tracking) only rotates the cycle;
     every row then restarts at frame 0 of a fresh replay. The test split
-    always starts fresh: it only feeds the fixed eval set (seat_mid_game).
+    always starts fresh: the evals draw their rows from its replays.
     """
     train_replays, test_replays = data_lib.train_test_split(config.dataset)
     if name_map is None:
@@ -296,11 +296,9 @@ class TorchBatchStream:
         source: Split,
         config: DataConfig,
         encode_network=None,
-        with_sticks: bool = False,
     ):
         self._source = source
         self._network = encode_network
-        self._with_sticks = with_sticks
         self._pin = config.pin_memory and torch.cuda.is_available()
         self._queue: queue.Queue = queue.Queue(maxsize=config.prefetch)
         self._stop = threading.Event()
@@ -319,8 +317,6 @@ class TorchBatchStream:
                     )
                 else:
                     item = batch_to_torch(batch_with_meta.batch, self._pin)
-                if self._with_sticks:
-                    item = (item, exact_sticks(batch_with_meta.batch.game.p0.controller))
                 while not self._stop.is_set():
                     try:
                         self._queue.put((item, epoch, state), timeout=1.0)
