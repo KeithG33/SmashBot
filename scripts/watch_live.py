@@ -116,21 +116,6 @@ def resolve_specs(args) -> dict[int, SideSpec]:
     }
 
 
-# the sim's six (melee_sim.config.Stage), which the RL bot trains on
-LEGAL_STAGES = ("FINAL_DESTINATION", "BATTLEFIELD", "YOSHIS_STORY", "DREAMLAND",
-                "POKEMON_STADIUM", "FOUNTAIN_OF_DREAMS")
-
-
-def resolve_stage(spec: str) -> str:
-    """'random' (or empty) draws a legal stage; otherwise validate the name."""
-    if not spec or spec.lower() == "random":
-        return random.choice(LEGAL_STAGES)
-    name = spec.upper()
-    if name not in melee.Stage.__members__:
-        raise ValueError(f"unknown stage {spec!r}")
-    return name
-
-
 def resolve_char(spec: str, rng=None) -> str:
     """'random' (or empty) draws from the main 12; otherwise validate the
     name against libmelee's roster."""
@@ -342,7 +327,7 @@ def main(argv=None) -> None:
     try:
         specs = resolve_specs(args)
         chars = {1: resolve_char(args.p1_char), 2: resolve_char(args.p2_char)}
-        stage = resolve_stage(args.stage)
+        stage = game_lib.resolve_stage(args.stage)
     except ValueError as e:
         sys.exit(f"error: {e}")
 
@@ -424,7 +409,7 @@ def main(argv=None) -> None:
         ):
             records.append(record)
             print(f"{_describe(record, len(records))} on {stage}")
-            stage = resolve_stage(args.stage)   # the next game's, chosen before its stage select
+            stage = game_lib.resolve_stage(args.stage)   # the next game's, chosen before its stage select
             dolphin.stage = melee.Stage[stage]
     except EnetDisconnected:
         print(f"window closed, {len(records)} game"

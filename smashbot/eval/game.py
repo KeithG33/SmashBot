@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import random
 import time
 import typing as tp
 
@@ -58,6 +59,21 @@ def compile_policy(policy) -> None:
     # been overwritten"). Fusion alone is enough for batch-1 live inference.
     policy.sample = torch.compile(policy.sample, mode="default")
     torch._dynamo.config.recompile_limit = 128
+
+
+# the sim's six (melee_sim.config.Stage), which the RL bot trains on
+LEGAL_STAGES = ("FINAL_DESTINATION", "BATTLEFIELD", "YOSHIS_STORY", "DREAMLAND",
+                "POKEMON_STADIUM", "FOUNTAIN_OF_DREAMS")
+
+
+def resolve_stage(spec: str) -> str:
+    """'random' (or empty) draws a legal stage; otherwise validate the name."""
+    if not spec or spec.lower() == "random":
+        return random.choice(LEGAL_STAGES)
+    name = spec.upper()
+    if name not in melee.Stage.__members__:
+        raise ValueError(f"unknown stage {spec!r}")
+    return name
 
 
 def make_dolphin(

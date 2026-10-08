@@ -13,6 +13,7 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
 import unicodedata
 
@@ -40,12 +41,13 @@ def main(argv=None) -> None:
                     help="the bot's own Slippi account (a second account, not yours)")
     ap.add_argument("--connect-code", required=True, help="the code the bot dials")
     ap.add_argument("--char", default="FOX")
-    ap.add_argument("--stage", default="FINAL_DESTINATION",
-                    help="the bot's pick when it is the one choosing")
+    ap.add_argument("--stage", default="random",
+                    help="the bot's pick when it chooses: a stage, or 'random' = a legal stage each game")
     ap.add_argument("--online-delay", type=int, default=15,
                     help="Slippi input delay on the bot's side, taken out of its policy delay")
     ap.add_argument("--name", default="Master Player", help="identity to condition on")
     ap.add_argument("--device", default="cuda", choices=("cpu", "cuda"))
+    ap.add_argument("--replay-dir", default="/home/kage/drive2/ShineBot/replays/netplay")
     args = ap.parse_args(argv)
 
     with open(args.user_json) as f:
@@ -64,12 +66,15 @@ def main(argv=None) -> None:
           f"delay {policy.delay} = {args.online_delay} online + {agent.delay} agent | {device}",
           flush=True)
 
+    os.makedirs(args.replay_dir, exist_ok=True)
     dolphin = game_lib.make_dolphin(
         {1: dolphin_lib.AI(character=melee.Character[args.char.upper()])},
         headless=False,
-        stage=args.stage,
+        stage=game_lib.resolve_stage(args.stage),
         online_delay=args.online_delay,
         mute=True,
+        save_replays=True,
+        replay_dir=args.replay_dir,
         connect_code=args.connect_code,
         user_json_path=args.user_json,
     )
@@ -77,24 +82,35 @@ def main(argv=None) -> None:
     # which online is not the in-game port (upstream skips it with a connect code)
     dolphin.next_gamestate = dolphin.console.step
     controller = dolphin.controllers[1]   # the local controller; Slippi picks the in-game port
-    last_frame = None
+    last_frame = score = None
+
+    def report():
+        if score:
+            print("game over: bot {} stocks {:.0f}% | {} {} stocks {:.0f}%".format(*score), flush=True)
+
     try:
         for gamestate in dolphin.iter_gamestates():
             if last_frame is None or gamestate.frame < last_frame:
+                report()
                 codes = {port: _code(p.connectCode) for port, p in gamestate.players.items()}
                 own = [port for port, code in codes.items() if code == bot_code]
                 if len(own) != 1:
                     raise RuntimeError(f"bot {bot_code} not found among {codes}")
                 (opponent,) = [port for port in codes if port != own[0]]
                 agent.set_ports(own[0], opponent)
-                print(f"game: bot on port {own[0]}, {codes[opponent]} on port {opponent}", flush=True)
+                print(f"game: bot on port {own[0]}, {codes[opponent]} on port {opponent}, "
+                      f"{gamestate.stage.name}", flush=True)
+                dolphin.stage = melee.Stage[game_lib.resolve_stage(args.stage)]   # the next game's pick
             last_frame = gamestate.frame
+            bot, opp = gamestate.players[own[0]], gamestate.players[opponent]
+            score = (bot.stock, bot.percent, codes[opponent], opp.stock, opp.percent)
             controller_lib.send_controller(controller, agent.step(gamestate))
     except EnetDisconnected:
         print("the bot's Dolphin closed", flush=True)
     except KeyboardInterrupt:
         pass
     finally:
+        report()
         dolphin.stop()
 
 
