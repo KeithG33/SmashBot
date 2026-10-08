@@ -126,7 +126,7 @@ def group_by_architecture(policies: dict) -> list[list]:
     groups: dict = {}
     for key, policy in policies.items():
         shape = (tuple((k, tuple(v.shape)) for k, v in policy.state_dict().items()),
-                 policy.delay, policy.network.tech_mask_window)
+                 policy.delay, policy.network.tech_mask_window, policy.network.tech_mask_forward_window)
         groups.setdefault(shape, []).append(key)
     return list(groups.values())
 

@@ -1,6 +1,7 @@
 """Typed configs for SmashBot. Mirrors slippi-ai's nested flag structure."""
 
 import dataclasses
+import typing
 
 from slippi_ai.data import DatasetConfig
 
@@ -9,8 +10,9 @@ def from_dict(cls, saved: dict):
     """A config from a checkpoint's saved dict. A key the class no longer
     has is a setting whose behaviour became unconditional (gate_gelu, v_norm)
     and is dropped; a key the checkpoint predates takes its default."""
-    fields = {f.name for f in dataclasses.fields(cls)}
-    return cls(**{k: v for k, v in saved.items() if k in fields})
+    types = typing.get_type_hints(cls)
+    return cls(**{k: from_dict(types[k], v) if dataclasses.is_dataclass(types[k]) and isinstance(v, dict) else v
+                  for k, v in saved.items() if k in types})
 
 
 @dataclasses.dataclass
@@ -37,6 +39,19 @@ class DataConfig:
 @dataclasses.dataclass
 class PolicyConfig:
     delay: int = 18
+
+
+@dataclasses.dataclass
+class GameInputs:
+    """What the simple embedding reads of the game. slippi-ai's 2025 models
+    (fox_d18_ditto_v4) read no Nana, Randall, FoD platforms or items, and
+    jumps_left over 6 values (fixed upstream to 7 in Sep 2025)."""
+
+    with_nana: bool = True
+    with_randall: bool = True
+    with_fod: bool = True
+    items: bool = True
+    legacy_jumps_left: bool = False
 
 
 @dataclasses.dataclass
@@ -77,6 +92,10 @@ class NetworkConfig:
     # the opponent's tech hidden as a neutral tech for its first frames
     # (slippi-ai's AnimationFilter; the big RL Phillips' observation); 0 = off
     tech_mask_window: int = 0
+    # forward tech's own window where it differs (slippi-ai's 2025 per-character
+    # tables: 7 frames against Fox or Falco, back tech 4); 0 = tech_mask_window
+    tech_mask_forward_window: int = 0
+    game_inputs: GameInputs = dataclasses.field(default_factory=GameInputs)
 
 
 @dataclasses.dataclass

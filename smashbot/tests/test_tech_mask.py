@@ -15,8 +15,15 @@ StateAction = collections.namedtuple("StateAction", "state")
 
 class _Filter:
     tech_mask_window = 4
+    tech_mask_forward_window = 4
     _mask_tech = StateActionNetwork._mask_tech
     _mask_tech_unroll = StateActionNetwork._mask_tech_unroll
+    _tech_windows = StateActionNetwork._tech_windows
+
+
+class _Fox2025(_Filter):
+    """slippi-ai's 2025 table against Fox: back tech hidden 4 frames, forward 7."""
+    tech_mask_forward_window = 7
 
 
 def _sequences(B=8, T=48, seed=0):
@@ -47,8 +54,7 @@ def _unroll(f, action, reset, prev, count):
 
 
 def test_unroll_matches_serving():
-    f = _Filter()
-    for seed in range(5):
+    for f, seed in [(f, seed) for f in (_Filter(), _Fox2025()) for seed in range(5)]:
         action, reset, prev, count = _sequences(seed=seed)
         want = _serving(f, action, reset, prev, count)
         got = _unroll(f, action, reset, prev, count)
@@ -65,3 +71,11 @@ def test_chunked_unroll_carries_state():
     second = _unroll(f, action[:, 19:], reset[:, 19:], first[1], first[2])
     assert torch.equal(torch.cat([first[0], second[0]], 1).long(), whole[0].long())
     assert torch.equal(second[1], whole[1]) and torch.equal(second[2], whole[2])
+
+
+def test_fox_2025_hides_forward_tech_7_frames_and_back_tech_4():
+    for tech, hidden in ((FORWARD_TECH, 7), (BACKWARD_TECH, 4), (NEUTRAL_TECH, 10)):
+        action = torch.tensor([[14] * 3 + [tech] * 10], dtype=torch.int16)
+        masked, _, _ = _unroll(_Fox2025(), action, torch.zeros_like(action, dtype=torch.bool),
+                               torch.zeros(1, dtype=torch.long), torch.zeros(1, dtype=torch.long))
+        assert (masked[0, 3:] == NEUTRAL_TECH).sum() == hidden

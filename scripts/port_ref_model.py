@@ -4,7 +4,7 @@
 Three phases, run in the right interpreter:
 
   1. export  (venv-ref: TF + full slippi_ai)
-     Dumps the 141 policy variables, the name_map/config, and a golden set of
+     Dumps the policy variables, the name_map/config, and a golden set of
      synthetic encoded state-action sequences with the TF policy's per-step
      logits (all 13 controller components) and final LSTM states.
 
@@ -164,7 +164,7 @@ def export(args):
         out2, state2 = policy.network.unroll(
             tree.map_structure(lambda t: t[CHUNK_T:], inputs),
             reset[CHUNK_T:], state1)
-        outputs = tf.concat([out1, out2], axis=0)  # [T, B, 768]
+        outputs = tf.concat([out1, out2], axis=0)  # [T, B, H]
 
         prev_action = tree.map_structure(lambda t: t[:TOTAL_T], sa.action)
         target_action = tree.map_structure(lambda t: t[1:], sa.action)
@@ -180,7 +180,7 @@ def export(args):
             golden[f"g{g}_logit{i:02d}"] = t.numpy()
 
         flat_state = tree.flatten(state2)  # h0, c0, h1, c1, h2, c2
-        assert len(flat_state) == 6, len(flat_state)
+        assert len(flat_state) == 2 * len(state2), len(flat_state)
         for i, t in enumerate(flat_state):
             golden[f"g{g}_fs{i}"] = t.numpy()
 
@@ -200,38 +200,92 @@ def export(args):
 # ---------------------------------------------------------------------------
 
 
-def _build_torch_policy():
+# slippi-ai's per-character tech masks, May 2025 to Feb 2026 (observations.py,
+# 409624ac until 043f1d9d made it one 7-frame window): against each opponent,
+# (frames back tech reads as neutral, frames forward tech does)
+TECH_MASKS_2025 = {"FOX": (4, 7), "FALCO": (4, 7)}
+
+
+def _opponent_chars(tf_ckpt) -> set[str]:
+    """The characters a self-play RL checkpoint trained against: its own, from
+    rl_config (or, before that field, its dataset's), as slippi-ai's
+    AgentSummary reads them."""
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from port_jax_phillip import load_pickle
+
+    saved = load_pickle(tf_ckpt)
+    rl = saved["rl_config"]
+    if rl["opponent"]["type"] not in ("self", "OpponentType.SELF"):
+        raise ValueError(f"opponent type {rl['opponent']['type']} not covered by this port")
+    chars = rl["agent"].get("char") or saved["config"]["dataset"]["allowed_characters"].split(",")
+    return {str(c).split(".")[-1].upper() for c in chars}
+
+
+def _tech_mask(config, tf_ckpt) -> tuple[int, int]:
+    if not config.get("observation", {}).get("animation", {}).get("mask"):
+        return 0, 0
+    windows = {TECH_MASKS_2025.get(c) for c in _opponent_chars(tf_ckpt)}
+    if len(windows) != 1 or None in windows:
+        raise ValueError(f"tech mask against {_opponent_chars(tf_ckpt)} not covered by this port")
+    return windows.pop()
+
+
+def _game_inputs(embed: dict):
+    from smashbot import configs
+
+    player = embed.get("player", {})
+    covered = dict(xy_scale=0.05, shield_scale=0.01, speed_scale=0.5, with_speeds=False, with_controller=False)
+    wrong = {k: player[k] for k, v in covered.items() if k in player and player[k] != v}
+    if wrong:
+        raise ValueError(f"player embedding not covered by this port: {wrong}")
+    return configs.GameInputs(
+        with_nana=player.get("with_nana", True),
+        legacy_jumps_left=player.get("legacy_jumps_left", False),
+        with_randall=embed.get("with_randall", True),
+        with_fod=embed.get("with_fod", True),
+        items="SKIP" not in str(embed.get("items", {}).get("type", "")),
+    )
+
+
+def _build_torch_policy(config, tf_ckpt):
     from smashbot import configs, embed as embed_lib
     from smashbot.policy import build_policy
 
     head_config = configs.ControllerHeadConfig(
         residual_size=128, component_depth=2, axis_spacing=32, shoulder_spacing=10
     )
+    network_config = _network_config(config, tf_ckpt)
     policy = build_policy(
-        embed_config=embed_lib.EmbedConfig(),
+        embed_config=embed_lib.simple_embed_config(network_config.game_inputs),
         controller_config=embed_lib.ControllerConfig(
             axis_spacing=head_config.axis_spacing,
             shoulder_spacing=head_config.shoulder_spacing,
         ),
-        network_config=_network_config(),
+        network_config=network_config,
         head_config=head_config,
-        policy_config=configs.PolicyConfig(delay=21),
-        num_names=128,
+        policy_config=configs.PolicyConfig(delay=config["policy"]["delay"]),
+        num_names=config["max_names"],
     )
-    return policy, head_config
+    return policy, head_config, network_config
 
 
-def _network_config():
+def _network_config(config, tf_ckpt):
     from smashbot import configs
 
+    tx = config["network"]["tx_like"]
+    back, forward = _tech_mask(config, tf_ckpt)
     return configs.NetworkConfig(
         name="tx_like",
-        hidden_size=768,
-        num_layers=3,
-        ffw_multiplier=2,
-        recurrent_layer="lstm",
+        hidden_size=tx["hidden_size"],
+        num_layers=tx["num_layers"],
+        ffw_multiplier=tx["ffw_multiplier"],
+        recurrent_layer=tx["recurrent_layer"],
         # slippi-ai's LayerNorm has no epsilon; torch's default is 1e-5.
         ln_eps=0.0,
+        tech_mask_window=back,
+        tech_mask_forward_window=forward,
+        game_inputs=_game_inputs(config["embed"]),
     )
 
 
@@ -244,9 +298,9 @@ def convert(args):
     with open(os.path.join(args.scratch, "port_meta.json")) as f:
         meta = json.load(f)
     names = meta["var_names"]
-    assert len(names) == 141, len(names)
+    config = meta["config"]
 
-    policy, head_config = _build_torch_policy()
+    policy, head_config, network_config = _build_torch_policy(config, args.tf_ckpt)
     policy.eval()
 
     cursor = [0]
@@ -289,19 +343,20 @@ def convert(args):
     set_linear(policy.controller_head.to_residual, "AutoRegressive/linear")
 
     # --- item MLP (one module shared by all 15 slots) ---
-    embed_game = policy.network.embed_game
-    items_embed = dict(embed_game.embedding)["items"]
-    item_mlp = items_embed.embedding[0][1]._mlp  # Sequential(Linear, ReLU, Linear, ReLU)
-    for slot_name, slot_embed in items_embed.embedding:
-        assert slot_embed._mlp is item_mlp, slot_name  # shared weights
-    set_linear(item_mlp[0], "MLP_Item/mlp/linear_0")
-    set_linear(item_mlp[2], "MLP_Item/mlp/linear_1")
+    if network_config.game_inputs.items:
+        embed_game = policy.network.embed_game
+        items_embed = dict(embed_game.embedding)["items"]
+        item_mlp = items_embed.embedding[0][1]._mlp  # Sequential(Linear, ReLU, Linear, ReLU)
+        for slot_name, slot_embed in items_embed.embedding:
+            assert slot_embed._mlp is item_mlp, slot_name  # shared weights
+        set_linear(item_mlp[0], "MLP_Item/mlp/linear_0")
+        set_linear(item_mlp[2], "MLP_Item/mlp/linear_1")
 
     # --- tx_like core ---
     core = policy.network.core
     set_linear(core._layers[0]._module, "TransformerLike/encoder")
     num_layers = (len(core._layers) - 1) // 2
-    assert num_layers == 3
+    assert num_layers == network_config.num_layers
     for l in range(num_layers):
         lstm = core._layers[1 + 2 * l]._net._core
         H = lstm.hidden_size
@@ -327,7 +382,7 @@ def convert(args):
     take("value_head/b:0", (1,))
     take("value_head/w:0", (H, 1))
 
-    assert cursor[0] == 141, cursor[0]
+    assert cursor[0] == len(names), (cursor[0], len(names))
     missing = [n for n, p in policy.named_parameters() if id(p) not in assigned]
     assert not missing, f"unassigned parameters: {missing}"
 
@@ -336,12 +391,12 @@ def convert(args):
     from smashbot import configs, saving
     from smashbot.train_bc import TrainConfig
 
-    config = TrainConfig(
-        policy=configs.PolicyConfig(delay=21),
-        network=_network_config(),
+    train_config = TrainConfig(
+        policy=configs.PolicyConfig(delay=config["policy"]["delay"]),
+        network=network_config,
         head=head_config,
     )
-    config.data.max_names = 128
+    train_config.data.max_names = config["max_names"]
     state = {
         "policy": policy.state_dict(),
         "name_map": meta["name_map"] or {},
@@ -349,7 +404,7 @@ def convert(args):
         "ported_from": f"slippi-ai {os.path.basename(args.tf_ckpt)} (TF), "
                        f"via scripts/port_ref_model.py",
     }
-    saving.save_checkpoint(args.torch_ckpt, config, state, best_eval_loss=float("inf"))
+    saving.save_checkpoint(args.torch_ckpt, train_config, state, best_eval_loss=float("inf"))
     print(f"wrote {args.torch_ckpt}")
 
     # prove it loads through the eval path
@@ -375,7 +430,7 @@ def _erf(x: np.ndarray) -> np.ndarray:
         return torch.special.erf(torch.from_numpy(x)).numpy()
 
 
-def _ref64_forward(w, emb32, reset, prev_encs, target_encs):
+def _ref64_forward(w, var_names, emb32, reset, prev_encs, target_encs):
     """Independent fp64 reference: sonnet equations + raw TF weights.
 
     w: index -> np.ndarray (TF checkpoint order, sonnet [in, out] layout).
@@ -393,15 +448,18 @@ def _ref64_forward(w, emb32, reset, prev_encs, target_encs):
         sd = np.sqrt(np.square(xc).mean(-1, keepdims=True))  # their LN: no eps
         return (xc / sd) * scale + bias
 
-    x = emb32.astype(np.float64) @ w[111] + w[110]  # encoder
-    h = [np.zeros((B, 768)) for _ in range(3)]
-    c = [np.zeros((B, 768)) for _ in range(3)]
-    outputs = np.empty((T, B, 768))
+    enc = var_names.index("TransformerLike/encoder/b:0")
+    num_layers = sum("lstm/b:0" in n for n in var_names)
+    H = w[enc].shape[0]
+    x = emb32.astype(np.float64) @ w[enc + 1] + w[enc]  # encoder
+    h = [np.zeros((B, H)) for _ in range(num_layers)]
+    c = [np.zeros((B, H)) for _ in range(num_layers)]
+    outputs = np.empty((T, B, H))
     for t in range(T):
         xt = x[t]
         mask = reset[t][:, None]
-        for l in range(3):
-            base = 112 + 9 * l
+        for l in range(num_layers):
+            base = enc + 2 + 9 * l
             w_h, w_i, b = w[base], w[base + 1], w[base + 2]
             ln_bias, ln_scale = w[base + 3], w[base + 4]
             l1_b, l1_w, l2_b, l2_w = (w[base + 5], w[base + 6],
@@ -420,7 +478,8 @@ def _ref64_forward(w, emb32, reset, prev_encs, target_encs):
         outputs[t] = xt
 
     # Autoregressive head, teacher forcing.
-    residual = outputs @ w[105] + w[104]  # to_residual
+    res = var_names.index("AutoRegressive/linear/b:0")
+    residual = outputs @ w[res + 1] + w[res]  # to_residual
     relu = lambda z: np.maximum(z, 0.0)
     logits_out = []
     for ci, (pe, te) in enumerate(zip(prev_encs, target_encs)):
@@ -430,7 +489,7 @@ def _ref64_forward(w, emb32, reset, prev_encs, target_encs):
         y = relu(y @ w[base + 5] + w[base + 4])
         logits_out.append(y @ w[base + 7] + w[base + 6])
         residual = residual + (te @ w[base + 1] + w[base])
-    final = [h[0], c[0], h[1], c[1], h[2], c[2]]
+    final = [s for l in range(num_layers) for s in (h[l], c[l])]
     return logits_out, final
 
 
@@ -527,6 +586,8 @@ def run_report(policy, asset) -> dict:
 
     logit_paths = json.loads(str(asset["logit_paths"]))
     policy64 = copy.deepcopy(policy).double()
+    unfiltered = copy.deepcopy(policy)   # slippi-ai's tech mask filters observations outside the network
+    unfiltered.network.tech_mask_window = 0
     diffs = {}
 
     def acc(key, got, ref):
@@ -566,11 +627,11 @@ def run_report(policy, asset) -> dict:
                     t.numpy().reshape(BATCH, -1), asset[f"g{g}_ref64_fs{i}"])
 
             # --- gate c: fp32 end-to-end vs the TF fp32 run ---
-            state = policy.network.initial_state(BATCH, device="cpu")
+            state = unfiltered.network.initial_state(BATCH, device="cpu")
             out32, state = _chunked_unroll(
-                policy.network.unroll, state, inputs, reset,
+                unfiltered.network.unroll, state, inputs, reset,
                 lambda x, a, b: tree.map_structure(lambda t: t[:, a:b], x))
-            dist = policy.controller_head.distance(
+            dist = unfiltered.controller_head.distance(
                 out32, prev_action, target_action)
             for i, t in enumerate(tree.flatten(dist.logits)):
                 acc(f"fp32/logits/{logit_paths[i]}",
@@ -592,7 +653,7 @@ def check_report(diffs: dict) -> list[str]:
     return failures
 
 
-def _build_asset(policy, golden, debug, weights):
+def _build_asset(policy, golden, debug, weights, var_names):
     """Golden npz + TF embedded inputs + independent fp64 reference outputs."""
 
     w = {int(k[2:]): weights[k] for k in weights.files}
@@ -603,7 +664,7 @@ def _build_asset(policy, golden, debug, weights):
         names, prev_encs, target_encs = _component_names_and_encodings(
             policy, sa_np)
         logits64, final64 = _ref64_forward(
-            w, debug[f"g{g}_embedded"], golden[f"g{g}_reset"],
+            w, var_names, debug[f"g{g}_embedded"], golden[f"g{g}_reset"],
             prev_encs, target_encs)
         for name, arr in zip(names, logits64):
             asset[f"g{g}_ref64_{name.replace('/', '_')}"] = arr
@@ -622,8 +683,10 @@ def verify(args):
     golden = np.load(os.path.join(args.scratch, "ref_port_golden.npz"))
     debug = np.load(os.path.join(args.scratch, "ref_port_debug.npz"))
     weights = np.load(os.path.join(args.scratch, "port_weights.npz"))
+    with open(os.path.join(args.scratch, "port_meta.json")) as f:
+        var_names = json.load(f)["var_names"]
 
-    asset = _build_asset(policy, golden, debug, weights)
+    asset = _build_asset(policy, golden, debug, weights, var_names)
     os.makedirs(os.path.dirname(args.golden_asset), exist_ok=True)
     np.savez_compressed(args.golden_asset, **asset)
     print(f"wrote {args.golden_asset} "

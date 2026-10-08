@@ -373,7 +373,9 @@ def make_embed_char():
 
 
 # puff and kirby have 6 jumps; one-hot of 7
-def make_embed_jumps_left():
+def make_embed_jumps_left(legacy: bool = False):
+    if legacy:   # slippi-ai before Sep 2025: one value short, the overflow embeds as zeros
+        return OneHotEmbedding("jumps_left", 6, dtype=np.uint8, one_hot_policy=OneHotPolicy.EMPTY)
     return OneHotEmbedding("jumps_left", 7, dtype=np.uint8)
 
 
@@ -382,6 +384,7 @@ def _base_player_embedding(
     shield_scale: float = 0.01,
     speed_scale: float = 0.5,
     with_speeds: bool = False,
+    legacy_jumps_left: bool = False,
 ) -> list[tuple[str, Embedding]]:
     embed_xy = FloatEmbedding("xy", scale=xy_scale)
 
@@ -393,7 +396,7 @@ def _base_player_embedding(
         ("action", make_embed_action()),
         ("character", make_embed_char()),
         ("invulnerable", BoolEmbedding()),
-        ("jumps_left", make_embed_jumps_left()),
+        ("jumps_left", make_embed_jumps_left(legacy_jumps_left)),
         ("shield_strength", FloatEmbedding("shield_size", scale=shield_scale)),
         ("on_ground", BoolEmbedding()),
     ]
@@ -420,12 +423,14 @@ def make_player_embedding(
     with_speeds: bool = False,
     with_controller: bool = False,
     with_nana: bool = True,
+    legacy_jumps_left: bool = False,
 ) -> StructEmbedding[Player]:
     embedding = _base_player_embedding(
         xy_scale=xy_scale,
         shield_scale=shield_scale,
         speed_scale=speed_scale,
         with_speeds=with_speeds,
+        legacy_jumps_left=legacy_jumps_left,
     )
 
     if with_nana:
@@ -450,6 +455,7 @@ class PlayerConfig:
     # opponent's controller is not embedded; our own prev action is separate
     with_controller: bool = False
     with_nana: bool = True
+    legacy_jumps_left: bool = False
 
 
 def make_embed_stage():
@@ -782,6 +788,16 @@ class EmbedConfig:
             with_fod=self.with_fod,
             items_config=self.items,
         )
+
+
+def simple_embed_config(inputs) -> EmbedConfig:
+    """The simple embedding of a configs.GameInputs."""
+    return EmbedConfig(
+        player=PlayerConfig(with_nana=inputs.with_nana, legacy_jumps_left=inputs.legacy_jumps_left),
+        with_randall=inputs.with_randall,
+        with_fod=inputs.with_fod,
+        items=ItemsConfig() if inputs.items else ItemsConfig(type=ItemsType.SKIP),
+    )
 
 
 def get_state_action_embedding(

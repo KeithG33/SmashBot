@@ -985,7 +985,7 @@ class StateActionNetwork(Network):
     """Embeds StateAction structs, then runs the core network."""
 
     def __init__(self, embed_game, embed_state_action, core: Network,
-                 enhanced=None, tech_mask_window: int = 0):
+                 enhanced=None, tech_mask_window: int = 0, tech_mask_forward_window: int = 0):
         super().__init__()
         from smashbot import embed as embed_lib
 
@@ -994,6 +994,7 @@ class StateActionNetwork(Network):
         self.core = core
         self.enhanced = enhanced   # an EnhancedEmbed in place of the leaves' embedding
         self.tech_mask_window = tech_mask_window   # see _mask_tech
+        self.tech_mask_forward_window = tech_mask_forward_window or tech_mask_window
         self.packed_embed = (
             embed_lib.PackedStructForward(embed_state_action) if enhanced is None else None
         )
@@ -1071,7 +1072,7 @@ class StateActionNetwork(Network):
         from_start = start_count.gather(1, last_start.clamp(min=0)) + pos - last_start
         counts = torch.where(last_start >= 0, from_start, count[:, None] + 1 + pos)
         tech = (action == NEUTRAL_TECH) | (action == FORWARD_TECH) | (action == BACKWARD_TECH)
-        masked = torch.where(tech & (counts < self.tech_mask_window), NEUTRAL_TECH, action)
+        masked = torch.where(tech & (counts < self._tech_windows(action)), NEUTRAL_TECH, action)
         state = state_action.state._replace(p1=state_action.state.p1._replace(action=masked))
         return state_action._replace(state=state), (a[:, -1], counts[:, -1])
 
@@ -1085,9 +1086,12 @@ class StateActionNetwork(Network):
         action = state_action.state.p1.action
         count = torch.where(action.long() == prev_action, count + 1, 0)
         tech = (action == NEUTRAL_TECH) | (action == FORWARD_TECH) | (action == BACKWARD_TECH)
-        masked = torch.where(tech & (count < self.tech_mask_window), NEUTRAL_TECH, action)
+        masked = torch.where(tech & (count < self._tech_windows(action)), NEUTRAL_TECH, action)
         state = state_action.state._replace(p1=state_action.state.p1._replace(action=masked))
         return state_action._replace(state=state), (action.long(), count)
+
+    def _tech_windows(self, action):
+        return torch.where(action == FORWARD_TECH, self.tech_mask_forward_window, self.tech_mask_window)
 
 
 def build_embed_network(
@@ -1151,4 +1155,5 @@ def build_embed_network(
         core,
         enhanced=enhanced,
         tech_mask_window=getattr(network_config, "tech_mask_window", 0),
+        tech_mask_forward_window=getattr(network_config, "tech_mask_forward_window", 0),
     )

@@ -269,7 +269,7 @@ def main(config: TrainConfig) -> None:
     print(f"name_map: {sources.name_map}")
 
     policy = build_policy(
-        embed_config=embed_lib.EmbedConfig(),
+        embed_config=embed_lib.simple_embed_config(config.network.game_inputs),
         controller_config=embed_lib.ControllerConfig(
             axis_spacing=config.head.axis_spacing,
             shoulder_spacing=config.head.shoulder_spacing,

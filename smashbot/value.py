@@ -25,7 +25,8 @@ class ValueOutputs(tp.NamedTuple):
     metrics: dict
 
 
-INPUT_KEYS = ("embed", "embed_hidden_size", "rating", "embed_joint_index_wraps", "tech_mask_window")
+INPUT_KEYS = ("embed", "embed_hidden_size", "rating", "embed_joint_index_wraps", "tech_mask_window",
+              "tech_mask_forward_window", "game_inputs")
 
 
 def value_network_config(network: dict, value: dict):
@@ -40,7 +41,7 @@ def value_network_config(network: dict, value: dict):
         name = network["name"]
     inputs = ({k: network[k] for k in INPUT_KEYS if k in network}
               if value.get("inputs", "simple") == "policy" else {})
-    return configs.NetworkConfig(
+    return configs.from_dict(configs.NetworkConfig, dict(
         name=name,
         hidden_size=value["hidden_size"],
         num_layers=value["num_layers"],
@@ -49,7 +50,7 @@ def value_network_config(network: dict, value: dict):
         layout=value.get("layout", ""),
         qk_norm=network.get("qk_norm", False),
         **inputs,
-    )
+    ))
 
 
 class ValueFunction(nn.Module):
@@ -146,7 +147,7 @@ def build_value_function(cfg: dict, device: str) -> ValueFunction:
     net_cfg = value_network_config(cfg["network"], cfg["value"])
     return ValueFunction(
         build_embed_network(
-            embed_config=embed_lib.EmbedConfig(),
+            embed_config=embed_lib.simple_embed_config(net_cfg.game_inputs),
             controller_embedding=embed_lib.ControllerConfig(
                 axis_spacing=cfg["head"]["axis_spacing"],
                 shoulder_spacing=cfg["head"]["shoulder_spacing"],

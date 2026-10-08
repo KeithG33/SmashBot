@@ -314,14 +314,15 @@ def build_policy_from_config(cfg: dict) -> Policy:
     """A policy from a checkpoint's saved config dict."""
     from smashbot import configs, embed as embed_lib
 
+    network_config = configs.from_dict(configs.NetworkConfig, cfg["network"])
     return build_policy(
-        embed_config=embed_lib.EmbedConfig(),
+        embed_config=embed_lib.simple_embed_config(network_config.game_inputs),
         controller_config=embed_lib.ControllerConfig(
             axis_spacing=cfg["head"]["axis_spacing"],
             shoulder_spacing=cfg["head"]["shoulder_spacing"],
             type=cfg["head"].get("controller_type", "default"),
         ),
-        network_config=configs.from_dict(configs.NetworkConfig, cfg["network"]),
+        network_config=network_config,
         head_config=configs.from_dict(configs.ControllerHeadConfig, cfg["head"]),
         policy_config=configs.from_dict(configs.PolicyConfig, cfg["policy"]),
         num_names=cfg["data"]["max_names"],
