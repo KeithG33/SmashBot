@@ -51,6 +51,11 @@ class DelayedAgent:
         self._graph = None
         self.reset()
 
+    def set_ports(self, own_port: int, opponent_port: int) -> None:
+        """Seats the agent anew (online, Slippi assigns ports per game)."""
+        self._ports = (own_port, opponent_port)
+        self.reset()
+
     def reset(self) -> None:
         self.parser = Parser(ports=list(self._ports))
         initial = self.policy.initial_state(1, self.device)

@@ -70,11 +70,18 @@ def make_dolphin(
     mute: bool = False,
     save_replays: bool = False,
     replay_dir: str = "",
+    connect_code: str = "",
+    user_json_path: str = "",
 ) -> dolphin_lib.Dolphin:
     """One Dolphin. Headless uses the ExiAI build (null video, fast-forward);
     visible play uses the standard netplay build. save_replays writes .slp
-    files (headless included: run fast, watch later in Slippi at 60fps)."""
+    files (headless included: run fast, watch later in Slippi at 60fps).
+    connect_code takes the bot to Slippi Online Direct with that code, signed
+    in as the account in user_json_path."""
     console_kwargs: dict = {"stage": melee.Stage[stage.upper()]}
+    if connect_code:
+        console_kwargs["connect_code"] = connect_code
+        console_kwargs["user_json_path"] = user_json_path
     if save_replays:
         console_kwargs["save_replays"] = True
         if replay_dir:
