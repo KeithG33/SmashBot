@@ -1020,7 +1020,11 @@ class StateActionNetwork(Network):
         return self.embed_game.from_state(game)
 
     def initial_state(self, batch_size, device=None):
-        core = self.core.initial_state(batch_size, device)
+        return self.around_core(self.core.initial_state(batch_size, device), batch_size, device)
+
+    def around_core(self, core, batch_size, device=None):
+        """The network's recurrent state around a core state (also a serving
+        ring): the tech mask's filter state rides beside it."""
         if not self.tech_mask_window:
             return core
         zero = torch.zeros(batch_size, dtype=torch.long, device=device)

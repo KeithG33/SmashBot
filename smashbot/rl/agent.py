@@ -140,7 +140,7 @@ class BatchedPolicyAgent:
         self._ring = (self._use_capture and hasattr(self._core, "initial_ring_state")
                       and ring is not False)
         if self._ring:   # the ring state exists from the start: snapshots precede the first replay
-            self.hidden = self._cast_state(self._core.initial_ring_state(num_envs, device))
+            self.hidden = self._cast_state(self._initial_ring(num_envs, device))
         self._graph = None
         # flat inputs (capture): the static inputs are the worker's three typed
         # flats and the struct the forward reads is a view of them, built once —
@@ -314,23 +314,30 @@ class BatchedPolicyAgent:
         # warmup + capture ran on whatever frame arrived first: restart the
         # carried state so the first replay begins from zeros
         init = self._cast_state(
-            self._core.initial_ring_state(self.num_envs, self.device) if self._ring
+            self._initial_ring(self.num_envs, self.device) if self._ring
             else self.policy.initial_state(self.num_envs, self.device))
         tree.map_structure(
             lambda dst, src: dst.copy_(src) if isinstance(dst, torch.Tensor) else None,
             self.hidden, init,
         )
 
+    def _initial_ring(self, batch, device):
+        return self.policy.network.around_core(self._core.initial_ring_state(batch, device), batch, device)
+
     def _ring_carry(self, new_hidden):
-        ptr, kv_ptr = self.hidden["ptr"], self.hidden["kv_ptr"]
-        for layer, new in zip(self.hidden["layers"], new_hidden["layers"]):
+        hidden = self.hidden
+        if "core" in hidden:   # the tech mask's filter state rides beside the ring
+            tree.map_structure(lambda d, s: d.copy_(s), hidden["tech_mask"], new_hidden["tech_mask"])
+            hidden, new_hidden = hidden["core"], new_hidden["core"]
+        ptr, kv_ptr = hidden["ptr"], hidden["kv_ptr"]
+        for layer, new in zip(hidden["layers"], new_hidden["layers"]):
             if not isinstance(layer, tuple):   # recurrent layer: one state tensor
                 layer.copy_(new)
                 continue
             (v_ring, _), (v_new, _) = layer, new   # the attention ring was written by the forward
             assert v_new.dim() == 2 and v_ring.dim() == 3, "ring carry takes a [B, d] slot, never a cache"
             v_ring.index_copy_(1, ptr.view(1), v_new.unsqueeze(1).to(v_ring.dtype))
-        self.hidden["cache_len"].copy_(new_hidden["cache_len"])
+        hidden["cache_len"].copy_(new_hidden["cache_len"])
         ptr.add_(1)
         ptr.remainder_(self._core.window - 1)
         kv_ptr.add_(1)
@@ -355,7 +362,10 @@ class BatchedPolicyAgent:
 
     def hidden_snapshot(self) -> tp.Any:
         """Detached copy of the recurrent state (for Trajectory.initial_state)."""
-        hidden = self._core.canonical_state(self.hidden) if self._ring else self.hidden
+        hidden = self.hidden
+        if self._ring:
+            hidden = ({**hidden, "core": self._core.canonical_state(hidden["core"])} if "core" in hidden
+                      else self._core.canonical_state(hidden))
         return tree.map_structure(
             lambda t: t.detach().clone() if isinstance(t, torch.Tensor) else t,
             hidden,
@@ -592,7 +602,9 @@ class LeagueAgent:
     # ---------------------------------------------------------- forward
 
     def _initial_hidden(self):
-        make = self._core.initial_ring_state if self._ring else self._template.initial_state
+        net = self._template.network
+        make = ((lambda n, d: net.around_core(self._core.initial_ring_state(n, d), n, d))
+                if self._ring else self._template.initial_state)
         h0 = [make(self.N, self.device) for _ in range(self.S)]
         stacked = tree.map_structure(
             lambda *xs: torch.stack(xs) if isinstance(xs[0], torch.Tensor) else xs[0],
@@ -717,15 +729,19 @@ class LeagueAgent:
         )
 
     def _ring_carry(self):
-        ptr, kv_ptr = self._in_hidden["ptr"], self._in_hidden["kv_ptr"]   # [S], all equal
-        for layer, new in zip(self._in_hidden["layers"], self._out_hidden["layers"]):
+        hidden, new_hidden = self._in_hidden, self._out_hidden
+        if "core" in hidden:   # the tech mask's filter state rides beside the ring
+            tree.map_structure(lambda d, s: d.copy_(s), hidden["tech_mask"], new_hidden["tech_mask"])
+            hidden, new_hidden = hidden["core"], new_hidden["core"]
+        ptr, kv_ptr = hidden["ptr"], hidden["kv_ptr"]   # [S], all equal
+        for layer, new in zip(hidden["layers"], new_hidden["layers"]):
             if not isinstance(layer, tuple):   # recurrent layer: one state tensor
                 layer.copy_(new)
                 continue
             (v_ring, _), (v_new, _) = layer, new   # the attention ring was written by the forward
             assert v_new.dim() == 3 and v_ring.dim() == 4, "ring carry takes [S, N, d] slots"
             v_ring.index_copy_(2, ptr[:1], v_new.unsqueeze(2).to(v_ring.dtype))
-        self._in_hidden["cache_len"].copy_(self._out_hidden["cache_len"])
+        hidden["cache_len"].copy_(new_hidden["cache_len"])
         ptr.add_(1)
         ptr.remainder_(self._core.window - 1)
         kv_ptr.add_(1)

@@ -138,7 +138,7 @@ GPU = pytest.mark.skipif(
     reason="cuda-only; set SMASHBOT_GPU_TESTS=1 on an IDLE gpu (never beside a live training run)")
 
 
-def _policy(layout, dev, seed=0):
+def _policy(layout, dev, seed=0, tech_mask=0):
     from smashbot import configs, embed as embed_lib
     from smashbot.policy import build_policy
     layout, qk_norm = _shape(layout)
@@ -146,7 +146,8 @@ def _policy(layout, dev, seed=0):
     pol = build_policy(
         embed_config=embed_lib.EmbedConfig(), controller_config=embed_lib.ControllerConfig(),
         network_config=configs.NetworkConfig(name="sgu", num_layers=len(layout), layout=layout,
-                                             hidden_size=64, window=W, qk_norm=qk_norm),
+                                             hidden_size=64, window=W, qk_norm=qk_norm,
+                                             tech_mask_window=tech_mask),
         head_config=configs.ControllerHeadConfig(), policy_config=configs.PolicyConfig(),
         num_names=16).to(dev)
     _randomize(pol.network.core.blocks)
@@ -157,7 +158,8 @@ def _policy(layout, dev, seed=0):
 
 @GPU
 @pytest.mark.parametrize("layout", LAYOUTS)
-def test_student_serving_matches_eager_under_capture_and_ring(layout):
+@pytest.mark.parametrize("tech_mask", [0, 4])
+def test_student_serving_matches_eager_under_capture_and_ring(layout, tech_mask):
     """BatchedPolicyAgent as RL serves the student (fp16, captured graph, ring)
     against the same agent uncaptured and captured without the ring: the
     recurrent snapshot handed to the learner, every frame, over three wraps
@@ -168,7 +170,7 @@ def test_student_serving_matches_eager_under_capture_and_ring(layout):
     from smashbot.rl.agent import BatchedPolicyAgent
     from scripts.bench_agent_step import _rand_raw
     dev, N = "cuda", 16
-    pol = _policy(layout, dev)
+    pol = _policy(layout, dev, tech_mask=tech_mask)
     game = embed_lib.EmbedConfig().make_game_embedding()
     rng = np.random.default_rng(1)
     to_dev = lambda x: torch.from_numpy(np.ascontiguousarray(
@@ -197,7 +199,8 @@ def test_student_serving_matches_eager_under_capture_and_ring(layout):
 @GPU
 @pytest.mark.parametrize("layout", LAYOUTS)
 @pytest.mark.parametrize("read", ["gather", "roll", "fused"])
-def test_grid_ring_matches_canonical_under_capture(layout, read):
+@pytest.mark.parametrize("tech_mask", [0, 4])
+def test_grid_ring_matches_canonical_under_capture(layout, read, tech_mask):
     """LeagueAgent (fp16 stacked slices, captured vmap) with the ring vs without:
     every slice's recurrent state over three wraps, staggered resets, two seat
     moves and a reload of a different member's weights. The attention sums its
@@ -208,7 +211,8 @@ def test_grid_ring_matches_canonical_under_capture(layout, read):
     from smashbot.rl.agent import LeagueAgent
     from scripts.bench_agent_step import _rand_raw
     dev, S, N = "cuda", 2, 8
-    sd, other = _policy(layout, dev).state_dict(), _policy(layout, dev, seed=7).state_dict()
+    sd = _policy(layout, dev, tech_mask=tech_mask).state_dict()
+    other = _policy(layout, dev, seed=7, tech_mask=tech_mask).state_dict()
     game = embed_lib.EmbedConfig().make_game_embedding()
     ff = sim_env.FlatFrames(dev)
     rng = np.random.default_rng(1)
@@ -226,7 +230,7 @@ def test_grid_ring_matches_canonical_under_capture(layout, read):
     moves, reload_at = {9: ((0, 1), (1, 5)), 23: ((1, 0), (1, 7))}, 31
 
     def make(ring):
-        a = LeagueAgent(_policy(layout, dev), S, N, 1, dev, capture=True,
+        a = LeagueAgent(_policy(layout, dev, tech_mask=tech_mask), S, N, 1, dev, capture=True,
                         weights_dtype=torch.float16, state_dtype=torch.float16, ring=ring)
         if ring:
             a._core.ring_read = read
@@ -252,9 +256,14 @@ def test_grid_ring_matches_canonical_under_capture(layout, read):
             "layers": [tuple(x.reshape(S * N, *x.shape[2:]) for x in l) if isinstance(l, tuple)
                        else l.reshape(S * N, *l.shape[2:]) for l in h["layers"]],
             "cache_len": h["cache_len"].reshape(-1)}
-        want = flat(canonical._out_hidden)
-        got = ringed._core.canonical_state({**flat(ringed._in_hidden), "ptr": ringed._in_hidden["ptr"][0],
-                                            "kv_ptr": ringed._in_hidden["kv_ptr"][0]})
+        canonical_h, ringed_h = canonical._out_hidden, ringed._in_hidden
+        if tech_mask:   # the filter state rides beside the core's
+            for x, y in zip(canonical_h["tech_mask"], ringed_h["tech_mask"]):
+                assert torch.equal(x, y), f"tech mask state differs at frame {t}"
+            canonical_h, ringed_h = canonical_h["core"], ringed_h["core"]
+        want = flat(canonical_h)
+        got = ringed._core.canonical_state({**flat(ringed_h), "ptr": ringed_h["ptr"][0],
+                                            "kv_ptr": ringed_h["kv_ptr"][0]})
         assert torch.equal(want["cache_len"], got["cache_len"]), f"cache_len differs at frame {t}"
         for x, y in zip(tree.flatten(want["layers"]), tree.flatten(got["layers"])):
             diff = (x.float() - y.float()).abs().max().item()
