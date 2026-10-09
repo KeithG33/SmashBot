@@ -112,7 +112,7 @@ class ControllerHeadConfig:
 @dataclasses.dataclass
 class ValueConfig:
     # slippi-ai pattern: value = smaller instance of the POLICY's family.
-    # "match" mirrors the policy core's name/window/heads at num_layers depth.
+    # "match": the policy's network, every setting, at this size and depth.
     name: str = "match"  # match | tx_like | transformer | sgu
     hidden_size: int = 512
     num_layers: int = 1

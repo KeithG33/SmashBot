@@ -14,3 +14,10 @@ def test_value_net_takes_the_policys_inputs_unless_saved_without_them():
     for value in ({**VALUE, "inputs": "simple"}, VALUE):   # explicit, and a config saved before the key
         simple = value_network_config(NETWORK, value)
         assert (simple.embed, simple.tech_mask_window) == ("simple", 0)
+
+
+def test_match_value_net_is_the_policys_network_at_its_own_size():
+    network = {**NETWORK, "attn_heads": 2, "attn_head_dim": 8, "qk_norm": True, "ffw_multiplier": 3}
+    value = value_network_config(network, {**VALUE, "inputs": "policy"})
+    assert (value.name, value.attn_heads, value.attn_head_dim, value.qk_norm, value.ffw_multiplier) == ("sgu", 2, 8, True, 3)
+    assert (value.hidden_size, value.num_layers, value.window, value.layout) == (32, 1, 4, "")

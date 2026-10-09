@@ -31,26 +31,26 @@ INPUT_KEYS = ("embed", "embed_hidden_size", "rating", "embed_joint_index_wraps",
 
 def value_network_config(network: dict, value: dict):
     """The value net's NetworkConfig from saved (or asdict'd) network and value
-    sections: value's size, depth, window and layout on the policy's family
-    ("match"), with the policy's inputs unless value["inputs"] is "simple"
-    (configs saved before 2026-10-02 lack the key and are simple)."""
+    sections. "match": the policy's network, every setting, at the value's
+    own size, depth, window and layout; with the policy's inputs unless
+    value["inputs"] is "simple" (configs saved before 2026-10-02 lack the key
+    and are simple). Another family takes only the policy's inputs."""
     from smashbot import configs
 
-    name = value.get("name", "match")
-    if name == "match":
-        name = network["name"]
-    inputs = ({k: network[k] for k in INPUT_KEYS if k in network}
-              if value.get("inputs", "simple") == "policy" else {})
-    return configs.from_dict(configs.NetworkConfig, dict(
-        name=name,
+    own = dict(
         hidden_size=value["hidden_size"],
         num_layers=value["num_layers"],
-        num_heads=network["num_heads"],
         window=value.get("window", 0) or network["window"],
         layout=value.get("layout", ""),
-        qk_norm=network.get("qk_norm", False),
-        **inputs,
-    ))
+    )
+    inputs = ({k: network[k] for k in INPUT_KEYS if k in network}
+              if value.get("inputs", "simple") == "policy" else {})
+    if value.get("name", "match") == "match":
+        shared = {k: v for k, v in network.items() if k not in INPUT_KEYS}
+        return configs.from_dict(configs.NetworkConfig, {**shared, **own, **inputs})
+    return configs.from_dict(configs.NetworkConfig, dict(
+        name=value["name"], num_heads=network["num_heads"], qk_norm=network.get("qk_norm", False),
+        **own, **inputs))
 
 
 class ValueFunction(nn.Module):
