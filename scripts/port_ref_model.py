@@ -180,7 +180,7 @@ def export(args):
             golden[f"g{g}_logit{i:02d}"] = t.numpy()
 
         flat_state = tree.flatten(state2)  # h0, c0, h1, c1, h2, c2
-        assert len(flat_state) == 2 * len(state2), len(flat_state)
+        assert len(flat_state) == 2 * state["config"]["network"]["tx_like"]["num_layers"], len(flat_state)
         for i, t in enumerate(flat_state):
             golden[f"g{g}_fs{i}"] = t.numpy()
 
