@@ -147,6 +147,7 @@ def build_agents(
     name: str = "Master Player",
     temperature: float | None = None,
     capture: bool = False,
+    names: dict[int, str] | None = None,
 ) -> tuple[dict[int, AsyncDelayedAgent], dict[int, SideInfo]]:
     """Load both policies and wrap each in an AsyncDelayedAgent. Each agent
     keeps its own delay (from its checkpoint's policy config -- Phillip 21,
@@ -181,7 +182,7 @@ def build_agents(
         if compile_policies:
             game_lib.compile_policy(policy)
             policy.sample = _race_guarded(policy.sample)
-        code = saving.resolve_name_code(name_map, name)
+        code = saving.resolve_name_code(name_map, (names or {}).get(port, name))
         (opponent,) = [p for p in ports if p != port]
         agents[port] = AsyncDelayedAgent(
             policy,
@@ -278,6 +279,9 @@ def parse_args(argv=None):
     ap.add_argument("--name", default="Master Player",
                     help="identity to condition on (looked up in each "
                          "policy's own name_map)")
+    ap.add_argument("--p2-name", default="",
+                    help="player 2's identity instead of --name (a specialist's "
+                         "trained name, e.g. Zain)")
     ap.add_argument("--fullscreen", action="store_true")
     ap.add_argument("--gfx-backend", default="OGL", help="OGL | Vulkan | ''")
     ap.add_argument("--device", default="cuda", choices=("cpu", "cuda"),
@@ -338,14 +342,16 @@ def main(argv=None) -> None:
         name=args.name,
         temperature=args.temperature,
         capture=args.capture and device == "cuda",
+        names={2: args.p2_name} if args.p2_name else None,
     )
 
     for port in sorted(infos):
         info = infos[port]
         step = f" (train step {info.step})" if info.step is not None else ""
         print(f"P{port}: {info.label}{step}")
+        name = args.p2_name if port == 2 and args.p2_name else args.name
         print(f"    char {chars[port]} | delay {info.delay} | "
-              f"{args.name!r} -> code {info.name_code}")
+              f"{name!r} -> code {info.name_code}")
     print(f"stage {stage}{' (random each game)' if stage != args.stage.upper() else ''} | "
           f"games {args.games or 'forever'} | "
           f"device {device} | "
