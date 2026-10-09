@@ -134,7 +134,7 @@ def compile_cores(policy, value_fn, teacher=None) -> None:
     from smashbot import delay as delay_lib
     from smashbot.networks import FFWWrapper
 
-    policies = [policy] if teacher is None else [policy, teacher]
+    policies = [p for p in (policy, teacher) if p is not None]   # no policy: a value net alone
     # cores x chunk shapes x cache dtypes; never lower a limit the caller raised
     torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 64)
     for net in [p.network for p in policies] + [value_fn.network]:
