@@ -94,9 +94,14 @@ class RLConfig:
     # every eligible row, N > 0 = a uniform sample of N, 0 = off. They run in
     # chunks no larger than the PPO micro-batch: learner time, not VRAM.
     imitation_rows: int = 0
-    # MARWIL/AWR weighting: w = clip(exp(A_norm / beta), max=w_cap)
+    # MARWIL/AWR weighting against the critic's expectation: w =
+    # min(w_cap, exp(A / (beta * s))), s the running RMS of our own on-policy
+    # advantages, so a harvested action that meets the critic's expectation
+    # weighs 1 whichever opponent played it
     imitation_beta: float = 1.0
     imitation_w_cap: float = 20.0
+    # s's update rate per learner step (about 1/rate steps of memory)
+    imitation_scale_rate: float = 0.01
     # lambda_t * L_opp joins the policy loss, decaying linearly to
     # imitation_lambda * imitation_lambda_final_frac over runtime.schedule_steps;
     # 0 = no actor-side term (the critic still trains on harvested states)
@@ -249,21 +254,15 @@ class _Fixed(tp.NamedTuple):
 
 def imitation_weights(
     advantages: torch.Tensor,  # [B, T], will be detached
-    valid: torch.Tensor,  # [B, T] float mask
     beta: float,
     w_cap: float,
+    scale: float,
 ) -> torch.Tensor:
-    """MARWIL/AWR weighting for opponent-advantage imitation.
-
-    A is detached, normalized over the VALID positions of this imitation
-    minibatch, then w = clip(exp(A_norm / beta), max=w_cap). Returns [B, T]
-    detached weights (unmasked; the loss applies `valid` itself)."""
-    adv = advantages.detach()
-    n = valid.sum().clamp(min=1.0)
-    mean = (adv * valid).sum() / n
-    var = (torch.square(adv - mean) * valid).sum() / n
-    a_norm = (adv - mean) / (var.sqrt() + 1e-8)
-    return torch.exp(a_norm / beta).clamp(max=w_cap)
+    """MARWIL/AWR weighting for opponent-advantage imitation: w =
+    min(w_cap, exp(A / (beta * scale))) with A detached. No batch mean comes
+    off: A = 0 (the critic's expectation met) weighs 1 whatever else is in
+    the batch. Returns [B, T] weights (unmasked; the loss applies `valid`)."""
+    return torch.exp(advantages.detach() / (beta * scale)).clamp(max=w_cap)
 
 
 class _ImitFixed(tp.NamedTuple):
@@ -349,6 +348,9 @@ class Learner:
         )
         self._ops = _StructOps(policy.controller_head.controller_embedding)
         self._imit_rng = random.Random(0)   # the imitation row-cap sample
+        # running mean of our own on-policy A^2, whose root scales the
+        # imitation weights; the first step seeds it, checkpoints carry it
+        self.advantage_ms: tp.Optional[float] = None
         # the leash weights now; step() sets them from the decay schedule
         self._kl_teacher_w = config.kl_teacher_weight
         self._reverse_kl_teacher_w = config.reverse_kl_teacher_weight
@@ -815,7 +817,7 @@ class Learner:
         )
 
     def _imitation_fixed(
-        self, traj: Trajectory, row_budget: int = 0,
+        self, traj: Trajectory, scale: float, row_budget: int = 0,
     ) -> tp.Optional[_ImitFixed]:
         """Fixed pass for one harvested opponent trajectory: critic update on
         its states (targets = discounted returns G_t along the opponent's
@@ -873,8 +875,8 @@ class Learner:
             self.value_optimizer.step()
 
         weights = imitation_weights(
-            torch.cat(adv_chunks, dim=0), valid,
-            self.config.imitation_beta, self.config.imitation_w_cap,
+            torch.cat(adv_chunks, dim=0),
+            self.config.imitation_beta, self.config.imitation_w_cap, scale,
         )
         if not torch.isfinite(weights).all():
             print("NONFINITE IMITATION WEIGHTS: dropping trajectory",
@@ -940,7 +942,7 @@ class Learner:
         ]
 
     def _plan_imitation(
-        self, imit_trajs: list[Trajectory], row_budget: int = 0,
+        self, imit_trajs: list[Trajectory], scale: float, row_budget: int = 0,
     ) -> tuple[list[_ImitFixed], dict]:
         """All harvested rows this step (or a uniform sample of
         imitation_rows of them when capped): per harvest group, the critic
@@ -963,7 +965,7 @@ class Learner:
                 continue
             if len(rows) < traj.rewards.shape[0]:
                 traj = slice_trajectory_rows(traj, rows)
-            imf = self._imitation_fixed(traj, row_budget)
+            imf = self._imitation_fixed(traj, scale, row_budget)
             if imf is not None:
                 imit_fixed.append(imf)
         if not imit_fixed:
@@ -972,10 +974,13 @@ class Learner:
         w_mean = sum(
             (imf.weights * imf.valid).sum() for imf in imit_fixed
         ) / n
+        capped = sum(
+            ((imf.weights >= cfg.imitation_w_cap) * imf.valid).sum() for imf in imit_fixed
+        ) / n
         stats = {
             "traj_count": sum(imf.rows for imf in imit_fixed),
             "w_mean": w_mean.detach(),
-            "w_max": torch.stack([(imf.weights * imf.valid).max() for imf in imit_fixed]).max(),
+            "w_capped": capped.detach(),
         }
         return imit_fixed, stats
 
@@ -1013,6 +1018,12 @@ class Learner:
 
         imit_fixed: list[_ImitFixed] = []
         imit_stats: dict = {}
+        if fixed_list:   # this step's mean A^2 over our own valid positions
+            batch_ms = float(
+                sum((f.advantages.square() * f.valid).sum() for f in fixed_list)
+                / sum(f.valid.sum() for f in fixed_list).clamp(min=1.0))
+            if self.advantage_ms is None:
+                self.advantage_ms = batch_ms
         if cfg.imitation_rows != 0 and imit_trajs and fixed_list:
             # the imitation critic pass chunks to the PPO micro-batch's row
             # size, so a max-harvest step can never raise the VRAM peak
@@ -1020,7 +1031,12 @@ class Learner:
             budget = -(-max(
                 f.valid.shape[0] for f in fixed_list
             ) // max(1, cfg.micro_batches))
-            imit_fixed, imit_stats = self._plan_imitation(imit_trajs, budget)
+            # weighed on the scale from before this step: no batch sets its own temperature
+            scale = (self.advantage_ms + 1e-8) ** 0.5
+            imit_fixed, imit_stats = self._plan_imitation(imit_trajs, scale, budget)
+        if fixed_list:
+            rate = cfg.imitation_scale_rate
+            self.advantage_ms = (1 - rate) * self.advantage_ms + rate * batch_ms
         lambda_t = self.lambda_at(progress)
         self._kl_teacher_w = self.kl_teacher_weight_at(progress)
         self._reverse_kl_teacher_w = self.reverse_kl_teacher_weight_at(progress)

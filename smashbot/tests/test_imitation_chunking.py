@@ -38,8 +38,8 @@ def test_chunked_imitation_fixed_is_exact(budget):
     lb.value_optimizer.load_state_dict(la.value_optimizer.state_dict())
 
     traj = _imit_traj(la.policy, B=5, seed=3)
-    imf_a = la._imitation_fixed(copy.deepcopy(traj), 0)       # unchunked
-    imf_b = lb._imitation_fixed(copy.deepcopy(traj), budget)  # chunked
+    imf_a = la._imitation_fixed(copy.deepcopy(traj), 0.5, 0)       # unchunked
+    imf_b = lb._imitation_fixed(copy.deepcopy(traj), 0.5, budget)  # chunked
 
     assert imf_a is not None and imf_b is not None
     assert torch.allclose(imf_a.weights, imf_b.weights, atol=1e-6), (
@@ -65,9 +65,9 @@ def test_step_budget_derivation_matches_micro_batches():
     seen = {}
     orig = learner._plan_imitation
 
-    def spy(trajs, row_budget=0):
+    def spy(trajs, scale, row_budget=0):
         seen["budget"] = row_budget
-        return orig(trajs, row_budget)
+        return orig(trajs, scale, row_budget)
 
     learner._plan_imitation = spy
     ppo = _rollout(learner.policy, B=5, T=8, seed=0)
@@ -113,12 +113,11 @@ def test_burn_in_warms_policy_and_critic_like_one_unbroken_unroll():
                                   discount=learner.config.discount, detail=False)
         expected_policy = learner.policy.unroll(learner._frames(full),
                                                 learner.policy.initial_state(B))
-    valid = chunk.valid.float()
-    expected_weights = imitation_weights(straight.advantages[:, P:], valid,
+    expected_weights = imitation_weights(straight.advantages[:, P:],
                                          learner.config.imitation_beta,
-                                         learner.config.imitation_w_cap)
+                                         learner.config.imitation_w_cap, 0.5)
 
-    imf = learner._imitation_fixed(chunk, 3)
+    imf = learner._imitation_fixed(chunk, 0.5, 3)
     assert torch.allclose(imf.weights, expected_weights, atol=1e-5)
     (part,) = learner._imit_chunks(imf, B)
     with torch.no_grad():
@@ -147,3 +146,46 @@ def test_imitation_loss_by_source():
     n_phillip, n_pfsp = phillip.valid.sum().item(), pfsp.valid.sum().item()
     weighted = (both["loss_phillip"] * n_phillip + both["loss_pfsp"] * n_pfsp) / (n_phillip + n_pfsp)
     assert weighted == pytest.approx(both["loss"], rel=1e-5)
+
+
+def test_weights_are_absolute_against_the_critic():
+    """A = 0 weighs 1, A = +-scale weighs e^+-1 and the cap holds, and no
+    entry's weight depends on what else shares its batch."""
+    from smashbot.rl.ppo import imitation_weights
+
+    a = torch.tensor([[0.0, 0.4, -0.4, 9.0]])
+    w = imitation_weights(a, 1.0, 20.0, 0.4)
+    assert torch.allclose(w, torch.tensor([[1.0, torch.e, 1 / torch.e, 20.0]]))
+    shifted = imitation_weights(torch.tensor([[0.0, -3.0, -3.0, -3.0]]), 1.0, 20.0, 0.4)
+    assert shifted[0, 0] == w[0, 0]
+
+
+def test_running_scale_seeds_then_lags_one_step():
+    """The first step seeds the running mean of our own A^2 with its batch
+    value; every step weighs its imitation rows on the scale from before
+    it, then moves the mean by imitation_scale_rate."""
+    learner = _make_learner(imitation_rows=-1, imitation_scale_rate=0.25)
+    seen = {"scales": [], "ms": []}
+    plan, fixed_pass = learner._plan_imitation, learner._fixed_pass
+
+    def spy_plan(trajs, scale, row_budget=0):
+        seen["scales"].append(scale)
+        return plan(trajs, scale, row_budget)
+
+    def spy_fixed(traj, state):
+        fixed, state, vm = fixed_pass(traj, state)
+        valid = fixed.valid
+        seen["ms"].append(float((fixed.advantages.square() * valid).sum() / valid.sum()))
+        return fixed, state, vm
+
+    learner._plan_imitation, learner._fixed_pass = spy_plan, spy_fixed
+    state = learner.initial_state(5)
+    state, _ = learner.step([_rollout(learner.policy, B=5, T=8, seed=0),
+                             _imit_traj(learner.policy, B=4, seed=7)], state)
+    first = learner.advantage_ms
+    assert first == pytest.approx(seen["ms"][0], rel=1e-6)
+    assert seen["scales"][0] == pytest.approx((first + 1e-8) ** 0.5, rel=1e-6)
+    learner.step([_rollout(learner.policy, B=5, T=8, seed=1),
+                  _imit_traj(learner.policy, B=4, seed=8)], state)
+    assert seen["scales"][1] == pytest.approx((first + 1e-8) ** 0.5, rel=1e-6)
+    assert learner.advantage_ms == pytest.approx(0.75 * first + 0.25 * seen["ms"][1], rel=1e-6)

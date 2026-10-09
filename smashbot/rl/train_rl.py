@@ -74,6 +74,7 @@ def _save_rl_checkpoint(
                 "teacher_ckpt": teacher,
                 "trackers": _save_rl_checkpoint.tracker_states(),
                 "clip_history": {"policy": _save_rl_checkpoint.clip_history()},
+                "imitation_advantage_ms": _save_rl_checkpoint.advantage_ms(),
             },
             "best_eval_loss": None,
             "version": saving.VERSION,

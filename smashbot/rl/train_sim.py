@@ -331,10 +331,12 @@ def run(args) -> None:
         restored_trackers = rl_ckpt["state"].get("trackers")
         learner.policy_clipper.restore_history(
             (rl_ckpt["state"].get("clip_history") or {}).get("policy", []))
+        learner.advantage_ms = rl_ckpt["state"].get("imitation_advantage_ms")
         print(f"restored RL run from {rpath} at step {start_step}")
     _save_rl_checkpoint.policy_opt = learner.policy_optimizer
     _save_rl_checkpoint.value_opt = learner.value_optimizer
     _save_rl_checkpoint.clip_history = lambda: learner.policy_clipper.history
+    _save_rl_checkpoint.advantage_ms = lambda: learner.advantage_ms
     _save_rl_checkpoint.grad_scaler = lambda: (
         None if learner.grad_scaler is None else learner.grad_scaler.state_dict())
 
