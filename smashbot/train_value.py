@@ -21,7 +21,7 @@ import tyro
 from smashbot import saving
 from smashbot.data import loader
 from smashbot.delay import slice_delayed_frames
-from smashbot.networks import keep_sgu_activations, use_chunk_start_resets, use_packed_encoder
+from smashbot.networks import keep_sgu_activations, use_bf16_cells, use_chunk_start_resets, use_packed_encoder
 from smashbot.train_bc import TrainConfig, _get_rng, _nonfinite, _resume_state, _set_rng, _StopRequest, _to
 from smashbot.training import GradClipper, compile_cores, resolve_restore
 from smashbot.value import build_value_function
@@ -70,6 +70,10 @@ def main(config: TrainConfig) -> None:
     use_chunk_start_resets(value_fn)
     keep_sgu_activations(value_fn)
     use_packed_encoder(value_fn)
+    if config.learner.bf16_cells:
+        if config.learner.precision != "bf16":
+            raise ValueError("--learner.bf16-cells needs --learner.precision bf16")
+        use_bf16_cells(value_fn)
     value_opt = torch.optim.Adam(value_fn.parameters(), lr=config.learner.learning_rate, fused=device == "cuda")
     clip = GradClipper(value_fn.parameters(), config.learner.max_grad_norm)
     if config.learner.precision == "bf16" and device == "cuda":

@@ -28,7 +28,7 @@ import tyro
 from smashbot import configs, embed as embed_lib, saving
 from smashbot.data import loader
 from smashbot.delay import slice_delayed_frames
-from smashbot.networks import (check_loadable, keep_sgu_activations,
+from smashbot.networks import (check_loadable, keep_sgu_activations, use_bf16_cells,
                                use_chunk_start_resets, use_packed_encoder)
 from smashbot.policy import ActionLoss, EnergyScore, StickScorer, build_policy, imitation_metrics, stick_metrics
 from smashbot.training import GradClipper, compile_cores, resolve_restore
@@ -289,6 +289,11 @@ def main(config: TrainConfig) -> None:
     keep_sgu_activations(value_fn)
     use_packed_encoder(policy)
     use_packed_encoder(value_fn)
+    if config.learner.bf16_cells:
+        if config.learner.precision != "bf16":
+            raise ValueError("--learner.bf16-cells needs --learner.precision bf16")
+        use_bf16_cells(policy)
+        use_bf16_cells(value_fn)
     policy_opt = torch.optim.Adam(policy.parameters(), lr=config.learner.learning_rate, fused=True)
     value_opt = torch.optim.Adam(value_fn.parameters(), lr=config.learner.learning_rate, fused=True)
     # AutoClip is for the policy only: the value net's step-to-step norms swing

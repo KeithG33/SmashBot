@@ -197,6 +197,23 @@ class RecurrentWrapper(Network):
     # never take this path.
     manual_step: bool = False
 
+    # The cell runs at its weights' dtype whatever the autocast: autocast runs
+    # cuDNN's RNNs in fp16 even when asked for bf16, with no loss scaling.
+    # use_bf16_cells opts BC into bf16.
+    cell_dtype: torch.dtype | None = None
+
+    def _run(self, inputs, state):
+        core = self._core
+        dtype = self.cell_dtype or core.weight_ih_l0.dtype
+        cast = lambda t: t.to(dtype)
+        lstm = isinstance(core, nn.LSTM)
+        with torch.autocast(inputs.device.type, enabled=False):
+            out, *next_state = (torch.lstm if lstm else torch.gru)(
+                cast(inputs), tuple(map(cast, state)) if lstm else cast(state),
+                [cast(w) for w in core.all_weights[0]], core.bias, 1, 0.0, self.training, False, True)
+        next_state = [t.to(core.weight_ih_l0.dtype) for t in next_state]
+        return out.to(inputs.dtype), tuple(next_state) if lstm else next_state[0]
+
     def step(self, inputs, prev_state):
         if self.manual_step:
             if isinstance(self._core, nn.LSTM):
@@ -205,11 +222,11 @@ class RecurrentWrapper(Network):
                 return h2, (h2.unsqueeze(0), c2.unsqueeze(0))
             h2 = _gru_cell(self._core, inputs, prev_state[0])
             return h2, h2.unsqueeze(0)
-        out, next_state = self._core(inputs.unsqueeze(1), prev_state)
+        out, next_state = self._run(inputs.unsqueeze(1), prev_state)
         return out.squeeze(1), next_state
 
     def unroll(self, inputs, reset, initial_state):
-        return self._segmented_unroll(self._core, inputs, reset, initial_state)   # one cuDNN call per segment
+        return self._segmented_unroll(self._run, inputs, reset, initial_state)   # one cuDNN call per segment
 
 
 class ResidualWrapper(Network):
@@ -722,6 +739,13 @@ def use_packed_encoder(module: nn.Module) -> None:
     for m in module.modules():
         if isinstance(m, StateActionNetwork) and m.packed_embed is not None and hasattr(m.core, "inputs_encoded"):
             m.packed_encoder = m.core.inputs_encoded = True
+
+
+def use_bf16_cells(module: nn.Module) -> None:
+    """Run every tx_like LSTM/GRU in bf16 (BC under bf16 autocast)."""
+    for m in module.modules():
+        if isinstance(m, RecurrentWrapper):
+            m.cell_dtype = torch.bfloat16
 
 
 def use_manual_recurrent_step(module: nn.Module) -> None:

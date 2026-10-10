@@ -137,6 +137,8 @@ class LearnerConfig:
     # of its own gradient-norm history instead of a constant; 0 = off
     autoclip_percentile: float = 0.0
     precision: str = "fp32"  # bf16 | fp32
+    # BC with precision bf16: tx_like's LSTM/GRU runs in bf16 too (else fp32)
+    bf16_cells: bool = False
     compile: bool = False
     # BC: add these weights x each joint stick's energy score
     # (policy.EnergyScore) and action loss (policy.ActionLoss) to the loss;
