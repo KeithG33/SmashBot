@@ -64,7 +64,8 @@ def main(config: TrainConfig) -> None:
     ckpt = saving.load_checkpoint(restore_path) if restore_path else None
     resume = _resume_state(ckpt)
     sources = loader.make_sources(config.data, extra_frames=config.policy.delay + 1,
-                                  name_map=resume.get("name_map"), train_state=resume.get("train_data"))
+                                  name_map=resume.get("name_map"), train_state=resume.get("train_data"),
+                                  train=not config.data.producer_process)
 
     value_fn = build_value_function(dataclasses.asdict(config), device)
     use_chunk_start_resets(value_fn)
@@ -103,7 +104,8 @@ def main(config: TrainConfig) -> None:
     if resume.get("rng") is not None:
         _set_rng(resume["rng"])
     train_data_state = resume.get("train_data")
-    train_stream = loader.TorchBatchStream(sources.train, config.data, encode_network=value_fn.network)
+    train_stream = loader.make_train_stream(sources, config.data, config.policy.delay + 1, train_data_state,
+                                            value_fn.network)
     sources.test.shutdown()
     warm_batches = -(-rt.eval_burn_in // config.data.unroll_length)
     eval_stream = loader.random_eval_stream(

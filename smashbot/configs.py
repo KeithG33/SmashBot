@@ -34,6 +34,8 @@ class DataConfig:
     # Torch bridge
     prefetch: int = 4
     pin_memory: bool = True
+    # build batches in a process of their own (loader.ProcessBatchStream), off the trainer's GIL
+    producer_process: bool = False
 
 
 @dataclasses.dataclass

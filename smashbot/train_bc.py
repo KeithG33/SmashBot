@@ -156,7 +156,8 @@ def _resume_state(ckpt: tp.Optional[dict]) -> dict:
     return state
 
 
-_RESUME_FREE = {"runtime", "data.num_workers", "data.prefetch", "data.pin_memory", "learner.compile"}
+_RESUME_FREE = {"runtime", "data.num_workers", "data.prefetch", "data.pin_memory", "data.producer_process",
+                "learner.compile"}
 
 
 def _check_config(saved: dict, current: dict, defaults: dict, prefix: str = "") -> None:
@@ -265,6 +266,7 @@ def main(config: TrainConfig) -> None:
         extra_frames=config.policy.delay + 1,
         name_map=resume.get("name_map", init["state"]["name_map"] if init else None),
         train_state=resume.get("train_data"),
+        train=not config.data.producer_process,
     )
     print(f"name_map: {sources.name_map}")
 
@@ -373,8 +375,8 @@ def main(config: TrainConfig) -> None:
         _set_rng(resume["rng"])
     train_data_state = resume.get("train_data")
 
-    train_stream = loader.TorchBatchStream(
-        sources.train, config.data, encode_network=policy.network
+    train_stream = loader.make_train_stream(
+        sources, config.data, config.policy.delay + 1, train_data_state, policy.network
     )
     sources.test.shutdown()   # the evals draw their own rows from its replays
     warm_batches = -(-rt.eval_burn_in // config.data.unroll_length)

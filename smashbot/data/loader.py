@@ -14,10 +14,14 @@ This module adds the only missing pieces:
 """
 
 import collections
+import copy
 import dataclasses
 import multiprocessing as mp
+import os
 import queue
 import threading
+import time
+import traceback
 import typing as tp
 
 import numpy as np
@@ -171,7 +175,7 @@ def seat_random(split: Split, span: int, rng: np.random.Generator, num_workers: 
 
 @dataclasses.dataclass
 class Sources:
-    train: Split
+    train: tp.Optional[Split]   # None: a ProcessBatchStream builds its own
     test: Split
     name_map: dict[str, int]
 
@@ -214,6 +218,7 @@ def make_sources(
     extra_frames: int,
     name_map: tp.Optional[dict[str, int]] = None,
     train_state: tp.Optional[dict] = None,
+    train: bool = True,
 ) -> Sources:
     """Build train/test splits. extra_frames must be policy.delay + 1.
 
@@ -223,12 +228,13 @@ def make_sources(
     rows (checkpoints that predate row tracking) only rotates the cycle;
     every row then restarts at frame 0 of a fresh replay. The test split
     always starts fresh: the evals draw their rows from its replays.
+    train=False leaves the train split to a ProcessBatchStream.
     """
     train_replays, test_replays = data_lib.train_test_split(config.dataset)
     if name_map is None:
         name_map = create_name_map(train_replays, config.max_names)
     return Sources(
-        train=_make_split(train_replays, config, extra_frames, name_map, train_state),
+        train=_make_split(train_replays, config, extra_frames, name_map, train_state) if train else None,
         test=_make_split(test_replays, config, extra_frames, name_map, None),
         name_map=name_map,
     )
@@ -249,13 +255,7 @@ def random_eval_stream(
     return RandomEvalStream(eval_split, network, groups, batches, span, seed, config.num_workers, interval)
 
 
-def batch_to_frames(batch: data_lib.Batch, network, pin: bool = False):
-    """Training-path glue: numpy Batch -> encoded torch Frames, batch-major [B, T].
-
-    Mirrors slippi-ai's TrainManager.produce_frames (minus their time-major
-    transpose — all SmashBot tensors are (batch, time, ...)): the p0 controller
-    becomes the action stream and the network's embedding encodes it.
-    """
+def _encode_frames(batch: data_lib.Batch, encode) -> data_lib.Frames:
     from slippi_ai.types import StateAction
 
     if np.any(np.asarray(batch.is_resetting)[:, 1:]):
@@ -264,13 +264,21 @@ def batch_to_frames(batch: data_lib.Batch, network, pin: bool = False):
     state_action = StateAction(
         state=batch.game, action=batch.game.p0.controller, name=batch.name
     )
-    state_action = network.encode(state_action)  # numpy
-
-    frames = data_lib.Frames(
-        state_action=state_action,
+    return data_lib.Frames(
+        state_action=encode(state_action),  # numpy
         is_resetting=batch.is_resetting,
         reward=batch.reward,
     )
+
+
+def batch_to_frames(batch: data_lib.Batch, network, pin: bool = False):
+    """Training-path glue: numpy Batch -> encoded torch Frames, batch-major [B, T].
+
+    Mirrors slippi-ai's TrainManager.produce_frames (minus their time-major
+    transpose — all SmashBot tensors are (batch, time, ...)): the p0 controller
+    becomes the action stream and the network's embedding encodes it.
+    """
+    frames = _encode_frames(batch, network.encode)
     return tree.map_structure(lambda x: _to_torch(np.ascontiguousarray(x), pin), frames)
 
 
@@ -343,6 +351,119 @@ class TorchBatchStream:
         self._stop.set()
         self._thread.join(timeout=5.0)
         self._source.shutdown()
+
+
+class _ProducerError(tp.NamedTuple):
+    traceback: str
+
+
+def _owned(x) -> np.ndarray:
+    """A leaf the producer can hand over: its own memory (the accumulator
+    reuses its buffers, and a queue pickles after put returns), widened as
+    _to_torch would widen it."""
+    x = np.asarray(x)
+    return np.array(x, dtype=_DTYPE_MAP.get(x.dtype, x.dtype), order="C")
+
+
+def _produce(config: DataConfig, extra_frames: int, name_map: dict[str, int], state: tp.Optional[dict],
+             encoder, out, stop, trainer_pid: int) -> None:
+    """ProcessBatchStream's producer: the train split and the encode, as
+    TorchBatchStream._work runs them."""
+    torch.set_num_threads(1)
+    split, trainer_gone = None, False
+    try:
+        train_replays, _ = data_lib.train_test_split(config.dataset)
+        split = _make_split(train_replays, config, extra_frames, name_map, state)
+        while not stop.is_set():
+            batch_with_meta, epoch = next(split)
+            item = (tree.map_structure(_owned, _encode_frames(batch_with_meta.batch, encoder.from_state)),
+                    epoch, split.state())
+            while not stop.is_set():
+                try:
+                    os.kill(trainer_pid, 0)
+                except ProcessLookupError:
+                    trainer_gone = True
+                    return
+                try:
+                    out.put(item, timeout=1.0)
+                    break
+                except queue.Full:
+                    continue
+    except BaseException:
+        try:
+            out.put(_ProducerError(traceback.format_exc()), timeout=10.0)
+        except queue.Full:
+            pass
+    finally:
+        # the exit flushes what is queued while stop() reads it: a message cut
+        # off mid-write would block that read forever. Only with no trainer
+        # left to read does it go unflushed.
+        if trainer_gone:
+            out.cancel_join_thread()
+        if split is not None:
+            split.shutdown()
+
+
+class ProcessBatchStream:
+    """TorchBatchStream with its producer in a process of its own: the train
+    split (row managers, decode pool) and the encode run there, so their
+    Python (~290 ms per 1024-row batch) no longer shares the trainer's GIL
+    with its kernel launches; the trainer only unpickles and pins. The same
+    items in the same order, each with its Split.state(). Built from the
+    config instead of a Split: make_sources(train=False) skips the trainer's
+    own copy."""
+
+    def __init__(self, config: DataConfig, extra_frames: int, name_map: dict[str, int],
+                 state: tp.Optional[dict], encode_network):
+        if config.random_offset:
+            raise ValueError("random_offset draws from the producer's own global RNG; use TorchBatchStream")
+        ctx = mp.get_context("forkserver")
+        self._pin = config.pin_memory and torch.cuda.is_available()
+        self._queue = ctx.Queue(maxsize=config.prefetch)
+        self._stop = ctx.Event()
+        encoder = copy.deepcopy(encode_network.embed_state_action).cpu()
+        self._process = ctx.Process(
+            target=_produce, name="batch-producer",
+            args=(config, extra_frames, name_map, state, encoder, self._queue, self._stop, os.getpid()))
+        self._process.start()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> tuple[data_lib.Frames, float, dict]:
+        while True:
+            try:
+                item = self._queue.get(timeout=1.0)
+            except queue.Empty:
+                if not self._process.is_alive():
+                    raise RuntimeError(f"batch producer exited with code {self._process.exitcode}")
+                continue
+            if isinstance(item, _ProducerError):
+                raise RuntimeError(f"batch producer failed:\n{item.traceback}")
+            frames, epoch, state = item
+            return tree.map_structure(lambda x: _to_torch(x, self._pin), frames), epoch, state
+
+    def stop(self) -> None:
+        """Reads until the producer exits, so a put it is blocked in sees the stop."""
+        self._stop.set()
+        deadline = time.monotonic() + 60.0
+        while self._process.is_alive() and time.monotonic() < deadline:
+            try:
+                self._queue.get(timeout=0.5)
+            except queue.Empty:
+                pass
+        if self._process.is_alive():
+            self._process.terminate()
+        self._process.join(timeout=10.0)
+
+
+def make_train_stream(sources: "Sources", config: DataConfig, extra_frames: int,
+                      state: tp.Optional[dict], encode_network):
+    """The trainer's batch stream: a process of its own when make_sources
+    left the train split out (config.producer_process), else a thread over it."""
+    if sources.train is None:
+        return ProcessBatchStream(config, extra_frames, sources.name_map, state, encode_network)
+    return TorchBatchStream(sources.train, config, encode_network=encode_network)
 
 
 class RandomEvalStream:

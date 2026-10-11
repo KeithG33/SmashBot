@@ -73,6 +73,23 @@ def test_resume_equals_uninterrupted(tmp_path):
         _assert_same(whole[key], halves[key], key)
 
 
+def test_the_process_stream_trains_the_same_run(tmp_path):
+    """Thread producer for the first half, process producer resuming the
+    second: the same run as the thread producer throughout."""
+    run_dir = str(tmp_path)
+    train_bc.main(_config(run_dir, "thread", 2 * N))
+    train_bc.main(_config(run_dir, "mixed", N))
+    cfg = _config(run_dir, "mixed", 2 * N)
+    cfg.runtime.restore = "auto"
+    cfg.data.producer_process = True
+    train_bc.main(cfg)
+
+    thread, mixed = _latest(run_dir, "thread"), _latest(run_dir, "mixed")
+    for key in ("policy", "value", "policy_opt", "value_opt", "train_data",
+                "train_hidden", "value_hidden"):
+        _assert_same(thread[key], mixed[key], key)
+
+
 def test_autoclip_history_resumes(tmp_path):
     """AutoClip's threshold is a percentile of every step so far, so the
     history must be restored or the resumed run clips differently."""
