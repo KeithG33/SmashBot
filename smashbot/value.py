@@ -99,10 +99,8 @@ class ValueFunction(nn.Module):
         with torch.autocast(values.device.type, enabled=False):
             values = values.float()
             rewards = frames.reward.float()
-            discounts = torch.where(
-                frames.is_resetting[:, 1:], 0.0,
-                torch.as_tensor(discount, device=values.device),
-            )
+            # a python scalar, not a device tensor: copying one waits for the GPU
+            discounts = (~frames.is_resetting[:, 1:]).float() * discount
             with torch.no_grad():
                 targets = self.returns(
                     rewards=rewards, discounts=discounts, bootstrap=last_value.float()
