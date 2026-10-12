@@ -6,7 +6,7 @@ limit). The ops call the kernels nn.LSTM runs, aten._cudnn_rnn and
 aten._cudnn_rnn_backward, wired as PyTorch's own autograd formula for
 _cudnn_rnn wires them (the backward takes the forward's output, reserve and
 weight_buf): bit-identical to nn.LSTM, outputs and gradients. One layer,
-unidirectional, time-major, fp32 whatever the autocast."""
+unidirectional, time-major, in its inputs' dtype whatever the autocast."""
 import torch
 from torch import Tensor
 
@@ -16,7 +16,7 @@ _LSTM = 2   # cuDNN's mode id
 @torch.library.custom_op("smashbot::cudnn_lstm", mutates_args=())
 def _cudnn_lstm(x: Tensor, h0: Tensor, c0: Tensor, w_ih: Tensor, w_hh: Tensor, b_ih: Tensor, b_hh: Tensor,
                 train: bool) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-    with torch.autocast(x.device.type, enabled=False):   # fp32 whatever the caller's autocast (it casts _cudnn_rnn)
+    with torch.autocast(x.device.type, enabled=False):   # the inputs' dtype whatever the caller's autocast (it casts _cudnn_rnn)
         out, hy, cy, reserve, weight_buf = torch.ops.aten._cudnn_rnn(
             x, [w_ih, w_hh, b_ih, b_hh], 4, None, h0, c0, _LSTM, w_hh.shape[1], 0, 1, False, 0.0, train, False, [],
             None)
@@ -68,9 +68,13 @@ def _grads(ctx, g_out, g_hy, g_cy, _reserve, _weight_buf):
 _cudnn_lstm.register_autograd(_grads, setup_context=_setup_context)
 
 
-def cudnn_lstm(rnn: torch.nn.LSTM, x: Tensor, h0: Tensor, c0: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+def cudnn_lstm(rnn: torch.nn.LSTM, x: Tensor, h0: Tensor, c0: Tensor,
+               dtype: torch.dtype | None = None) -> tuple[Tensor, Tensor, Tensor]:
     """nn.LSTM(x, (h0, c0)) on CUDA, time-major: x [T, B, d], h0/c0 [1, B, H]
-    -> (out [T, B, H], hy, cy). Training mode as the module's (as nn.LSTM)."""
-    out, hy, cy, _, _ = _cudnn_lstm(x, h0, c0, rnn.weight_ih_l0, rnn.weight_hh_l0, rnn.bias_ih_l0, rnn.bias_hh_l0,
-                                    rnn.training)
+    -> (out [T, B, H], hy, cy). Training mode as the module's (as nn.LSTM).
+    dtype: the weights cast to it (tx_like's bf16 cells), else as stored."""
+    weights = (rnn.weight_ih_l0, rnn.weight_hh_l0, rnn.bias_ih_l0, rnn.bias_hh_l0)
+    if dtype is not None:
+        weights = tuple(w.to(dtype) for w in weights)
+    out, hy, cy, _, _ = _cudnn_lstm(x, h0, c0, *weights, rnn.training)
     return out, hy, cy

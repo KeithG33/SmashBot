@@ -124,10 +124,10 @@ def compile_cores(policy, value_fn, teacher=None) -> None:
     length: the packed input embeddings and their encode (in eager each of
     their out-of-place writes copies the whole input), an SGU core's
     per-chunk forward (cuDNN recurrent layers stay eager inside it unless
-    use_cudnn_lstm_op made them one traced op), the
-    enhanced embed (the big Phillips' input layer), a
-    tx_like core's stateless layers (the encoder and the FFW blocks between
-    its LSTMs), the controller head, and the value net's return recursion
+    use_cudnn_lstm_op made them one traced op), the enhanced embed (the big
+    Phillips' input layer), a tx_like core's stateless layers (the encoder
+    and the FFW blocks between its LSTMs) or, with use_cudnn_lstm_op, its
+    whole unroll, the controller head, and the value net's return recursion
     (tiny kernels, one per frame, in eager). RL's frozen teacher compiles
     like the policy. The reset chunking, tree maps and metric .item()s around
     them stay in Python. For the learner's copies only: a serving copy has
@@ -149,6 +149,8 @@ def compile_cores(policy, value_fn, teacher=None) -> None:
         core = net.core
         if hasattr(core, "_forward"):
             core._forward = torch.compile(core._forward, dynamic=True)
+        elif any(getattr(m, "cudnn_op", False) for m in core.modules()):
+            core.unroll = torch.compile(core.unroll, dynamic=True)   # its LSTMs are traceable ops: one graph
         else:
             for layer in core.modules():
                 if isinstance(layer, FFWWrapper):

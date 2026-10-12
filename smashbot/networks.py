@@ -203,15 +203,22 @@ class RecurrentWrapper(Network):
     # use_bf16_cells opts BC into bf16.
     cell_dtype: torch.dtype | None = None
 
+    cudnn_op: bool = False   # BC: see use_cudnn_lstm_op
+
     def _run(self, inputs, state):
         core = self._core
         dtype = self.cell_dtype or core.weight_ih_l0.dtype
         cast = lambda t: t.to(dtype)
         lstm = isinstance(core, nn.LSTM)
         with torch.autocast(inputs.device.type, enabled=False):
-            out, *next_state = (torch.lstm if lstm else torch.gru)(
-                cast(inputs), tuple(map(cast, state)) if lstm else cast(state),
-                [cast(w) for w in core.all_weights[0]], core.bias, 1, 0.0, self.training, False, True)
+            if self.cudnn_op and lstm and inputs.is_cuda:
+                out, *next_state = cudnn_lstm(core, cast(inputs).transpose(0, 1).contiguous(),
+                                              *(cast(t).contiguous() for t in state), dtype)
+                out = out.transpose(0, 1)
+            else:
+                out, *next_state = (torch.lstm if lstm else torch.gru)(
+                    cast(inputs), tuple(map(cast, state)) if lstm else cast(state),
+                    [cast(w) for w in core.all_weights[0]], core.bias, 1, 0.0, self.training, False, True)
         next_state = [t.to(core.weight_ih_l0.dtype) for t in next_state]
         return out.to(inputs.dtype), tuple(next_state) if lstm else next_state[0]
 
@@ -734,13 +741,14 @@ def keep_sgu_activations(module: nn.Module) -> None:
 
 
 def use_cudnn_lstm_op(module: nn.Module) -> None:
-    """For BC: the hybrid's LSTM layers run as one traceable cuDNN op
-    (cudnn_lstm.py, bit-identical to nn.LSTM), so the compiled core no longer
-    breaks its graph around them and fuses the glue (-2.3% BC step time). RL
-    keeps nn.LSTM: without the break each of its many core variants becomes a
-    whole-graph compile, which made the RL dry run slower."""
+    """For BC: every LSTM layer (the hybrid's blocks, tx_like's wrappers) runs
+    as one traceable cuDNN op (cudnn_lstm.py, bit-identical to nn.LSTM), so a
+    compiled core no longer breaks its graph around them and fuses the glue
+    (-2.3% hybrid BC step time); compile_cores then compiles a tx_like core
+    whole. RL keeps nn.LSTM: without the break each of its many core variants
+    becomes a whole-graph compile, which made the RL dry run slower."""
     for m in module.modules():
-        if isinstance(m, RecurrentBlock):
+        if isinstance(m, (RecurrentBlock, RecurrentWrapper)):
             m.cudnn_op = True
     # compiled code reaches the LSTM's parameters, and the op's reserve buffer
     # has a data-dependent size

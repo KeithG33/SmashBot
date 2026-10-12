@@ -89,3 +89,53 @@ def test_compiles_as_one_graph(autocast):
         assert out.dtype == torch.float32
         out.sum().backward()
         assert x.grad is not None and rnn.weight_hh_l0.grad is not None
+
+
+def _wrapper_run(wrapper, x, state):
+    wrapper.zero_grad()
+    x = x.clone().requires_grad_()
+    state = tuple(t.clone().requires_grad_() for t in state)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        out, (hy, cy) = wrapper._run(x, state)
+    (out.float().sum() + hy.sum() + cy.sum()).backward()
+    return [out, hy, cy, x.grad, *(t.grad for t in state)] + [p.grad.clone() for p in wrapper.parameters()]
+
+
+@pytest.mark.parametrize("cell_dtype", [None, torch.bfloat16])
+def test_tx_like_wrapper_with_op_matches_torch_lstm(cell_dtype):
+    """tx_like's LSTM through the op equals its torch.lstm path, fp32 and bf16
+    cells: outputs, states and every gradient bit for bit."""
+    from smashbot.networks import RecurrentWrapper, use_cudnn_lstm_op
+    torch.manual_seed(0)
+    wrapper = RecurrentWrapper(nn.LSTM(64, 64, batch_first=True)).cuda()
+    wrapper.cell_dtype = cell_dtype
+    x = torch.randn(5, 80, 64, device="cuda")
+    state = tuple(torch.randn(1, 5, 64, device="cuda") for _ in range(2))
+    plain = _wrapper_run(wrapper, x, state)
+    use_cudnn_lstm_op(wrapper)
+    op = _wrapper_run(wrapper, x, state)
+    assert all(a.dtype == b.dtype and torch.equal(a, b) for a, b in zip(plain, op))
+
+
+@pytest.mark.parametrize("cell_dtype", [None, torch.bfloat16])
+def test_tx_like_core_with_op_compiles_as_one_graph(cell_dtype):
+    """With the op, a tx_like core's whole unroll traces as one graph across
+    chunk lengths and matches eager up to the fused glue's rounding."""
+    from smashbot.networks import TransformerLike, use_bf16_cells, use_chunk_start_resets, use_cudnn_lstm_op
+    torch.manual_seed(0)
+    core = TransformerLike(input_size=48, hidden_size=64, num_layers=2).cuda()
+    use_chunk_start_resets(core)
+    use_cudnn_lstm_op(core)
+    if cell_dtype is not None:
+        use_bf16_cells(core)
+    unroll = torch.compile(core.unroll, dynamic=True, fullgraph=True)
+    for T in (80, 33, 80):
+        x = torch.randn(4, T, 48, device="cuda", requires_grad=True)
+        reset = torch.zeros(4, T, dtype=torch.bool, device="cuda")
+        reset[1, 0] = True
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            out, _ = unroll(x, reset, core.initial_state(4, "cuda"))
+            ref, _ = core.unroll(x, reset, core.initial_state(4, "cuda"))
+        assert (out.float() - ref.float()).norm() / ref.float().norm() < 2e-2
+        out.float().sum().backward()
+        assert x.grad is not None and all(p.grad is not None for p in core.parameters())
