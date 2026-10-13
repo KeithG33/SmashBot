@@ -139,3 +139,19 @@ def test_tx_like_core_with_op_compiles_as_one_graph(cell_dtype):
         assert (out.float() - ref.float()).norm() / ref.float().norm() < 2e-2
         out.float().sum().backward()
         assert x.grad is not None and all(p.grad is not None for p in core.parameters())
+
+
+def test_flattened_weights_are_read_in_place():
+    """A module on the GPU is flattened: the op reads its cuDNN buffer as
+    nn.LSTM does, with no per-call repack (cuDNN's 'not part of single
+    contiguous chunk' warning), forward and backward."""
+    import warnings
+    from smashbot.cudnn_lstm import cudnn_lstm
+    rnn = nn.LSTM(48, 48).cuda()
+    x, h, c = _inputs(20, 3, 48, seed=0)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        out, hy, cy = cudnn_lstm(rnn, x, h, c)
+        (out.sum() + hy.sum() + cy.sum()).backward()
+    assert not [w for w in caught if "contiguous chunk" in str(w.message)]
+    assert rnn.weight_hh_l0.grad is not None
