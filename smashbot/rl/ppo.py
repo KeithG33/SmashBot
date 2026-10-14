@@ -1041,7 +1041,6 @@ class Learner:
         self._kl_teacher_w = self.kl_teacher_weight_at(progress)
         self._reverse_kl_teacher_w = self.reverse_kl_teacher_weight_at(progress)
 
-        check_fixed = fixed_list  # post-update KL check: full rows, no grad
         train_fixed = fixed_list
         if cfg.micro_batches > 1:
             train_fixed = [
@@ -1190,14 +1189,15 @@ class Learner:
                     self.policy_optimizer.step()
             epoch_metrics.append(_mean_dicts(batch_metrics))
 
-        # Post-update measurement (and trust-region backstop).
+        # Post-update measurement (and trust-region backstop), over the
+        # training chunks: full rows would set the step's VRAM peak.
         with torch.no_grad():
             checked = []
-            for f in check_fixed:
+            for f in train_fixed:
                 loss, m = self._policy_loss(f)
                 self._check_chunk(loss, m, f)   # forensics; the revert reads actor KL below
                 checked.append(m)
-            post = _mean_dicts(checked)
+            post = _mean_dicts(checked, weights=chunk_valid)
         # FAIL CLOSED: NaN > x is False — a contaminated measurement must
         # revert, not silently keep the update.
         post_kl = float(post["actor_kl_mean"])
@@ -1241,19 +1241,24 @@ _SUM_KEYS = ("anomalous_samples", "adv_nonfinite", "nf_surrogate",
              "target_nonfinite")
 
 
-def _mean_dicts(dicts: tp.Sequence[dict]) -> dict:
+def _mean_dicts(dicts: tp.Sequence[dict], weights: tp.Sequence[float] | None = None) -> dict:
+    """Means weighted by `weights` (each chunk's valid count makes a
+    per-chunk mean over valid positions the whole batch's)."""
+    w = [1.0] * len(dicts) if weights is None else list(weights)
+    total = sum(w) or 1.0
     out = {}
     for key in dicts[0]:
         vals = [d[key] for d in dicts]
         if isinstance(vals[0], torch.Tensor):
             v = torch.stack(vals)
-            out[key] = v.max() if key in _MAX_KEYS else v.sum() if key in _SUM_KEYS else v.mean()
+            out[key] = (v.max() if key in _MAX_KEYS else v.sum() if key in _SUM_KEYS
+                        else (v * v.new_tensor(w)).sum() / total)
         elif key in _MAX_KEYS:
             out[key] = max(vals)
         elif key in _SUM_KEYS:
             out[key] = sum(vals)
         else:
-            out[key] = sum(vals) / len(vals)
+            out[key] = sum(x * wi for x, wi in zip(vals, w)) / total
     return out
 
 
