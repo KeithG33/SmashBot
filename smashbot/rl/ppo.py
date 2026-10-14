@@ -88,6 +88,10 @@ class RLConfig:
     # fp16 loss-scale doubling interval in learner steps (torch's 2000 assumes
     # a far higher step rate)
     grad_scaler_growth_interval: int = 500
+    # updates at lr 0 that fill a fresh Adam's moments before the first real
+    # one (slippi-ai's optimizer_burnin_epochs): until the first moment has
+    # averaged ~1/(1-beta1) gradients, a step is ~lr on every weight
+    optimizer_burnin_steps: int = 1
     ppo: PPOConfig = dataclasses.field(default_factory=PPOConfig)
     # --- opponent advantage imitation (docs/idea-opponent-learning.md) ---
     # harvested opponent rows trained per step on top of the PPO batch: -1 =
@@ -1070,12 +1074,11 @@ class Learner:
             "opt", self.policy_optimizer.state_dict()
         )
 
-        # optimizer burn-in (slippi-ai's optimizer_burnin_epochs=1): a fresh
-        # Adam's first step is a full ±lr step on every weight, past the trust
-        # region, and the revert empties it again; the first epoch's update
-        # runs at lr 0 to fill its moments from a real gradient
+        # optimizer burn-in: an lr-sized step overshoots the trust region, and
+        # the revert restores the optimizer too, so without it Adam never warms
+        # up; the first epoch's update runs at lr 0 and only fills the moments
         burn_in_lrs = None
-        if not self.policy_optimizer.state:
+        if _optimizer_steps(self.policy_optimizer) < cfg.optimizer_burnin_steps:
             burn_in_lrs = [g["lr"] for g in self.policy_optimizer.param_groups]
             for g in self.policy_optimizer.param_groups:
                 g["lr"] = 0.0
@@ -1253,6 +1256,12 @@ _SUM_KEYS = ("anomalous_samples", "adv_nonfinite", "nf_surrogate",
              "nf_actor_kl", "nf_teacher_kl", "nf_reverse_kl",
              "nf_entropy", "reward_nonfinite", "value_nonfinite",
              "target_nonfinite")
+
+
+def _optimizer_steps(opt: torch.optim.Optimizer) -> int:
+    """Updates an Adam has taken (0 while it has no moments)."""
+    state = next(iter(opt.state.values()), None)
+    return 0 if state is None else int(state["step"])
 
 
 def _mean_dicts(dicts: tp.Sequence[dict], weights: tp.Sequence[float] | None = None) -> dict:

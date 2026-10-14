@@ -228,6 +228,13 @@ def test_a_fresh_optimizer_burns_in_before_moving():
     assert not metrics["reverted"] and learner.policy_optimizer.state
     assert all(torch.equal(a, b) for a, b in zip(before, copy_params(learner.policy)))
     assert learner.policy_optimizer.param_groups[0]["lr"] == learner.config.learning_rate
+    learner, traj = _make_learner(optimizer_burnin_steps=3, ppo=PPOConfig(max_mean_actor_kl=1.0))
+    before = copy_params(learner.policy)
+    for _ in range(3):
+        learner.step([traj], learner.initial_state(3))
+    assert all(torch.equal(a, b) for a, b in zip(before, copy_params(learner.policy)))
+    learner.step([traj], learner.initial_state(3))
+    assert any(not torch.equal(a, b) for a, b in zip(before, copy_params(learner.policy)))
 
 
 def test_sequential_steps_carry_state():
