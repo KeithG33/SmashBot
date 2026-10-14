@@ -107,3 +107,14 @@ def test_optimizer_restores_past_a_removed_trailing_parameter():
     assert saved_opt["param_groups"][0]["params"] == [0, 1, 2, 3], "the saved dict is not mutated"
     plain = torch.optim.Adam(net.parameters(), lr=1e-3)
     saving.load_optimizer(plain, plain.state_dict(), net.state_dict())   # nothing to drop
+
+
+def test_a_run_moves_machines_with_its_dataset_elsewhere_but_keeps_its_data_choices():
+    defaults = dataclasses.asdict(train_bc.TrainConfig())
+    current = train_bc.TrainConfig()
+    current.data.dataset.data_dir = "/elsewhere/Root/Parsed"
+    current.data.dataset.meta_path = "/elsewhere/Root/meta.json"
+    train_bc._check_config(defaults, dataclasses.asdict(current), defaults)
+    current.data.dataset.allowed_characters = "fox"
+    with pytest.raises(ValueError, match="data.dataset.allowed_characters differs"):
+        train_bc._check_config(defaults, dataclasses.asdict(current), defaults)
