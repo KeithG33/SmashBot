@@ -211,11 +211,23 @@ def test_oversized_step_reverts():
         learning_rate=1.0,  # absurd on purpose
         ppo=PPOConfig(num_epochs=1, max_mean_actor_kl=1e-6),
     )
+    learner.step([traj], learner.initial_state(3))   # optimizer burn-in
     before = copy_params(learner.policy)
     _, metrics = learner.step([traj], learner.initial_state(3))
     assert metrics["reverted"]
     for a, b in zip(before, copy_params(learner.policy)):
         assert torch.equal(a, b), "revert must restore parameters exactly"
+
+
+def test_a_fresh_optimizer_burns_in_before_moving():
+    """slippi-ai's optimizer burn-in: the first update fills Adam's moments
+    at lr 0 (a fresh Adam's first step is a full-size sign step)."""
+    learner, traj = _make_learner(ppo=PPOConfig(num_epochs=1, max_mean_actor_kl=1e-6))
+    before = copy_params(learner.policy)
+    _, metrics = learner.step([traj], learner.initial_state(3))
+    assert not metrics["reverted"] and learner.policy_optimizer.state
+    assert all(torch.equal(a, b) for a, b in zip(before, copy_params(learner.policy)))
+    assert learner.policy_optimizer.param_groups[0]["lr"] == learner.config.learning_rate
 
 
 def test_sequential_steps_carry_state():
@@ -489,6 +501,7 @@ def test_nonfinite_chunk_graph_released_before_next_forward():
         learning_rate=1e-3, micro_batches=2,
         ppo=PPOConfig(max_mean_actor_kl=1e9),  # no trust-region revert
     )
+    learner.step([traj], learner.initial_state(traj.rewards.shape[0]))   # optimizer burn-in
     before = [p.detach().clone() for p in learner.policy.parameters()]
     orig = learner._policy_loss
     poisoned = []  # weakref to the skipped chunk's loss (its graph never

@@ -1070,6 +1070,16 @@ class Learner:
             "opt", self.policy_optimizer.state_dict()
         )
 
+        # optimizer burn-in (slippi-ai's optimizer_burnin_epochs=1): a fresh
+        # Adam's first step is a full ±lr step on every weight, past the trust
+        # region, and the revert empties it again; the first epoch's update
+        # runs at lr 0 to fill its moments from a real gradient
+        burn_in_lrs = None
+        if not self.policy_optimizer.state:
+            burn_in_lrs = [g["lr"] for g in self.policy_optimizer.param_groups]
+            for g in self.policy_optimizer.param_groups:
+                g["lr"] = 0.0
+
         epoch_metrics: list[dict] = []
         imit_loss_val = 0.0
         imit_source_loss: dict = {}
@@ -1188,6 +1198,10 @@ class Learner:
                 else:
                     self.policy_optimizer.step()
             epoch_metrics.append(_mean_dicts(batch_metrics))
+            if burn_in_lrs is not None:
+                for g, lr in zip(self.policy_optimizer.param_groups, burn_in_lrs):
+                    g["lr"] = lr
+                burn_in_lrs = None
 
         # Post-update measurement (and trust-region backstop), over the
         # training chunks: full rows would set the step's VRAM peak.
