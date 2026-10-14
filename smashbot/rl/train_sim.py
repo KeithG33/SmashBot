@@ -14,6 +14,7 @@ and per-ghost `rl/snapshots/s{step}` win estimates.
 """
 from __future__ import annotations
 
+import contextvars
 import dataclasses
 import os
 import random
@@ -560,7 +561,10 @@ def run(args) -> None:
                           flush=True)
                 return out
 
-            fut, fut_i = overlap_pool.submit(_run), i
+            # torch's compile configs are context variables: in a fresh thread
+            # the learner would run with the defaults (recompile limit 8, its
+            # later variants eager)
+            fut, fut_i = overlap_pool.submit(contextvars.copy_context().run, _run), i
             # drop the loop's redundant reference: the closure keeps the
             # trajectories alive for the learner; without this they also
             # survive the whole NEXT collect (~0.5-1 GiB of dead co-peak)
