@@ -121,6 +121,7 @@ class MatchSet:
         P, G = len(players), len(self.slate)
         self.results: list = [[None] * G for _ in range(P)]   # [player][game] -> (its stocks, opponent's)
         self.outcomes: list = [[None] * G for _ in range(P)]  # rollouts.game_outcome, the player's view
+        self.ends: list = [[None] * G for _ in range(P)]      # how each game ended; percents the player's first
         self.kill_percents: list = [[[] for _ in range(G)] for _ in range(P)]   # opponent % at the player's kills
         self.death_percents: list = [[[] for _ in range(G)] for _ in range(P)]  # player % at its deaths
         unplayed = [iter(range(G)) for _ in range(P)]
@@ -131,11 +132,12 @@ class MatchSet:
 
         # game_info[env]: the slate game the env's frames belong to (None for
         # a filler), held until the next game's first frame
-        def on_game(env, player, s0, s1, outcome):
+        def on_game(env, player, s0, s1, outcome, end):
             game = self.worker.game_info[env]
             if game is not None:
                 self.results[player][game] = (s1, s0)
                 self.outcomes[player][game] = -outcome
+                self.ends[player][game] = dict(end, percent=end["percent"][::-1])
 
         def on_event(env, player, kind, percent):   # kind is seat 0's: its kill is the player's death
             game = self.worker.game_info[env]
@@ -194,10 +196,14 @@ class MatchSet:
         kills = [p for game in self.kill_percents[player] for p in game]
         deaths = [p for game in self.death_percents[player] for p in game]
         mean = lambda xs: sum(xs) / len(xs) if xs else float("nan")
+        ends = self.ends[player]
+        draws = [dict(ends[g], game=g, characters=self.slate[g]) for g, o in enumerate(outcomes) if o == 0]
         return {
             "games": games, "wins": wins, "losses": losses, "draws": games - wins - losses,
             "win_rate": wins / games,
             "avg_stock_diff": sum(s0 - s1 for s0, s1 in results) / games,
             "avg_percent_at_kill": mean(kills),
             "avg_percent_at_death": mean(deaths),
+            "ends": {k: sum(e["kind"] == k for e in ends) for k in ("stocks", "timer", "double_ko")},
+            "draw_games": draws,
         }

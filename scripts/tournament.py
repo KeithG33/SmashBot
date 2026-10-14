@@ -26,6 +26,12 @@ from smashbot import paths
 from smashbot.eval.sim_arena import MatchSet, dittos, load_player, stratified, unique_labels
 
 
+def clock(frame: int) -> str:
+    """Game time since GO (frame 0) as m:ss."""
+    seconds = max(frame, 0) // 60
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpts", nargs="+", required=True)
@@ -77,6 +83,12 @@ def main():
                 by_char[char][0 if outcome > 0 else 1 if outcome < 0 else 2] += 1
             print("    by " + a + "'s character: " + ", ".join(
                 f"{c} {w}-{l}" + (f"-{d}" if d else "") for c, (w, l, d) in by_char.items()), flush=True)
+            ends = st["ends"]
+            print(f"    ends: {ends['stocks']} by stocks, {ends['timer']} on time, {ends['double_ko']} double KO",
+                  flush=True)
+            for d in st["draw_games"]:
+                print(f"    draw: {d['characters'][0]} vs {d['characters'][1]}, {d['kind']} at {clock(d['frame'])}, "
+                      f"{d['percent'][0]:.0f}% vs {d['percent'][1]:.0f}%", flush=True)
 
     standings = {label: sum(v) / len(v) for label, v in win_rates.items()}
     print("\nstandings (mean win rate over pairings):")

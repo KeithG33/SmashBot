@@ -30,7 +30,7 @@ from smashbot.rl.league import League, MemberWeights
 from smashbot.rl.pool import SnapshotPool
 from smashbot.rl.ppo import Learner
 from smashbot.rl.rollouts import (ChunkAssembler, Followers, HarvestAssembler, compute_reward,
-                                  game_outcome)
+                                  game_end, game_outcome)
 from smashbot.rl import sim_env
 from smashbot.rl.sim_env import follower_stats, seat_stats
 
@@ -161,8 +161,9 @@ class MultiOpponentSimWorker:
         dynamic PfspGrid. match_fn(env, member) -> (MatchConfig, info): the
         match for env's NEXT game (called at boot and every game end);
         default = the fixed stage/char_pairs given, fresh seed per game.
-        record_fn(env, gid, s0, s1, outcome) / event_fn(env, gid, kind, pct) are
-        called with the gid of the game the frames belong to; game_info[env]
+        record_fn(env, gid, s0, s1, outcome, end) / event_fn(env, gid, kind, pct)
+        are called with the gid of the game the frames belong to (end: how the
+        game ended, its last frame and the final percents, seat 0 first); game_info[env]
         holds match_fn's info for that game. shards: the envs are split into
         that many sim batches, stepped in parallel (sim_env.ShardedEnvBatch).
         learn=False (eval): games only — no learner chunks, harvests or rewards."""
@@ -370,9 +371,12 @@ class MultiOpponentSimWorker:
             done = np.asarray(term["done"], dtype=bool)
             if done.any():
                 fs, fp = seat_stats(env.current_frame)   # terminal frame
+                end_frames = env.current_frame["frame_id"]
                 for i in np.nonzero(done)[0]:
                     s0, s1 = int(fs[i, 0]), int(fs[i, 1])
-                    self._on_done(int(i), s0, s1, game_outcome(s0, s1, fp[i, 0], fp[i, 1]))
+                    end = {"kind": game_end(s0, s1), "frame": int(end_frames[i]),
+                           "percent": (float(fp[i, 0]), float(fp[i, 1]))}
+                    self._on_done(int(i), s0, s1, game_outcome(s0, s1, fp[i, 0], fp[i, 1]), end)
 
             if self.assembler.ready():
                 ppo_out.append(self.assembler.emit())
@@ -383,12 +387,12 @@ class MultiOpponentSimWorker:
                         imit_out.append(traj)
         return ppo_out, imit_out
 
-    def _on_done(self, e, s0, s1, outcome):
+    def _on_done(self, e, s0, s1, outcome, end):
         """env e's game ended this step (terminal frame published; the sim
         resets it on the next step). Record, re-seat (PFSP), re-draw the
         match. The new gid/info commit on the entry frame."""
         if self.record_fn is not None:
-            self.record_fn(e, self.env_opp[e], s0, s1, outcome)
+            self.record_fn(e, self.env_opp[e], s0, s1, outcome, end)
         if e in self._pfsp_envs:
             self.pfsp_grid.unseat(e)
             s, n = self.league.on_boundary(e)

@@ -12,7 +12,7 @@ import torch
 from smashbot import train_bc
 from smashbot.eval import sim_arena
 from smashbot.eval.sim_arena import load_player, unique_labels
-from smashbot.rl.rollouts import game_outcome
+from smashbot.rl.rollouts import game_end, game_outcome
 from smashbot.tests.test_restart_guard import _config
 
 
@@ -85,13 +85,14 @@ class _ScriptedWorker:
                     continue
                 self.left[env] -= 1
                 if self.left[env] == 0:
-                    _, (s0, s1), (p0, p1) = self._script(env)
+                    length, (s0, s1), (p0, p1) = self._script(env)
                     player = self.player[env]
                     if s0 == 0:
                         self.event_fn(env, player, "death", 40.0)
                     if s1 == 0:
                         self.event_fn(env, player, "kill", 90.0)
-                    self.record_fn(env, player, s0, s1, game_outcome(s0, s1, p0, p1))
+                    end = {"kind": game_end(s0, s1), "frame": length, "percent": (p0, p1)}
+                    self.record_fn(env, player, s0, s1, game_outcome(s0, s1, p0, p1), end)
                     self.pending[env] = self.match_fn(env, player)[1]
         return [], []
 
@@ -117,6 +118,13 @@ def test_matchset_counts_each_slate_game_once_per_player_and_never_a_filler(monk
     assert [len(d) for d in ms.death_percents[0]] == [0, 0, 1, 0, 0]
     st = ms.stats(0)
     assert (st["games"], st["wins"], st["losses"], st["draws"]) == (5, 3, 2, 0)
+    assert st["ends"] == {"stocks": 3, "timer": 2, "double_ko": 0}
+    assert ms.ends[0][1] == {"kind": "timer", "frame": 50, "percent": (60.2, 85.6)}   # the player's percent first
     assert (st["avg_percent_at_kill"], st["avg_percent_at_death"]) == (40.0, 90.0)
     assert ms.results[1] == [stocks for _, stocks, _ in SCRIPT]   # player 1 played the mirror
     assert ms.outcomes[1] == [-1, -1, 1, 1, -1]
+
+
+def test_game_end_names_how_a_game_ended():
+    assert [game_end(0, 0), game_end(0, 2), game_end(3, 0), game_end(1, 1), game_end(2, 1)] == \
+        ["double_ko", "stocks", "stocks", "timer", "timer"]

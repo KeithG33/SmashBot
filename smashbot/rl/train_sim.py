@@ -163,7 +163,7 @@ class SimLeagueWorker:
         tr = self._tracker_of(gid)
         (tr.add_kill if kind == "kill" else tr.add_death)(percent)
 
-    def _on_game(self, env_i: int, gid: str, s0: int, s1: int, outcome: int) -> None:
+    def _on_game(self, env_i: int, gid: str, s0: int, s1: int, outcome: int, end: dict) -> None:
         if outcome:  # draws never enter the PFSP ledger
             self.lg.record(gid, outcome > 0)
         self._tracker_of(gid).add_game((s0, s1), self._worker.game_info[env_i], outcome)

@@ -279,6 +279,14 @@ def game_outcome(s0: int, s1: int, p0: float, p1: float) -> int:
     return (a < b) - (a > b)
 
 
+def game_end(s0: int, s1: int) -> str:
+    """How a game ended: "stocks" (one player out), "double_ko" (both out on
+    the same frame) or "timer" (both alive at the time limit)."""
+    if s0 == 0 and s1 == 0:
+        return "double_ko"
+    return "stocks" if min(s0, s1) == 0 else "timer"
+
+
 class GameTracker:
     """Game-outcome metrics against one opponent class.
 
