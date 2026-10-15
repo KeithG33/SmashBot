@@ -423,6 +423,12 @@ class Learner:
         else:
             loss.backward()
 
+    def _policy_initial_state(self, batch_size: int, device=None):
+        """A fresh state in the dtype the policy's forward carries it: fp32
+        zeros under fp16 autocast compile a variant of their own."""
+        state = self.policy.initial_state(batch_size, device)
+        return self.policy.network.cache_state(state, torch.float16) if self._amp_enabled else state
+
     def initial_state(self, batch_size: int, device=None) -> LearnerState:
         teacher = self.teacher.initial_state(batch_size, device)
         if self._amp_enabled:   # as the fp16 forward carries it: no fp32 first-step peak
@@ -903,7 +909,7 @@ class Learner:
         batch_size = imf.valid.shape[0]
         initial_state = imf.initial_state
         if initial_state is None:
-            initial_state = self.policy.initial_state(batch_size, imf.valid.device)
+            initial_state = self._policy_initial_state(batch_size, imf.valid.device)
         with self._autocast():
             out = self.policy.unroll(imf.frames, initial_state)
             # masked-position NaN-grad armor (see _policy_loss_inner)
@@ -926,7 +932,7 @@ class Learner:
                 with self._autocast():
                     initial_state = _warm(
                         self.policy.network, tree.map_structure(take, imf.prefix),
-                        self.policy.initial_state(hi - lo, imf.valid.device))
+                        self._policy_initial_state(hi - lo, imf.valid.device))
             out.append(_ImitFixed(
                 frames=tree.map_structure(take, imf.frames),
                 weights=imf.weights[lo:hi], valid=imf.valid[lo:hi],

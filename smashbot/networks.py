@@ -653,14 +653,13 @@ class SGUBlock(nn.Module):
                 + self.spatial.bias
             ).unsqueeze(1)
             return v_mixed, torch.cat([v_cache[:, 1:], v], dim=1)
-        if v.is_cuda:   # the conv and the carried cache mask the reset rows as they copy
-            T = v.shape[1]
-            v_mixed = causal_conv(v_cache, v, self.spatial.weight, self.spatial.bias, reset)
-            v_new = (torch.cat([_reset_rows(v_cache[:, T:], reset), v], dim=1) if T < W - 1
-                     else v[:, T - (W - 1):])
-            return v_mixed, v_new.contiguous()
         v_full = torch.cat([_reset_rows(v_cache, reset), v], dim=1)
-        v_mixed = self.spatial(v_full.transpose(1, 2)).transpose(1, 2)
+        if v.is_cuda:   # the conv masks the reset rows as it copies
+            v_mixed = causal_conv(v_cache, v, self.spatial.weight, self.spatial.bias, reset)
+        else:
+            v_mixed = self.spatial(v_full.transpose(1, 2)).transpose(1, 2)
+        # the same slice for every chunk length: compiled, a branch on T < W - 1
+        # (and its edge lengths) specializes a variant each
         return v_mixed, v_full[:, -(W - 1):].contiguous()
 
     def _spatial_ring(self, v, v_ring, where, read):
@@ -1023,12 +1022,16 @@ class SGUCore(Network):
         """A segment per reset frame, each starting with its reset rows'
         caches masked where they are read (_forward), no zeroed state."""
         if self.chunk_start_resets:
-            return self._forward(inputs, initial_state, reset[:, 0])
+            return self._forward(inputs, initial_state, reset[:, 0].contiguous())
         T = inputs.shape[1]
         starts = [0] + [t for t in torch.nonzero(reset.any(dim=0)).squeeze(-1).tolist() if t > 0]
         outputs, state = [], initial_state
         for start, end in zip(starts, starts[1:] + [T]):
-            out, state = self._forward(inputs[:, start:end], state, reset[:, start])
+            x, r = inputs[:, start:end], reset[:, start].contiguous()
+            # a one-frame segment runs eager: compiled, its size-1 specialization
+            # would add a variant per combination it meets, rare ones late
+            out, state = (self._forward(x, state, r) if end - start > 1
+                          else type(self)._forward(self, x, state, r))
             outputs.append(out)
         return torch.cat(outputs, dim=1) if len(outputs) > 1 else outputs[0], state
 
@@ -1103,6 +1106,10 @@ class StateActionNetwork(Network):
         return out, {"core": core, "tech_mask": mask}
 
     def unroll(self, state_action, reset, initial_state):
+        # dense copies: views into differently shaped buffers (chunk slices,
+        # row ranges, burn-in prefixes) each compile their own variant
+        state_action, reset = torch.utils._pytree.tree_map(
+            lambda t: t.clone(memory_format=torch.contiguous_format), (state_action, reset))
         if not self.tech_mask_window:
             return self.core.unroll(self.embed_sa(state_action), reset, initial_state)
         state_action, mask = self._mask_tech_unroll(state_action, reset, *initial_state["tech_mask"])

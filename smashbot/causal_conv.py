@@ -81,9 +81,10 @@ def _to_channels_last(src, dst, reset=None, BL=64, BC=64):
 def _row(M, T):
     """The operand's row length: M + 1 + T padded to an odd multiple of 8
     elements, aligned for cuBLAS, where a multiple of 16 halves the
-    transposes' write bandwidth (measured)."""
-    row = -(-(M + 1 + T) // 8) * 8
-    return row + 8 * (row // 8 % 2 == 0)
+    transposes' write bandwidth (measured). Arithmetic, not a test: a
+    compiled caller would specialize on the parity."""
+    r = -(-(M + 1 + T) // 8)
+    return 8 * (r + 1 - r % 2)
 
 
 def _channels_first(cache, v, reset):
