@@ -31,7 +31,7 @@ class State(tp.NamedTuple):
 
 
 class SmashBot(TorchBot):
-    name, author, framework, max_games = "smashbot", "KeithG33", "torch", 256
+    name, author, framework = "smashbot", "KeithG33", "torch"
 
     def __init__(self, checkpoints: dict[int, str], scope: str = "12", name: str = "smashbot",
                  temperature: float | None = None, player_name: str = "Master Player", device: str | None = None):
