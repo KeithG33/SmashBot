@@ -6,9 +6,10 @@ batch. The arena applies the input delay, so unlike eval/agent.py's
 DelayedAgent there is no action queue: each observation's sample is returned
 as the reply.
 
-  python -m umi_bot.bot --checkpoint 21=models/qk-scratch-810076.pt --scope 12
+  python -m umi_bot.bot --checkpoint 21=models/qk-1057011.pt --scope 12
 """
 import argparse
+import typing as tp
 
 import numpy as np
 import torch
@@ -22,9 +23,12 @@ from slippi_ai.types import StateAction
 from smashbot import encode
 from smashbot.eval.agent import _neutral_controller
 from smashbot.eval.sim_arena import load_player
+from smashbot.policy import Policy
+
+Nest = tp.Any   # a nest (dicts, tuples, named tuples) of tensors
 
 
-def batch_axes(policy, device) -> list[int]:
+def batch_axes(policy: Policy, device: str) -> list[int]:
     """Each recurrent-state leaf's batch axis: the one that changes with the
     batch size (batch-first leaves, and [layers, B, H] torch RNN states)."""
     a, b = (tree.flatten(policy.initial_state(n, device)) for n in (3, 5))
@@ -36,7 +40,7 @@ def batch_axes(policy, device) -> list[int]:
     return axes
 
 
-def _torch(x, device):
+def _torch(x: np.ndarray, device: str) -> torch.Tensor:
     x = np.ascontiguousarray(x.astype(np.int64) if x.dtype.kind in "iu" else x)
     return torch.from_numpy(x).to(device)
 
@@ -51,36 +55,38 @@ class SmashBot(TorchBot):
         self.player_name = player_name
         self.delays = tuple(sorted(checkpoints))
 
-    def setup(self, s):
-        path = self.checkpoints[s.delay]
-        self.policy, name_code, step = load_player(path, self.device, "")
-        self.policy.eval()
+    def setup(self, session: umi.Session) -> None:
+        """Once per session, before `ready`: the checkpoint for the session's
+        delay, and one row of state per game slot."""
+        path = self.checkpoints[session.delay]
+        policy, name_code, _ = load_player(path, self.device, "")
+        self.policy: Policy = policy
         if self.player_name:   # condition on a player name the checkpoint was trained with
             from smashbot import saving
             name_map = torch.load(path, map_location="cpu", weights_only=False)["state"].get("name_map", {})
             name_code = saving.resolve_name_code(name_map, self.player_name, verbose=False)
-        assert self.policy.delay == s.delay, f"{self.checkpoints[s.delay]} was trained at delay {self.policy.delay}"
+        assert self.policy.delay == session.delay, f"{path} was trained at delay {self.policy.delay}"
         self.embed_controller = self.policy.controller_head.controller_embedding
-        self.axes = batch_axes(self.policy, self.device)
-        self.initial = self.policy.initial_state(s.num_slots, self.device)
-        self.hidden = tree.map_structure(torch.clone, self.initial)
-        neutral = tree.map_structure(lambda x: np.asarray(x)[None].repeat(s.num_slots, 0), _neutral_controller())
-        self.neutral_action = tree.map_structure(lambda x: _torch(x, self.device),
-                                                 self.embed_controller.from_state(neutral))
-        self.prev_action = tree.map_structure(torch.clone, self.neutral_action)
-        self.names = torch.full((s.num_slots,), name_code, dtype=torch.int64, device=self.device)
+        self.axes: list[int] = batch_axes(self.policy, self.device)
+        self.hidden: Nest = self.policy.initial_state(session.num_slots, self.device)
+        neutral = tree.map_structure(lambda x: np.asarray(x)[None].repeat(session.num_slots, 0), _neutral_controller())
+        self.neutral_action: Nest = tree.map_structure(lambda x: _torch(x, self.device),
+                                                       self.embed_controller.from_state(neutral))
+        self.prev_action: Nest = tree.map_structure(torch.clone, self.neutral_action)
+        self.names: torch.Tensor = torch.full((session.num_slots,), name_code, dtype=torch.int64, device=self.device)
 
-    def _take(self, state, rows):
+    def _take(self, state: Nest, rows: torch.Tensor) -> Nest:
         return tree.unflatten_as(state, [x.index_select(ax, rows) for x, ax in zip(tree.flatten(state), self.axes)])
 
-    def _put(self, state, rows, values):
+    def _put(self, state: Nest, rows: torch.Tensor, values: Nest) -> None:
         for x, ax, v in zip(tree.flatten(state), self.axes, tree.flatten(values)):
             x.index_copy_(ax, rows, v.to(x.dtype))
 
-    def act(self, b):
-        rows = torch.as_tensor(b.slots, device=self.device)
-        first = torch.as_tensor(b.first, device=self.device)
-        game = self.policy.network.encode_game(to_slippi_ai(b.frames))
+    def act(self, batch: umi.Batch) -> umi.Actions:
+        """One frame of N games: their observations in, [N, 13] controller rows out."""
+        rows = torch.as_tensor(batch.slots, device=self.device)
+        first = torch.as_tensor(batch.first, device=self.device)
+        game = self.policy.network.encode_game(to_slippi_ai(batch.frames))
         state = tree.map_structure(lambda x: _torch(x, self.device), game)
         prev = tree.map_structure(lambda p, n: torch.where(first.view(-1, *[1] * (p.dim() - 1)), n[rows], p[rows]),
                                   self.prev_action, self.neutral_action)
@@ -95,7 +101,7 @@ class SmashBot(TorchBot):
         return umi.Actions(ctrl=encode.controller_rows(decoded))
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", action="append", required=True,
                         help="DELAY=PATH; one per division the bot enters, e.g. 21=models/qk.pt")
