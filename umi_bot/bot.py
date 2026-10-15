@@ -5,6 +5,17 @@ batch's games and returns their new state. The arena applies the input delay,
 so unlike eval/agent.py's DelayedAgent there is no action queue: each
 observation's sample is the reply.
 
+An entry subclasses SmashBot with what it plays, in the class body, where the
+arena reads it. An uploaded zip's run.py:
+
+    class SmashBotQK(SmashBot):
+        name, scope, delays = "smashbot-qk", "FOX", (21,)
+        checkpoints = {21: "qk-1057011.pt"}
+
+    umi.serve(SmashBotQK())
+
+From the command line (an image), main() builds that subclass from its arguments:
+
   python -m umi_bot.bot --checkpoint 21=models/qk-1057011.pt --scope 12
 """
 import argparse
@@ -31,14 +42,9 @@ class State(tp.NamedTuple):
 
 
 class SmashBot(TorchBot):
-    name, author, framework = "smashbot", "KeithG33", "torch"
-
-    def __init__(self, checkpoints: dict[int, str], scope: str = "12", name: str = "smashbot",
-                 temperature: float | None = None, player_name: str = "Master Player", device: str | None = None):
-        super().__init__(device)
-        self.checkpoints, self.scope, self.name, self.temperature = checkpoints, scope, name, temperature
-        self.player_name = player_name
-        self.delays = tuple(sorted(checkpoints))
+    checkpoints: dict[int, str]           # {delay: checkpoint path}, one per declared delay
+    temperature: float | None = None
+    player_name = "Master Player"         # the player name the policy is conditioned on
 
     def setup(self, session: umi.Session) -> None:
         """Once, before the first game. session.delay is the division being played, so load
@@ -100,7 +106,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--player-name", default="Master Player", help="the player name to condition on")
     args, rest = parser.parse_known_args(argv)
     checkpoints = {int(d): p for d, p in (c.split("=", 1) for c in args.checkpoint)}
-    umi.serve(SmashBot(checkpoints, args.scope, args.name, args.temperature, args.player_name), argv=rest)
+    entry = type("SmashBotEntry", (SmashBot,), {
+        "name": args.name, "scope": args.scope, "delays": tuple(sorted(checkpoints)), "checkpoints": checkpoints,
+        "temperature": args.temperature, "player_name": args.player_name})
+    umi.serve(entry(), argv=rest)
 
 
 if __name__ == "__main__":
