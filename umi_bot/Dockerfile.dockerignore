@@ -1,0 +1,10 @@
+*
+!smashbot
+!umi_bot
+!vendor/slippi-ai
+**/__pycache__
+smashbot/tests
+vendor/slippi-ai/.git
+vendor/slippi-ai/notebooks
+vendor/slippi-ai/tests
+vendor/slippi-ai/*.egg-info
