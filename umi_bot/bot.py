@@ -42,7 +42,9 @@ class SmashBot(TorchBot):
 
     def setup(self, session: umi.Session) -> None:
         """Once, before the first game. session.delay is the division being played, so load
-        the checkpoint trained for it; the arena delays every input itself."""
+        the checkpoint trained for it; the arena delays every input itself.
+        """
+
         from smashbot import saving
         path = self.checkpoints[session.delay]
         policy, _, _ = load_player(path, self.device, "")
@@ -58,7 +60,9 @@ class SmashBot(TorchBot):
         TorchBot calls it once for every slot to allocate storage, then again as games
         start; act() then receives each game's memory and returns the updated one. Here
         the memory is the network's recurrent state and the controller the bot sent last
-        frame (the policy's input), neutral at the start."""
+        frame (the policy's input), neutral at the start.
+        """
+
         neutral = tree.map_structure(lambda x: np.asarray(x)[None].repeat(n, 0), _neutral_controller())
         encoded = self.policy.controller_head.controller_embedding.from_state(neutral)
         return State(self.policy.initial_state(n, self.device), tree.map_structure(self._tensor, encoded))
@@ -71,7 +75,9 @@ class SmashBot(TorchBot):
              otherwise what the last act() returned for it.
         Out: controller rows [N, 13] (main_x, main_y, c_x, c_y, shoulder in [0, 1];
              A, B, X, Y, Z, L, R, D_UP pressed when > 0.5), and the new state, which
-             TorchBot keeps for each game's next frame."""
+             TorchBot keeps for each game's next frame.
+        """
+
         game = tree.map_structure(self._tensor, self.policy.network.encode_game(to_slippi_ai(batch.frames)))
         inputs = StateAction(state=game, action=state.prev_action, name=self.name_code.expand(len(batch.games)))
         sampled, hidden = self.policy.sample(inputs, state.hidden, temperature=self.temperature)
