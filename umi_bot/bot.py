@@ -41,7 +41,8 @@ class SmashBot(TorchBot):
         self.delays = tuple(sorted(checkpoints))
 
     def setup(self, session: umi.Session) -> None:
-        """Once per session, before `ready`: the checkpoint for its delay."""
+        """Once, before the first game. session.delay is the division being played, so load
+        the checkpoint trained for it; the arena delays every input itself."""
         from smashbot import saving
         path = self.checkpoints[session.delay]
         policy, _, _ = load_player(path, self.device, "")
@@ -52,13 +53,25 @@ class SmashBot(TorchBot):
                                       device=self.device)
 
     def initial_state(self, n: int) -> State:
-        """n fresh games: the network's initial state, and a neutral controller as the last action."""
+        """The memory of n games that are just starting, as a nest of tensors with n rows.
+
+        TorchBot calls it once for every slot to allocate storage, then again as games
+        start; act() then receives each game's memory and returns the updated one. Here
+        the memory is the network's recurrent state and the controller the bot sent last
+        frame (the policy's input), neutral at the start."""
         neutral = tree.map_structure(lambda x: np.asarray(x)[None].repeat(n, 0), _neutral_controller())
         encoded = self.policy.controller_head.controller_embedding.from_state(neutral)
         return State(self.policy.initial_state(n, self.device), tree.map_structure(self._tensor, encoded))
 
     def act(self, batch: umi.Batch, state: State) -> tuple[umi.Actions, State]:
-        """One frame of N games: observations and their state in; controller rows and their new state out."""
+        """One frame of N games.
+
+        In:  batch.frames, Frame[N] seen from this bot's seat (players[:, 0] is this bot);
+             state, row k the memory of batch game k: initial_state's for a new game,
+             otherwise what the last act() returned for it.
+        Out: controller rows [N, 13] (main_x, main_y, c_x, c_y, shoulder in [0, 1];
+             A, B, X, Y, Z, L, R, D_UP pressed when > 0.5), and the new state, which
+             TorchBot keeps for each game's next frame."""
         game = tree.map_structure(self._tensor, self.policy.network.encode_game(to_slippi_ai(batch.frames)))
         inputs = StateAction(state=game, action=state.prev_action, name=self.name_code.expand(len(batch.games)))
         sampled, hidden = self.policy.sample(inputs, state.hidden, temperature=self.temperature)
