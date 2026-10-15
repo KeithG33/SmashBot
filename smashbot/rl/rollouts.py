@@ -295,20 +295,12 @@ class GameTracker:
     average opponent percent at our kills (low = early kills, strong punish
     game), and average own percent at our deaths (high = hard to kill)."""
 
-    # ema_alpha 0.008 ~ a 250-game horizon. Checkpoints store EMA values
-    # only, so alpha changes apply cleanly on restore.
-    def __init__(self, window: int = 250, event_window: int = 200,
-                 ema_alpha: float = 0.008):
+    def __init__(self, window: int = 250, event_window: int = 200):
         self.diffs = collections.deque(maxlen=window)  # per finished game
         self.outcomes = collections.deque(maxlen=window)
         self.kill_percents = collections.deque(maxlen=event_window)
         self.death_percents = collections.deque(maxlen=event_window)
         self.wins = self.losses = self.draws = 0
-        # EMA companion to the window: smoother (no window-exit jumps). Both
-        # ride in the RL checkpoint via state()/load_state.
-        self.ema_alpha = ema_alpha
-        self.win_ema: float | None = None
-        self.diff_ema: float | None = None
         self.by_char: dict[str, tuple[int, int]] = {}
 
     def add_game(self, final_stocks: tuple[int, int],
@@ -329,28 +321,13 @@ class GameTracker:
             self.losses += 1
         else:
             self.draws += 1
-        if outcome:  # EMA over decided games, matching win_rate_recent
-            self.win_ema = self._ema_step(self.win_ema, float(outcome > 0),
-                                          self.wins + self.losses)
-        self.diff_ema = self._ema_step(self.diff_ema, diff,
-                                       self.wins + self.losses + self.draws)
-
-    def _ema_step(self, ema: float | None, x: float, n: int) -> float:
-        """Bias-corrected EMA (Adam's correction) with x its nth sample: the
-        plain mean of the samples while n << 1/alpha, recency-weighted after."""
-        if ema is None:
-            return x
-        rate = self.ema_alpha / (1 - (1 - self.ema_alpha) ** n)
-        return ema + rate * (x - ema)
 
     def state(self) -> dict:
-        """Persistable state: EMA values, lifetime counters and the recent
-        windows, so window stats continue across a restart. ema_alpha and the
-        window sizes are NOT persisted: they're code-level knobs, so restored
-        checkpoints pick up the current defaults (a longer saved window keeps
-        its newest games)."""
-        return {"win_ema": self.win_ema, "diff_ema": self.diff_ema,
-                "wins": self.wins, "losses": self.losses,
+        """Persistable state: lifetime counters and the recent windows, so
+        window stats continue across a restart. The window sizes are NOT
+        persisted: they're code-level knobs, so restored checkpoints pick up
+        the current defaults (a longer saved window keeps its newest games)."""
+        return {"wins": self.wins, "losses": self.losses,
                 "draws": self.draws,
                 "diffs": [int(d) for d in self.diffs],
                 "outcomes": [int(o) for o in self.outcomes],
@@ -358,8 +335,6 @@ class GameTracker:
                 "death_percents": [float(p) for p in self.death_percents]}
 
     def load_state(self, st: dict) -> None:
-        self.win_ema = st.get("win_ema")
-        self.diff_ema = st.get("diff_ema")
         self.wins = st.get("wins", 0)
         self.losses = st.get("losses", 0)
         self.draws = st.get("draws", 0)
@@ -387,6 +362,4 @@ class GameTracker:
             "avg_stock_diff": mean(self.diffs),
             "avg_percent_at_kill": mean(self.kill_percents),
             "avg_percent_at_death": mean(self.death_percents),
-            "win_rate_ema": self.win_ema if self.win_ema is not None else 0.5,
-            "stock_diff_ema": self.diff_ema if self.diff_ema is not None else 0.0,
         }

@@ -574,41 +574,6 @@ def test_async_agent_absorbs_slow_samples(monkeypatch):
     assert ready.waits == 0
 
 
-def test_tracker_ema_and_persistence():
-    """EMA updates on decided games only, matches hand-rolled math, and
-    round-trips through state()/load_state (the part that survives
-    restarts — the windows are boot-local by design). Only the EMA VALUES
-    persist: alpha is a code-level knob, so a restored tracker uses the
-    CURRENT default horizon (250 games, alpha 0.008), not the one that
-    produced the checkpoint."""
-    from smashbot.rl.rollouts import GameTracker
-
-    assert GameTracker().ema_alpha == 0.008  # ~250-game horizon (default)
-
-    t = GameTracker(ema_alpha=0.5)
-    t.add_game((4, 0))   # win  -> the first outcome itself, no prior: 1
-    t.add_game((0, 4))   # loss -> bias-corrected: 0.25 / (1 - 0.5**2) = 1/3
-    t.add_game((2, 2))   # draw -> win_ema untouched
-    t.add_game((4, 1))   # win  -> 0.625 / (1 - 0.5**3) = 5/7
-    assert t.win_ema == pytest.approx(5 / 7)
-    assert t.stats()["win_rate_ema"] == pytest.approx(5 / 7)
-
-    t2 = GameTracker()
-    t2.load_state(t.state())
-    assert t2.win_ema == pytest.approx(5 / 7)
-    assert t2.wins == 2 and t2.losses == 1 and t2.draws == 1
-    assert "ema_alpha" not in t.state()  # values persist, alpha doesn't
-    t2.add_game((0, 4))
-    # continues at the tracker's OWN alpha (0.008), not the persisted run's,
-    # corrected for the 4 decided games the restored EMA already holds
-    rate = 0.008 / (1 - 0.992 ** 4)
-    assert t2.win_ema == pytest.approx(5 / 7 * (1 - rate))
-    # legacy checkpoints carrying an alpha are ignored gracefully
-    t3 = GameTracker()
-    t3.load_state({"win_ema": 0.6, "ema_alpha": 0.5, "wins": 1})
-    assert t3.ema_alpha == 0.008 and t3.win_ema == 0.6
-
-
 def test_tracker_windows_survive_restart():
     """The recent windows ride in state(), so win_rate_recent and the stock
     diff/percent averages continue after a restart instead of starting from
@@ -633,20 +598,6 @@ def test_tracker_windows_survive_restart():
     legacy = GameTracker()
     legacy.load_state({"win_ema": 0.6, "wins": 1})
     assert len(legacy.diffs) == 0 and legacy.stats()["win_rate_recent"] == 0.5
-
-
-def test_tracker_ema_starts_as_the_plain_mean():
-    """No prior: while games << 1/alpha the EMA is (almost exactly) the plain
-    win rate and stock differential, from the very first game."""
-    from smashbot.rl.rollouts import GameTracker
-
-    t = GameTracker()
-    t.add_game((0, 3))
-    assert t.win_ema == 0.0 and t.diff_ema == -3
-    for stocks in [(2, 0), (1, 0), (3, 0)]:
-        t.add_game(stocks)
-    assert t.win_ema == pytest.approx(0.75, abs=0.005)
-    assert t.diff_ema == pytest.approx(0.75, abs=0.02)
 
 
 def test_tracker_records_winrate_by_opponent_character():

@@ -394,7 +394,7 @@ def run(args) -> None:
         loaded = sorted(k for k in restored_trackers if k in worker.trackers)
         for k in loaded:
             worker.trackers[k].load_state(restored_trackers[k])
-        print(f"tracker EMAs restored for {loaded}")
+        print(f"tracker windows restored for {loaded}")
     _save_rl_checkpoint.tracker_states = lambda: {
         k: t.state() for k, t in worker.trackers.items()
     }
@@ -480,7 +480,7 @@ def run(args) -> None:
         if i % 5 == 0:
             games = sum(t.wins + t.losses + t.draws for t in worker.trackers.values())
             phil_bits = " ".join(
-                f"{t[:2]}{worker.trackers[f'phillip:{t}'].win_ema:.2f}"
+                f"{t[:2]}{worker.trackers[f'phillip:{t}'].stats()['win_rate_recent']:.2f}"
                 for t in scfg.phillip_tiers
                 if worker.trackers[f"phillip:{t}"].wins + worker.trackers[f"phillip:{t}"].losses)
             print(f"[{i}] {phil_bits} ({games:.0f}g) | "

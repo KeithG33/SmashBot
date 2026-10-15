@@ -747,7 +747,6 @@ class Learner:
             "teacher_kl": vmean(teacher_kl),
             "reverse_teacher_kl": vmean(reverse_teacher_kl),
             "actor_kl_mean": vmean(actor_kl),
-            "actor_kl_max": (actor_kl * valid).max().detach(),
             "entropy": vmean(entropy),
             "ratio_mean": vmean(log_rhos.exp() * valid + (1 - valid)),
             "log_rho_abs_max": raw_abs_max,
@@ -1255,7 +1254,7 @@ class Learner:
         return state, _to_host(metrics)
 
 
-_MAX_KEYS = ("actor_kl_max", "log_rho_abs_max", "log_rho_masked_absmax",
+_MAX_KEYS = ("log_rho_abs_max", "log_rho_masked_absmax",
              "logit_absmax_valid", "logit_absmax_masked",
              "adv_absmax", "reward_absmax", "value_absmax", "target_absmax")
 _SUM_KEYS = ("anomalous_samples", "adv_nonfinite", "nf_surrogate",
