@@ -40,8 +40,12 @@ class SmashBot(umi.Bot):
     player_name = "Master Player"         # the player name the policy is conditioned on
 
     def setup(self, session: umi.Session) -> None:
-        """Once, before the first game: load the policy. The arena delays every input
-        itself, so the policy just answers each frame.
+        """Load the policy once, before the first game.
+
+        Args:
+            session: This session's settings. The arena delays every input itself, so the
+                policy just answers each frame; session.delay must be the one it was
+                trained at.
         """
 
         from smashbot import saving
@@ -54,12 +58,17 @@ class SmashBot(umi.Bot):
                                       device=self.device)
 
     def initial_state(self, n: int) -> State:
-        """The memory of n games that are just starting, as a nest of tensors with n rows.
+        """Return the memory of n games that are just starting.
 
-        umi.Bot calls it once to allocate a row for every game, then again as games
-        start; act() then receives each game's memory and returns the updated one. Here
-        the memory is the network's recurrent state and the controller the bot sent last
-        frame (the policy's input), neutral at the start.
+        umi.Bot calls this once to allocate a row for every game, then again as games
+        start; act() then receives each game's memory and returns the updated one.
+
+        Args:
+            n: How many games are starting.
+
+        Returns:
+            The network's recurrent state and the controller the bot sent last frame
+            (the policy's input), neutral at the start: tensors with n rows.
         """
 
         neutral = tree.map_structure(lambda x: np.asarray(x)[None].repeat(n, 0), _neutral_controller())
@@ -67,14 +76,20 @@ class SmashBot(umi.Bot):
         return State(self.policy.initial_state(n, self.device), tree.map_structure(self._tensor, encoded))
 
     def act(self, batch: umi.Batch, state: State) -> tuple[umi.Actions, State]:
-        """One frame of N games.
+        """Play one frame of N games.
 
-        In:  batch.frames, Frame[N] seen from this bot's seat (players[:, 0] is this bot);
-             state, row k the memory of batch game k: initial_state's for a new game,
-             otherwise what the last act() returned for it.
-        Out: controller rows [N, 13] (main_x, main_y, c_x, c_y, shoulder in [0, 1];
-             A, B, X, Y, Z, L, R, D_UP pressed when > 0.5), and the new state, which
-             umi.Bot keeps for each game's next frame.
+        Args:
+            batch: This frame's games. batch.frames is Frame[N], seen from this bot's
+                seat: players[:, 0] is this bot.
+            state: The memory of the batch's games, row k for batch game k. A new game's
+                row comes from initial_state; otherwise it is what the last act()
+                returned for that game.
+
+        Returns:
+            The actions and the new state, which umi.Bot keeps for each game's next
+            frame. The actions hold one controller row of 13 per game: main_x, main_y,
+            c_x, c_y and shoulder in [0, 1], then A, B, X, Y, Z, L, R and D_UP, each
+            pressed when > 0.5.
         """
 
         game = tree.map_structure(self._tensor, self.policy.network.encode_game(to_slippi_ai(batch.frames)))
