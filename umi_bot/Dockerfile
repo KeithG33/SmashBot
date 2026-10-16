@@ -2,7 +2,7 @@
 # checkpoints (python -m umi_bot.slim) as named contexts:
 #   docker build -f umi_bot/Dockerfile \
 #     --build-context umi=../computer-melee-championship/umi --build-context models=<dir> \
-#     --build-arg CHECKPOINTS="21=/models/qk-1057011.pt" -t smashbot:dev .
+#     --build-arg CHECKPOINT=/models/qk-1057011.pt --build-arg DELAY=21 -t smashbot:dev .
 #   umi-conform --image smashbot:dev
 FROM python:3.12-slim
 RUN pip install --no-cache-dir torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
@@ -16,9 +16,10 @@ COPY smashbot /bot/smashbot
 COPY umi_bot /bot/umi_bot
 COPY --from=models . /models
 WORKDIR /bot
-ARG CHECKPOINTS="21=/models/qk.pt"
+ARG CHECKPOINT=/models/qk.pt
+ARG DELAY=21
 ARG SCOPE=12
 ARG NAME=smashbot
-ENV CHECKPOINTS=${CHECKPOINTS} SCOPE=${SCOPE} BOT_NAME=${NAME} HOME=/home/bot TRITON_CACHE_DIR=/tmp/triton
+ENV CHECKPOINT=${CHECKPOINT} DELAY=${DELAY} SCOPE=${SCOPE} BOT_NAME=${NAME} HOME=/home/bot TRITON_CACHE_DIR=/tmp/triton
 USER 10001
-CMD ["sh", "-c", "exec python -m umi_bot.bot $(for c in $CHECKPOINTS; do printf -- '--checkpoint %s ' \"$c\"; done) --scope \"$SCOPE\" --name \"$BOT_NAME\""]
+CMD ["sh", "-c", "exec python -m umi_bot.bot --checkpoint \"$CHECKPOINT\" --delay \"$DELAY\" --scope \"$SCOPE\" --name \"$BOT_NAME\""]
