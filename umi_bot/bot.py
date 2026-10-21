@@ -114,7 +114,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--player-name", default="Master Player", help="the player name to condition on")
     args, rest = parser.parse_known_args(argv)
     entry = type("SmashBotEntry", (SmashBot,), {
-        "name": args.name, "scope": args.scope, "delays": (args.delay,), "checkpoint": args.checkpoint,
+        "name": args.name, "scope": args.scope, "delay": args.delay, "checkpoint": args.checkpoint,
         "temperature": args.temperature, "player_name": args.player_name})
     umi.serve(entry(), argv=rest)
 
