@@ -10,7 +10,7 @@ arena reads it; computer-melee-championship's examples/smashbot is an uploaded
 zip's version of this file. From the command line (an image), main() builds
 that subclass from its arguments:
 
-  python -m umi_bot.bot --checkpoint models/qk-1057011.pt --delay 21 --scope 12
+  python -m umi_bot.bot --checkpoint models/qk-1057011.pt --delay 21 --characters 12
 """
 import argparse
 import typing as tp
@@ -108,13 +108,13 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True, help="the policy, e.g. models/qk-1057011.pt")
     parser.add_argument("--delay", type=int, required=True, help="the delay it was trained at: 18 or 21")
-    parser.add_argument("--scope", default="12")
+    parser.add_argument("--characters", default="12", help="the ones it plays: 12, ALL, or names such as FOX")
     parser.add_argument("--name", default="smashbot")
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--player-name", default="Master Player", help="the player name to condition on")
     args, rest = parser.parse_known_args(argv)
     entry = type("SmashBotEntry", (SmashBot,), {
-        "name": args.name, "scope": args.scope, "delay": args.delay, "checkpoint": args.checkpoint,
+        "name": args.name, "characters": args.characters, "delay": args.delay, "checkpoint": args.checkpoint,
         "temperature": args.temperature, "player_name": args.player_name})
     umi.serve(entry(), argv=rest)
 
