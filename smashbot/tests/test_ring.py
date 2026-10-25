@@ -4,6 +4,8 @@ LSTM layers. The blocks initialize their history projections to zero or
 identity, so every block parameter is randomized: otherwise history has no
 effect on outputs and a wrong read is invisible."""
 import os
+import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -131,6 +133,22 @@ def test_serving_never_stores_a_non_finite_attention_entry():
     bad[[0, A + 1]] = True
     assert torch.equal(kv[..., bad], torch.zeros_like(kv[..., bad]))
     assert torch.equal(kv[..., ~bad], kv_clean[..., ~bad])
+
+
+def test_a_cpu_install_without_triton_serves():
+    """CPU-only installs (the arena's runtimes) have no triton: the conv module still imports."""
+    code = f"""
+import sys
+sys.modules["triton"] = None  # import triton fails, as without it installed
+import torch
+from smashbot.networks import SGUCore
+core = SGUCore({D}, {H}, 3, {W}, layout="sls")
+y, _ = core.step_with_reset(torch.randn(2, {D}), torch.ones(2, dtype=torch.bool), core.initial_state(2))
+assert y.isfinite().all()
+"""
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="")
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    subprocess.run([sys.executable, "-c", code], check=True, env=env, cwd=root)
 
 
 GPU = pytest.mark.skipif(

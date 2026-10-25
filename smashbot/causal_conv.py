@@ -8,12 +8,18 @@ activation dtype and fp32 accumulation, as the direct conv kernels had them,
 in half their time for the 256-tap window (measured). The matmuls take the
 channels first; a tiled Triton kernel transposes (PyTorch's permute copy runs
 these 20x slower); the backward reuses the forward's channels-first operand.
-Registered as custom ops so a compiled core calls them as single ops."""
+Registered as custom ops so a compiled core calls them as single ops.
+Without triton (a CPU-only install) the module still imports: only CUDA
+tensors launch the kernels."""
 from typing import Optional
 
 import torch
-import triton
-import triton.language as tl
+
+try:
+    import triton
+    import triton.language as tl
+except ModuleNotFoundError:
+    triton = None
 
 _INDEX: dict = {}
 
@@ -43,21 +49,23 @@ def _toeplitz(weight, T, dtype):
     return torch.where(reaches, weight.reshape(C, W).to(dtype)[:, tap], 0)
 
 
-@triton.jit
-def _relayout(src, dst, reset, L, C, s_b, s_l, s_c, d_b, d_l, d_c,
-              RESET: tl.constexpr, BL: tl.constexpr, BC: tl.constexpr):
-    """dst[b, l, c] = src[b, l, c] through each side's strides, in tiles so
-    that a transpose between channels-last and channels-first reads and
-    writes contiguous runs on both sides; 0 for a reset row b."""
-    l = tl.program_id(0) * BL + tl.arange(0, BL)
-    c = tl.program_id(1) * BC + tl.arange(0, BC)
-    b = tl.program_id(2)
-    m = (l < L)[:, None] & (c < C)[None, :]
-    if RESET:
-        m = m & (tl.load(reset + b) == 0)
-    x = tl.load(src + b * s_b + l[:, None] * s_l + c[None, :] * s_c, mask=m, other=0)
-    m = (l < L)[:, None] & (c < C)[None, :]
-    tl.store(dst + b * d_b + l[:, None] * d_l + c[None, :] * d_c, x.to(dst.dtype.element_ty), mask=m)
+if triton is not None:
+
+    @triton.jit
+    def _relayout(src, dst, reset, L, C, s_b, s_l, s_c, d_b, d_l, d_c,
+                  RESET: tl.constexpr, BL: tl.constexpr, BC: tl.constexpr):
+        """dst[b, l, c] = src[b, l, c] through each side's strides, in tiles so
+        that a transpose between channels-last and channels-first reads and
+        writes contiguous runs on both sides; 0 for a reset row b."""
+        l = tl.program_id(0) * BL + tl.arange(0, BL)
+        c = tl.program_id(1) * BC + tl.arange(0, BC)
+        b = tl.program_id(2)
+        m = (l < L)[:, None] & (c < C)[None, :]
+        if RESET:
+            m = m & (tl.load(reset + b) == 0)
+        x = tl.load(src + b * s_b + l[:, None] * s_l + c[None, :] * s_c, mask=m, other=0)
+        m = (l < L)[:, None] & (c < C)[None, :]
+        tl.store(dst + b * d_b + l[:, None] * d_l + c[None, :] * d_c, x.to(dst.dtype.element_ty), mask=m)
 
 
 def _to_channels_first(src, dst, reset=None, BL=64, BC=64):
@@ -172,28 +180,30 @@ def causal_conv(cache: torch.Tensor, v: torch.Tensor, weight: torch.Tensor, bias
     return _causal_conv(cache, v, weight, bias, reset)[0]
 
 
-@triton.jit
-def _ring(ring, v, w, bias, cache_len, ptr, y, C,
-          ring_ss, ring_sb, ring_sm, v_ss, v_sb, w_ss, bias_ss, cl_ss, cl_sb, ptr_ss, y_ss, y_sb,
-          M: tl.constexpr, MM: tl.constexpr, BC: tl.constexpr):
-    c = tl.program_id(0) * BC + tl.arange(0, BC)
-    b = tl.program_id(1)
-    sl = tl.program_id(2)
-    cm = c < C
-    p0 = tl.load(ptr + sl * ptr_ss)
-    first = M - tl.load(cache_len + sl * cl_ss + b * cl_sb)   # oldest valid position
-    acc = tl.zeros((BC,), dtype=tl.float32)
-    for s0 in range(0, M, MM):
-        s = s0 + tl.arange(0, MM)
-        pos = (s - p0 + M) % M                                  # slot s holds this position
-        m = ((s < M) & (pos >= first))[:, None] & cm[None, :]
-        x = tl.load(ring + sl * ring_ss + b * ring_sb + s[:, None] * ring_sm + c[None, :], mask=m, other=0.0)
-        k = tl.load(w + sl * w_ss + pos[:, None] * C + c[None, :], mask=m, other=0.0)
-        acc += tl.sum(x.to(tl.float32) * k.to(tl.float32), axis=0)
-    now = tl.load(v + sl * v_ss + b * v_sb + c, mask=cm, other=0.0).to(tl.float32)
-    acc += now * tl.load(w + sl * w_ss + M * C + c, mask=cm, other=0.0).to(tl.float32)
-    acc += tl.load(bias + sl * bias_ss + c, mask=cm, other=0.0).to(tl.float32)
-    tl.store(y + sl * y_ss + b * y_sb + c, acc.to(y.dtype.element_ty), mask=cm)
+if triton is not None:
+
+    @triton.jit
+    def _ring(ring, v, w, bias, cache_len, ptr, y, C,
+              ring_ss, ring_sb, ring_sm, v_ss, v_sb, w_ss, bias_ss, cl_ss, cl_sb, ptr_ss, y_ss, y_sb,
+              M: tl.constexpr, MM: tl.constexpr, BC: tl.constexpr):
+        c = tl.program_id(0) * BC + tl.arange(0, BC)
+        b = tl.program_id(1)
+        sl = tl.program_id(2)
+        cm = c < C
+        p0 = tl.load(ptr + sl * ptr_ss)
+        first = M - tl.load(cache_len + sl * cl_ss + b * cl_sb)   # oldest valid position
+        acc = tl.zeros((BC,), dtype=tl.float32)
+        for s0 in range(0, M, MM):
+            s = s0 + tl.arange(0, MM)
+            pos = (s - p0 + M) % M                                  # slot s holds this position
+            m = ((s < M) & (pos >= first))[:, None] & cm[None, :]
+            x = tl.load(ring + sl * ring_ss + b * ring_sb + s[:, None] * ring_sm + c[None, :], mask=m, other=0.0)
+            k = tl.load(w + sl * w_ss + pos[:, None] * C + c[None, :], mask=m, other=0.0)
+            acc += tl.sum(x.to(tl.float32) * k.to(tl.float32), axis=0)
+        now = tl.load(v + sl * v_ss + b * v_sb + c, mask=cm, other=0.0).to(tl.float32)
+        acc += now * tl.load(w + sl * w_ss + M * C + c, mask=cm, other=0.0).to(tl.float32)
+        acc += tl.load(bias + sl * bias_ss + c, mask=cm, other=0.0).to(tl.float32)
+        tl.store(y + sl * y_ss + b * y_sb + c, acc.to(y.dtype.element_ty), mask=cm)
 
 
 def ring_taps(weight: torch.Tensor) -> torch.Tensor:
