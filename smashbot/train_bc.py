@@ -268,6 +268,7 @@ def main(config: TrainConfig) -> None:
         name_map=resume.get("name_map", init["state"]["name_map"] if init else None),
         train_state=resume.get("train_data"),
         train=not config.data.producer_process,
+        extend_name_map=init is not None,
     )
     print(f"name_map: {sources.name_map}")
 

@@ -30,6 +30,10 @@ class DataConfig:
     random_offset: int = 0
     balance_characters: bool = False
     max_names: int = 16
+    # Name maps this run builds give the empty name (an Unknown player) no slot, so it and any name the
+    # map lacks embed as all zeros (loader.create_name_map). A checkpoint's saved map encodes as it was
+    # built, so runs and models from before this setting are unchanged.
+    zero_unknown_names: bool = True
 
     # Torch bridge
     prefetch: int = 4

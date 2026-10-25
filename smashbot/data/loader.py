@@ -51,17 +51,46 @@ def batch_to_torch(batch: data_lib.Batch, pin: bool) -> data_lib.Batch:
     return tree.map_structure(lambda x: _to_torch(x, pin), batch)
 
 
+UNKNOWN_NAME = ""
+
+
 def create_name_map(
     replays: list[data_lib.ReplayInfo],
     max_names: int,
+    zero_unknown: bool = False,
+    base: tp.Optional[dict[str, int]] = None,
 ) -> dict[str, int]:
-    # Ported from slippi_ai/tf/train_lib.py (module imports TF, function doesn't).
-    name_map: dict[str, int] = {}
+    """Main-player name -> one-hot slot, the most frequent names first.
+
+    Ported from slippi_ai/tf/train_lib.py (module imports TF, function doesn't).
+
+    Args:
+        replays: the replays whose main-player names fill the slots.
+        max_names: the one-hot's width.
+        zero_unknown: the empty name (an Unknown player) gets no slot: it maps to max_names, past the
+            one-hot, so it and every name missing from the map (nametags encodes a miss as the largest
+            code + 1) embed as all zeros. Without it the empty name takes a slot like any other name.
+        base: with zero_unknown, a map to extend (a warm start's): its slots stay as they are and the
+            replays' other names take the free ones.
+
+    Returns:
+        The name map.
+    """
     name_counts = collections.Counter(
         nametags.normalize_name(replay.main_player.name) for replay in replays
     )
-    for i, (name, _) in enumerate(name_counts.most_common(max_names)):
-        name_map[name] = i
+    if zero_unknown:
+        base = base or {}
+        name_map = {name: code for name, code in base.items() if name != UNKNOWN_NAME}
+        free = iter(sorted(set(range(max_names)) - set(base.values())))
+        for name, _ in name_counts.most_common():
+            if name == UNKNOWN_NAME or name in name_map:
+                continue
+            if (code := next(free, None)) is None:
+                break
+            name_map[name] = code
+    else:
+        name_map = {name: i for i, (name, _) in enumerate(name_counts.most_common(max_names))}
 
     for first, *rest in nametags.NAME_GROUPS:
         if first not in name_map:
@@ -69,6 +98,8 @@ def create_name_map(
         for name in rest:
             name_map[name] = name_map[first]
 
+    if zero_unknown:
+        name_map[UNKNOWN_NAME] = max_names
     return name_map
 
 
@@ -219,6 +250,7 @@ def make_sources(
     name_map: tp.Optional[dict[str, int]] = None,
     train_state: tp.Optional[dict] = None,
     train: bool = True,
+    extend_name_map: bool = False,
 ) -> Sources:
     """Build train/test splits. extra_frames must be policy.delay + 1.
 
@@ -229,10 +261,13 @@ def make_sources(
     every row then restarts at frame 0 of a fresh replay. The test split
     always starts fresh: the evals draw their rows from its replays.
     train=False leaves the train split to a ProcessBatchStream.
+    extend_name_map: name_map is a warm start's (another run's checkpoint):
+    with config.zero_unknown_names, the dataset's names it lacks take its free
+    slots and Unknown embeds as zeros. A resumed run passes False.
     """
     train_replays, test_replays = data_lib.train_test_split(config.dataset)
-    if name_map is None:
-        name_map = create_name_map(train_replays, config.max_names)
+    if name_map is None or (extend_name_map and config.zero_unknown_names):
+        name_map = create_name_map(train_replays, config.max_names, config.zero_unknown_names, base=name_map)
     return Sources(
         train=_make_split(train_replays, config, extra_frames, name_map, train_state) if train else None,
         test=_make_split(test_replays, config, extra_frames, name_map, None),
