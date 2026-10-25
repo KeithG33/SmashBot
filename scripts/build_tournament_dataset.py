@@ -6,8 +6,7 @@ with slippi_db's own functions, label each player, then delete the archive and i
 
 Labels go in netplay.name, where the loader's name_from_metadata reads them: "GM Player" for HAL's 38
 pros and SSBMRank's top players, "Master Player" for other named players, and "" (Unknown) when the
-set doesn't say who played. Players who asked not to be in AI training (nametags.BANNED_NAMES) carry
-that name instead, so the loader's name filter drops their side of the game, as it would upstream.
+set doesn't say who played; real names stay in provenance fields the loader doesn't read.
 meta-pro.json and meta-misc.json split meta.json by whether a pro is named in the game's set.
 
 Raw.json records finished archives, so a rerun resumes. Each archive's work runs in its own systemd
@@ -18,6 +17,7 @@ Usage:
   .venv/bin/python -I scripts/build_tournament_dataset.py                 # every archive
   .venv/bin/python -I scripts/build_tournament_dataset.py --only gx3.7z   # chosen archives
   .venv/bin/python -I scripts/build_tournament_dataset.py report          # counts so far
+  .venv/bin/python -I scripts/build_tournament_dataset.py relabel         # after the name lists change
 """
 
 import argparse
@@ -108,27 +108,12 @@ def _character_ids() -> dict[str, frozenset[int]]:
 
 CHARACTER_IDS = _character_ids()
 PRO_SLUGS = {form: slug for slug, forms in PROS.items() for form in forms}
-TOP = {norm(n) for n in (RANK_2025 + "|" + RANK_SUMMER_2026).replace("\n", "").split("|")} | {"jahridin"}
-
-
-def _opt_outs() -> dict[str, str]:
-    from slippi_ai import nametags
-
-    out = {norm(alias): group[0] for group in nametags.NAME_GROUPS if group[0] in nametags.BANNED_NAMES
-           for alias in group}
-    for slug, forms in PROS.items():
-        if slug in out:
-            out.update((form, out[slug]) for form in forms)
-    return out
-
-
-OPT_OUT = _opt_outs()
+TOP = {norm(n) for n in (RANK_2025 + "|" + RANK_SUMMER_2026).replace("\n", "").split("|")}
+TOP |= {"jahridin", "hbox"}  # spellings seen in brackets
 
 
 def kind(name: str) -> str:
     key = norm(name)
-    if key in OPT_OUT:
-        return "opt-out"
     if key in PRO_SLUGS:
         return "pro"
     if key in TOP:
@@ -279,16 +264,25 @@ def context_info(ctx: dict, path: str) -> tuple[str | None, list[Side], dict[int
         return None, [], None
 
 
-def own_name(player: dict) -> str:
-    """nametags.name_from_metadata for a parse result, whose netplay may be an empty dict."""
-    netplay = player.get("netplay") or {}
-    return (netplay.get("code") or "").replace("＃", "#") or netplay.get("name") or player.get("name_tag") or ""
+def port_labels(named: list[Side], by_port: list[Side] | None) -> tuple[list[str], list[str | None], bool]:
+    """Each port's label and identity, and whether the same-label rule put the set's names on unknown ports.
+
+    Ports the set's names can't be matched to (a ditto, a set naming no characters) still get its label when both
+    players have the same one.
+    """
+    if by_port:
+        return [LABELS[kind(s.name)] for s in by_port], [s.name for s in by_port], False
+    if named and LABELS[kind(named[0].name)] == LABELS[kind(named[1].name)]:
+        return [LABELS[kind(named[0].name)]] * 2, [None, None], True
+    return ["", ""], [None, None], False
+
+
+def group_of(named: list[Side]) -> str:
+    return "pro" if any(kind(s.name) == "pro" for s in named) else "misc"
 
 
 def label_game(event: str, path: str, players: list[dict], ctx: dict | None) -> tuple[list[str], list, dict]:
     """Labels (netplay names) and identities per port, and the game's provenance record."""
-    from slippi_ai import nametags
-
     set_info = find_set(event, path)
     round_ = set_info[0] if set_info else None
     named: list[Side] = []
@@ -309,34 +303,14 @@ def label_game(event: str, path: str, players: list[dict], ctx: dict | None) -> 
         by_port = match_characters(named, [p["character"] for p in players])
         method = "characters" if by_port else "unresolved"
 
-    kinds = [kind(s.name) for s in named]
-    if by_port:
-        identities = [s.name for s in by_port]
-        labels = [OPT_OUT[norm(s.name)] if kind(s.name) == "opt-out" else LABELS[kind(s.name)] for s in by_port]
-    else:
-        identities = [None, None]
-        opted = [OPT_OUT[norm(s.name)] for s in named if kind(s.name) == "opt-out"]
-        if opted:
-            labels = [opted[0]] * 2
-        elif named and LABELS[kinds[0]] == LABELS[kinds[1]]:
-            labels = [LABELS[kinds[0]]] * 2
-            method += " same-label"
-        else:
-            labels = ["", ""]
-
-    for i, player in enumerate(players):
-        own = own_name(player)
-        if own and (nametags.is_banned_name(own) or norm(own) in OPT_OUT):
-            labels[i] = OPT_OUT.get(norm(own)) or nametags.normalize_name(own)
-            identities[i] = identities[i] or own
-
+    labels, identities, same_label = port_labels(named, by_port)
     provenance = {
         "event": event,
         "path": path,
-        "group": "pro" if "pro" in kinds else "misc",
+        "group": group_of(named),
         "round": round_,
         "players": [s.name for s in named],
-        "assignment": method,
+        "assignment": f"{method} same-label" if same_label else method,
     }
     return labels, identities, provenance
 
@@ -705,6 +679,34 @@ def finalize(root: Path) -> None:
     print(f"finalize: parsed.pkl written; removed {len(stray)} stray parquet files", flush=True)
 
 
+def relabel(root: Path) -> None:
+    """Recompute every kept game's labels and group from its provenance, by the name lists as they now are."""
+    conn = open_db(root)
+    games, replays = [], []
+    for raw, name, row_json in conn.execute("SELECT raw, name, row FROM games").fetchall():
+        row = json.loads(row_json)
+        prov = row["tournament"]
+        named = [Side(name) for name in prov["players"]]
+        resolved = prov["assignment"] in ("context", "characters")
+        by_port = [Side(p["identity"]) for p in row["players"]] if resolved else None
+        labels, identities, same_label = port_labels(named, by_port)
+        for player, label, identity in zip(row["players"], labels, identities):
+            player["netplay"]["name"], player["identity"] = label, identity
+        prov["group"] = group_of(named)
+        if prov["assignment"]:
+            prov["assignment"] = prov["assignment"].removesuffix(" same-label") + " same-label" * same_label
+        games.append((prov["group"], json.dumps(row), row["slp_md5"]))
+        replays.append((*labels, name, raw))
+    with conn:
+        conn.executemany("UPDATE games SET grp = ?, row = ? WHERE slp_md5 = ?", games)
+        conn.executemany(
+            "UPDATE replays SET p0_netplay_name = ?, p1_netplay_name = ? WHERE name = ? AND raw = ?", replays)
+    write_meta(root, conn)
+    conn.close()
+    print(f"relabel: {len(games)} games", flush=True)
+    finalize(root)
+
+
 def share_url() -> str:
     return SHARE_FILE.read_text().split()[0]
 
@@ -859,8 +861,6 @@ def report(root: Path) -> dict:
             label = player["netplay"]["name"]
             if label == "":
                 slots["Unknown"] += 1
-            elif label not in ("GM Player", "Master Player"):
-                slots["opt-out"] += 1
             else:
                 slots[kind(player["identity"] or prov["players"][i])] += 1
         for slug in {PRO_SLUGS[norm(n)] for n in prov["players"] if kind(n) == "pro"}:
@@ -878,7 +878,7 @@ def report(root: Path) -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("command", nargs="?", default="run", choices=["run", "process", "finalize", "report"])
+    ap.add_argument("command", nargs="?", default="run", choices=["run", "process", "finalize", "relabel", "report"])
     ap.add_argument("--root", type=Path, default=DATA / "tournament" / "Root")
     ap.add_argument("--work", type=Path, default=DATA / "tournament" / "work")
     ap.add_argument("--existing_meta", type=Path, default=DATA / "full" / "Root" / "meta.json")
@@ -893,6 +893,8 @@ def main() -> None:
         process(args.archive, args.root, args.work, args.work / "existing-md5.txt", args.workers)
     elif args.command == "finalize":
         finalize(args.root)
+    elif args.command == "relabel":
+        relabel(args.root)
     else:
         print(json.dumps(report(args.root), indent=1))
 
