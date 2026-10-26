@@ -13,11 +13,18 @@ Raw.json records finished archives, so a rerun resumes. Each archive's work runs
 scope (MemoryMax) at nice 19 / ionice idle. Archives are untrusted: only 7z touches them, and every
 entry is checked before extraction.
 
+`upgrade` recovers the replays dropped as "slippi version too low" (Slippi 1.7/2.0, which lack the
+hurtbox state behind `invulnerable`): it re-records each in a playback Dolphin at PLAYBACK_VERSION
+(slippi_db.upgrade_slp), checks the re-recording is the same game, then parses, filters and labels
+it like any other and puts it in place of its old outcome. The upgrades table keeps each finished
+replay, so a rerun resumes mid-archive.
+
 Usage:
   .venv/bin/python -I scripts/build_tournament_dataset.py                 # every archive
   .venv/bin/python -I scripts/build_tournament_dataset.py --only gx3.7z   # chosen archives
   .venv/bin/python -I scripts/build_tournament_dataset.py report          # counts so far
   .venv/bin/python -I scripts/build_tournament_dataset.py relabel         # after the name lists change
+  .venv/bin/python -I scripts/build_tournament_dataset.py upgrade --workers 24 --cpus 0-15,24-39
 """
 
 import argparse
@@ -53,6 +60,16 @@ SKIP = {
 EVENT_PLAYERS = {"the-match-zain-vs-cody": ("Zain", "Cody")}
 MIN_FREE_BYTES = 60e9
 MEMORY_MAX = "16G"
+
+OLD_REPLAY_OUTCOME = "pipeline: slippi version too low"
+UPGRADE_TOOLS = Path("/home/kage/drive2/ShineBot/upgrade-tools")
+PLAYBACK_DOLPHIN = UPGRADE_TOOLS / "dolphin-batch-playback/build-nogui-playback/Binaries/dolphin-emu"
+COPY_SLP_METADATA = UPGRADE_TOOLS / "bin/copy_slp_metadata"
+MELEE_ISO = Path("/home/kage/slippi/Super Smash Bros. Melee (USA) (En,Ja) (v1.02).iso")
+PLAYBACK_VERSION = (3, 19, 0)
+DOLPHIN_TIMEOUT = 300
+MAX_DESYNC_RUN = 60  # the pilot's longest same-game run: 41 frames (Link recovering to the ledge)
+UPGRADE_MEMORY_MAX = "32G"
 
 PROS = {  # HAL MDS's 38 pros: slug -> name forms seen in brackets
     "cody": ["cody", "codyschwab", "ibdw"], "mang0": ["mang0", "mango"], "solobattle": ["solobattle"],
@@ -375,8 +392,11 @@ def without_metadata(slp_bytes: bytes) -> bytes:
     return slp_bytes[:end] + b"U\x08metadata{}}"
 
 
-def parse_replay(task: tuple[str, str, str, str]) -> dict:
-    """parse_local.parse_slp's steps for a replay on disk, with HAL's filter before the parquet is written."""
+def parse_replay(task: tuple[str, str, str, str], identity: tuple[str, int] | None = None) -> dict:
+    """parse_local.parse_slp's steps for a replay on disk, with HAL's filter before the parquet is written.
+
+    `identity` (md5, size) files the parse under another replay, as an upgraded replay is filed under its original.
+    """
     from slippi_db import parse_peppi, parsing_utils, preprocessing, utils
     from slippi_db.parsing_utils import CompressionType
 
@@ -384,8 +404,8 @@ def parse_replay(task: tuple[str, str, str, str]) -> dict:
     try:
         with open(path, "rb") as f:
             slp_bytes = f.read()
-        md5 = utils.md5(slp_bytes)
-        result = dict(name=name, raw=raw, slp_md5=md5, slp_size=len(slp_bytes))
+        md5, size = identity or (utils.md5(slp_bytes), len(slp_bytes))
+        result = dict(name=name, raw=raw, slp_md5=md5, slp_size=size)
         try:
             game = parse_peppi.read_slippi(path)
         except OSError as e:
@@ -432,10 +452,10 @@ def to_row(result: dict, labels: list[str]) -> dict:
     return parse_local.sqlite_row_to_dict(dict(zip(parse_local.PARSED_COLUMNS, parse_local.result_to_tuple(result))))
 
 
-def check_listing(archive: Path) -> int:
-    """Total unpacked bytes, after refusing any entry that is a link or could land outside the target."""
+def listing(archive: Path) -> dict[str, int]:
+    """Each entry's path and unpacked size, after refusing any entry that is a link or could land outside the target."""
     out = subprocess.run(["7z", "l", "-slt", str(archive)], capture_output=True, text=True, check=True).stdout
-    total = 0
+    entries = {}
     for block in out.partition("----------")[2].strip().split("\n\n"):
         kv = dict(line.split(" = ", 1) for line in block.splitlines() if " = " in line)
         path = kv.get("Path")
@@ -444,14 +464,26 @@ def check_listing(archive: Path) -> int:
         parts = path.replace("\\", "/").split("/")
         if path.startswith(("/", "\\")) or ".." in parts or re.search(r"\bl[rwx-]{9}\b", kv.get("Attributes", "")):
             raise ValueError(f"unsafe entry in {archive.name}: {path!r} {kv.get('Attributes')!r}")
-        total += int(kv.get("Size") or 0)
-    return total
+        entries["/".join(parts)] = int(kv.get("Size") or 0)
+    return entries
 
 
-def extract(archive: Path, dest: Path) -> None:
+def check_listing(archive: Path) -> int:
+    """Total unpacked bytes, after refusing any entry that is a link or could land outside the target."""
+    return sum(listing(archive).values())
+
+
+def extract(archive: Path, dest: Path, only: list[str] | None = None) -> None:
+    """Unpack the archive, or just the entries in `only`, into a new directory."""
     dest.mkdir(parents=True)
-    res = subprocess.run(["7z", "x", "-y", "-bd", f"-o{dest}", str(archive)],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt") as names:
+        selection = []
+        if only is not None:
+            names.write("".join(f"{name}\n" for name in only))
+            names.flush()
+            selection = ["-spd", "-scsUTF-8", f"@{names.name}"]
+        res = subprocess.run(["7z", "x", "-y", "-bd", f"-o{dest}", str(archive), *selection],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     if res.returncode > 2:
         raise RuntimeError(f"7z failed on {archive.name} ({res.returncode}): {res.stderr[-500:]}")
     if res.returncode:
@@ -510,6 +542,8 @@ CREATE TABLE IF NOT EXISTS outcomes (
 CREATE TABLE IF NOT EXISTS games (
     slp_md5 TEXT PRIMARY KEY, raw TEXT NOT NULL, name TEXT NOT NULL, grp TEXT NOT NULL, match_key TEXT,
     row TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS upgrades (
+    raw TEXT NOT NULL, name TEXT NOT NULL, result TEXT NOT NULL, PRIMARY KEY (raw, name));
 """
 
 
@@ -530,6 +564,8 @@ def drop_reason(result: dict, row: dict, check_replay, match_keys: set[str]) -> 
     """The first filter a parsed replay fails, or None when it counts."""
     if not result["valid"]:
         return "parse error"
+    if error := result.get("upgrade_error"):
+        return f"upgrade: {error}"
     if not result["is_training"]:
         return f"pipeline: {result['not_training_reason']}"
     if result.get("quality"):
@@ -552,14 +588,38 @@ def labelled_row(result: dict, event: str, ctx: dict | None) -> dict:
             out["orig_netplay"] = orig["netplay"]
     if result.get("metadata_dropped"):
         provenance["metadata_dropped"] = True
+    if result.get("upgrade"):
+        provenance["upgraded"] = result["upgrade"]
     row["tournament"] = provenance
     return row
+
+
+def judge(results: list[dict], raw: str, event: str, contexts: dict[str, Path], match_keys: set[str],
+          parsed_dir: Path) -> tuple[list[tuple], list[tuple], dict[str, tuple[str | None, str]]]:
+    """Replays rows, games rows and outcomes for parse results; dropped games lose their parquet."""
+    from slippi_db import parse_local
+    from slippi_db.scripts.make_local_dataset import check_replay
+
+    replay_rows, games, outcomes = [], [], {}
+    for result in results:
+        path = result["name"]
+        row = to_row(result, ["", ""]) if result["valid"] else result
+        outcome = drop_reason(result, row, check_replay, match_keys) or "kept"
+        if outcome == "kept":
+            row = labelled_row(result, event, find_context(contexts, path))
+            if key := match_key(row):
+                match_keys.add(key)
+            games.append((row["slp_md5"], raw, path, row["tournament"]["group"], key, json.dumps(row)))
+        elif result.get("pq_size"):
+            Path(parsed_dir, result["slp_md5"]).unlink(missing_ok=True)
+        outcomes[path] = (result.get("slp_md5"), outcome)
+        replay_rows.append(parse_local.result_to_tuple(row))
+    return replay_rows, games, outcomes
 
 
 def process(archive: Path, root: Path, work: Path, existing_md5s: Path, workers: int) -> dict:
     """Unpack, parse, filter and label one archive, and record it in root. Returns its outcome counts."""
     from slippi_db import parse_local
-    from slippi_db.scripts.make_local_dataset import check_replay
 
     raw, event = archive.name, re.sub(r"\.(7z|zip)$", "", archive.name)
     unpacked = check_listing(archive)
@@ -606,20 +666,8 @@ def process(archive: Path, root: Path, work: Path, existing_md5s: Path, workers:
                     print(f"  {raw}: parsed {len(results)}/{len(tasks)} in {time.time() - t1:.0f}s", flush=True)
         t2 = time.time()
 
-        replay_rows, games = [], []
-        for result in results:
-            path = result["name"]
-            row = to_row(result, ["", ""]) if result["valid"] else result
-            outcome = drop_reason(result, row, check_replay, match_keys) or "kept"
-            if outcome == "kept":
-                row = labelled_row(result, event, find_context(contexts, path))
-                if key := match_key(row):
-                    match_keys.add(key)
-                games.append((row["slp_md5"], raw, path, row["tournament"]["group"], key, json.dumps(row)))
-            elif result.get("pq_size"):
-                Path(parsed_dir, result["slp_md5"]).unlink(missing_ok=True)
-            outcomes[path] = (result.get("slp_md5"), outcome)
-            replay_rows.append(parse_local.result_to_tuple(row))
+        replay_rows, games, judged = judge(results, raw, event, contexts, match_keys, parsed_dir)
+        outcomes.update(judged)
 
         with conn:
             for table in ("replays", "outcomes", "games"):
@@ -638,6 +686,193 @@ def process(archive: Path, root: Path, work: Path, existing_md5s: Path, workers:
     summary = {"archive": raw, "files": len(replays), "kept": counts["kept"],
                "pro": sum(g[3] == "pro" for g in games), "context.json": len(contexts),
                "unpack_s": round(t1 - t0), "parse_s": round(t2 - t1), "outcomes": dict(counts.most_common())}
+    print("SUMMARY " + json.dumps(summary), flush=True)
+    return summary
+
+
+def unexplained_frames(old: np.ndarray, new: np.ndarray) -> np.ndarray:
+    """Frames where new differs from old by more than a tenth of a unit, other than by old being a frame stale."""
+    def differs(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        if np.issubdtype(a.dtype, np.floating):
+            return ~np.isclose(a, b, rtol=1e-5, atol=0.1, equal_nan=True)
+        return a != b
+
+    out = differs(old, new)
+    out[:-1] &= differs(new[:-1], old[1:])
+    out[1:] &= differs(old[1:], new[:-1])
+    return out
+
+
+def longest_run(mask: np.ndarray) -> int:
+    edges = np.diff(np.concatenate([[0], mask.astype(np.int8), [0]]))
+    return int((np.flatnonzero(edges == -1) - np.flatnonzero(edges == 1)).max(initial=0))
+
+
+def desync(original_path: str, upgraded_path: str) -> tuple[str | None, dict]:
+    """Why an upgraded replay isn't its original's game (None when it is), and how its post-frame data differs.
+
+    Old replays record some post-frame values a frame stale, where a re-recording of a modern replay matches exactly,
+    so those differences don't count; more than MAX_DESYNC_RUN frames in a row of any other difference is a desync.
+    Inputs must match exactly, Nana's included, except the physical buttons and triggers playback can't know. Before
+    2.0 a game end said only resolved or unresolved, which the re-recording refines.
+    """
+    import peppi_py
+    import pyarrow as pa
+    import tree
+    from peppi_py.game import EndMethod
+    from slippi_db import upgrade_slp
+
+    original, upgraded = (peppi_py.read_slippi(p, rollback_mode=peppi_py.RollbackMode.LAST)
+                          for p in (original_path, upgraded_path))
+    if (version := tuple(upgraded.start.slippi.version)) != PLAYBACK_VERSION:
+        return "wrong version", {"detail": str(version)}
+    refined = {EndMethod.RESOLVED: (EndMethod.TIME, EndMethod.GAME), EndMethod.UNRESOLVED: (EndMethod.NO_CONTEST,)}
+    if original.end and upgraded.end and upgraded.end.method in refined.get(original.end.method, ()):
+        original = dataclasses.replace(original, end=dataclasses.replace(original.end, method=upgraded.end.method))
+    if problem := upgrade_slp.check_same_metadata(original, upgraded):
+        return "metadata differs", {"detail": problem}
+    if len(original.frames.id) != len(upgraded.frames.id):
+        return "frame count differs", {}
+    new_leaves = dict(tree.flatten_with_path(dataclasses.asdict(upgraded.frames)))
+    unexplained = longest = 0
+    for path, old in tree.flatten_with_path(dataclasses.asdict(original.frames)):
+        new = new_leaves.get(path)
+        if not (problem := upgrade_slp.check_leaf(path, old, new)):
+            continue
+        detail = {"detail": f"{'.'.join(map(str, path))}: {problem}"}
+        if "pre" in path:
+            return "inputs differ", detail
+        if "post" not in path or new is None or isinstance(old, pa.ListArray):
+            return "frames differ", detail
+        frames = unexplained_frames(old.to_numpy(zero_copy_only=False), new.to_numpy(zero_copy_only=False))
+        unexplained += int(frames.sum())
+        longest = max(longest, longest_run(frames))
+    stats = {"post_unexplained": unexplained, "longest_run": longest}
+    return ("desync" if longest > MAX_DESYNC_RUN else None), stats
+
+
+def upgrade_replay(task: tuple[str, str, str, str]) -> dict:
+    """parse_replay for a replay older than Slippi 2.1, re-recorded in playback Dolphin first.
+
+    Games the dataset would drop anyway skip Dolphin. The parse keeps the original's md5 and size.
+    """
+    from slippi_db import parse_peppi, preprocessing, upgrade_slp, utils
+
+    path, name, raw, parsed_dir = task
+    try:
+        with open(path, "rb") as f:
+            slp_bytes = f.read()
+        identity = utils.md5(slp_bytes), len(slp_bytes)
+        result = dict(name=name, raw=raw, slp_md5=identity[0], slp_size=identity[1])
+        with tempfile.TemporaryDirectory(dir=utils.get_tmp_dir(in_memory=True)) as tmp:
+            source = path
+            try:
+                game = parse_peppi.read_slippi(source)
+            except OSError as e:
+                if "invalid UTF8" not in str(e):
+                    raise
+                source = os.path.join(tmp, "original.slp")
+                with open(source, "wb") as f:
+                    f.write(without_metadata(slp_bytes))
+                game = parse_peppi.read_slippi(source)
+                result["metadata_dropped"] = True
+            del slp_bytes
+            metadata = preprocessing.get_metadata(game)
+            is_training, reason = preprocessing.is_training_replay(dict(metadata, slippi_version=PLAYBACK_VERSION))
+            result.update(metadata, valid=True, is_training=is_training, not_training_reason=reason)
+            if not is_training:
+                return result
+            result["quality"] = quality_problem(game, metadata)
+            if result["quality"]:
+                return result
+
+            upgraded = os.path.join(tmp, "upgraded.slp")
+            try:
+                upgrade_slp.upgrade_slp(source, upgraded, upgrade_slp.DolphinConfig(str(PLAYBACK_DOLPHIN), str(MELEE_ISO)),
+                                        time_limit=DOLPHIN_TIMEOUT, copy_slp_metadata_binary=str(COPY_SLP_METADATA))
+                problem, stats = desync(source, upgraded)
+            except Exception as e:
+                problem, stats = type(e).__name__, {"detail": str(e)[-500:]}
+            if problem:
+                return dict(result, is_training=False, not_training_reason=f"upgrade: {problem}",
+                            upgrade_error=problem, upgrade=stats)
+            parsed = parse_replay((upgraded, name, raw, parsed_dir), identity)
+            parsed["upgrade"] = dict(stats, version=".".join(map(str, metadata["slippi_version"])))
+            if result.get("metadata_dropped"):
+                parsed["metadata_dropped"] = True
+            return parsed
+    except KeyboardInterrupt:
+        raise
+    except BaseException as e:
+        return dict(name=name, raw=raw, valid=False, reason=repr(e))
+
+
+def json_default(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    raise TypeError(f"{type(value).__name__} is not JSON serializable")
+
+
+def upgrade_archive(archive: Path, root: Path, work: Path, workers: int) -> dict:
+    """Upgrade, parse, filter and label an archive's old replays, and record each in place of its old outcome.
+
+    Each finished replay goes in the upgrades table at once, so a rerun redoes only the rest. Only the old replays and
+    the context.json files are unpacked.
+    """
+    from slippi_db import parse_local
+
+    raw, event = archive.name, re.sub(r"\.(7z|zip)$", "", archive.name)
+    conn = open_db(root)
+    names = {n for (n,) in conn.execute(
+        "SELECT name FROM outcomes WHERE raw = ? AND outcome = ?", (raw, OLD_REPLAY_OUTCOME))}
+    done = {n for (n,) in conn.execute("SELECT name FROM upgrades WHERE raw = ?", (raw,))}
+    entries = listing(archive)
+    if missing := names - set(entries):
+        raise RuntimeError(f"{raw}: {len(missing)} old replays not in the archive, e.g. {sorted(missing)[:3]}")
+    todo = sorted(names - done)
+    wanted = todo + [p for p in entries if os.path.basename(p) == "context.json"]
+    free = shutil.disk_usage(work).free
+    if free - sum(entries[p] for p in wanted) < MIN_FREE_BYTES:
+        print(f"PAUSE: {raw}'s old replays need {sum(entries[p] for p in wanted) / 1e9:.1f} GB "
+              f"with {free / 1e9:.1f} GB free", flush=True)
+        sys.exit(3)
+    dest = work / "x" / event
+    shutil.rmtree(dest, ignore_errors=True)
+    parsed_dir = root / "Parsed"
+    t0 = time.time()
+    try:
+        extract(archive, dest, wanted)
+        contexts = {os.path.dirname(p): dest / p for p in wanted if os.path.basename(p) == "context.json"}
+        t1 = time.time()
+        tasks = [(str(dest / name), name, raw, str(parsed_dir)) for name in todo]
+        print(f"  {raw}: {len(names)} old replays, {len(done)} upgraded before, {len(todo)} to go", flush=True)
+        with concurrent.futures.ProcessPoolExecutor(workers, initializer=_init_worker) as pool:
+            for i, result in enumerate(pool.map(upgrade_replay, tasks), 1):
+                with conn:
+                    conn.execute("INSERT OR REPLACE INTO upgrades VALUES (?, ?, ?)",
+                                 (raw, result["name"], json.dumps(result, default=json_default)))
+                if i % 500 == 0:
+                    print(f"  {raw}: upgraded {i}/{len(todo)} in {time.time() - t1:.0f}s", flush=True)
+        t2 = time.time()
+
+        results = [json.loads(r) for (r,) in conn.execute("SELECT result FROM upgrades WHERE raw = ?", (raw,))]
+        match_keys = {k for (k,) in conn.execute("SELECT match_key FROM games WHERE match_key IS NOT NULL")}
+        replay_rows, games, outcomes = judge(results, raw, event, contexts, match_keys, parsed_dir)
+        with conn:
+            for table in ("replays", "outcomes", "games"):
+                conn.executemany(f"DELETE FROM {table} WHERE raw = ? AND name = ?", [(raw, p) for p in outcomes])
+            conn.executemany(parse_local.PARSED_INSERT_SQL, replay_rows)
+            conn.executemany("INSERT INTO outcomes VALUES (?, ?, ?, ?)",
+                             [(raw, p, m, o) for p, (m, o) in outcomes.items()])
+            conn.executemany("INSERT INTO games VALUES (?, ?, ?, ?, ?, ?)", games)
+        write_meta(root, conn)
+        conn.close()
+    finally:
+        shutil.rmtree(dest, ignore_errors=True)
+
+    counts = collections.Counter(o for _, o in outcomes.values())
+    summary = {"archive": raw, "old": len(names), "kept": counts["kept"], "pro": sum(g[3] == "pro" for g in games),
+               "unpack_s": round(t1 - t0), "upgrade_s": round(t2 - t1), "outcomes": dict(counts.most_common())}
     print("SUMMARY " + json.dumps(summary), flush=True)
     return summary
 
@@ -711,7 +946,19 @@ def share_url() -> str:
     return SHARE_FILE.read_text().split()[0]
 
 
-def list_archives() -> dict[str, dict]:
+def list_archives(attempts: int = 5) -> dict[str, dict]:
+    """name -> {size, url} for every archive in the share; OneDrive sometimes refuses a listing, so it retries."""
+    for attempt in range(attempts):
+        try:
+            return _list_archives()
+        except (urllib.error.URLError, http.client.HTTPException, OSError) as e:
+            if attempt == attempts - 1:
+                raise
+            print(f"  listing failed ({e!r}); retrying", flush=True)
+            time.sleep(30 * (attempt + 1))
+
+
+def _list_archives() -> dict[str, dict]:
     """name -> {size, url} for every archive in the share, via OneDrive's anonymous "badger" token."""
     req = urllib.request.Request("https://api-badgerp.svc.ms/v1.0/token",
                                  data=json.dumps({"appId": BADGER_APP_ID}).encode(),
@@ -795,10 +1042,11 @@ def write_existing_md5s(meta: Path, out: Path) -> None:
     print(f"{len(found)} md5s from {meta}", flush=True)
 
 
-def scoped(args: list[str]) -> int:
+def scoped(args: list[str], memory: str = MEMORY_MAX, cpus: str | None = None, unit: str | None = None) -> int:
     """Run this script's subcommand in its own memory-capped systemd scope at the lowest priority."""
-    cmd = ["systemd-run", "--user", "--scope", "-q", "-p", f"MemoryMax={MEMORY_MAX}", "--",
-           "env", "OMP_NUM_THREADS=1", "RAYON_NUM_THREADS=1",
+    cmd = ["systemd-run", "--user", "--scope", "-q", *([f"--unit={unit}"] if unit else []),
+           "-p", f"MemoryMax={memory}", "--",
+           "env", "OMP_NUM_THREADS=1", "RAYON_NUM_THREADS=1", *(["taskset", "-c", cpus] if cpus else []),
            "nice", "-n", "19", "ionice", "-c3", sys.executable, "-I", str(Path(__file__).resolve()), *args]
     proc = subprocess.Popen(cmd)
     print(f"  pid {proc.pid}: {' '.join(args[:3])}", flush=True)
@@ -845,18 +1093,66 @@ def run(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def run_upgrades(args: argparse.Namespace) -> int:
+    """Upgrade every archive that still has old replays, then rewrite parsed.pkl and report.json."""
+    root, work = args.root, args.work
+    work.mkdir(parents=True, exist_ok=True)
+    conn = open_db(root)
+    pending = sorted({raw for (raw,) in conn.execute(
+        "SELECT DISTINCT raw FROM outcomes WHERE outcome = ?", (OLD_REPLAY_OUTCOME,))})
+    conn.close()
+    todo = [n for n in pending if not args.only or n in args.only]
+    archives = list_archives()
+    print(f"{len(pending)} archives with old replays; {len(todo)} to go. To stop: kill {os.getpid()}, then "
+          "systemctl --user stop 'tournament-upgrade-*.scope'", flush=True)
+    failed = []
+    start = time.time()
+    for i, name in enumerate(todo):
+        size = archives[name]["size"]
+        free = shutil.disk_usage(work).free
+        if free - size < MIN_FREE_BYTES:
+            print(f"PAUSE: {free / 1e9:.0f} GB free, {name} is {size / 1e9:.0f} GB", flush=True)
+            return 3
+        t = time.time()
+        print(f"[{i + 1}/{len(todo)}] {time.strftime('%H:%M')} {name} ({size / 1e9:.2f} GB)", flush=True)
+        folder = work / "dl" / name
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / name
+        if not (path.exists() and path.stat().st_size == size):
+            download(name, size, folder)
+            print(f"  downloaded in {time.time() - t:.0f}s", flush=True)
+        rc = scoped(["upgrade-archive", "--archive", str(path), "--root", str(root), "--work", str(work),
+                     "--workers", str(args.workers)], UPGRADE_MEMORY_MAX, args.cpus,
+                    f"tournament-upgrade-{re.sub(r'[.](7z|zip)$', '', name)}")
+        path.unlink()
+        folder.rmdir()
+        if rc == 3:
+            return 3
+        if rc:
+            failed.append(name)
+            print(f"  FAILED {name} (exit {rc}); a rerun resumes it", flush=True)
+        print(f"  {name} done in {time.time() - t:.0f}s; {time.time() - start:.0f}s total; "
+              f"{shutil.disk_usage(work).free / 1e9:.0f} GB free", flush=True)
+    scoped(["finalize", "--root", str(root)])
+    (root.parent / "report.json").write_text(json.dumps(report(root), indent=1))
+    print(f"DONE in {time.time() - start:.0f}s; failed: {failed}", flush=True)
+    return 1 if failed else 0
+
+
 def report(root: Path) -> dict:
     """Counts over everything recorded so far: outcomes, groups, label slots, pros, sizes."""
     conn = open_db(root)
     outcomes = collections.Counter(o for (o,) in conn.execute("SELECT outcome FROM outcomes"))
     rows = [json.loads(r) for (r,) in conn.execute("SELECT row FROM games")]
     conn.close()
-    groups, slots, pros, events, methods = (collections.Counter() for _ in range(5))
+    groups, slots, pros, events, methods, upgraded = (collections.Counter() for _ in range(6))
     for row in rows:
         prov = row["tournament"]
         groups[prov["group"]] += 1
         events[prov["event"]] += 1
         methods[prov["assignment"]] += 1
+        if prov.get("upgraded"):
+            upgraded[prov["upgraded"]["version"]] += 1
         for i, player in enumerate(row["players"]):
             label = player["netplay"]["name"]
             if label == "":
@@ -869,7 +1165,7 @@ def report(root: Path) -> dict:
     disk = sum(f.stat().st_size for f in root.rglob("*") if f.is_file())
     return {
         "games": len(rows), "groups": dict(groups), "label_slots": dict(slots),
-        "games_per_pro": dict(pros.most_common()), "assignment": dict(methods),
+        "games_per_pro": dict(pros.most_common()), "assignment": dict(methods), "upgraded_from": dict(upgraded),
         "outcomes": dict(outcomes.most_common()), "games_per_event": dict(events.most_common()),
         "pq_size": {"mean": int(sizes.mean()), "median": int(np.median(sizes)), "max": int(sizes.max())},
         "disk_gb": round(disk / 1e9, 2),
@@ -878,18 +1174,26 @@ def report(root: Path) -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("command", nargs="?", default="run", choices=["run", "process", "finalize", "relabel", "report"])
+    ap.add_argument("command", nargs="?", default="run",
+                    choices=["run", "process", "finalize", "relabel", "report", "upgrade", "upgrade-archive"])
     ap.add_argument("--root", type=Path, default=DATA / "tournament" / "Root")
-    ap.add_argument("--work", type=Path, default=DATA / "tournament" / "work")
+    ap.add_argument("--work", type=Path, help="default: tournament/work, or tournament-upgrade for upgrade")
     ap.add_argument("--existing_meta", type=Path, default=DATA / "full" / "Root" / "meta.json")
     ap.add_argument("--only", nargs="*", help="archive names to build (default: all)")
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--cpus", help="upgrade: CPU list for the Dolphin workers (taskset -c)")
     ap.add_argument("--archive", type=Path, help="process: the downloaded archive")
     args = ap.parse_args()
+    if args.work is None:
+        args.work = DATA / "tournament-upgrade" if args.command.startswith("upgrade") else DATA / "tournament" / "work"
 
     if args.command == "run":
         sys.exit(run(args))
-    if args.command == "process":
+    if args.command == "upgrade":
+        sys.exit(run_upgrades(args))
+    if args.command == "upgrade-archive":
+        upgrade_archive(args.archive, args.root, args.work, args.workers)
+    elif args.command == "process":
         process(args.archive, args.root, args.work, args.work / "existing-md5.txt", args.workers)
     elif args.command == "finalize":
         finalize(args.root)
