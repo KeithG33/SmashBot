@@ -63,7 +63,7 @@ MEMORY_MAX = "16G"
 
 OLD_REPLAY_OUTCOME = "pipeline: slippi version too low"
 UPGRADE_TOOLS = Path("/home/kage/drive2/ShineBot/upgrade-tools")
-PLAYBACK_DOLPHIN = UPGRADE_TOOLS / "dolphin-batch-playback/build-nogui-playback/Binaries/dolphin-emu"
+PLAYBACK_DOLPHIN = UPGRADE_TOOLS / "bin/playback-dolphin"  # standard controllers, not the GameCube adapter
 COPY_SLP_METADATA = UPGRADE_TOOLS / "bin/copy_slp_metadata"
 MELEE_ISO = Path("/home/kage/slippi/Super Smash Bros. Melee (USA) (En,Ja) (v1.02).iso")
 PLAYBACK_VERSION = (3, 19, 0)
